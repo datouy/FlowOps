@@ -12,18 +12,29 @@
         <el-card shadow="never">
           <template #header><span>内容条件</span></template>
           <el-form label-width="80px">
-            <el-form-item label="主题">
-              <el-input v-model="form.topic" placeholder="例如：桂林秋季纯玩、亲子研学" />
+            <el-form-item label="行业">
+              <el-select v-model="form.industry" style="width:100%">
+                <el-option v-for="i in industries" :key="i" :label="i" :value="i" />
+              </el-select>
             </el-form-item>
-            <el-form-item label="线路名">
+            <el-form-item v-if="form.industry === '其他'" label="自定义行业">
+              <el-input v-model="form.custom_industry" placeholder="例如：宠物服务、民宿、家政" />
+            </el-form-item>
+            <el-form-item label="主题">
+              <el-input v-model="form.topic" placeholder="例如：新品上市、到店体验、桂林秋季纯玩" />
+            </el-form-item>
+            <el-form-item :label="form.industry === '旅行社' ? '线路名' : '名称/产品'">
               <el-input v-model="form.tour_name" placeholder="选填" />
             </el-form-item>
-            <el-form-item label="天数/报价">
-              <el-input-number v-model="form.days" :min="1" style="width:110px" />
+            <el-form-item label="目标人群">
+              <el-input v-model="form.audience" placeholder="例如：宝妈、上班族、本地家庭" />
+            </el-form-item>
+            <el-form-item :label="form.industry === '旅行社' ? '天数/报价' : '价格'">
+              <el-input-number v-if="form.industry === '旅行社'" v-model="form.days" :min="1" style="width:110px" />
               <el-input-number v-model="form.price" :min="0" style="width:140px;margin-left:10px" />
             </el-form-item>
             <el-form-item label="亮点">
-              <el-input v-model="form.highlights" type="textarea" :rows="3" placeholder="0购物、漓江竹筏、四钻住宿" />
+              <el-input v-model="form.highlights" type="textarea" :rows="3" placeholder="口味、成分、课程内容、服务项目或产品卖点" />
             </el-form-item>
             <el-form-item label="素材">
               <el-select v-model="sourceFile" placeholder="选择一条素材用于生成封面" clearable style="width:100%">
@@ -79,7 +90,8 @@ import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
 
 const router = useRouter()
-const form = ref({ topic: '', tour_name: '', days: 3, price: 0, highlights: '' })
+const industries = ['旅行社', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '其他']
+const form = ref({ industry: '旅行社', custom_industry: '', topic: '', tour_name: '', audience: '', days: 3, price: 0, highlights: '' })
 const materials = ref([])
 const sourceFile = ref('')
 const loading = ref(false)
@@ -100,14 +112,19 @@ async function loadMaterials() {
 }
 
 async function generate() {
-  if (!form.value.topic && !form.value.tour_name) return ElMessage.warning('请填写主题或线路名')
+  if (!form.value.topic && !form.value.tour_name) return ElMessage.warning('请填写主题或名称')
+  if (form.value.industry === '其他' && !form.value.custom_industry.trim()) return ElMessage.warning('请填写自定义行业')
   loading.value = true
   try {
     const r = await http.post('/ai/generate-pack', form.value)
     items.value = r.data.items
     tagsText.value = Object.fromEntries(r.data.items.map(i => [i.platform, (i.tags || []).join('，')]))
     activePlatform.value = '小红书'
-    ElMessage.success('6 平台内容已生成')
+    if (r.data.errors && r.data.errors.length) {
+      ElMessage.warning('部分平台生成失败：' + r.data.errors.join('；'))
+    } else {
+      ElMessage.success('6 平台内容已生成')
+    }
   } catch (e) { ElMessage.error(e.message || '生成失败') }
   finally { loading.value = false }
 }
