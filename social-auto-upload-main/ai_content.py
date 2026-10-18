@@ -185,6 +185,54 @@ def _parse_tags(value) -> list:
     return [str(t).lstrip("#") for t in tags][:10]
 
 
+def _decode_json_string(value: str) -> str:
+    try:
+        return json.loads('"' + value + '"')
+    except Exception:
+        return value.replace("\\n", "\n").replace('\\"', '"')
+
+
+def _regex_unwrap(value: str) -> dict:
+    if not isinstance(value, str) or not value.strip().startswith("{"):
+        return {}
+    title_m = re.search(r'"title"\s*:\s*"((?:\\.|[^"\\])*)"', value)
+    body_m = re.search(r'"body"\s*:\s*"((?:\\.|[^"\\])*)"', value)
+    result = {}
+    if title_m:
+        result["title"] = _decode_json_string(title_m.group(1)).strip()
+    if body_m:
+        result["body"] = _decode_json_string(body_m.group(1)).strip()
+    elif title_m:
+        marker = value.find('"body"')
+        if marker >= 0:
+            rest = value[marker + 6:].lstrip(" :")
+            rest = rest.lstrip('"')
+            result["body"] = _decode_json_string(rest).strip()
+    return result
+
+
+def _normalize_item(item):
+    """Model sometimes double-encodes the JSON object inside title/body."""
+    if not isinstance(item, dict):
+        return {}
+    for key in ("title", "body"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                inner = json.loads(value)
+                if isinstance(inner, dict):
+                    item = dict(item)
+                    item.update({k: v for k, v in inner.items() if v})
+            except Exception:
+                inner = _regex_unwrap(value)
+                if inner:
+                    item = dict(item)
+                    item.update({k: v for k, v in inner.items() if v})
+    return item
+
+
+
+
 TITLE_LIMITS = {"小红书": 30, "抖音": 25, "视频号": 25, "快手": 25, "微博": 30, "百家号": 30}
 
 
@@ -250,7 +298,7 @@ def generate_content_with_ai(data: dict) -> dict:
         + '{"title":"标题","body":"正文，可含换行","tags":["话题不带#号"],"tip":"发布建议一句"}'
     )
     try:
-        text = _call_with_retry(prompt)
+        text = _call_with_retry(prompt, 1800)
     except RuntimeError:
         return _template_content(platform, industry, fields, profile)
     cleaned = _clean_json(text)
@@ -258,6 +306,7 @@ def generate_content_with_ai(data: dict) -> dict:
         parsed = json.loads(cleaned)
     except Exception:
         parsed = {"title": text.splitlines()[0][:60], "body": text, "tags": [], "tip": ""}
+    parsed = _normalize_item(parsed)
     title = str(parsed.get("title") or "").strip()[:TITLE_LIMITS.get(platform, 30)]
     tags = _parse_tags(parsed.get("tags"))
     if not tags:
@@ -278,7 +327,7 @@ def generate_content(data: dict) -> dict:
     return generate_content_with_ai(data)
 
 
-def _fallback_pack(data: dict, platforms: list, industry: str) -> dict:
+def _fallback_pack(data: dict, platforms: list, industry: str, progress_cb=None) -> dict:
     generated = {}
     errors = []
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -292,6 +341,11 @@ def _fallback_pack(data: dict, platforms: list, industry: str) -> dict:
                 generated[platform] = future.result()
             except Exception as exc:
                 errors.append(platform + ": " + str(exc)[:120])
+            if progress_cb:
+                try:
+                    progress_cb(10 + int(80 * (len(generated) + len(errors)) / max(len(platforms), 1)))
+                except Exception:
+                    pass
     result = []
     for platform in platforms:
         one = generated.get(platform) or {}
@@ -310,7 +364,7 @@ def _fallback_pack(data: dict, platforms: list, industry: str) -> dict:
     }
 
 
-def generate_pack(data: dict) -> dict:
+def generate_pack(data: dict, progress_cb=None) -> dict:
     """一次生成 6 个平台的内容；失败时降级为逐平台生成。"""
     platforms = ["小红书", "抖音", "视频号", "快手", "微博", "百家号"]
     industry = _industry(data)
@@ -336,24 +390,33 @@ def generate_pack(data: dict) -> dict:
         + "只输出 JSON，不要代码块。格式："
         + '{"小红书":{"title":"","body":"","tags":[]},"抖音":{"title":"","body":"","tags":[]},"视频号":{"title":"","body":"","tags":[]},"快手":{"title":"","body":"","tags":[]},"微博":{"title":"","body":"","tags":[]},"百家号":{"title":"","body":"","tags":[]}}'
     )
+    if progress_cb:
+        try: progress_cb(5)
+        except Exception: pass
     try:
         text = _call_with_retry(prompt, 3000)
     except RuntimeError:
-        return _fallback_pack(data, platforms, industry)
+        return _fallback_pack(data, platforms, industry, progress_cb)
+    if progress_cb:
+        try: progress_cb(70)
+        except Exception: pass
     cleaned = _clean_json(text)
     try:
         parsed = json.loads(cleaned)
     except Exception:
-        return _fallback_pack(data, platforms, industry)
+        return _fallback_pack(data, platforms, industry, progress_cb)
     result = []
     for platform in platforms:
-        item = parsed.get(platform) or {}
+        item = _normalize_item(parsed.get(platform) or {})
         result.append({
             "platform": platform,
             "title": str(item.get("title") or "").strip(),
             "body": str(item.get("body") or "").strip(),
             "tags": _parse_tags(item.get("tags")),
         })
+    if progress_cb:
+        try: progress_cb(100)
+        except Exception: pass
     return {"items": result, "model": _load_env().get("WB_MODEL"), "industry": industry}
 
 

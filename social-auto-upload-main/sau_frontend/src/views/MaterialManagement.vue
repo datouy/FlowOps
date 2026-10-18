@@ -24,6 +24,7 @@
         </div>
         <div class="action-buttons">
           <el-button type="primary" @click="handleUploadMaterial">上传素材</el-button>
+          <el-button type="warning" @click="openCleanup">清理未使用素材</el-button>
           <el-button type="info" @click="fetchMaterials" :loading="false">
             <el-icon :class="{ 'is-loading': isRefreshing }"><Refresh /></el-icon>
             <span v-if="isRefreshing">刷新中</span>
@@ -167,6 +168,24 @@
         <el-button type="primary" @click="saveTags">保存</el-button>
       </template>
     </el-dialog>
+    <el-dialog v-model="cleanupDialog" title="清理未使用素材" width="620px">
+      <div class="cleanup-head">
+        <span>清理超过</span>
+        <el-input-number v-model="cleanupDays" :min="0" :max="365" @change="loadUnused" />
+        <span>天且没有被发布记录使用的素材</span>
+        <el-button size="small" @click="loadUnused" :loading="cleanupLoading">刷新</el-button>
+      </div>
+      <p class="cleanup-total">共 {{ unusedItems.length }} 个文件，合计 {{ formatSize(unusedTotal) }}</p>
+      <el-table :data="unusedItems" size="small" max-height="320">
+        <el-table-column prop="filename" label="文件" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="upload_time" label="上传时间" width="150" />
+        <el-table-column label="大小" width="90"><template #default="s">{{ formatSize(s.row.size) }}</template></el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="cleanupDialog=false">取消</el-button>
+        <el-button type="danger" :disabled="!unusedItems.length" @click="doCleanup">确认清理</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -188,6 +207,11 @@ const statusFilter = ref('all')
 const tagDialog = ref(false)
 const tagText = ref('')
 const currentMaterialId = ref(null)
+const cleanupDialog = ref(false)
+const cleanupDays = ref(30)
+const cleanupLoading = ref(false)
+const unusedItems = ref([])
+const unusedTotal = ref(0)
 const publishedFiles = ref(new Set())
 async function loadPublished() {
   try {
@@ -269,6 +293,42 @@ async function saveTags() {
   ElMessage.success('标签已保存')
   fetchMaterials()
   loadPublished()
+}
+
+function formatSize(bytes) {
+  const n = Number(bytes || 0)
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB'
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB'
+  return n + ' B'
+}
+
+async function openCleanup() {
+  cleanupDialog.value = true
+  await loadUnused()
+}
+
+async function loadUnused() {
+  cleanupLoading.value = true
+  try {
+    const r = await http.get('/materials/unused', { days: cleanupDays.value })
+    unusedItems.value = Array.isArray(r.data) ? r.data : []
+    unusedTotal.value = r.total_size || 0
+  } catch (e) { ElMessage.error('加载未使用素材失败') }
+  finally { cleanupLoading.value = false }
+}
+
+async function doCleanup() {
+  if (!unusedItems.value.length) return
+  try {
+    await ElMessageBox.confirm('确认删除这些未使用素材？删除后不可恢复。', '确认清理', { type: 'warning' })
+    const r = await http.post('/materials/cleanup', { days: cleanupDays.value, ids: unusedItems.value.map(i => i.id) })
+    ElMessage.success('已清理 ' + (r.data.removed || []).length + ' 个文件')
+    cleanupDialog.value = false
+    fetchMaterials()
+    loadPublished()
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error(e.message || '清理失败')
+  }
 }
 
 // 搜索处理
@@ -518,4 +578,6 @@ onMounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.cleanup-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.cleanup-total { color: #909399; margin: 6px 0 10px; }
 </style>

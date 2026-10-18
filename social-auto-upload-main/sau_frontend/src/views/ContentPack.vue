@@ -43,6 +43,8 @@
             </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="loading" @click="generate" style="width:100%">生成 6 平台内容包</el-button>
+              <el-progress v-if="packRunning" :percentage="packProgress" :stroke-width="8" style="width:100%;margin-top:10px" />
+              <small v-if="packRunning" class="progress-text">正在并行生成各平台内容，请稍候…</small>
             </el-form-item>
             <el-form-item v-if="sourceFile">
               <el-button @click="makeCovers" :loading="coverLoading" style="width:100%">生成 3:4 / 9:16 封面</el-button>
@@ -95,6 +97,8 @@ const form = ref({ industry: '旅行社', custom_industry: '', topic: '', tour_n
 const materials = ref([])
 const sourceFile = ref('')
 const loading = ref(false)
+const packRunning = ref(false)
+const packProgress = ref(0)
 const coverLoading = ref(false)
 const covers = ref([])
 const items = ref([])
@@ -115,18 +119,42 @@ async function generate() {
   if (!form.value.topic && !form.value.tour_name) return ElMessage.warning('请填写主题或名称')
   if (form.value.industry === '其他' && !form.value.custom_industry.trim()) return ElMessage.warning('请填写自定义行业')
   loading.value = true
+  packRunning.value = true
+  packProgress.value = 0
   try {
-    const r = await http.post('/ai/generate-pack', form.value)
-    items.value = r.data.items
-    tagsText.value = Object.fromEntries(r.data.items.map(i => [i.platform, (i.tags || []).join('，')]))
-    activePlatform.value = '小红书'
-    if (r.data.errors && r.data.errors.length) {
-      ElMessage.warning('部分平台生成失败：' + r.data.errors.join('；'))
-    } else {
-      ElMessage.success('6 平台内容已生成')
+    const start = await http.post('/ai/pack/start', form.value)
+    if (start.data.cached) {
+      applyPack(start.data.result)
+      ElMessage.success('已使用 24 小时内的缓存结果')
+      return
     }
+    const jobId = start.data.id
+    for (let i = 0; i < 150; i++) {
+      await new Promise(r => setTimeout(r, 2000))
+      const st = await http.get('/ai/pack/status/' + jobId)
+      packProgress.value = st.data.progress || 0
+      if (st.data.status === 'success') {
+        applyPack(st.data.result)
+        return
+      }
+      if (st.data.status === 'failed') {
+        throw new Error(st.data.error || '生成失败')
+      }
+    }
+    throw new Error('生成超时，请稍后重试')
   } catch (e) { ElMessage.error(e.message || '生成失败') }
-  finally { loading.value = false }
+  finally { loading.value = false; packRunning.value = false }
+}
+
+function applyPack(data) {
+  items.value = data.items || []
+  tagsText.value = Object.fromEntries(items.value.map(i => [i.platform, (i.tags || []).join('，')]))
+  activePlatform.value = '小红书'
+  if (data.errors && data.errors.length) {
+    ElMessage.warning('部分平台生成失败：' + data.errors.join('；'))
+  } else {
+    ElMessage.success('6 平台内容已生成')
+  }
 }
 
 async function makeCovers() {
@@ -166,4 +194,5 @@ onMounted(loadMaterials)
 .cover-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .cover-item { display: flex; flex-direction: column; gap: 6px; align-items: center; font-size: 12px; color: #909399; }
 .cover-item img { width: 100%; border-radius: 6px; }
+.progress-text { color: #909399; display: block; margin-top: 6px; }
 </style>
