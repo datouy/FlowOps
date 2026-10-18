@@ -171,6 +171,12 @@ def _run_job(job_id):
             else:
                 c.execute("UPDATE jobs SET status='failed', result=?, finished_at=? WHERE id=?", (error, now, job_id))
                 c.execute("UPDATE publish_records SET status='failed', error=?, finished_at=? WHERE id=?", (error, now, rec_id))
+                try:
+                    from notify_ops import notify
+                    names = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
+                    notify('发布失败', '平台：%s' % names.get(type, type) + '\n标题：' + title + '\n原因：' + error, 'error')
+                except Exception:
+                    pass
         else:
             c.execute("UPDATE jobs SET status='success', result='ok', finished_at=? WHERE id=?", (now, job_id))
             c.execute("UPDATE publish_records SET status='success', finished_at=? WHERE id=?", (now, rec_id))
@@ -317,8 +323,16 @@ def run_patrol_once():
             alive = False
         results.append({'account_id': row['id'], 'account_name': row['userName'], 'type': row['type'], 'alive': bool(alive)})
         with get_conn() as c:
+            previous = c.execute('SELECT alive FROM account_patrol WHERE account_id=? ORDER BY id DESC LIMIT 1', (row['id'],)).fetchone()
             c.execute('INSERT INTO account_patrol (account_id, account_name, type, alive) VALUES (?,?,?,?)',
                 (row['id'], row['userName'], row['type'], 1 if alive else 0))
+            if not alive and (previous is None or previous['alive']):
+                try:
+                    from notify_ops import notify
+                    names = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
+                    notify('账号登录过期', '平台：%s' % names.get(row['type'], row['type']) + '\n账号：' + row['userName'] + '\n请重新扫码登录。', 'warning')
+                except Exception:
+                    pass
     loop.close()
     return results
 
