@@ -1,0 +1,46 @@
+# ---- local secrets ----
+.env
+**/.env
+*.pem
+*.key
+*.p12
+
+# ---- local data / account state ----
+*.db
+social-auto-upload-main/db/*.db
+social-auto-upload-main/cookies/
+social-auto-upload-main/cookiesFile/
+social-auto-upload-main/videoFile/
+social-auto-upload-main/logs/
+
+# ---- runtime output ----
+*.log
+backend*.log
+frontend*.log
+*.zip
+
+# ---- Python ----
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ---- Node / frontend build ----
+node_modules/
+dist/
+.vite/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ---- keep empty runtime directories ----
+!social-auto-upload-main/cookies/.gitkeep
+!social-auto-upload-main/cookiesFile/.gitkeep
+!social-auto-upload-main/videoFile/.gitkeep
+!social-auto-upload-main/logs/.gitkeep
+
