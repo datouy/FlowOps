@@ -8,6 +8,7 @@
       <div>
         <el-button type="primary" @click="openAdd">新增消息</el-button>
         <el-button @click="importDialog=true">批量导入</el-button>
+        <el-button @click="openCapture">浏览器采集</el-button>
       </div>
     </div>
 
@@ -137,6 +138,16 @@ async function doImport() {
   importText.value = ''
   ElMessage.success('已导入 ' + r.data.added + ' 条')
   load()
+}
+
+async function openCapture() {
+  const platform = filters.value.platform || '抖音'
+  try {
+    const r = await http.post('/messages/open-capture', { platform, open: true })
+    ElMessage.success(r.msg || '已打开平台页面')
+  } catch (e) {
+    ElMessage.error(e.message || '打开失败')
+  }
 }
 
 function openReply(row) {

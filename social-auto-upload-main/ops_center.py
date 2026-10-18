@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,14 @@ INTENT_WORDS = {
     "medium": ["好玩", "值得", "推荐", "攻略", "住宿", "吃", "门票", "孩子", "老人"],
 }
 NAMES = {1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "微博", 6: "百家号"}
+PLATFORM_URLS = {
+    "抖音": "https://creator.douyin.com/creator-micro/home",
+    "快手": "https://cp.kuaishou.com/",
+    "视频号": "https://channels.weixin.qq.com/platform",
+    "小红书": "https://creator.xiaohongshu.com/creator/home",
+    "微博": "https://weibo.com/",
+    "百家号": "https://baijiahao.baidu.com/",
+}
 
 
 def get_conn():
@@ -166,6 +175,12 @@ def todo_summary():
         expired = sum(1 for a in publish_jobs.latest_account_status() if not a.get("alive"))
     except Exception:
         expired = 0
+    unused_assets = 0
+    try:
+        from material_ops import unused_materials
+        unused_assets = len(unused_materials(30))
+    except Exception:
+        unused_assets = 0
     items = []
     if high_intent:
         items.append({"type": "message", "level": "high", "text": f"{high_intent} 条高意向留言待回复"})
@@ -179,6 +194,8 @@ def todo_summary():
         items.append({"type": "schedule", "level": "info", "text": f"今天有 {scheduled_today} 条定时发布"})
     if expired:
         items.append({"type": "account", "level": "high", "text": f"{expired} 个账号登录已过期，请重新扫码"})
+    if unused_assets:
+        items.append({"type": "storage", "level": "info", "text": f"有 {unused_assets} 个超过 30 天未使用的素材可清理"})
     if not last_sync or str(last_sync)[:10] < today:
         items.append({"type": "stats", "level": "info", "text": "今天还没有同步平台数据"})
     return jsonify({"code": 200, "data": {
@@ -186,7 +203,7 @@ def todo_summary():
         "counts": {"messages": pending_messages, "high_intent": high_intent,
                    "failed_jobs": failed_jobs, "pending_review": pending_review,
                    "scheduled_today": scheduled_today, "last_sync": last_sync,
-                   "expired_accounts": expired}
+                   "expired_accounts": expired, "unused_assets": unused_assets}
     }, "msg": None})
 
 
@@ -223,6 +240,22 @@ def templates_post():
 @bp.route("/todo/summary", methods=["GET"])
 def todo_get():
     return todo_summary()
+
+
+@bp.route("/messages/open-capture", methods=["POST"])
+def open_capture():
+    data = request.get_json(force=True) or {}
+    platform = data.get("platform") or "抖音"
+    url = PLATFORM_URLS.get(platform)
+    if not url:
+        return jsonify({"code": 400, "msg": "unsupported platform"}), 400
+    opened = False
+    if data.get("open", True):
+        try:
+            opened = webbrowser.open(url)
+        except Exception:
+            opened = False
+    return jsonify({"code": 200, "data": {"url": url, "opened": opened}, "msg": "请在浏览器中打开评论/私信页，复制内容后使用批量导入"})
 
 def weekly_report(days: int = 7) -> dict:
     days = max(1, min(int(days or 7), 90))

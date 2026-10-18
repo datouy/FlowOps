@@ -29,6 +29,9 @@ publish_jobs.backfill_scheduled_items()
 publish_jobs.recover_pending_jobs()
 import stats_reflow
 import ai_content
+import ai_pack_jobs
+import notify_ops
+notify_ops.register(app)
 import ops_center
 app.register_blueprint(ops_center.bp)
 import compliance
@@ -522,6 +525,30 @@ def ai_generate_pack():
     except Exception as exc:
         return jsonify({'code': 500, 'data': None, 'msg': str(exc)}), 500
     return jsonify({'code': 200, 'data': result, 'msg': 'ok'}), 200
+
+
+@app.route('/ai/pack/start', methods=['POST'])
+def ai_pack_start():
+    data = request.get_json(force=True) or {}
+    try:
+        result = ai_pack_jobs.start(data)
+    except Exception as exc:
+        return jsonify({'code': 500, 'data': None, 'msg': str(exc)}), 500
+    return jsonify({'code': 200, 'data': result, 'msg': 'ok'}), 200
+
+
+@app.route('/ai/pack/status/<int:job_id>', methods=['GET'])
+def ai_pack_status(job_id):
+    result = ai_pack_jobs.status(job_id)
+    if not result:
+        return jsonify({'code': 404, 'data': None, 'msg': 'job not found'}), 404
+    return jsonify({'code': 200, 'data': result, 'msg': None}), 200
+
+
+@app.route('/ai/pack/cache/clear', methods=['POST'])
+def ai_pack_cache_clear():
+    removed = ai_pack_jobs.clear_cache()
+    return jsonify({'code': 200, 'data': {'removed': removed}, 'msg': 'ok'}), 200
 
 @app.route('/login')
 def login():

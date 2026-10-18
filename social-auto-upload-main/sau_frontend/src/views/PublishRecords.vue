@@ -14,6 +14,8 @@
         <el-radio-button label="unmatched">待关联</el-radio-button>
       </el-radio-group>
       <div class="toolbar-actions">
+        <el-tag size="small" :type="notify.configured ? 'success' : 'info'">{{ notify.configured ? '异常通知已配置' : '未配置异常通知' }}</el-tag>
+        <el-button v-if="notify.configured" size="small" @click="testNotify">测试通知</el-button>
         <span v-if="lastFetchedAt" class="sync-time">上次同步 {{ formatTime(lastFetchedAt) }}</span>
         <el-button size="small" @click="triggerPatrol" :loading="patrolling">检查账号</el-button>
         <el-button size="small" @click="loadAll">刷新</el-button>
@@ -260,6 +262,7 @@ const unmatched = ref([])
 const linkDialog = ref(false)
 const linkStats = ref(null)
 const linkRecordId = ref(null)
+const notify = ref({ configured: false, type: 'auto' })
 const accountStatus = ref([])
 const patrolling = ref(false)
 const summary = ref({
@@ -314,16 +317,18 @@ function jobStatusText(row) {
 
 async function loadAll() {
   try {
-    const [stats, jobResult, accountResult, unmatchedResult] = await Promise.all([
+    const [stats, jobResult, accountResult, unmatchedResult, notifyResult] = await Promise.all([
       http.get('/stats/summary'),
       http.get('/jobs'),
       http.get('/account-status'),
       http.get('/stats/unmatched'),
+      http.get('/notify/status'),
     ])
     summary.value = stats.data
     jobs.value = jobResult.data
     accountStatus.value = accountResult.data
     unmatched.value = unmatchedResult.data
+    notify.value = notifyResult.data
   } catch (error) {
     console.error(error)
   }
@@ -337,6 +342,15 @@ async function triggerPatrol() {
     setTimeout(loadAll, 15000)
   } finally {
     patrolling.value = false
+  }
+}
+
+async function testNotify() {
+  try {
+    await http.post('/notify/test')
+    ElMessage.success('测试通知已发送')
+  } catch (e) {
+    ElMessage.error(e.message || '通知发送失败')
   }
 }
 
