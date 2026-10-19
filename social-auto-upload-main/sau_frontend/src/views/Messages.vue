@@ -214,7 +214,7 @@
               </el-form-item>
               <el-form-item label="发送连接器">
                 <el-input v-model="autoForm.outbound_webhook" placeholder="https://你的发送服务/dm/reply" />
-                <span class="form-hint">不填则生成“待人工发送”，不会直接调用平台私信接口</span>
+                <span class="form-hint">抖音使用本地登录会话直接发送；其他平台可填写发送连接器</span>
               </el-form-item>
               <el-form-item label="接入密钥">
                 <el-input v-model="autoForm.inbound_secret" show-password placeholder="可选，用于校验 Webhook 来源" />
@@ -287,11 +287,11 @@
             />
             <el-alert
               class="sync-note"
-              title="首版只读：不点开会话、不标记已读、不自动发送"
+              title="抖音同步为只读，回复通过本地登录会话直发"
               type="info"
               :closable="false"
               show-icon
-              description="命中的规则回复会保存为“待人工发送”。适配器依赖抖音创作者中心网页版结构，平台改版时可能需要维护；陌生人私信是否展示仍受平台规则限制。"
+              description="同步时不会点开会话或标记已读；手动回复和启用发送的规则回复会打开对应会话并点击平台发送。适配器依赖抖音创作者中心网页版结构，平台改版时可能需要维护。"
             />
           </el-card>
 
@@ -309,11 +309,11 @@
               <div><span>发送失败</span><strong class="danger">{{ analytics.failed || 0 }}</strong></div>
             </div>
             <el-alert
-              title="平台没有面向个人开放的统一私信发送 API"
+              title="抖音支持通过已登录网页会话直接发送"
               type="warning"
               :closable="false"
               show-icon
-              description="本功能负责识别、规则回复、会话和线索。若要真正把回复送回平台，需要配置自己的发送连接器；否则回复会以“待人工发送”保留，方便人工复制发送。"
+              description="抖音回复会直接发送到平台并校验发送结果；其他平台仍可使用自有发送连接器。发送失败时不会误标为已发送。"
             />
             <div class="ingress-actions">
               <el-button @click="helpDialog = true">查看接入格式</el-button>
@@ -583,9 +583,9 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
         <h4>2. 自动回复如何落地</h4>
         <p>系统先识别客群和意向，再按关键词与优先级匹配规则。命中后生成一条回复：</p>
         <ul>
-          <li>配置了“发送连接器”时，会把回复 POST 到你的连接器；成功标记为已发送。</li>
-          <li>未配置或不在发送时段时，回复保留为“待人工发送”，不会假装已经发到平台。</li>
-          <li>平台私信接口需要你在自己的合规连接器中实现，云策不绕过平台风控。</li>
+          <li>抖音会根据客户昵称打开对应会话，通过当前已登录账号直接点击发送。</li>
+          <li>发送成功后才标记为“已发送”；登录失效或平台限制会明确显示失败原因。</li>
+          <li>其他平台可以继续配置发送连接器。</li>
         </ul>
       </div>
       <div class="help-section">
@@ -693,9 +693,11 @@ X-YunCe-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未
   "content": "带爸妈去桂林，3个人从杭州出发，10月20日，多少钱？",
   "source_content": "银发慢游视频"
 }`)
-const connectorNote = computed(() => autoForm.outbound_webhook
-  ? '已配置发送连接器，发送结果会回写到消息状态'
-  : '未配置发送连接器：发送后保存为“待人工发送”，可在消息旁复制回复')
+const connectorNote = computed(() => currentContact.value?.platform === '抖音'
+  ? '抖音将通过当前登录账号直接发送并校验结果'
+  : (autoForm.outbound_webhook
+      ? '已配置发送连接器，发送结果会回写到消息状态'
+      : '未配置发送连接器：发送后保存为“待人工发送”，可在消息旁复制回复'))
 const syncAccounts = computed(() => syncStatus.value.accounts || [])
 const syncSelectedAccount = computed(() => syncStatus.value.selected_account || null)
 const syncSkipSummary = computed(() => Object.entries(syncStatus.value.last_skip_reasons || {})
@@ -973,8 +975,8 @@ async function sendReply() {
   try {
     const res = await http.post(`/dm/conversations/${currentContact.value.id}/reply`, { text })
     const status = res.data?.delivery_status
-    if (status === 'sent') ElMessage.success('回复已通过连接器发送')
-    else if (status === 'failed') ElMessage.error('回复已记录，但发送连接器返回失败')
+    if (status === 'sent') ElMessage.success(currentContact.value?.platform === '抖音' ? '回复已发送到抖音' : '回复已通过连接器发送')
+    else if (status === 'failed') ElMessage.error(res.data?.delivery_error || '回复发送失败')
     else ElMessage.warning('回复已记录为待人工发送，可在消息旁复制')
     replyText.value = ''
     templateId.value = null
