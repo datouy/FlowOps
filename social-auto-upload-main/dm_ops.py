@@ -889,6 +889,16 @@ def conversation_detail(cid: int):
     }, "msg": None})
 
 
+def mark_conversation_read(cid: int):
+    with get_conn() as c:
+        contact = c.execute("SELECT id FROM dm_contacts WHERE id=?", (cid,)).fetchone()
+        if not contact:
+            return jsonify({"code": 404, "data": None, "msg": "conversation not found"}), 404
+        cur = c.execute("""UPDATE messages SET status='read', handled_at=COALESCE(handled_at,?)
+            WHERE contact_id=? AND direction='inbound' AND status='new'""", (_now(), cid))
+    return jsonify({"code": 200, "data": {"marked": int(cur.rowcount or 0)}, "msg": "ok"})
+
+
 def simulate_inbound():
     data = request.get_json(silent=True) or {}
     content = _clean(data.get("content"), 2000)
@@ -1170,6 +1180,11 @@ def dm_conversations():
 @bp.route("/dm/conversations/<int:cid>", methods=["GET"])
 def dm_conversation(cid):
     return conversation_detail(cid)
+
+
+@bp.route("/dm/conversations/<int:cid>/read", methods=["POST"])
+def dm_conversation_read(cid):
+    return mark_conversation_read(cid)
 
 
 @bp.route("/dm/conversations/<int:cid>/reply", methods=["POST"])
