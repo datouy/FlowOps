@@ -995,20 +995,26 @@ async function generateDraft() {
 }
 
 async function sendReply() {
-  if (!currentContact.value) return
+  if (!currentContact.value || sending.value) return
   const text = replyText.value.trim()
   if (!text) return ElMessage.warning('请先输入回复内容')
   sending.value = true
+  replyText.value = ''
+  templateId.value = null
   try {
     const res = await http.post(`/dm/conversations/${currentContact.value.id}/reply`, { text })
     const status = res.data?.delivery_status
     if (status === 'sent') ElMessage.success(currentContact.value?.platform === '抖音' ? '回复已发送到抖音' : '回复已通过连接器发送')
-    else if (status === 'failed') ElMessage.error(res.data?.delivery_error || '回复发送失败')
+    else if (status === 'failed') {
+      replyText.value = text
+      ElMessage.error(res.data?.delivery_error || '回复发送失败')
+    }
     else ElMessage.warning('回复已记录为待人工发送，可在消息旁复制')
-    replyText.value = ''
-    templateId.value = null
     await Promise.all([loadConversation(currentContact.value.id), loadConversations(), loadAnalytics()])
-  } catch (error) { console.error(error) }
+  } catch (error) {
+    replyText.value = text
+    ElMessage.error(error.message || '回复发送失败，内容已恢复')
+  }
   finally { sending.value = false }
 }
 
