@@ -861,6 +861,24 @@ def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
 
 
 def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
+    platform = _clean(payload.get("platform"), 40)
+    nickname = _clean(payload.get("nickname"), 80)
+    text = _clean(payload.get("text"), 2000)
+    if platform == "抖音" and nickname and text:
+        try:
+            import platform_reply
+            platform_reply.send_douyin(payload.get("account"), nickname, text)
+            status, error = "sent", ""
+        except Exception as exc:
+            status, error = "failed", f"抖音直发失败：{str(exc)[:300]}"
+        with get_conn() as c:
+            c.execute("UPDATE messages SET delivery_status=? WHERE id=?", (status, out_id))
+            c.execute("""UPDATE dm_reply_logs SET status=?,reason=?
+                WHERE outbound_message_id=?""",
+                (status, error or "抖音网页私信已发送", out_id))
+        return {"delivery_status": status, "delivery_error": error,
+                "transport": "douyin-web" if status == "sent" else ""}
+
     url = _clean(settings.get("outbound_webhook"), 1000)
     if not url:
         with get_conn() as c:
