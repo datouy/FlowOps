@@ -91,6 +91,7 @@
                     <el-tag size="small" effect="plain">{{ item.platform }}</el-tag>
                     <el-tag size="small" :type="segmentTagType(item.segment)" effect="light">{{ item.segment_label }}</el-tag>
                     <el-tag size="small" :type="intentTagType(item.intent)" effect="light">{{ intentText(item.intent) }}</el-tag>
+                    <el-tag v-if="item.needs_reply" size="small" type="danger" effect="dark">未回复</el-tag>
                   </div>
                   <div class="conversation-preview">
                     <span v-if="item.last_direction === 'outbound'" class="reply-mark">我：</span>
@@ -113,6 +114,7 @@
                       {{ currentContact.nickname || '匿名用户' }}
                       <el-tag size="small" :type="segmentTagType(currentContact.segment)">{{ currentContact.segment_label }}</el-tag>
                       <el-tag size="small" :type="intentTagType(currentContact.intent)">{{ intentText(currentContact.intent) }}</el-tag>
+                      <el-tag v-if="currentContact.needs_reply" size="small" type="danger" effect="dark">未回复</el-tag>
                     </div>
                     <div class="chat-sub">{{ currentContact.platform }} · {{ currentContact.account || '未填账号' }} · {{ currentContact.stage_label }}</div>
                   </div>
