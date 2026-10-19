@@ -127,7 +127,7 @@ def _run_job(job_id):
         return
     type = job['type']
     title = job['title']
-    tags = job['tags']
+    tags = json_loads(job['tags'])
     file_list = json_loads(job['file_list'])
     account_list = json_loads(job['account_list'])
     extra = json_loads(job['extra'] or '{}')
@@ -263,10 +263,14 @@ def _expand_schedule(job_id):
 
 def enqueue_job(type, title, tags, file_list, account_list, extra, review_required=False):
     import json
+    if isinstance(tags, str):
+        tags = [item.strip() for item in tags.split(',') if item.strip()]
+    elif not isinstance(tags, list):
+        tags = []
     with get_conn() as c:
         status = 'pending_review' if review_required else 'pending'
         cur = c.execute('INSERT INTO jobs (type,title,tags,file_list,account_list,extra,status) VALUES (?,?,?,?,?,?,?)',
-            (type, title, tags or '', json.dumps(file_list), json.dumps(account_list), json.dumps(extra or {}), status))
+            (type, title, json.dumps(tags, ensure_ascii=False), json.dumps(file_list), json.dumps(account_list), json.dumps(extra or {}), status))
         job_id = cur.lastrowid
     if not review_required:
         _start_workers()
