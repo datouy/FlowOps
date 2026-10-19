@@ -843,6 +843,7 @@ def list_conversations():
     q = _clean(request.args.get("q"), 120)
     sql = """SELECT c.*, m.content AS last_content, m.direction AS last_direction,
         m.created_at AS last_message_time, m.delivery_status AS last_delivery_status,
+        CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply,
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='inbound'
             AND x.status='new') AS unread_count,
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id) AS message_count,
@@ -882,6 +883,10 @@ def conversation_detail(cid: int):
             SELECT * FROM messages WHERE contact_id=?
             ORDER BY datetime(created_at) DESC, id DESC LIMIT 200
         ) ORDER BY datetime(created_at) ASC, id ASC""", (cid,)).fetchall()]
+        contact["needs_reply"] = bool(
+            messages and messages[-1].get("direction") == "inbound"
+            and messages[-1].get("status") in ("new", "read")
+        )
         logs = [dict(r) for r in c.execute("""SELECT * FROM dm_reply_logs WHERE contact_id=?
             ORDER BY id DESC LIMIT 30""", (cid,)).fetchall()]
     return jsonify({"code": 200, "data": {
