@@ -34,12 +34,25 @@ request.interceptors.response.use(
     if (data.code === 200 || data.success) {
       return data
     } else {
-      ElMessage.error(data.msg || data.message || '请求失败')
-      return Promise.reject(new Error(data.msg || data.message || '请求失败'))
+      const message = data.msg || data.message || '请求失败'
+      if (!response.config?.silent) {
+        ElMessage.error(message)
+      }
+      return Promise.reject(new Error(message))
     }
   },
   (error) => {
     console.error('响应错误:', error)
+
+    if (error.config?.silent) {
+      return Promise.reject(error)
+    }
+
+    const serverMessage = error.response?.data?.msg
+    if (serverMessage) {
+      ElMessage.error(serverMessage)
+      return Promise.reject(error)
+    }
     
     // 处理HTTP错误状态码
     if (error.response) {
@@ -71,8 +84,8 @@ request.interceptors.response.use(
 
 // 封装常用的请求方法
 export const http = {
-  get(url, params) {
-    return request.get(url, { params })
+  get(url, params, config = {}) {
+    return request.get(url, { ...config, params })
   },
   
   post(url, data, config = {}) {

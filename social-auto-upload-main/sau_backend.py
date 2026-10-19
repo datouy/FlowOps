@@ -1,5 +1,6 @@
 import asyncio
 import os
+os.environ.setdefault("FLOWOPS_BACKEND", "1")
 import sqlite3
 import threading
 import time
@@ -11,6 +12,7 @@ from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
 from werkzeug.utils import secure_filename
 from publish_jobs import enqueue_job, start_patrol, run_patrol_once, latest_account_status
+import verify_codes
 from travel_ops import bp as travel_ops_bp
 from conf import BASE_DIR
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
@@ -433,6 +435,61 @@ def get_job(job_id):
     if not row:
         return jsonify({'code': 404, 'msg': 'job not found'}), 404
     return jsonify({'code': 200, 'data': dict(row), 'msg': None}), 200
+
+
+def _verify_request_payload(item):
+    data = dict(item or {})
+    account_file = os.path.basename(str(data.get('account_file') or ''))
+    if account_file:
+        try:
+            conn = sqlite3.connect(Path(BASE_DIR / "db" / "database.db"))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute('SELECT userName, type FROM user_info WHERE filePath=?', (account_file,)).fetchone()
+            conn.close()
+            if row:
+                data['account_name'] = row['userName']
+                names = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
+                data['platform'] = names.get(row['type'], data.get('platform') or '')
+        except Exception:
+            pass
+    return data
+
+
+@app.route('/verify/pending', methods=['GET'])
+def verify_pending():
+    pending = verify_codes.latest_pending()
+    return jsonify({
+        'code': 200,
+        'data': _verify_request_payload(pending) if pending else None,
+        'msg': None,
+    }), 200
+
+
+@app.route('/verify/submit', methods=['POST'])
+def verify_submit_code():
+    payload = request.get_json(silent=True) or {}
+    request_id = str(payload.get('request_id') or '').strip()
+    code = str(payload.get('code') or '').strip()
+    if not request_id:
+        return jsonify({'code': 400, 'data': None, 'msg': '缺少验证码请求标识'}), 400
+    if not code.isdigit() or not (4 <= len(code) <= 8):
+        return jsonify({'code': 400, 'data': None, 'msg': '请输入 4-8 位数字验证码'}), 400
+    ok, msg = verify_codes.submit_code(request_id, code)
+    if not ok:
+        return jsonify({'code': 409, 'data': None, 'msg': msg}), 409
+    return jsonify({'code': 200, 'data': {'request_id': request_id}, 'msg': '验证码已提交'}), 200
+
+
+@app.route('/verify/resend', methods=['POST'])
+def verify_resend_code():
+    payload = request.get_json(silent=True) or {}
+    request_id = str(payload.get('request_id') or '').strip()
+    if not request_id:
+        return jsonify({'code': 400, 'data': None, 'msg': '缺少验证码请求标识'}), 400
+    ok, msg = verify_codes.request_resend(request_id)
+    if not ok:
+        return jsonify({'code': 409, 'data': None, 'msg': msg}), 409
+    return jsonify({'code': 200, 'data': {'request_id': request_id}, 'msg': '已请求重新发送验证码'}), 200
 
 
 @app.route('/review/pending', methods=['GET'])

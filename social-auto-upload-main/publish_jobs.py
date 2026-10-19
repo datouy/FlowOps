@@ -7,6 +7,7 @@ import traceback
 import queue as _queue
 from pathlib import Path
 from conf import BASE_DIR
+import verify_codes
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
 _lock = threading.Lock()
@@ -131,6 +132,8 @@ def _run_job(job_id):
     file_list = json_loads(job['file_list'])
     account_list = json_loads(job['account_list'])
     extra = json_loads(job['extra'] or '{}')
+    platform_names = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
+    verify_codes.set_job_context(job_id=job_id, title=title, platform=platform_names.get(type, ''))
 
     if extra.get('enableTimer'):
         _expand_schedule(job_id)
@@ -159,6 +162,9 @@ def _run_job(job_id):
     except Exception as e:
         error = str(e)[:500]
         traceback.print_exc()
+    finally:
+        verify_codes.clear_job_context()
+        verify_codes.cancel_job_requests(job_id, error)
 
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     with get_conn() as c:
