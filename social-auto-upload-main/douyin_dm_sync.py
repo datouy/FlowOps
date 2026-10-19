@@ -338,6 +338,197 @@ SCAN_SCRIPT = r"""
 }
 """
 
+HISTORY_SCRIPT = r"""
+() => {
+  const nodes = Array.from(document.querySelectorAll('.box-item-W0TV01'));
+  const rows = [];
+  let currentTime = '';
+  for (let index = 0; index < nodes.length; index++) {
+    const el = nodes[index];
+    const cls = String(el.className || '');
+    if (cls.includes('time-Tl7Z4j')) {
+      currentTime = String(el.innerText || '').trim();
+      continue;
+    }
+    if (cls.includes('tip-skRp_9')) continue;
+    const textNode = el.querySelector('.text-prz9K6, .text-item-message-zUNhSB');
+    const text = String(textNode?.innerText || '').trim();
+    if (!text) continue;
+    let displayTime = '';
+    for (let next = index + 1; next < Math.min(nodes.length, index + 4); next++) {
+      const nextCls = String(nodes[next].className || '');
+      if (nextCls.includes('time-Tl7Z4j')) {
+        displayTime = String(nodes[next].innerText || '').trim();
+        break;
+      }
+    }
+    if (!displayTime) displayTime = currentTime;
+    rows.push({
+      text: text.slice(0, 4000),
+      direction: cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound',
+      display_time: displayTime,
+    });
+  }
+  return rows;
+}
+"""
+
+
+def _pending_conversation_unread() -> dict[str, int]:
+    try:
+        with dm_ops.get_conn() as c:
+            rows = c.execute("""SELECT c.external_user_id, c.source_content, COUNT(m.id) unread_count
+                FROM dm_contacts c JOIN messages m ON m.contact_id=c.id
+                WHERE c.platform='抖音' AND m.direction='inbound' AND m.status='new'
+                GROUP BY c.id""").fetchall()
+            result = {}
+            for row in rows:
+                cid = str(row["external_user_id"] or "")
+                if not cid:
+                    continue
+                match = re.search(r"未读\s*(\d+)", str(row["source_content"] or ""))
+                result[cid] = max(int(row["unread_count"] or 0), int(match.group(1)) if match else 0)
+            return result
+    except Exception:
+        return {}
+
+
+def _history_marker_key(cid: str) -> str:
+    return "douyin_history_" + hashlib.sha1(cid.encode("utf-8")).hexdigest()
+
+
+def _history_signature(row: dict) -> str:
+    values = "|".join(str(row.get(key) or "") for key in (
+        "cid", "display_time", "preview", "created_at", "message_type", "unread"
+    ))
+    return hashlib.sha1(values.encode("utf-8")).hexdigest()
+
+
+def _history_marker(cid: str) -> str:
+    try:
+        with dm_ops.get_conn() as c:
+            row = c.execute("SELECT value FROM dm_meta WHERE key=?", (_history_marker_key(cid),)).fetchone()
+            return str(row["value"] or "") if row else ""
+    except Exception:
+        return ""
+
+
+def _save_history_marker(cid: str, signature: str):
+    try:
+        with dm_ops.get_conn() as c:
+            c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES (?,?)",
+                      (_history_marker_key(cid), signature))
+    except Exception:
+        pass
+
+
+def _display_time_to_text(value: str) -> str:
+    label = _clean_text(value, 40)
+    now = datetime.now()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", label)
+    if match:
+        candidate = now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
+        if candidate > now + timedelta(minutes=5):
+            candidate -= timedelta(days=1)
+        return candidate.strftime("%Y-%m-%d %H:%M:%S")
+    if label == "昨天":
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    if label.startswith("星期"):
+        weekdays = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+        target = weekdays.get(label[-1])
+        if target is not None:
+            days = (now.weekday() - target) % 7 or 7
+            return (now - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+    match = re.fullmatch(r"(\d{1,2})-(\d{1,2})", label)
+    if match:
+        try:
+            value = datetime(now.year, int(match.group(1)), int(match.group(2)))
+            if value > now:
+                value = value.replace(year=now.year - 1)
+            return value.strftime("%Y-%m-%d 00:00:00")
+        except ValueError:
+            pass
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _click_conversation(page, cid: str) -> bool:
+    await page.evaluate("""() => {
+        const grid = document.querySelector('.ReactVirtualized__Grid');
+        if (grid) grid.scrollTop = 0;
+    }""")
+    await page.wait_for_timeout(350)
+    for _ in range(20):
+        index = await page.evaluate("""(cid) => {
+            const items = Array.from(document.querySelectorAll('.semi-list-item'));
+            for (let index = 0; index < items.length; index++) {
+                const header = items[index].querySelector('.semi-list-item-body-header');
+                if (!header) continue;
+                const key = Object.keys(header).find(name => name.startsWith('__reactProps$'));
+                let conversation = null;
+                try { conversation = header[key]?.children?.props?.conversation; } catch (error) {}
+                if (conversation && String(conversation.id || conversation.shortId || '') === cid) return index;
+            }
+            return -1;
+        }""", cid)
+        if index >= 0:
+            await page.locator('.semi-list-item').nth(index).click()
+            await page.wait_for_timeout(1600)
+            return True
+        moved = await page.evaluate("""() => {
+            const grid = document.querySelector('.ReactVirtualized__Grid');
+            if (!grid) return false;
+            const before = grid.scrollTop;
+            grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+            return grid.scrollTop !== before;
+        }""")
+        if not moved:
+            return False
+        await page.wait_for_timeout(500)
+    return False
+
+
+def _history_items(row: dict, history: list[dict], account: dict) -> list[dict]:
+    cid = str(row.get("cid") or "")
+    nickname = _clean_text(row.get("name"), 80) or "抖音用户"
+    unread = max(0, int(row.get("unread") or 0))
+    inbound_positions = [index for index, item in enumerate(history) if item.get("direction") == "inbound"]
+    first_unread = max(0, len(inbound_positions) - unread)
+    inbound_seen = 0
+    result = []
+    for item in history:
+        text = _clean_text(item.get("text"), 4000)
+        if not text:
+            continue
+        direction = "outbound" if item.get("direction") == "outbound" else "inbound"
+        display_time = _clean_text(item.get("display_time"), 40)
+        created_at = _display_time_to_text(display_time)
+        marker = "outbound" if direction == "outbound" else ""
+        fingerprint = "|".join((cid, display_time, "7", text, marker))
+        status = "replied"
+        if direction == "inbound":
+            status = "new" if inbound_seen >= first_unread else "replied"
+            inbound_seen += 1
+        source = "抖音创作者中心聊天记录"
+        if row.get("is_stranger"):
+            source += " · 陌生人会话"
+        result.append({
+            "platform": "抖音",
+            "account": str(account.get("userName") or "").strip() or "抖音账号",
+            "external_user_id": cid,
+            "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
+            "author": nickname if direction == "inbound" else "我",
+            "content": text,
+            "source_content": source,
+            "msg_type": "dm",
+            "direction": direction,
+            "status": status,
+            "delivery_status": "received" if direction == "inbound" else "sent",
+            "created_at": created_at,
+            "auto_reply": False,
+            "intent": dm_ops.detect_intent(text) if direction == "inbound" else "low",
+        })
+    return result
+
 
 async def _page_is_login(page) -> bool:
     url = (page.url or "").lower()
@@ -426,6 +617,28 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
                     break
                 await page.wait_for_timeout(550)
             data = list(collected.values())
+            pending_unread = _pending_conversation_unread()
+            for row in data:
+                try:
+                    cid = str(row.get("cid") or "")
+                    signature = _history_signature(row)
+                    effective_unread = max(
+                        int(row.get("unread") or 0), int(pending_unread.get(cid) or 0)
+                    )
+                    row["unread"] = effective_unread
+                    should_scan_history = effective_unread > 0
+                    if should_scan_history and _history_marker(cid) == signature:
+                        row["history_synced"] = True
+                        continue
+                    if not should_scan_history:
+                        continue
+                    if await _click_conversation(page, cid):
+                        history = await page.evaluate(HISTORY_SCRIPT)
+                        if isinstance(history, list) and history:
+                            row["history"] = history
+                            _save_history_marker(cid, signature)
+                except Exception:
+                    pass
             return {"rows": data, "scanned": len(data)}
     finally:
         if context is not None:
@@ -540,15 +753,23 @@ def run_sync(trigger: str = "manual") -> dict:
         skipped = 0
         skip_reasons: dict[str, int] = {}
         for row in scan.get("rows") or []:
+            if row.get("history_synced"):
+                continue
             item, reason = _row_to_item(row, account, recent_only=bool(settings.get("recent_only")))
             if item:
-                items.append(item)
+                history_items = _history_items(row, row.get("history") or [], account)
+                items.extend(history_items or [item])
             else:
                 skipped += 1
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
         # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
         ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
+        for contact_id in {
+            int(result.get("contact_id")) for result in ingest.get("items", [])
+            if result.get("contact_id")
+        }:
+            dm_ops.dedupe_contact_messages(contact_id)
         finished_at = _now_text()
         duration_ms = int((time.monotonic() - started_mono) * 1000)
         ready = sum(
