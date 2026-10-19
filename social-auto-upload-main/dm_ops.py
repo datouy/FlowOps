@@ -1303,7 +1303,7 @@ def export_contacts():
             row.get("notes", ""), row.get("tags", ""), row.get("last_message_at", ""),
         ])
     return Response(output.getvalue(), mimetype="text/csv; charset=utf-8", headers={
-        "Content-Disposition": "attachment; filename=flowops-leads.csv",
+        "Content-Disposition": "attachment; filename=yunce-leads.csv",
     })
 
 
@@ -1311,7 +1311,9 @@ def _check_inbound_secret(settings: dict, body: dict):
     expected = _clean(settings.get("inbound_secret"), 200)
     if not expected:
         return True
-    supplied = request.headers.get("X-FlowOps-Secret") or body.get("secret")
+    supplied = (request.headers.get("X-YunCe-Secret")
+                or request.headers.get("X-FlowOps-Secret")
+                or body.get("secret"))
     return str(supplied or "") == expected
 
 

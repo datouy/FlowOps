@@ -253,8 +253,8 @@
                 </el-select>
               </el-form-item>
               <el-form-item label="同步间隔">
-                <el-input-number v-model="syncForm.interval_seconds" :min="30" :max="3600" :step="30" controls-position="right" />
-                <span class="form-hint">秒，最短 30 秒</span>
+                <el-input-number v-model="syncForm.interval_seconds" :min="5" :max="3600" :step="5" controls-position="right" />
+                <span class="form-hint">秒，最短 5 秒</span>
               </el-form-item>
               <el-form-item label="同步范围">
                 <el-switch v-model="syncForm.recent_only" />
@@ -565,7 +565,7 @@
         <h4>1. 把平台私信转发到这里</h4>
         <pre class="code-block">POST {{ webhookUrl }}
 Content-Type: application/json
-X-FlowOps-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设置可省略）' }}
+X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设置可省略）' }}
 
 {
   "platform": "抖音",
@@ -585,7 +585,7 @@ X-FlowOps-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设
         <ul>
           <li>配置了“发送连接器”时，会把回复 POST 到你的连接器；成功标记为已发送。</li>
           <li>未配置或不在发送时段时，回复保留为“待人工发送”，不会假装已经发到平台。</li>
-          <li>平台私信接口需要你在自己的合规连接器中实现，FlowOps 不绕过平台风控。</li>
+          <li>平台私信接口需要你在自己的合规连接器中实现，云策不绕过平台风控。</li>
         </ul>
       </div>
       <div class="help-section">
@@ -638,7 +638,7 @@ const autoForm = reactive({
 })
 const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
-const syncForm = reactive({ enabled: false, account_id: 0, interval_seconds: 60, recent_only: true })
+const syncForm = reactive({ enabled: false, account_id: 0, interval_seconds: 5, recent_only: true })
 const savingSync = ref(false)
 const syncing = ref(false)
 const rules = ref([])
@@ -681,7 +681,7 @@ const helpDialog = ref(false)
 const webhookUrl = computed(() => `${apiBase}/dm/inbound`)
 const webhookExample = computed(() => `POST ${webhookUrl.value}
 Content-Type: application/json
-X-FlowOps-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未设置可省略）'}
+X-YunCe-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未设置可省略）'}
 
 {
   "platform": "抖音",
@@ -849,7 +849,7 @@ async function loadSyncStatus() {
     syncStatus.value = data
     syncForm.enabled = Boolean(data.enabled)
     syncForm.account_id = Number(data.account_id || 0)
-    syncForm.interval_seconds = Number(data.interval_seconds || 60)
+    syncForm.interval_seconds = Number(data.interval_seconds || 5)
     syncForm.recent_only = Boolean(data.recent_only)
   } catch (error) { console.error(error) }
 }
@@ -860,7 +860,7 @@ async function saveSyncSettings() {
     const res = await http.put('/dm/sync/settings', {
       enabled: syncForm.enabled ? 1 : 0,
       account_id: Number(syncForm.account_id || 0),
-      interval_seconds: Number(syncForm.interval_seconds || 60),
+      interval_seconds: Number(syncForm.interval_seconds || 5),
       recent_only: syncForm.recent_only ? 1 : 0,
       max_conversations: Number(syncStatus.value.max_conversations || 20),
     })

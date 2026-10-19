@@ -60,6 +60,6 @@ def register(app):
 
     @app.route("/notify/test", methods=["POST"])
     def notify_test():
-        ok = notify("FlowOps 测试通知", "如果你收到这条消息，说明异常通知配置成功。", "info")
+        ok = notify("云策测试通知", "如果你收到这条消息，说明异常通知配置成功。", "info")
         return jsonify({"code": 200 if ok else 400, "data": {"sent": ok}, "msg": "sent" if ok else "未配置 webhook 或发送失败"}), 200 if ok else 400
 

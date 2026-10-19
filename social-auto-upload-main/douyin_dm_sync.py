@@ -34,7 +34,7 @@ RECENT_WINDOW = timedelta(hours=48)
 DEFAULT_SYNC_SETTINGS = {
     "enabled": 1,
     "account_id": 0,
-    "interval_seconds": 60,
+    "interval_seconds": 5,
     "max_conversations": 20,
     "recent_only": 1,
     "draft_only": 1,
@@ -85,7 +85,7 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id=1),
             enabled INTEGER DEFAULT 1,
             account_id INTEGER DEFAULT 0,
-            interval_seconds INTEGER DEFAULT 60,
+            interval_seconds INTEGER DEFAULT 5,
             max_conversations INTEGER DEFAULT 20,
             recent_only INTEGER DEFAULT 1,
             draft_only INTEGER DEFAULT 1,
@@ -140,9 +140,9 @@ def _load_settings() -> dict:
     except (TypeError, ValueError):
         data["account_id"] = 0
     try:
-        data["interval_seconds"] = max(30, min(int(data.get("interval_seconds") or 60), 3600))
+        data["interval_seconds"] = max(5, min(int(data.get("interval_seconds") or 5), 3600))
     except (TypeError, ValueError):
-        data["interval_seconds"] = 60
+        data["interval_seconds"] = 5
     try:
         data["max_conversations"] = max(1, min(int(data.get("max_conversations") or 20), 100))
     except (TypeError, ValueError):
@@ -553,10 +553,10 @@ def run_sync(trigger: str = "manual") -> dict:
     finally:
         _sync_lock.release()
         try:
-            interval = max(30, int(_load_settings().get("interval_seconds") or 60))
+            interval = max(5, int(_load_settings().get("interval_seconds") or 5))
             enabled = bool(_load_settings().get("enabled"))
         except Exception:
-            interval, enabled = 60, False
+            interval, enabled = 5, False
         with _state_lock:
             _next_run_at = time.time() + interval if enabled else None
 
@@ -583,7 +583,7 @@ def _background_loop():
                 continue
 
             result = run_sync("auto")
-            interval = max(30, int(_load_settings().get("interval_seconds") or 60))
+            interval = max(5, int(_load_settings().get("interval_seconds") or 5))
             if not result.get("ok"):
                 interval = max(interval, 300)
             with _state_lock:
@@ -617,7 +617,7 @@ def sync_settings():
     global _next_run_at
     data = request.get_json(silent=True) or {}
     try:
-        interval = max(30, min(int(data.get("interval_seconds") or 60), 3600))
+        interval = max(5, min(int(data.get("interval_seconds") or 5), 3600))
         max_conversations = max(1, min(int(data.get("max_conversations") or 20), 100))
         account_id = max(0, int(data.get("account_id") or 0))
     except (TypeError, ValueError):

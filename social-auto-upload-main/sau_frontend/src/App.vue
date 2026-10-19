@@ -3,7 +3,7 @@
     <el-container>
       <el-aside :width="isCollapse ? '64px' : '220px'" class="sidebar">
         <div class="logo-container">
-          <h2 v-if="!isCollapse">汇流运营台</h2>
+          <h2 v-if="!isCollapse">云策</h2>
           <el-icon class="toggle-sidebar" @click="toggleSidebar"><Fold /></el-icon>
         </div>
         <el-menu
