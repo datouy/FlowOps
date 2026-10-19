@@ -22,7 +22,7 @@
           </el-menu-item>
           <el-menu-item index="/messages">
             <el-icon><ChatDotRound /></el-icon>
-            <span>消息中心</span>
+            <span>私信中心</span>
           </el-menu-item>
           <el-menu-item index="/account-management">
             <el-icon><User /></el-icon>

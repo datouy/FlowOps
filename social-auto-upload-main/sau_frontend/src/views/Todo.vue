@@ -10,8 +10,8 @@
 
     <div class="metric-grid">
       <div class="metric" @click="go('/messages')">
-        <span>待回复留言</span><strong>{{ todo.counts.messages || 0 }}</strong>
-        <small>其中高意向 {{ todo.counts.high_intent || 0 }}</small>
+        <span>待回复私信/留言</span><strong>{{ todo.counts.messages || 0 }}</strong>
+        <small>高意向 {{ todo.counts.high_intent || 0 }} · 自动回复待发送 {{ todo.counts.auto_ready || 0 }}</small>
       </div>
       <div class="metric" @click="go('/publish-records')">
         <span>失败发布任务</span><strong class="danger">{{ todo.counts.failed_jobs || 0 }}</strong>
