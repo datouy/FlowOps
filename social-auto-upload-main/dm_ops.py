@@ -20,7 +20,7 @@ import ai_content
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
 
-SEGMENTS = {"silver": "银发", "family": "亲子", "team": "团建", "unknown": "未分类"}
+SEGMENTS = {"general": "通用", "new": "新客户", "interested": "意向客户", "existing": "老客户", "unknown": "未分类"}
 STAGES = {
     "new": "新咨询", "engaged": "已互动", "qualified": "已留资",
     "contacted": "已联系", "converted": "已成交", "lost": "已流失",
@@ -38,33 +38,13 @@ PLATFORM_STYLES = {
     "百家号": "稳重、清楚、避免营销腔",
 }
 
-SEGMENT_WORDS = {
-    "silver": [
-        "银发", "爸妈", "父母", "老人", "老年", "退休", "阿姨", "叔叔", "长辈",
-        "慢游", "适老", "不购物", "纯玩", "血压", "腿脚", "无障碍", "电梯房",
-        "带我妈", "带我爸", "带父母", "带爸妈", "60岁", "65岁", "70岁",
-    ],
-    "family": [
-        "亲子", "带娃", "遛娃", "孩子", "宝宝", "儿童", "宝妈", "宝爸", "几岁",
-        "幼儿园", "小学", "研学", "儿童餐", "亲子房", "儿童座椅", "一家三口",
-        "小朋友", "娃", "娘俩", "二胎",
-    ],
-    "team": [
-        "团建", "企业团建", "公司团建", "部门团建", "公司出游", "公司旅游",
-        "员工旅游", "员工活动", "团队出游", "企业活动", "年会", "拓展训练",
-        "户外拓展", "hr", "行政", "老板", "公司", "企业", "工厂", "厂里",
-        "事业部", "团队建设", "员工福利", "30人", "50人", "100人",
-    ],
-}
 HIGH_INTENT_WORDS = [
-    "价格", "多少钱", "报价", "费用", "报名", "行程", "几天", "优惠", "怎么去",
-    "联系", "微信", "电话", "余位", "名额", "定金", "订", "想报", "发我", "资料",
-    "路线", "出发", "日期", "单人", "两人", "三人", "预算", "方案", "档期",
-    "合同", "发票", "团建报价", "团建方案", "多少人",
+    "价格", "多少钱", "报价", "费用", "购买", "下单", "预约", "咨询", "联系", "电话",
+    "优惠", "库存", "名额", "方案", "合同", "发票", "合作", "怎么买", "地址", "营业时间",
 ]
 MEDIUM_INTENT_WORDS = [
-    "好玩", "值得", "推荐", "攻略", "住宿", "吃", "门票", "孩子", "老人",
-    "路线", "景点", "自由行", "跟团", "小团", "纯玩",
+    "了解", "推荐", "怎么样", "效果", "评价", "使用", "服务", "产品", "适合", "区别",
+    "功能", "规格", "发货", "售后", "详情", "资料",
 ]
 STOP_WORDS_DEFAULT = "人工,转人工,投诉,退款"
 
@@ -183,133 +163,8 @@ def init_db():
         _backfill_contacts(c)
 
 
-DEFAULT_RULES = [
-    {
-        "name": "银发 · 带爸妈咨询", "segment": "silver",
-        "keywords": "银发,爸妈,父母,老人,退休,慢游,老年团,不购物,阿姨,叔叔,适老",
-        "match_type": "any", "priority": 120,
-        "reply_template": (
-            "{greeting}带爸妈出门，最重要的是不折腾。你把出行人数、出发城市、大概日期发我，"
-            "我先发你银发慢游行程，以及每天大概走多少路、坐多久车。合适再聊价格，不硬推。"
-        ),
-    },
-    {
-        "name": "银发 · 报团避坑清单", "segment": "silver",
-        "keywords": "避坑,陷阱,购物团,赶早,爬山,无障碍,电梯,清单,注意什么",
-        "match_type": "any", "priority": 115,
-        "reply_template": (
-            "{greeting}给你一份《带爸妈报团自查清单》：①是否早起赶路 ②每天车程多久 "
-            "③进几个购物店 ④酒店有没有电梯和无障碍 ⑤是否含意外险和随车药箱。"
-            "回我“清单”，我把完整版和适老行程一起发你。"
-        ),
-    },
-    {
-        "name": "亲子 · 带娃咨询", "segment": "family",
-        "keywords": "亲子,带娃,遛娃,孩子,宝宝,儿童,宝妈,宝爸,几岁,幼儿园,研学,儿童餐,亲子房",
-        "match_type": "any", "priority": 120,
-        "reply_template": (
-            "{greeting}带娃出门，先看三件事：单日车程、儿童餐、有没有人帮着带玩。"
-            "你告诉我孩子几岁、几位出行、从哪出发，我发你对应的亲子行程和亲子房、餐食说明。"
-        ),
-    },
-    {
-        "name": "亲子 · 价格问询", "segment": "family",
-        "keywords": "多少钱,价格,费用,报价,优惠,早鸟,预算",
-        "match_type": "any", "priority": 110,
-        "reply_template": (
-            "{greeting}亲子线价格跟孩子年龄、是否占床和出发日期有关，我不想先给你一个不准的数。"
-            "你发我：孩子几岁、几位大人、出发城市和日期，我按这版给你算准价和余位。"
-        ),
-    },
-    {
-        "name": "团建 · 方案与报价", "segment": "team",
-        "keywords": "方案,报价,价格,多少钱,费用,预算,档期,发票,定制,30人,50人,100人,一日,两天一夜,过夜",
-        "match_type": "any", "priority": 140,
-        "reply_template": (
-            "{greeting}团建报价跟人数、车程、餐标、活动项目、是否过夜和保险有关。"
-            "为避免低价后加项，我会把车、餐、保险、领队和物料是否全含写清楚。"
-            "你发我人数、出发地、预算范围和日期，我出方案+明细，不先报虚价。"
-        ),
-    },
-    {
-        "name": "团建 · 行政避坑清单", "segment": "team",
-        "keywords": "避坑,隐形消费,购物,保险,超支,踩坑,注意什么,靠谱,安全",
-        "match_type": "any", "priority": 135,
-        "reply_template": (
-            "{greeting}给行政/HR一份企业团建自查清单：①车、餐、保险、领队是否全含 "
-            "②有没有隐形消费 ③高强度项目是否适合全员 ④有没有雨天备用方案 "
-            "⑤合同、发票和意外险由谁负责。回我“团建清单”，发你完整版。"
-        ),
-    },
-    {
-        "name": "团建 · 案例与保障", "segment": "team",
-        "keywords": "案例,反馈,评价,真实,资质,保障,回头客,合同",
-        "match_type": "any", "priority": 130,
-        "reply_template": (
-            "{greeting}可以发你近期真实团建案例：人数、行程、含项和客户反馈都会列清，"
-            "涉及公司信息会打码。你先看执行细节和真实评价，觉得合适我再按你们的人数和预算出方案。"
-        ),
-    },
-    {
-        "name": "团建 · 首次咨询", "segment": "team",
-        "keywords": "", "match_type": "any", "priority": 100,
-        "reply_template": (
-            "{greeting}企业团建先按“员工不尴尬、行政不为难、老板觉得值”来选。"
-            "你发我大概人数、出发城市、预算范围和想几月走，我按这四项发3套适配方案，不硬推。"
-        ),
-    },
-    {
-        "name": "通用 · 价格与行程", "segment": "",
-        "keywords": "价格,多少钱,费用,报价,报名,行程,几天,怎么去,余位,名额,优惠",
-        "match_type": "any", "priority": 50,
-        "reply_template": (
-            "{greeting}收到你的咨询。为了避免给你发错线路，方便说一下：几位出行、从哪出发、"
-            "大概几号走、是带爸妈、带孩子，还是公司团建？我按你的情况发行程和报价，不合适也没关系。"
-        ),
-    },
-    {
-        "name": "通用 · 领取资料", "segment": "",
-        "keywords": "资料,清单,行程表,路线表,攻略,发我,链接",
-        "match_type": "any", "priority": 45,
-        "reply_template": (
-            "{greeting}可以。你先告诉我出行人数、出发城市和大概日期，我发你对应的行程表；"
-            "如果是带爸妈，我另发《银发团行前准备表》；带孩子就发《亲子团避坑清单》；"
-            "公司团建就发《团建方案库》。"
-        ),
-    },
-    {
-        "name": "通用 · 首次承接", "segment": "",
-        "keywords": "", "match_type": "any", "priority": 1,
-        "reply_template": (
-            "{greeting}收到你的留言～这条线有银发慢游、亲子、企业团建和小团四种。方便告诉我："
-            "几位出行、从哪出发、大概几号走、是带爸妈、带孩子，还是公司团建？"
-            "我按你的情况发最合适那版，不硬推。"
-        ),
-    },
-]
-
-DEFAULT_TEMPLATES = [
-    ("银发 · 首次承接", "silver", "首咨",
-     "叔叔阿姨好～我们这条银发慢游不赶早、不进购物店，每天步行和车程都会提前写清楚。你这边几位、从哪出发、大概几号走？我按情况发行程。"),
-    ("银发 · 避坑清单", "silver", "干货",
-     "带爸妈报团先问五句：几点出发？每天车程多久？进几个购物店？酒店有没有电梯？有没有意外险和药箱？这五句问清楚，比只看价格靠谱。"),
-    ("亲子 · 首次承接", "family", "首咨",
-     "带娃出门先看单日车程、儿童餐和有没有人帮着带玩。你告诉我孩子几岁、几位出行、从哪出发，我发你对应的亲子行程。"),
-    ("亲子 · 价格问询", "family", "报价",
-     "亲子线价格跟孩子年龄、是否占床和日期有关。你发我孩子年龄、几位大人、出发城市和日期，我给你算准价，不先报虚的。"),
-    ("团建 · 首次承接", "team", "首咨",
-     "企业团建先看四件事：多少人、从哪出发、预算范围、想几月走。你发我这几项，我按“员工不尴尬、行政不为难、老板觉得值”发3套适配方案，不硬推。"),
-    ("团建 · 方案报价", "team", "报价",
-     "团建报价跟人数、车程、餐标、活动项目、是否过夜和保险有关。我会把车、餐、保险、领队和物料是否全含写清楚，你发人数、出发地、预算和日期，我出方案和明细。"),
-    ("团建 · 避坑清单", "team", "干货",
-     "给行政/HR一份团建自查：车餐保险领队是否全含、有没有隐形消费、高强度项目是否适合全员、有没有雨天备用方案、合同发票和意外险谁负责。回我“团建清单”发完整版。"),
-    ("团建 · 真实反馈", "team", "信任",
-     "发你近期企业团建的真实案例和客户反馈：人数、行程、含项、执行细节都列清，公司信息会打码。先看案例，合适再聊你们团队的定制方案。"),
-    ("团建 · 档期促销", "team", "促销",
-     "团建档期以实际余位为准。先按人数、出发地、预算和日期确认方案；定金、退款、改期规则以及车、餐、保险、领队等含项，都写进确认单再锁档。"),
-    ("通用 · 问清三件事", "", "首咨",
-     "收到～为了给你发对线路，方便说一下：几位出行、从哪出发、大概几号走？带爸妈、带孩子，还是公司团建？我按你的情况发，不硬推。"),
-]
+DEFAULT_RULES = []
+DEFAULT_TEMPLATES = []
 
 
 def _seed_defaults(c):
@@ -317,77 +172,24 @@ def _seed_defaults(c):
         cols = ",".join(DEFAULT_SETTINGS.keys())
         marks = ",".join("?" for _ in DEFAULT_SETTINGS)
         c.execute(f"INSERT INTO dm_settings (id,{cols}) VALUES (1,{marks})", list(DEFAULT_SETTINGS.values()))
-    seeded = c.execute("SELECT value FROM dm_meta WHERE key='default_seed_v1'").fetchone()
-    now = _now()
-    if not seeded:
-        for item in DEFAULT_RULES:
-            c.execute("""INSERT INTO dm_rules
-                (name,enabled,platform,segment,keywords,match_type,priority,reply_template,
-                 cooldown_minutes,once_per_contact,created_at,updated_at)
-                VALUES (?,?,'',?,?,?,?,?,0,0,?,?)""",
-                (item["name"], 1, item["segment"], item["keywords"], item["match_type"],
-                 item["priority"], item["reply_template"], now, now))
-        for name, segment, category, content in DEFAULT_TEMPLATES:
-            c.execute("""INSERT INTO message_templates (name,content,segment,category,platform,created_at)
-                VALUES (?,?,?,?,?,?)""", (name, content, segment, category, "", now))
-        c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES ('default_seed_v1','1')")
 
-    team_seeded = c.execute("SELECT value FROM dm_meta WHERE key='default_seed_team_v1'").fetchone()
-    if not team_seeded:
-        existing_rules = {row["name"] for row in c.execute("SELECT name FROM dm_rules").fetchall()}
-        for item in DEFAULT_RULES:
-            if item["segment"] != "team" or item["name"] in existing_rules:
-                continue
-            c.execute("""INSERT INTO dm_rules
-                (name,enabled,platform,segment,keywords,match_type,priority,reply_template,
-                 cooldown_minutes,once_per_contact,created_at,updated_at)
-                VALUES (?,?,'',?,?,?,?,?,0,0,?,?)""",
-                (item["name"], 1, item["segment"], item["keywords"], item["match_type"],
-                 item["priority"], item["reply_template"], now, now))
-        existing_templates = {row["name"] for row in c.execute(
-            "SELECT name FROM message_templates").fetchall()}
-        for name, segment, category, content in DEFAULT_TEMPLATES:
-            if segment != "team" or name in existing_templates:
-                continue
-            c.execute("""INSERT INTO message_templates (name,content,segment,category,platform,created_at)
-                VALUES (?,?,?,?,?,?)""", (name, content, segment, category, "", now))
-        c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES ('default_seed_team_v1','1')")
-
-    copy_upgraded = c.execute(
-        "SELECT value FROM dm_meta WHERE key='default_copy_team_v1'").fetchone()
-    if not copy_upgraded:
-        defaults = {item["name"]: item["reply_template"] for item in DEFAULT_RULES}
-        legacy_rules = {
-            "通用 · 价格与行程": (
-                "{greeting}收到你的咨询。为了避免给你发错线路，方便说一下：几位出行、从哪出发、"
-                "大概几号走、是带爸妈还是带孩子？我按你的情况发行程和报价，不合适也没关系。"
-            ),
-            "通用 · 领取资料": (
-                "{greeting}可以。你先告诉我出行人数、出发城市和大概日期，我发你对应的行程表；"
-                "如果是带爸妈，我另发《银发团行前准备表》，带孩子就发《亲子团避坑清单》。"
-            ),
-            "通用 · 首次承接": (
-                "{greeting}收到你的留言～这条线有银发慢游、亲子和小团三种。方便告诉我："
-                "几位出行、从哪出发、大概几号走？我按你的情况发最合适那版，不硬推。"
-            ),
-        }
-        for name, old_template in legacy_rules.items():
-            c.execute("""UPDATE dm_rules SET reply_template=?,updated_at=?
-                WHERE name=? AND reply_template=?""",
-                (defaults[name], now, name, old_template))
-        c.execute("""UPDATE message_templates SET content=?
-            WHERE name='通用 · 问清三件事' AND content=?""",
-            ("收到～为了给你发对线路，方便说一下：几位出行、从哪出发、大概几号走？"
-             "带爸妈、带孩子，还是公司团建？我按你的情况发，不硬推。",
-             "收到～为了给你发对线路，方便说一下：几位出行、从哪出发、大概几号走？"
-             "带爸妈还是带孩子？我按你的情况发，不硬推。"))
-        c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES ('default_copy_team_v1','1')")
-
-    c.execute("""UPDATE dm_rules SET keywords=?,updated_at=?
-        WHERE name='团建 · 方案与报价' AND keywords=?""",
-        ("方案,报价,价格,多少钱,费用,预算,档期,发票,定制,30人,50人,100人,一日,两天一夜,过夜",
-         now,
-         "方案,报价,价格,多少钱,费用,预算,档期,合同,发票,定制,30人,50人,100人,一日,两天一夜,过夜"))
+    cleaned = c.execute("SELECT value FROM dm_meta WHERE key='generic_defaults_v1'").fetchone()
+    if not cleaned:
+        legacy_rules = [
+            "银发 · 带爸妈咨询", "银发 · 报团避坑清单", "亲子 · 带娃咨询", "亲子 · 价格问询",
+            "团建 · 方案与报价", "团建 · 行政避坑清单", "团建 · 案例与保障", "团建 · 首次咨询",
+            "通用 · 价格与行程", "通用 · 领取资料", "通用 · 首次承接",
+        ]
+        legacy_templates = [
+            "银发 · 首次承接", "银发 · 避坑清单", "亲子 · 首次承接", "亲子 · 价格问询",
+            "团建 · 首次承接", "团建 · 方案报价", "团建 · 避坑清单", "团建 · 真实反馈",
+            "团建 · 档期促销", "通用 · 问清三件事",
+        ]
+        c.executemany("DELETE FROM dm_rules WHERE name=?", [(name,) for name in legacy_rules])
+        c.executemany("DELETE FROM message_templates WHERE name=?", [(name,) for name in legacy_templates])
+        c.execute("UPDATE dm_contacts SET segment='unknown' WHERE segment IN ('silver','family','team')")
+        c.execute("UPDATE dm_rules SET segment='' WHERE segment IN ('silver','family','team')")
+        c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES ('generic_defaults_v1','1')")
 
 
 def _backfill_contacts(c):
@@ -412,14 +214,9 @@ def _backfill_contacts(c):
 
 
 def detect_segment(text: str, explicit: str = "") -> str:
-    if explicit in SEGMENTS and explicit != "unknown":
+    if explicit in SEGMENTS:
         return explicit
-    text = (text or "").lower()
-    scores = {}
-    for segment, words in SEGMENT_WORDS.items():
-        scores[segment] = sum(1 for word in words if word.lower() in text)
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "unknown"
+    return "unknown"
 
 
 def detect_intent(text: str) -> str:
@@ -784,19 +581,10 @@ def _build_ai_reply(c, contact: dict, content: str, platform: str) -> str:
         ("客户：" if row["direction"] == "inbound" else "客服：") + str(row["content"])
         for row in reversed(history)
     )
-    segment_note = ""
-    if contact.get("segment") == "team":
-        segment_note = (
-            "企业团建场景：重点问清大概人数、出发城市、预算范围、出行档期和是否过夜；"
-            "兼顾行政/HR 的执行压力与老板的预算判断，不承诺赠品、档期或折扣。\n"
-        )
     prompt = (
-        "你是旅行社私信客服。请用中文回复最后一条客户私信，60-100字。\n"
+        "你是品牌私信客服。请用中文回复最后一条客户私信，60-100字。" + "\n"
         f"平台：{platform}；平台语气：{_reply_style(platform)}。\n"
-        f"客群：{SEGMENTS.get(contact.get('segment'), '未分类')}。\n"
-        f"{segment_note}"
-        "要求：先回应用户关注点；只问最关键的1-2个信息（人数、出发城市、日期、孩子年龄等）；"
-        "不要编造价格、余位、赠品、医疗或退款承诺；不要硬推。只输出回复正文。\n"
+        "要求：先回应客户关注点；只追问1-2个关键信息，例如规格、预算、时间、使用场景或联系方式；不要编造价格、库存、优惠、效果、资质或服务承诺；不要硬推。只输出回复正文。" + "\n"
         f"对话记录：\n{history_text}\n"
     )
     text = ai_content._call_llm(prompt, max_tokens=500)

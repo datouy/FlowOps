@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h2>AI 文案生成</h2>
-        <p class="sub">选择行业，输入主题或产品信息，按平台风格生成标题、正文和话题。</p>
+        <p class="sub">适用于产品、服务、门店、课程或活动。填写名称、受众和卖点，即可按平台风格生成内容。</p>
       </div>
       <el-tag :type="status.configured ? 'success' : 'danger'" effect="plain">
         {{ status.configured ? ('模型 ' + status.model) : 'AI 未配置' }}
@@ -14,42 +14,45 @@
       <el-col :xs="24" :lg="10">
         <el-card shadow="never">
           <template #header><span>生成条件</span></template>
-          <el-form label-width="84px">
-            <el-form-item label="行业">
+          <el-form label-width="96px">
+            <el-form-item label="行业/类型">
               <el-select v-model="form.industry" style="width:100%">
-                <el-option v-for="i in industries" :key="i" :label="i" :value="i" />
+                <el-option v-for="item in industries" :key="item" :label="item" :value="item" />
               </el-select>
             </el-form-item>
             <el-form-item v-if="form.industry === '其他'" label="自定义行业">
-              <el-input v-model="form.custom_industry" placeholder="例如：宠物服务、民宿、家政" />
+              <el-input v-model="form.custom_industry" placeholder="例如：宠物服务、软件、家居、教育" />
             </el-form-item>
             <el-form-item label="发布平台">
               <el-select v-model="form.platform" style="width:100%">
-                <el-option v-for="p in platforms" :key="p" :label="p" :value="p" />
+                <el-option v-for="platform in platforms" :key="platform" :label="platform" :value="platform" />
               </el-select>
             </el-form-item>
-            <el-form-item label="主题">
-              <el-input v-model="form.topic" :placeholder="topicPlaceholder" />
+            <el-form-item label="产品/服务名称">
+              <el-input v-model="form.business_name" placeholder="例如：新品名称、课程名称、服务套餐" />
             </el-form-item>
-            <el-form-item :label="nameLabel">
-              <el-input v-model="form.tour_name" :placeholder="namePlaceholder" />
+            <el-form-item label="主题">
+              <el-input v-model="form.topic" placeholder="例如：新品上市、使用场景、活动推广、品牌介绍" />
             </el-form-item>
             <el-form-item label="目标人群">
-              <el-input v-model="form.audience" placeholder="例如：25-35 岁女性、宝妈、上班族、本地家庭" />
+              <el-input v-model="form.audience" placeholder="例如：年轻上班族、新手父母、企业客户" />
             </el-form-item>
-            <el-form-item :label="form.industry === '旅行社' ? '天数/价格' : '价格'">
-              <el-input-number v-if="form.industry === '旅行社'" v-model="form.days" :min="1" :max="60" style="width:110px" />
-              <el-input-number v-model="form.price" :min="0" style="width:140px;margin-left:10px" />
+            <el-form-item label="规格/周期">
+              <el-input v-model="form.specification" placeholder="选填，例如：标准版、3个月、单次服务" />
+            </el-form-item>
+            <el-form-item label="价格/定位">
+              <el-input v-model="form.price" placeholder="选填，例如：299元、面议、中高端" />
             </el-form-item>
             <el-form-item label="核心卖点">
-              <el-input v-model="form.highlights" type="textarea" :rows="3" :placeholder="highlightsPlaceholder" />
+              <el-input v-model="form.highlights" type="textarea" :rows="3" placeholder="填写真实功能、服务内容、使用体验或差异化价值" />
             </el-form-item>
             <el-form-item label="语气">
               <el-select v-model="form.tone" style="width:100%">
                 <el-option label="真实亲切" value="真实、亲切、像朋友推荐" />
                 <el-option label="专业稳重" value="专业、稳重、信息清晰" />
                 <el-option label="轻松活泼" value="轻松、活泼、适合年轻用户" />
-                <el-option label="性价比导向" value="实在、突出性价比和费用透明" />
+                <el-option label="简洁直接" value="简洁、直接、重点突出" />
+                <el-option label="高性价比" value="实在、突出价格透明和性价比" />
               </el-select>
             </el-form-item>
             <el-form-item>
@@ -97,57 +100,64 @@ import { http } from '@/utils/request'
 
 const router = useRouter()
 const platforms = ['小红书', '抖音', '视频号', '快手', '微博', '百家号']
-const industries = ['旅行社', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '其他']
+const industries = ['通用', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '旅行社', '其他']
 const status = ref({ configured: false, model: '', base_url: '' })
 const loading = ref(false)
-const form = ref({ industry: '旅行社', custom_industry: '', platform: '小红书', topic: '', tour_name: '', audience: '', days: 3, price: 0, highlights: '', tone: '真实、亲切、像朋友推荐' })
+const form = ref({
+  industry: '通用',
+  custom_industry: '',
+  platform: '小红书',
+  business_name: '',
+  topic: '',
+  audience: '',
+  specification: '',
+  price: '',
+  highlights: '',
+  tone: '真实、亲切、像朋友推荐'
+})
 const result = ref({ title: '', body: '', tags: [], tip: '', platform: '', industry: '' })
-
-const nameLabel = computed(() => form.value.industry === '旅行社' ? '线路名称' : '名称/产品')
-const namePlaceholder = computed(() => form.value.industry === '旅行社' ? '例如：桂林阳朔5日纯玩团' : '例如：招牌菜、课程、产品名或门店名')
-const topicPlaceholder = computed(() => form.value.industry === '旅行社' ? '例如：桂林秋季纯玩、亲子研学' : '例如：新品上市、到店体验、使用场景')
-const highlightsPlaceholder = computed(() => form.value.industry === '旅行社' ? '例如：0购物、漓江竹筏、四钻住宿' : '例如：口味、成分、课程内容、服务项目或产品卖点')
 
 const tagsText = computed({
   get: () => (result.value.tags || []).join('，'),
-  set: (v) => { result.value.tags = v.split(/[,，\s]+/).map(t => t.trim().replace(/^#/, '')).filter(Boolean) }
+  set: value => {
+    result.value.tags = String(value || '').split(/[,，\s]+/).map(item => item.trim().replace(/^#/, '')).filter(Boolean)
+  }
 })
 
 async function loadStatus() {
   try {
-    const r = await http.get('/ai/status')
-    status.value = r.data
-  } catch (e) { console.error(e) }
+    const response = await http.get('/ai/status')
+    status.value = response.data
+  } catch (error) {
+    console.error(error)
+  }
 }
 
 async function generate() {
-  if (!form.value.topic && !form.value.tour_name) {
-    ElMessage.warning('请先填写主题或名称')
-    return
+  if (!form.value.topic && !form.value.business_name) {
+    return ElMessage.warning('请先填写主题或产品/服务名称')
   }
   if (form.value.industry === '其他' && !form.value.custom_industry.trim()) {
-    ElMessage.warning('请填写自定义行业')
-    return
+    return ElMessage.warning('请填写自定义行业')
   }
   loading.value = true
   try {
-    const payload = { ...form.value }
-    const r = await http.post('/ai/generate', payload)
-    result.value = r.data
+    const response = await http.post('/ai/generate', form.value)
+    result.value = response.data
     ElMessage.success('文案已生成')
-  } catch (e) {
-    ElMessage.error(e.message || '生成失败，请稍后重试')
+  } catch (error) {
+    ElMessage.error(error.message || '生成失败，请稍后重试')
   } finally {
     loading.value = false
   }
 }
 
 async function copyAll() {
-  const text = [result.value.title, '', result.value.body, '', (result.value.tags || []).map(t => '#' + t).join(' ')].join('\n')
+  const text = [result.value.title, '', result.value.body, '', (result.value.tags || []).map(tag => '#' + tag).join(' ')].join('\n')
   try {
     await navigator.clipboard.writeText(text)
     ElMessage.success('已复制')
-  } catch (e) {
+  } catch (error) {
     ElMessage.error('复制失败，请手动选择文本')
   }
 }

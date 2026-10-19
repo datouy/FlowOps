@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h2>私信自动回复</h2>
-        <p class="sub">统一收件箱 · 银发/亲子/团建客群识别 · 规则自动承接 · 线索沉淀</p>
+        <p class="sub">统一收件箱 · 意向识别 · 自定义回复规则 · 线索沉淀</p>
       </div>
       <div class="head-actions">
         <el-tag :type="settings.enabled ? 'success' : 'info'" effect="dark" round>
@@ -26,7 +26,7 @@
       <div class="metric-card" @click="jumpToHighIntent">
         <span>高意向客户</span>
         <strong class="danger">{{ analytics.high_intent || 0 }}</strong>
-        <small>价格 / 行程 / 报名 / 联系方式</small>
+        <small>价格 / 预约 / 购买 / 联系方式</small>
       </div>
       <div class="metric-card">
         <span>今日自动回复</span>
@@ -36,7 +36,7 @@
       <div class="metric-card">
         <span>已沉淀线索</span>
         <strong>{{ analytics.qualified || 0 }}</strong>
-        <small>银发 {{ analytics.silver || 0 }} · 亲子 {{ analytics.family || 0 }} · 团建 {{ analytics.team || 0 }}</small>
+        <small>意向客户 {{ analytics.interested || 0 }} · 重点客户 {{ analytics.qualified || 0 }}</small>
       </div>
     </div>
 
@@ -52,10 +52,10 @@
                 <el-select v-model="convFilters.platform" clearable placeholder="全部平台" @change="loadConversations">
                   <el-option v-for="p in platforms" :key="p" :label="p" :value="p" />
                 </el-select>
-                <el-select v-model="convFilters.segment" clearable placeholder="全部客群" @change="loadConversations">
-                  <el-option label="银发" value="silver" />
-                  <el-option label="亲子" value="family" />
-                  <el-option label="企业团建" value="team" />
+                <el-select v-model="convFilters.segment" clearable placeholder="全部类型" @change="loadConversations">
+                  <el-option label="新客户" value="new" />
+                  <el-option label="意向客户" value="interested" />
+                  <el-option label="老客户" value="existing" />
                   <el-option label="未分类" value="unknown" />
                 </el-select>
                 <el-select v-model="convFilters.status" clearable placeholder="全部状态" @change="loadConversations">
@@ -337,7 +337,7 @@
           </template>
           <el-table :data="rules" border stripe size="small">
             <el-table-column prop="name" label="规则" min-width="170" show-overflow-tooltip />
-            <el-table-column label="客群" width="82">
+            <el-table-column label="类型" width="82">
               <template #default="scope"><el-tag size="small" :type="segmentTagType(scope.row.segment)">{{ scope.row.segment_label }}</el-tag></template>
             </el-table-column>
             <el-table-column prop="keywords" label="关键词" min-width="220" show-overflow-tooltip>
@@ -366,10 +366,10 @@
                 <span class="card-sub">会话自动沉淀人数、出发地、日期、公司、预算、联系方式与跟进阶段</span>
               </div>
               <div class="lead-actions">
-                <el-select v-model="leadFilters.segment" clearable placeholder="全部客群" @change="loadLeads">
-                  <el-option label="银发" value="silver" />
-                  <el-option label="亲子" value="family" />
-                  <el-option label="企业团建" value="team" />
+            <el-select v-model="leadFilters.segment" clearable placeholder="全部类型" @change="loadLeads">
+                  <el-option label="新客户" value="new" />
+                  <el-option label="意向客户" value="interested" />
+                  <el-option label="老客户" value="existing" />
                   <el-option label="未分类" value="unknown" />
                 </el-select>
                 <el-select v-model="leadFilters.stage" clearable placeholder="全部阶段" @change="loadLeads">
@@ -382,7 +382,7 @@
           <el-table :data="leads" border stripe size="small" v-loading="loadingLeads">
             <el-table-column prop="nickname" label="客户" width="130" show-overflow-tooltip />
             <el-table-column prop="platform" label="平台" width="72" />
-            <el-table-column label="客群 / 意向" width="128">
+            <el-table-column label="类型 / 意向" width="128">
               <template #default="scope">
                 <el-tag size="small" :type="segmentTagType(scope.row.segment)">{{ scope.row.segment_label }}</el-tag>
                 <el-tag v-if="scope.row.intent === 'high'" size="small" type="danger" style="margin-left:4px">高</el-tag>
@@ -426,8 +426,8 @@
         </el-form-item>
         <el-form-item label="昵称"><el-input v-model="simulateForm.nickname" placeholder="例如：王姐" /></el-form-item>
         <el-form-item label="来信内容">
-          <el-input v-model="simulateForm.content" type="textarea" :rows="4" placeholder="例如：公司团建30人，从上海出发，预算3万，12月中旬，要方案和报价" @input="simulateResult = null" />
-          <span class="form-hint">也支持测试：带爸妈去桂林，3个人从杭州出发，10月20日，多少钱？</span>
+          <el-input v-model="simulateForm.content" type="textarea" :rows="4" placeholder="例如：这个产品有哪些规格？多少钱？可以预约吗？" @input="simulateResult = null" />
+          <span class="form-hint">填写一条真实客户可能发来的咨询，用于测试关键词和回复规则。</span>
         </el-form-item>
       </el-form>
       <div v-if="simulateResult" class="simulate-result">
@@ -453,7 +453,7 @@
 
     <el-dialog v-model="importDialog" title="批量导入消息" width="620px">
       <p class="dialog-hint">每行一条：<code>平台|账号|用户|留言内容|来源内容(可选)|用户ID(可选)</code></p>
-      <el-input v-model="importText" type="textarea" :rows="8" placeholder="抖音|陆大头|小明|桂林五日游多少钱？&#10;小红书|亲子号|豆豆妈|3岁宝宝桂林怎么玩？|亲子游笔记" />
+      <el-input v-model="importText" type="textarea" :rows="8" placeholder="抖音|账号名|客户昵称|我想了解这个产品&#10;小红书|账号名|另一位客户|有优惠活动吗？|来源内容" />
       <div class="import-option">
         <el-switch v-model="importAutoReply" />
         <span>导入后对命中的规则自动回复</span>
@@ -466,19 +466,19 @@
 
     <el-dialog v-model="ruleDialog" :title="ruleForm.id ? '编辑回复规则' : '新建回复规则'" width="760px">
       <el-form label-width="86px">
-        <el-form-item label="规则名称"><el-input v-model="ruleForm.name" placeholder="例如：银发 · 价格问询" /></el-form-item>
-        <el-form-item label="适用客群">
+        <el-form-item label="规则名称"><el-input v-model="ruleForm.name" placeholder="例如：价格咨询、预约咨询、售后问题" /></el-form-item>
+        <el-form-item label="客户类型">
           <el-select v-model="ruleForm.segment" style="width: 180px">
             <el-option label="通用" value="" />
-            <el-option label="银发" value="silver" />
-            <el-option label="亲子" value="family" />
-            <el-option label="企业团建" value="team" />
+            <el-option label="新客户" value="new" />
+            <el-option label="意向客户" value="interested" />
+            <el-option label="老客户" value="existing" />
           </el-select>
-          <span class="form-hint">具体客群规则会优先于通用规则</span>
+          <span class="form-hint">具体客户类型规则会优先于通用规则</span>
         </el-form-item>
         <el-form-item label="关键词">
           <el-input v-model="ruleForm.keywords" type="textarea" :rows="3" placeholder="用逗号或换行分隔，例如：多少钱,价格,报价" />
-          <span class="form-hint">留空表示该客群的所有来信都匹配</span>
+          <span class="form-hint">留空表示该类型的所有来信都匹配</span>
         </el-form-item>
         <el-form-item label="匹配方式">
           <el-radio-group v-model="ruleForm.match_type">
@@ -521,11 +521,11 @@
         <el-form label-position="top" class="profile-form">
           <el-form-item label="昵称"><el-input v-model="profileForm.nickname" /></el-form-item>
           <div class="two-col">
-            <el-form-item label="客群">
+            <el-form-item label="客户类型">
               <el-select v-model="profileForm.segment">
-                <el-option label="银发" value="silver" />
-                <el-option label="亲子" value="family" />
-                <el-option label="企业团建" value="team" />
+                <el-option label="新客户" value="new" />
+                <el-option label="意向客户" value="interested" />
+                <el-option label="老客户" value="existing" />
                 <el-option label="未分类" value="unknown" />
               </el-select>
             </el-form-item>
@@ -574,14 +574,14 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
   "external_message_id": "平台内消息ID",
   "author": "王姐",
   "msg_type": "dm",
-  "content": "带爸妈去桂林，3个人从杭州出发，10月20日，多少钱？",
-  "source_content": "银发慢游视频"
+  "content": "这个产品有哪些规格？多少钱？可以预约吗？",
+  "source_content": "产品介绍视频"
 }</pre>
         <el-button size="small" @click="copyText(webhookExample, '请求示例已复制')">复制请求示例</el-button>
       </div>
       <div class="help-section">
         <h4>2. 自动回复如何落地</h4>
-        <p>系统先识别客群和意向，再按关键词与优先级匹配规则。命中后生成一条回复：</p>
+        <p>系统先识别意向，再按关键词与优先级匹配你设置的规则。命中后生成一条回复：</p>
         <ul>
           <li>抖音会根据客户昵称打开对应会话，通过当前已登录账号直接点击发送。</li>
           <li>发送成功后才标记为“已发送”；登录失效或平台限制会明确显示失败原因。</li>
@@ -690,8 +690,8 @@ X-YunCe-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未
   "external_message_id": "平台内消息ID",
   "author": "王姐",
   "msg_type": "dm",
-  "content": "带爸妈去桂林，3个人从杭州出发，10月20日，多少钱？",
-  "source_content": "银发慢游视频"
+  "content": "这个产品有哪些规格？多少钱？可以预约吗？",
+  "source_content": "产品介绍视频"
 }`)
 const connectorNote = computed(() => currentContact.value?.platform === '抖音'
   ? '抖音将通过当前登录账号直接发送并校验结果'
@@ -713,44 +713,23 @@ const syncTagType = computed(() => {
   return syncStatus.value.enabled ? 'success' : 'info'
 })
 const availableTemplates = computed(() => {
-  const segment = currentContact.value?.segment
-  if (!segment || segment === 'unknown') return templates.value.filter(t => !t.segment)
-  return templates.value.filter(t => !t.segment || t.segment === segment)
-})
-const quickReplies = computed(() => {
-  const segment = currentContact.value?.segment
-  if (segment === 'silver') {
-    return [
-      { label: '问清三件事', text: '叔叔阿姨这边几位出行、从哪出发、大概几号走？我先按这三点发您合适的银发行程。' },
-      { label: '发避坑清单', text: '给您发一份带爸妈报团自查清单：看是否赶早、每天车程、购物店数量、酒店电梯和无障碍、意外险和药箱。' },
-      { label: '说明慢游标准', text: '我们这条银发线不赶早、不进购物店，每天步行和车程会提前写清楚。合适的话我再把详细行程发您。' },
-    ]
-  }
-  if (segment === 'family') {
-    return [
-      { label: '问孩子年龄', text: '孩子今年几岁啦？不同年龄适合的线路和儿童餐、亲子房安排不一样，我按年龄给您发合适的。' },
-      { label: '问清出行信息', text: '您这边几位大人、几位小朋友，从哪出发、大概几号走？我按人数和日期给您算准价。' },
-      { label: '说明带娃安排', text: '亲子线会控制单日车程，安排儿童餐和领队带玩，大人也留自由时间。您把出行信息发我，我发详细行程。' },
-    ]
-  }
-  if (segment === 'team') {
-    return [
-      { label: '问清四项', text: '方便说一下大概多少人、从哪出发、预算范围、想几月走吗？我再确认是否过夜，按这几项给你发3套适配方案，不硬推。' },
-      { label: '发方案和明细', text: '可以。我按人数、出发地、预算和日期筛3套方案；车、餐、保险、领队和物料是否全含会列在明细里，方便你直接对比。' },
-      { label: '发避坑清单', text: '给你一份企业团建自查：车餐保险领队是否全含、有没有隐形消费、强度是否适合全员、雨天备用方案、合同发票和意外险谁负责。' },
-    ]
-  }
-  return [
-    { label: '问清三件事', text: '方便说一下几位出行、从哪出发、大概几号走吗？带爸妈还是带孩子？我按您的情况发合适线路，不硬推。' },
-    { label: '发线路资料', text: '可以的，我先按您的出行人数、出发城市和日期找一版最合适的行程，您看合适再聊价格。' },
+  const segment = currentContact.value?.segment || 'unknown'
+  const items = [
+    ...templates.value.map(item => ({
+      id: 'template-' + item.id, name: item.name, content: item.content,
+      label: item.name, text: item.content, segment: item.segment || ''
+    })),
+    ...rules.value.filter(item => item.enabled).map(item => ({
+      id: 'rule-' + item.id, name: item.name, content: item.reply_template,
+      label: item.name, text: item.reply_template, segment: item.segment || ''
+    }))
   ]
+  return items.filter(item => !item.segment || item.segment === 'unknown' || segment === 'unknown' || item.segment === segment)
 })
+const quickReplies = computed(() => availableTemplates.value.slice(0, 6))
 
 function segmentTagType(segment) {
-  if (segment === 'silver') return 'warning'
-  if (segment === 'family') return 'success'
-  if (segment === 'team') return 'primary'
-  return 'info'
+  return { new: 'success', interested: 'warning', existing: 'info' }[segment] || 'info'
 }
 
 function intentText(intent) {
@@ -952,7 +931,7 @@ function scrollToBottom() {
 }
 
 function applyMessageTemplate(id) {
-  const template = templates.value.find(item => item.id === id)
+  const template = availableTemplates.value.find(item => item.id === id)
   if (template) replyText.value = template.content
 }
 
