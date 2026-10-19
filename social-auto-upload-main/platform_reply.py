@@ -121,6 +121,28 @@ def _click_text(page, cdp, target):
     return False
 
 
+def _find_row(page, cdp, author):
+    for _ in range(20):
+        rows = _snapshot_rows(cdp)
+        row = next((item for item in rows if item["name"] == author), None)
+        if row is None:
+            row = next((item for item in rows
+                        if item["name"].startswith(author) or author.startswith(item["name"])), None)
+        if row is not None:
+            return row
+        moved = page.evaluate("""() => {
+            const grid = document.querySelector('.ReactVirtualized__Grid');
+            if (!grid) return false;
+            const before = grid.scrollTop;
+            grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+            return grid.scrollTop !== before;
+        }""")
+        if not moved:
+            break
+        page.wait_for_timeout(500)
+    return None
+
+
 def send_douyin(account_name: str, author: str, text: str) -> dict:
     """Reply to one Douyin conversation through the creator web UI."""
     text = str(text or "").strip()
@@ -166,11 +188,7 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
                 if not _click_text(page, cdp, "全部"):
                     _click_text(page, cdp, "全部私信")
                 page.wait_for_timeout(700)
-                rows = _snapshot_rows(cdp)
-                row = next((item for item in rows if item["name"] == author), None)
-                if row is None:
-                    row = next((item for item in rows
-                                if item["name"].startswith(author) or author.startswith(item["name"])), None)
+                row = _find_row(page, cdp, author)
                 if row is None:
                     raise RuntimeError(f"未找到客户“{author}”的抖音会话，可能不在当前列表")
 
