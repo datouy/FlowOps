@@ -382,7 +382,7 @@ def _external_id(item: dict, content: str) -> str:
 
 
 def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: str,
-                    source_content: str = ""):
+                    source_content: str = "", direction: str = "inbound"):
     platform = _clean(item.get("platform") or "抖音", 40)
     account = _clean(item.get("account"), 120)
     external = _external_id(item, content)
@@ -402,7 +402,7 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
             (platform, account, external, nickname or "匿名用户", segment, intent, stage,
              _clean(source_content, 500), fields["contact_info"], fields["traveler_count"],
              fields["origin"], fields["travel_date"], fields["company_name"], fields["budget"],
-             ts, ts, ts, ts, ts))
+             ts, ts, ts if direction == "inbound" else None, ts, ts))
         return cur.lastrowid
 
     new_segment = segment if segment != "unknown" else row["segment"]
@@ -421,7 +421,9 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
          fields["traveler_count"] or row["traveler_count"],
          fields["origin"] or row["origin"], fields["travel_date"] or row["travel_date"],
          fields["company_name"] or row["company_name"], fields["budget"] or row["budget"],
-         max(row["last_message_at"] or ts, ts), ts, _now(), row["id"]))
+         max(row["last_message_at"] or ts, ts),
+         max(row["last_inbound_at"] or ts, ts) if direction == "inbound" else row["last_inbound_at"],
+         _now(), row["id"]))
     return row["id"]
 
 
@@ -714,31 +716,36 @@ def ingest_message(item: dict, allow_auto_reply: bool = True,
     msg_type = _clean(item.get("msg_type") or "dm", 20)
     if msg_type not in ("dm", "comment"):
         msg_type = "dm"
-    ts = _now()
+    direction = "outbound" if item.get("direction") == "outbound" else "inbound"
+    is_inbound = direction == "inbound"
+    ts = _clean(item.get("created_at"), 40) or _now()
     with get_conn() as c:
         duplicate = _duplicate(c, platform, account, external_message_id)
         if duplicate:
             return {"added": 0, "duplicate": True, "message_id": duplicate["id"],
                     "contact_id": duplicate.get("contact_id"), "auto_reply": None}
         settings = _get_settings(c)
-        intent = _priority_intent(item.get("intent"), detect_intent(content))
-        segment = detect_segment(content, _clean(item.get("segment"), 20))
+        intent = _priority_intent(item.get("intent"), detect_intent(content)) if is_inbound else "low"
+        segment = detect_segment(content, _clean(item.get("segment"), 20)) if is_inbound else "unknown"
         contact_id = _upsert_contact(
             c, dict(item, platform=platform, account=account), content, intent, segment, ts,
-            _clean(item.get("source_content"), 500),
+            _clean(item.get("source_content"), 500), direction=direction,
         )
+        status = _clean(item.get("status"), 20) or ("new" if is_inbound else "replied")
+        delivery_status = _clean(item.get("delivery_status"), 20) or ("received" if is_inbound else "sent")
+        auto_reply_status = "" if is_inbound else "history"
         cur = c.execute("""INSERT INTO messages
             (platform,account,msg_type,author,content,source_content,intent,status,created_at,
-             contact_id,external_user_id,external_message_id,direction,delivery_status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contact_id,external_user_id,external_message_id,direction,delivery_status,auto_reply_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (platform, account, msg_type, _clean(item.get("author") or item.get("nickname"), 80),
-             content, _clean(item.get("source_content"), 500), intent, "new", ts, contact_id,
+             content, _clean(item.get("source_content"), 500), intent, status, ts, contact_id,
              _external_id(dict(item, platform=platform, account=account), content),
-             external_message_id, "inbound", "received"))
+             external_message_id, direction, delivery_status, auto_reply_status))
         inbound_id = cur.lastrowid
         contact = dict(c.execute("SELECT * FROM dm_contacts WHERE id=?", (contact_id,)).fetchone())
         auto = None
-        if allow_auto_reply and _as_bool(item.get("auto_reply"), True):
+        if is_inbound and allow_auto_reply and _as_bool(item.get("auto_reply"), True):
             auto = _prepare_auto_reply(
                 c, contact,
                 dict(item, id=inbound_id, content=content, msg_type=msg_type),
@@ -791,6 +798,37 @@ def ingest_many(items: list[dict], allow_auto_reply: bool = True,
     }
 
 
+def dedupe_contact_messages(contact_id: int) -> int:
+    """Collapse a list preview and the same message imported from full history."""
+    removed_ids = []
+    with get_conn() as c:
+        rows = c.execute("""SELECT id,direction,content,created_at,status
+            FROM messages WHERE contact_id=? ORDER BY id""", (contact_id,)).fetchall()
+        kept = {}
+        for row in rows:
+            item = dict(row)
+            key = (
+                item["direction"], item["content"],
+                str(item.get("created_at") or "")[:16],
+            )
+            current = kept.get(key)
+            if current is None:
+                kept[key] = item
+                continue
+            if item.get("status") == "new" and current.get("status") != "new":
+                c.execute("DELETE FROM messages WHERE id=?", (current["id"],))
+                removed_ids.append(current["id"])
+                kept[key] = item
+            else:
+                c.execute("DELETE FROM messages WHERE id=?", (item["id"],))
+                removed_ids.append(item["id"])
+        if removed_ids:
+            marks = ",".join("?" for _ in removed_ids)
+            c.execute(f"DELETE FROM dm_reply_logs WHERE inbound_message_id IN ({marks}) OR outbound_message_id IN ({marks})",
+                      removed_ids + removed_ids)
+    return len(removed_ids)
+
+
 def _decorate_contact(data: dict) -> dict:
     data["segment_label"] = SEGMENTS.get(data.get("segment"), "未分类")
     data["stage_label"] = STAGES.get(data.get("stage"), data.get("stage") or "")
@@ -841,8 +879,9 @@ def conversation_detail(cid: int):
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = _decorate_contact(dict(row))
         messages = [dict(r) for r in c.execute("""SELECT * FROM (
-            SELECT * FROM messages WHERE contact_id=? ORDER BY id DESC LIMIT 200
-        ) ORDER BY id ASC""", (cid,)).fetchall()]
+            SELECT * FROM messages WHERE contact_id=?
+            ORDER BY datetime(created_at) DESC, id DESC LIMIT 200
+        ) ORDER BY datetime(created_at) ASC, id ASC""", (cid,)).fetchall()]
         logs = [dict(r) for r in c.execute("""SELECT * FROM dm_reply_logs WHERE contact_id=?
             ORDER BY id DESC LIMIT 30""", (cid,)).fetchall()]
     return jsonify({"code": 200, "data": {
