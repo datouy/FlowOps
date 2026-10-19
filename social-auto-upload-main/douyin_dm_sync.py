@@ -499,6 +499,7 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
         "source_content": source,
         "msg_type": "dm",
         "auto_reply": allow_auto_reply,
+        "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
     }, ""
 
 
