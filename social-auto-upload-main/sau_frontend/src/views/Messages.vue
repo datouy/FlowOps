@@ -885,7 +885,11 @@ async function refreshLive() {
   const contactId = currentContact.value?.id
   try {
     await Promise.all([loadSyncStatus(), loadConversations(true), loadAnalytics()])
-    if (contactId) await loadConversation(contactId, true)
+    if (contactId) {
+      const hadUnread = Number(currentContact.value?.unread_count || 0) > 0
+      await loadConversation(contactId, true)
+      if (hadUnread) await markConversationRead(contactId)
+    }
   } catch (error) {
     console.error(error)
   } finally {
@@ -918,7 +922,7 @@ async function loadConversations(silent = false) {
       const latest = conversations.value.find(item => item.id === currentContact.value.id)
       if (latest) currentContact.value = { ...currentContact.value, ...latest }
     } else if (conversations.value.length) {
-      selectConversation(conversations.value[0])
+      selectConversation(conversations.value[0], false)
     }
   } catch (error) { console.error(error) }
   finally { if (!silent) loadingConversations.value = false }
@@ -935,10 +939,25 @@ async function loadLeads() {
   finally { loadingLeads.value = false }
 }
 
-async function selectConversation(item) {
+async function selectConversation(item, markRead = true) {
   currentContact.value = item
   templateId.value = null
   await loadConversation(item.id)
+  if (markRead && Number(item.unread_count || 0) > 0) {
+    await markConversationRead(item.id)
+  }
+}
+
+async function markConversationRead(id) {
+  try {
+    await http.post(`/dm/conversations/${id}/read`, {}, { silent: true })
+    const item = conversations.value.find(conversation => conversation.id === id)
+    if (item) item.unread_count = 0
+    if (currentContact.value?.id === id) currentContact.value.unread_count = 0
+    await loadAnalytics()
+  } catch (error) {
+    console.error(error)
+  }
 }
 
 async function loadConversation(id, silent = false) {
