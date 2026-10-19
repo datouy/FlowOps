@@ -36,6 +36,10 @@ import notify_ops
 notify_ops.register(app)
 import ops_center
 app.register_blueprint(ops_center.bp)
+import dm_ops
+app.register_blueprint(dm_ops.bp)
+import douyin_dm_sync
+app.register_blueprint(douyin_dm_sync.bp)
 import compliance
 compliance.register(app)
 import media_ops
@@ -952,6 +956,7 @@ import publish_jobs
 
 start_patrol()
 stats_reflow.start_stats_loop(24)
+douyin_dm_sync.start_background()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0' ,port=5409)

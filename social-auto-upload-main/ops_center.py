@@ -89,20 +89,13 @@ def add_messages():
     items = data.get("items")
     if items is None:
         items = [data]
-    added = 0
-    with get_conn() as c:
-        for item in items:
-            content = str(item.get("content") or "").strip()
-            if not content:
-                continue
-            intent = item.get("intent") or detect_intent(content)
-            c.execute("""INSERT INTO messages
-                (platform, account, msg_type, author, content, source_content, intent, status)
-                VALUES (?,?,?,?,?,?,?,'new')""",
-                (item.get("platform", ""), item.get("account", ""), item.get("msg_type", "comment"),
-                 item.get("author", ""), content, item.get("source_content", ""), intent))
-            added += 1
-    return jsonify({"code": 200, "data": {"added": added}, "msg": "ok"})
+    try:
+        import dm_ops
+        result = dm_ops.ingest_many([dict(x, msg_type=x.get("msg_type") or "comment") for x in items],
+                                    allow_auto_reply=False)
+        return jsonify({"code": 200, "data": result, "msg": "ok"})
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": str(exc)}), 500
 
 
 def update_message(mid):
@@ -159,6 +152,11 @@ def todo_summary():
     with get_conn() as c:
         pending_messages = c.execute("SELECT COUNT(*) FROM messages WHERE status='new'").fetchone()[0]
         high_intent = c.execute("SELECT COUNT(*) FROM messages WHERE status='new' AND intent='high'").fetchone()[0]
+        try:
+            auto_ready = c.execute("""SELECT COUNT(*) FROM messages
+                WHERE direction='outbound' AND delivery_status='ready'""").fetchone()[0]
+        except Exception:
+            auto_ready = 0
     with publish_jobs.get_conn() as c:
         failed_jobs = c.execute("SELECT COUNT(*) FROM jobs WHERE status='failed'").fetchone()[0]
         pending_review = c.execute("SELECT COUNT(*) FROM jobs WHERE status='pending_review'").fetchone()[0]
@@ -186,6 +184,8 @@ def todo_summary():
         items.append({"type": "message", "level": "high", "text": f"{high_intent} 条高意向留言待回复"})
     if pending_messages:
         items.append({"type": "message", "level": "normal", "text": f"共 {pending_messages} 条留言待处理"})
+    if auto_ready:
+        items.append({"type": "message", "level": "normal", "text": f"{auto_ready} 条自动回复待人工发送"})
     if failed_jobs:
         items.append({"type": "publish", "level": "high", "text": f"{failed_jobs} 个发布任务失败"})
     if pending_review:
@@ -203,7 +203,8 @@ def todo_summary():
         "counts": {"messages": pending_messages, "high_intent": high_intent,
                    "failed_jobs": failed_jobs, "pending_review": pending_review,
                    "scheduled_today": scheduled_today, "last_sync": last_sync,
-                   "expired_accounts": expired, "unused_assets": unused_assets}
+                   "expired_accounts": expired, "unused_assets": unused_assets,
+                   "auto_ready": auto_ready}
     }, "msg": None})
 
 
