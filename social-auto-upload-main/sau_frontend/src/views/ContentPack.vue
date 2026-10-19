@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h2>多平台内容包</h2>
-        <p class="sub">输入一次主题，生成 6 个平台的标题、正文和话题，并自动生成 3:4 / 9:16 封面。</p>
+        <p class="sub">输入一次产品或服务信息，生成 6 个平台的差异化标题、正文和话题，并可生成 3:4 / 9:16 封面。</p>
       </div>
     </div>
 
@@ -11,34 +11,36 @@
       <el-col :xs="24" :lg="9">
         <el-card shadow="never">
           <template #header><span>内容条件</span></template>
-          <el-form label-width="80px">
-            <el-form-item label="行业">
+          <el-form label-width="96px">
+            <el-form-item label="行业/类型">
               <el-select v-model="form.industry" style="width:100%">
-                <el-option v-for="i in industries" :key="i" :label="i" :value="i" />
+                <el-option v-for="item in industries" :key="item" :label="item" :value="item" />
               </el-select>
             </el-form-item>
             <el-form-item v-if="form.industry === '其他'" label="自定义行业">
-              <el-input v-model="form.custom_industry" placeholder="例如：宠物服务、民宿、家政" />
+              <el-input v-model="form.custom_industry" placeholder="例如：宠物服务、软件、家居、教育" />
+            </el-form-item>
+            <el-form-item label="产品/服务名称">
+              <el-input v-model="form.business_name" placeholder="例如：新品名称、课程名称、服务套餐" />
             </el-form-item>
             <el-form-item label="主题">
-              <el-input v-model="form.topic" placeholder="例如：新品上市、到店体验、桂林秋季纯玩" />
-            </el-form-item>
-            <el-form-item :label="form.industry === '旅行社' ? '线路名' : '名称/产品'">
-              <el-input v-model="form.tour_name" placeholder="选填" />
+              <el-input v-model="form.topic" placeholder="例如：新品上市、使用场景、活动推广、品牌介绍" />
             </el-form-item>
             <el-form-item label="目标人群">
-              <el-input v-model="form.audience" placeholder="例如：宝妈、上班族、本地家庭" />
+              <el-input v-model="form.audience" placeholder="例如：年轻上班族、新手父母、企业客户" />
             </el-form-item>
-            <el-form-item :label="form.industry === '旅行社' ? '天数/报价' : '价格'">
-              <el-input-number v-if="form.industry === '旅行社'" v-model="form.days" :min="1" style="width:110px" />
-              <el-input-number v-model="form.price" :min="0" style="width:140px;margin-left:10px" />
+            <el-form-item label="规格/周期">
+              <el-input v-model="form.specification" placeholder="选填，例如：标准版、3个月、单次服务" />
             </el-form-item>
-            <el-form-item label="亮点">
-              <el-input v-model="form.highlights" type="textarea" :rows="3" placeholder="口味、成分、课程内容、服务项目或产品卖点" />
+            <el-form-item label="价格/定位">
+              <el-input v-model="form.price" placeholder="选填，例如：299元、面议、中高端" />
+            </el-form-item>
+            <el-form-item label="核心卖点">
+              <el-input v-model="form.highlights" type="textarea" :rows="3" placeholder="填写真实功能、服务内容、使用体验或差异化价值" />
             </el-form-item>
             <el-form-item label="素材">
               <el-select v-model="sourceFile" placeholder="选择一条素材用于生成封面" clearable style="width:100%">
-                <el-option v-for="f in materials" :key="f.file_path" :label="f.filename" :value="f.file_path" />
+                <el-option v-for="file in materials" :key="file.file_path" :label="file.filename" :value="file.file_path" />
               </el-select>
             </el-form-item>
             <el-form-item>
@@ -54,9 +56,9 @@
         <el-card v-if="covers.length" shadow="never" style="margin-top:14px">
           <template #header><span>自动封面</span></template>
           <div class="cover-grid">
-            <div v-for="c in covers" :key="c.name" class="cover-item">
-              <img :src="fileUrl(c.url)" :alt="c.name" />
-              <span>{{ c.name }}</span>
+            <div v-for="cover in covers" :key="cover.name" class="cover-item">
+              <img :src="fileUrl(cover.url)" :alt="cover.name" />
+              <span>{{ cover.name }}</span>
             </div>
           </div>
         </el-card>
@@ -92,8 +94,17 @@ import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
 
 const router = useRouter()
-const industries = ['旅行社', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '其他']
-const form = ref({ industry: '旅行社', custom_industry: '', topic: '', tour_name: '', audience: '', days: 3, price: 0, highlights: '' })
+const industries = ['通用', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '旅行社', '其他']
+const form = ref({
+  industry: '通用',
+  custom_industry: '',
+  business_name: '',
+  topic: '',
+  audience: '',
+  specification: '',
+  price: '',
+  highlights: ''
+})
 const materials = ref([])
 const sourceFile = ref('')
 const loading = ref(false)
@@ -106,18 +117,26 @@ const activePlatform = ref('小红书')
 const tagsText = ref({})
 const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
 
-function fileUrl(u) { return u.startsWith('http') ? u : apiBase.replace('/api', '') + u }
+function fileUrl(url) {
+  return url.startsWith('http') ? url : apiBase.replace('/api', '') + url
+}
 
 async function loadMaterials() {
   try {
-    const r = await http.get('/getFiles')
-    materials.value = r.data || []
-  } catch (e) { console.error(e) }
+    const response = await http.get('/getFiles')
+    materials.value = response.data || []
+  } catch (error) {
+    console.error(error)
+  }
 }
 
 async function generate() {
-  if (!form.value.topic && !form.value.tour_name) return ElMessage.warning('请填写主题或名称')
-  if (form.value.industry === '其他' && !form.value.custom_industry.trim()) return ElMessage.warning('请填写自定义行业')
+  if (!form.value.topic && !form.value.business_name) {
+    return ElMessage.warning('请填写主题或产品/服务名称')
+  }
+  if (form.value.industry === '其他' && !form.value.custom_industry.trim()) {
+    return ElMessage.warning('请填写自定义行业')
+  }
   loading.value = true
   packRunning.value = true
   packProgress.value = 0
@@ -129,26 +148,30 @@ async function generate() {
       return
     }
     const jobId = start.data.id
-    for (let i = 0; i < 150; i++) {
-      await new Promise(r => setTimeout(r, 2000))
-      const st = await http.get('/ai/pack/status/' + jobId)
-      packProgress.value = st.data.progress || 0
-      if (st.data.status === 'success') {
-        applyPack(st.data.result)
+    for (let index = 0; index < 150; index++) {
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      const state = await http.get('/ai/pack/status/' + jobId)
+      packProgress.value = state.data.progress || 0
+      if (state.data.status === 'success') {
+        applyPack(state.data.result)
         return
       }
-      if (st.data.status === 'failed') {
-        throw new Error(st.data.error || '生成失败')
+      if (state.data.status === 'failed') {
+        throw new Error(state.data.error || '生成失败')
       }
     }
     throw new Error('生成超时，请稍后重试')
-  } catch (e) { ElMessage.error(e.message || '生成失败') }
-  finally { loading.value = false; packRunning.value = false }
+  } catch (error) {
+    ElMessage.error(error.message || '生成失败')
+  } finally {
+    loading.value = false
+    packRunning.value = false
+  }
 }
 
 function applyPack(data) {
   items.value = data.items || []
-  tagsText.value = Object.fromEntries(items.value.map(i => [i.platform, (i.tags || []).join('，')]))
+  tagsText.value = Object.fromEntries(items.value.map(item => [item.platform, (item.tags || []).join('，')]))
   activePlatform.value = '小红书'
   if (data.errors && data.errors.length) {
     ElMessage.warning('部分平台生成失败：' + data.errors.join('；'))
@@ -160,20 +183,23 @@ function applyPack(data) {
 async function makeCovers() {
   coverLoading.value = true
   try {
-    const r = await http.post('/media/covers', { file: sourceFile.value })
-    covers.value = r.data.covers
+    const response = await http.post('/media/covers', { file: sourceFile.value })
+    covers.value = response.data.covers
     ElMessage.success('封面已生成')
-  } catch (e) { ElMessage.error(e.message || '封面生成失败') }
-  finally { coverLoading.value = false }
+  } catch (error) {
+    ElMessage.error(error.message || '封面生成失败')
+  } finally {
+    coverLoading.value = false
+  }
 }
 
 function syncTags(item) {
-  item.tags = String(tagsText.value[item.platform] || '').split(/[,，\s]+/).map(t => t.trim().replace(/^#/, '')).filter(Boolean)
+  item.tags = String(tagsText.value[item.platform] || '').split(/[,，\s]+/).map(tag => tag.trim().replace(/^#/, '')).filter(Boolean)
 }
 
 async function copyItem(item) {
   syncTags(item)
-  const text = [item.title, '', item.body, '', (item.tags || []).map(t => '#' + t).join(' ')].join('\n')
+  const text = [item.title, '', item.body, '', (item.tags || []).map(tag => '#' + tag).join(' ')].join('\n')
   await navigator.clipboard.writeText(text)
   ElMessage.success(item.platform + ' 文案已复制')
 }

@@ -29,6 +29,11 @@ PLATFORM_GUIDE = {
 }
 
 INDUSTRY_PROFILES = {
+    "通用": {
+        "role": "专业内容运营",
+        "focus": "产品价值、目标人群、使用场景、真实卖点和行动引导",
+        "taboo": "不要编造未提供的信息、价格、效果、资质、销量或服务承诺",
+    },
     "旅行社": {
         "role": "资深旅行社新媒体运营",
         "focus": "行程透明、纯玩体验、住宿交通、适合人群和真实服务细节",
@@ -147,10 +152,10 @@ def _call_with_retry(prompt: str, max_tokens: int = 1200) -> str:
 
 
 def _industry(data: dict) -> str:
-    industry = (data.get("industry") or "旅行社").strip()
-    if industry == "其他":
+    industry = (data.get("industry") or "通用").strip()
+    if industry in ("其他", "自定义"):
         custom = (data.get("custom_industry") or "").strip()
-        return custom or "其他"
+        return custom or "通用"
     return industry
 
 
@@ -159,11 +164,14 @@ def _fields(data: dict, industry: str) -> dict:
     topic = (data.get("topic") or "").strip()
     if not topic and not name:
         raise ValueError("请输入主题或名称")
-    days = str(data.get("days") or "").strip() if industry == "旅行社" else ""
+    specification = str(data.get("specification") or "").strip()
+    if not specification and industry == "旅行社":
+        days = str(data.get("days") or "").strip()
+        specification = days + "天" if days else ""
     return {
         "topic": topic,
         "name": name or topic,
-        "days": days,
+        "specification": specification,
         "price": str(data.get("price") or "").strip(),
         "highlights": (data.get("highlights") or "").strip(),
         "audience": (data.get("audience") or "").strip(),
@@ -241,6 +249,7 @@ def _template_content(platform, industry, fields, profile):
     highlights = fields.get("highlights") or profile.get("focus") or "真实体验"
     audience = fields.get("audience") or ""
     price = fields.get("price") or ""
+    specification = fields.get("specification") or ""
     limit = TITLE_LIMITS.get(platform, 30)
     title = name + "｜" + highlights.split("、")[0].split(",")[0]
     title = title[:limit]
@@ -248,6 +257,8 @@ def _template_content(platform, industry, fields, profile):
     if audience:
         lines.append("适合：" + audience)
     lines.append("亮点：" + highlights)
+    if specification:
+        lines.append("规格/周期：" + specification)
     if price:
         lines.append("参考价格：" + price)
     lines.append("想了解详情，可以在评论区留言或私信关键词【" + industry + "】。")
@@ -274,7 +285,7 @@ def _template_content(platform, industry, fields, profile):
 def generate_content_with_ai(data: dict) -> dict:
     platform = (data.get("platform") or "小红书").strip()
     industry = _industry(data)
-    profile = INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["其他"])
+    profile = INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["通用"])
     fields = _fields(data, industry)
     guide = PLATFORM_GUIDE.get(platform, PLATFORM_GUIDE["小红书"])
     context = [
@@ -286,8 +297,8 @@ def generate_content_with_ai(data: dict) -> dict:
         "卖点：" + fields["highlights"],
         "语气：" + fields["tone"],
     ]
-    if fields["days"]:
-        context.append("天数：" + fields["days"] + "天")
+    if fields["specification"]:
+        context.append("规格/周期：" + fields["specification"])
     prompt = (
         "你是一名" + profile["role"] + "。请生成一条" + platform + "发布用的文案。\n"
         + "\n".join(context) + "\n"
@@ -368,7 +379,7 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
     """一次生成 6 个平台的内容；失败时降级为逐平台生成。"""
     platforms = ["小红书", "抖音", "视频号", "快手", "微博", "百家号"]
     industry = _industry(data)
-    profile = INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["其他"])
+    profile = INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["通用"])
     fields = _fields(data, industry)
     guides = "\n".join("- " + p + "：" + PLATFORM_GUIDE[p] for p in platforms)
     context = [
@@ -379,8 +390,8 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
         "价格：" + fields["price"],
         "卖点：" + fields["highlights"],
     ]
-    if fields["days"]:
-        context.append("天数：" + fields["days"] + "天")
+    if fields["specification"]:
+        context.append("规格/周期：" + fields["specification"])
     prompt = (
         "你是" + profile["role"] + "。请围绕以下信息，一次生成 6 个平台的内容。\n"
         + "\n".join(context) + "\n\n"
