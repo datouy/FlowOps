@@ -18,6 +18,9 @@ social-auto-upload-main/logs/
 backend*.log
 frontend*.log
 *.zip
+/*-check.json
+social-auto-upload-main/*-check.json
+social-auto-upload-main/verify_code.txt
 
 # ---- Python ----
 venv/
