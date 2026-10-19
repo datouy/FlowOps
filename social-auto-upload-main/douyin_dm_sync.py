@@ -35,7 +35,7 @@ DEFAULT_SYNC_SETTINGS = {
     "enabled": 1,
     "account_id": 0,
     "interval_seconds": 5,
-    "max_conversations": 20,
+    "max_conversations": 100,
     "recent_only": 1,
     "draft_only": 1,
 }
@@ -86,7 +86,7 @@ def init_db():
             enabled INTEGER DEFAULT 1,
             account_id INTEGER DEFAULT 0,
             interval_seconds INTEGER DEFAULT 5,
-            max_conversations INTEGER DEFAULT 20,
+            max_conversations INTEGER DEFAULT 100,
             recent_only INTEGER DEFAULT 1,
             draft_only INTEGER DEFAULT 1,
             last_started_at TEXT DEFAULT '',
@@ -121,6 +121,12 @@ def init_db():
             DEFAULT_SYNC_SETTINGS["interval_seconds"], DEFAULT_SYNC_SETTINGS["max_conversations"],
             DEFAULT_SYNC_SETTINGS["recent_only"], DEFAULT_SYNC_SETTINGS["draft_only"],
         ))
+        migrated = c.execute(
+            "SELECT value FROM dm_meta WHERE key='douyin_scan_all_v1'"
+        ).fetchone()
+        if not migrated:
+            c.execute("UPDATE douyin_dm_sync_settings SET max_conversations=100, updated_at=CURRENT_TIMESTAMP WHERE id=1")
+            c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES ('douyin_scan_all_v1','1')")
 
 
 def _as_flag(value: Any) -> int:
@@ -144,9 +150,9 @@ def _load_settings() -> dict:
     except (TypeError, ValueError):
         data["interval_seconds"] = 5
     try:
-        data["max_conversations"] = max(1, min(int(data.get("max_conversations") or 20), 100))
+        data["max_conversations"] = max(1, min(int(data.get("max_conversations") or 100), 200))
     except (TypeError, ValueError):
-        data["max_conversations"] = 20
+        data["max_conversations"] = 100
     return data
 
 
@@ -287,6 +293,8 @@ SCAN_SCRIPT = r"""
     if (!conversation) continue;
 
     const content = conversation.content || {};
+    const badgeText = String(el.querySelector('.semi-badge-count')?.innerText || '').trim();
+    const unread = Number.parseInt(badgeText, 10) || 0;
     const lines = String(el.innerText || '').split('\n').map(line => line.trim()).filter(Boolean);
     const timeIndex = lines.findIndex(line => timePattern.test(line));
     const nameLines = lines.slice(0, timeIndex >= 0 ? timeIndex : lines.length)
@@ -322,6 +330,7 @@ SCAN_SCRIPT = r"""
       is_recalled: Boolean(content.isRecalled),
       is_group: Boolean(conversation.isGroupChat),
       is_stranger: Boolean(conversation.isStrangerChat),
+      unread: unread,
       text: typeof content.text === 'string' ? content.text : '',
     });
   }
@@ -395,8 +404,28 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
             await page.wait_for_timeout(1800)
             if await _page_is_login(page):
                 raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-            rows = await page.evaluate(SCAN_SCRIPT, int(settings.get("max_conversations") or 20))
-            data = rows if isinstance(rows, list) else []
+            limit = int(settings.get("max_conversations") or 100)
+            collected = {}
+            for _ in range(20):
+                rows = await page.evaluate(SCAN_SCRIPT, limit)
+                batch = rows if isinstance(rows, list) else []
+                added = 0
+                for row in batch:
+                    cid = str(row.get("cid") or "")
+                    if cid and cid not in collected:
+                        collected[cid] = row
+                        added += 1
+                moved = await page.evaluate("""() => {
+                    const grid = document.querySelector('.ReactVirtualized__Grid');
+                    if (!grid) return false;
+                    const before = grid.scrollTop;
+                    grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+                    return grid.scrollTop !== before;
+                }""")
+                if not moved and added == 0:
+                    break
+                await page.wait_for_timeout(550)
+            data = list(collected.values())
             return {"rows": data, "scanned": len(data)}
     finally:
         if context is not None:
@@ -418,21 +447,32 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
         return None, "群聊"
     if row.get("is_recalled"):
         return None, "消息已撤回"
-    if row.get("is_from_me"):
+    try:
+        unread = max(0, int(row.get("unread") or 0))
+    except (TypeError, ValueError):
+        unread = 0
+    if row.get("is_from_me") and not unread:
         return None, "自己发送的消息"
     try:
         message_type = int(row.get("message_type") or 0)
     except (TypeError, ValueError):
         message_type = 0
-    if message_type != 7:
-        return None, "非文本消息"
     text = _clean_text(row.get("text"), 4000)
+    preview = _clean_text(row.get("preview"), 300)
+    allow_auto_reply = message_type == 7 and bool(text) and not _is_placeholder(text)
     if _is_placeholder(text):
-        return None, "占位或表情消息"
+        if not unread:
+            return None, "占位或表情消息"
+        text = f"您有 {unread} 条未读消息，请打开抖音查看详情"
+    elif not text:
+        if not unread and not preview:
+            return None, "非文本消息"
+        labels = {3: "[图片]", 5: "[表情]", 8: "[视频]", 77: "[图片]", 110: "[分享内容]"}
+        text = preview or labels.get(message_type, "[非文本消息]")
 
     created_at = _parse_iso(row.get("created_at"))
     display_time = _clean_text(row.get("display_time"), 40)
-    if recent_only and created_at:
+    if recent_only and created_at and not unread:
         age = datetime.now(timezone.utc) - created_at
         if age > RECENT_WINDOW:
             return None, "超出近 48 小时"
@@ -446,6 +486,8 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
     source = "抖音创作者中心私信同步"
     if row.get("is_stranger"):
         source += " · 陌生人会话"
+    if unread:
+        source += f" · 未读 {unread}"
     nickname = _clean_text(row.get("name"), 80) or "抖音用户"
     return {
         "platform": "抖音",
@@ -456,6 +498,7 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
         "content": text,
         "source_content": source,
         "msg_type": "dm",
+        "auto_reply": allow_auto_reply,
     }, ""
 
 
