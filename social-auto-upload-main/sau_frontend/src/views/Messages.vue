@@ -10,6 +10,7 @@
           {{ settings.enabled ? '自动回复运行中' : '自动回复已暂停' }}
         </el-tag>
         <el-tag :type="syncTagType" effect="plain" round>{{ syncTagText }}</el-tag>
+        <el-tag type="success" effect="plain" round>界面 5 秒自动刷新</el-tag>
         <el-button @click="helpDialog = true">接入说明</el-button>
         <el-button @click="openSimulate">模拟来信</el-button>
         <el-button :loading="syncing" @click="runDouyinSync">同步抖音私信</el-button>
@@ -89,7 +90,7 @@
                   <div class="conversation-tags">
                     <el-tag size="small" effect="plain">{{ item.platform }}</el-tag>
                     <el-tag size="small" :type="segmentTagType(item.segment)" effect="light">{{ item.segment_label }}</el-tag>
-                    <el-tag v-if="item.intent === 'high'" size="small" type="danger" effect="light">高意向</el-tag>
+                    <el-tag size="small" :type="intentTagType(item.intent)" effect="light">{{ intentText(item.intent) }}</el-tag>
                   </div>
                   <div class="conversation-preview">
                     <span v-if="item.last_direction === 'outbound'" class="reply-mark">我：</span>
@@ -111,7 +112,7 @@
                     <div class="chat-name">
                       {{ currentContact.nickname || '匿名用户' }}
                       <el-tag size="small" :type="segmentTagType(currentContact.segment)">{{ currentContact.segment_label }}</el-tag>
-                      <el-tag v-if="currentContact.intent === 'high'" size="small" type="danger">高意向</el-tag>
+                      <el-tag size="small" :type="intentTagType(currentContact.intent)">{{ intentText(currentContact.intent) }}</el-tag>
                     </div>
                     <div class="chat-sub">{{ currentContact.platform }} · {{ currentContact.account || '未填账号' }} · {{ currentContact.stage_label }}</div>
                   </div>
@@ -153,8 +154,8 @@
                   type="textarea"
                   :rows="4"
                   resize="none"
-                  placeholder="回复客户。Ctrl + Enter 发送；价格、余位和服务承诺请先核对。"
-                  @keydown.ctrl.enter.prevent="sendReply"
+                  placeholder="回复客户。Enter 发送并记录，Shift + Enter 换行。"
+                  @keydown="handleComposerKeydown"
                 />
                 <div class="composer-footer">
                   <span class="connector-note">{{ connectorNote }}</span>
@@ -385,7 +386,7 @@
             <el-table-column label="类型 / 意向" width="128">
               <template #default="scope">
                 <el-tag size="small" :type="segmentTagType(scope.row.segment)">{{ scope.row.segment_label }}</el-tag>
-                <el-tag v-if="scope.row.intent === 'high'" size="small" type="danger" style="margin-left:4px">高</el-tag>
+                <el-tag size="small" :type="intentTagType(scope.row.intent)" style="margin-left:4px">{{ intentText(scope.row.intent) }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column prop="stage_label" label="阶段" width="88" />
@@ -606,7 +607,7 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { http } from '@/utils/request'
 
@@ -677,6 +678,8 @@ const importText = ref('')
 const importAutoReply = ref(false)
 const importing = ref(false)
 const helpDialog = ref(false)
+let liveTimer = null
+let liveRefreshing = false
 
 const webhookUrl = computed(() => `${apiBase}/dm/inbound`)
 const webhookExample = computed(() => `POST ${webhookUrl.value}
@@ -734,6 +737,16 @@ function segmentTagType(segment) {
 
 function intentText(intent) {
   return { high: '高意向', medium: '中意向', low: '低意向' }[intent] || intent || '未识别'
+}
+
+function intentTagType(intent) {
+  return { high: 'danger', medium: 'warning', low: 'info' }[intent] || 'info'
+}
+
+function handleComposerKeydown(event) {
+  if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter' || event.shiftKey) return
+  event.preventDefault()
+  sendReply()
 }
 
 function deliveryText(status) {
@@ -866,6 +879,20 @@ async function runDouyinSync() {
   } finally { syncing.value = false }
 }
 
+async function refreshLive() {
+  if (document.hidden || liveRefreshing || activeTab.value !== 'inbox') return
+  liveRefreshing = true
+  const contactId = currentContact.value?.id
+  try {
+    await Promise.all([loadSyncStatus(), loadConversations(true), loadAnalytics()])
+    if (contactId) await loadConversation(contactId, true)
+  } catch (error) {
+    console.error(error)
+  } finally {
+    liveRefreshing = false
+  }
+}
+
 async function loadRules() {
   try {
     const res = await http.get('/dm/rules')
@@ -880,8 +907,8 @@ async function loadTemplates() {
   } catch (error) { console.error(error) }
 }
 
-async function loadConversations() {
-  loadingConversations.value = true
+async function loadConversations(silent = false) {
+  if (!silent) loadingConversations.value = true
   try {
     const params = {}
     Object.entries(convFilters).forEach(([key, value]) => { if (value) params[key] = value })
@@ -894,7 +921,7 @@ async function loadConversations() {
       selectConversation(conversations.value[0])
     }
   } catch (error) { console.error(error) }
-  finally { loadingConversations.value = false }
+  finally { if (!silent) loadingConversations.value = false }
 }
 
 async function loadLeads() {
@@ -914,8 +941,8 @@ async function selectConversation(item) {
   await loadConversation(item.id)
 }
 
-async function loadConversation(id) {
-  loadingMessages.value = true
+async function loadConversation(id, silent = false) {
+  if (!silent) loadingMessages.value = true
   try {
     const res = await http.get(`/dm/conversations/${id}`)
     currentContact.value = res.data.contact
@@ -923,7 +950,7 @@ async function loadConversation(id) {
     await nextTick()
     scrollToBottom()
   } catch (error) { console.error(error) }
-  finally { loadingMessages.value = false }
+  finally { if (!silent) loadingMessages.value = false }
 }
 
 function scrollToBottom() {
@@ -1166,6 +1193,11 @@ onMounted(async () => {
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(),
   ])
+  liveTimer = window.setInterval(refreshLive, 5000)
+})
+
+onBeforeUnmount(() => {
+  if (liveTimer) window.clearInterval(liveTimer)
 })
 </script>
 
