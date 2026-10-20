@@ -12,8 +12,7 @@
         <el-tag :type="syncTagType" effect="plain" round>{{ syncTagText }}</el-tag>
         <el-tag type="success" effect="plain" round>界面 5 秒自动刷新</el-tag>
         <el-button @click="helpDialog = true">接入说明</el-button>
-        <el-button @click="openSimulate">模拟来信</el-button>
-        <el-button :loading="syncing" @click="runDouyinSync">同步抖音私信</el-button>
+        <el-button :loading="syncing || syncAnyRunning" :disabled="syncAnyRunning" @click="runAllPlatformSync">同步全部私信</el-button>
         <el-button type="primary" @click="activeTab = 'rules'">回复规则</el-button>
       </div>
     </div>
@@ -50,9 +49,14 @@
                 <template #prefix>搜</template>
               </el-input>
               <div class="filter-row">
-                <el-select v-model="convFilters.platform" clearable placeholder="全部平台" @change="loadConversations">
+                <el-select v-model="accountFilterKey" clearable filterable placeholder="全部账号" @change="handleAccountFilterChange">
+                  <el-option v-for="account in allMessageAccounts" :key="account.key" :label="account.label" :value="account.key" />
+                </el-select>
+                <el-select v-model="convFilters.platform" clearable placeholder="全部平台" @change="handlePlatformFilterChange">
                   <el-option v-for="p in platforms" :key="p" :label="p" :value="p" />
                 </el-select>
+              </div>
+              <div class="filter-row">
                 <el-select v-model="convFilters.segment" clearable placeholder="全部类型" @change="loadConversations">
                   <el-option label="新客户" value="new" />
                   <el-option label="意向客户" value="interested" />
@@ -89,6 +93,7 @@
                   </div>
                   <div class="conversation-tags">
                     <el-tag size="small" effect="plain">{{ item.platform }}</el-tag>
+                    <el-tag size="small" type="warning" effect="plain">账号：{{ item.account || '未填写' }}</el-tag>
                     <el-tag size="small" :type="segmentTagType(item.segment)" effect="light">{{ item.segment_label }}</el-tag>
                     <el-tag size="small" :type="intentTagType(item.intent)" effect="light">{{ intentText(item.intent) }}</el-tag>
                     <el-tag v-if="item.needs_reply" size="small" type="danger" effect="dark">未回复</el-tag>
@@ -112,11 +117,12 @@
                   <div>
                     <div class="chat-name">
                       {{ currentContact.nickname || '匿名用户' }}
+                      <el-tag size="small" type="warning" effect="plain">账号：{{ currentContact.account || '未填写' }}</el-tag>
                       <el-tag size="small" :type="segmentTagType(currentContact.segment)">{{ currentContact.segment_label }}</el-tag>
                       <el-tag size="small" :type="intentTagType(currentContact.intent)">{{ intentText(currentContact.intent) }}</el-tag>
                       <el-tag v-if="currentContact.needs_reply" size="small" type="danger" effect="dark">未回复</el-tag>
                     </div>
-                    <div class="chat-sub">{{ currentContact.platform }} · {{ currentContact.account || '未填账号' }} · {{ currentContact.stage_label }}</div>
+                    <div class="chat-sub">{{ currentContact.platform }} · {{ currentContact.stage_label }}</div>
                   </div>
                 </div>
                 <div class="chat-actions">
@@ -217,7 +223,7 @@
               </el-form-item>
               <el-form-item label="发送连接器">
                 <el-input v-model="autoForm.outbound_webhook" placeholder="https://你的发送服务/dm/reply" />
-                <span class="form-hint">抖音使用本地登录会话直接发送；其他平台可填写发送连接器</span>
+                <span class="form-hint">抖音、小红书、视频号使用本地登录会话直接发送；其他平台可填写发送连接器</span>
               </el-form-item>
               <el-form-item label="接入密钥">
                 <el-input v-model="autoForm.inbound_secret" show-password placeholder="可选，用于校验 Webhook 来源" />
@@ -232,20 +238,26 @@
             <template #header>
               <div class="card-head">
                 <div>
-                  <span>抖音私信本地同步</span>
-                  <span class="card-sub">Playwright 只读适配器</span>
+                  <span>{{ activeSyncMeta.title }}</span>
+                  <span class="card-sub">{{ activeSyncAdapter }}</span>
                 </div>
                 <el-tag size="small" effect="plain" type="success">只读</el-tag>
               </div>
             </template>
             <el-form label-width="92px" class="settings-form">
-              <el-form-item label="自动同步">
-                <el-switch v-model="syncForm.enabled" />
-                <span class="form-hint">开启后按间隔读取创作者中心私信列表</span>
+              <el-form-item label="同步平台">
+                <el-radio-group v-model="syncPlatform" size="small">
+                  <el-radio-button value="抖音">抖音</el-radio-button>
+                  <el-radio-button value="小红书">小红书</el-radio-button>
+                  <el-radio-button value="视频号">视频号</el-radio-button>
+                </el-radio-group>
               </el-form-item>
-              <el-form-item label="抖音账号">
-                <el-select v-model="syncForm.account_id" style="width: 100%">
-                  <el-option :value="0" label="自动选择最近登录的抖音账号" />
+              <el-form-item label="自动同步">
+                <el-switch v-model="activeSyncForm.enabled" />
+                <span class="form-hint">开启后按间隔读取当前平台的私信列表</span>
+              </el-form-item>
+              <el-form-item label="同步账号">
+                <el-select v-model="activeSyncForm.account_ids" multiple collapse-tags collapse-tags-tooltip filterable style="width: 100%" placeholder="不选则同步全部已登录账号">
                   <el-option
                     v-for="account in syncAccounts"
                     :key="account.id"
@@ -254,47 +266,48 @@
                     :disabled="!account.has_cookie"
                   />
                 </el-select>
+                <span class="form-hint">可多选；{{ activeSyncMeta.accountHint }}</span>
               </el-form-item>
               <el-form-item label="同步间隔">
-                <el-input-number v-model="syncForm.interval_seconds" :min="5" :max="3600" :step="5" controls-position="right" />
-                <span class="form-hint">秒，最短 5 秒</span>
+                <el-input-number v-model="activeSyncForm.interval_seconds" :min="activeSyncMeta.minInterval" :max="3600" :step="syncPlatform === '抖音' ? 5 : 30" controls-position="right" />
+                <span class="form-hint">秒，最短 {{ activeSyncMeta.minInterval }} 秒</span>
               </el-form-item>
               <el-form-item label="同步范围">
-                <el-switch v-model="syncForm.recent_only" />
-                <span class="form-hint">只处理近 {{ syncStatus.recent_window_hours || 48 }} 小时有更新的会话</span>
+                <el-switch v-model="activeSyncForm.recent_only" />
+                <span class="form-hint">只处理近 {{ activeSyncStatus.recent_window_hours || 48 }} 小时有更新的会话</span>
               </el-form-item>
               <el-form-item>
                 <el-button :loading="savingSync" @click="saveSyncSettings">保存同步设置</el-button>
-                <el-button type="primary" :loading="syncing" @click="runDouyinSync">立即同步</el-button>
+                <el-button type="primary" :loading="syncing" @click="runPlatformSync">同步当前平台</el-button>
               </el-form-item>
             </el-form>
             <div class="sync-summary">
-              <div><span>扫描会话</span><strong>{{ syncStatus.last_scanned || 0 }}</strong></div>
-              <div><span>新增私信</span><strong class="success">{{ syncStatus.last_imported || 0 }}</strong></div>
-              <div><span>重复跳过</span><strong>{{ syncStatus.last_duplicates || 0 }}</strong></div>
-              <div><span>条件跳过</span><strong>{{ syncStatus.last_skipped || 0 }}</strong></div>
+              <div><span>扫描会话</span><strong>{{ activeSyncStatus.last_scanned || 0 }}</strong></div>
+              <div><span>新增私信</span><strong class="success">{{ activeSyncStatus.last_imported || 0 }}</strong></div>
+              <div><span>重复跳过</span><strong>{{ activeSyncStatus.last_duplicates || 0 }}</strong></div>
+              <div><span>条件跳过</span><strong>{{ activeSyncStatus.last_skipped || 0 }}</strong></div>
             </div>
             <div class="sync-meta">
-              <span>账号：{{ syncSelectedAccount?.name || '未选择' }}</span>
-              <span>上次成功：{{ syncStatus.last_success_at || '尚未同步' }}</span>
-              <span>下次计划：{{ syncStatus.next_run_at || '未安排' }}</span>
+              <span>同步账号：{{ syncSelectedAccountNames }}</span>
+              <span>上次成功：{{ activeSyncStatus.last_success_at || '尚未同步' }}</span>
+              <span>下次计划：{{ activeSyncStatus.next_run_at || '未安排' }}</span>
               <span v-if="syncSkipSummary">本次跳过：{{ syncSkipSummary }}</span>
             </div>
             <el-alert
-              v-if="syncStatus.last_error"
-              title="最近一次同步失败"
+              v-if="activeSyncStatus.last_error"
+              title="最近一次同步异常"
               type="error"
               :closable="false"
               show-icon
-              :description="syncStatus.last_error"
+              :description="activeSyncStatus.last_error"
             />
             <el-alert
               class="sync-note"
-              title="抖音同步为只读，回复通过本地登录会话直发"
+              title="同步为只读，回复通过本地登录会话直发"
               type="info"
               :closable="false"
               show-icon
-              description="同步时不会点开会话或标记已读；手动回复和启用发送的规则回复会打开对应会话并点击平台发送。适配器依赖抖音创作者中心网页版结构，平台改版时可能需要维护。"
+              :description="activeSyncDescription"
             />
           </el-card>
 
@@ -312,15 +325,14 @@
               <div><span>发送失败</span><strong class="danger">{{ analytics.failed || 0 }}</strong></div>
             </div>
             <el-alert
-              title="抖音支持通过已登录网页会话直接发送"
+              title="抖音、小红书、视频号支持通过已登录网页会话直接发送"
               type="warning"
               :closable="false"
               show-icon
-              description="抖音回复会直接发送到平台并校验发送结果；其他平台仍可使用自有发送连接器。发送失败时不会误标为已发送。"
+              description="三类平台回复都会校验接口或页面结果并按来源账号发送；视频号 Cookie 失效时会提示重新扫码。其他平台仍可使用自有发送连接器，发送失败时不会误标为已发送。"
             />
             <div class="ingress-actions">
               <el-button @click="helpDialog = true">查看接入格式</el-button>
-              <el-button @click="openSimulate">测试一条来信</el-button>
             </div>
           </el-card>
         </div>
@@ -333,7 +345,6 @@
                 <span class="card-sub">按优先级从高到低匹配；未命中时走“首次承接”或 AI 兜底</span>
               </div>
               <div>
-                <el-button size="small" @click="openSimulate">测试规则</el-button>
                 <el-button size="small" type="primary" @click="openRule()">新建规则</el-button>
               </div>
             </div>
@@ -419,40 +430,6 @@
         </el-card>
       </el-tab-pane>
     </el-tabs>
-
-    <el-dialog v-model="simulateDialog" title="模拟一条私信" width="660px">
-      <el-form label-width="78px">
-        <el-form-item label="平台">
-          <el-select v-model="simulateForm.platform" style="width: 180px">
-            <el-option v-for="p in platforms" :key="p" :label="p" :value="p" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="昵称"><el-input v-model="simulateForm.nickname" placeholder="例如：王姐" /></el-form-item>
-        <el-form-item label="来信内容">
-          <el-input v-model="simulateForm.content" type="textarea" :rows="4" placeholder="例如：这个产品有哪些规格？多少钱？可以预约吗？" @input="simulateResult = null" />
-          <span class="form-hint">填写一条真实客户可能发来的咨询，用于测试关键词和回复规则。</span>
-        </el-form-item>
-      </el-form>
-      <div v-if="simulateResult" class="simulate-result">
-        <div class="simulate-tags">
-          <el-tag :type="segmentTagType(simulateResult.segment)">{{ simulateResult.segment_label }}</el-tag>
-          <el-tag :type="simulateResult.intent === 'high' ? 'danger' : 'warning'">{{ intentText(simulateResult.intent) }}</el-tag>
-          <el-tag effect="plain">{{ simulateResult.rule ? ('命中：' + simulateResult.rule.name) : '未命中规则' }}</el-tag>
-        </div>
-        <div class="simulate-reply">{{ simulateResult.reply || '没有生成回复。请检查规则或 AI 兜底。' }}</div>
-        <div v-if="simulateResult.contacts && simulateResult.segment === 'team'" class="simulate-fields">
-          识别字段：{{ simulateResult.contacts.company_name || '公司待确认' }} · {{ simulateResult.contacts.traveler_count ? simulateResult.contacts.traveler_count + '人' : '人数待确认' }} · {{ simulateResult.contacts.origin || '出发地待确认' }} · {{ simulateResult.contacts.budget || '预算待确认' }} · {{ simulateResult.contacts.travel_date || '档期待确认' }}
-        </div>
-        <div v-else-if="simulateResult.contacts" class="simulate-fields">
-          识别字段：{{ simulateResult.contacts.origin || '出发地待确认' }} · {{ simulateResult.contacts.traveler_count || '人数待确认' }} · {{ simulateResult.contacts.travel_date || '日期待确认' }}
-        </div>
-      </div>
-      <template #footer>
-        <el-button @click="simulateDialog = false">关闭</el-button>
-        <el-button :loading="testing" @click="testSimulate">测试匹配</el-button>
-        <el-button type="primary" :loading="writingSimulate" @click="writeSimulate">写入收件箱并回复</el-button>
-      </template>
-    </el-dialog>
 
     <el-dialog v-model="importDialog" title="批量导入消息" width="620px">
       <p class="dialog-hint">每行一条：<code>平台|账号|用户|留言内容|来源内容(可选)|用户ID(可选)</code></p>
@@ -587,8 +564,9 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
         <p>系统先识别意向，再按关键词与优先级匹配你设置的规则。命中后生成一条回复：</p>
         <ul>
           <li>抖音会根据客户昵称打开对应会话，通过当前已登录账号直接点击发送。</li>
+          <li>小红书和视频号会按稳定的会话 ID 直接调用平台私信接口，不依赖昵称匹配。</li>
           <li>发送成功后才标记为“已发送”；登录失效或平台限制会明确显示失败原因。</li>
-          <li>其他平台可以继续配置发送连接器。</li>
+          <li>快手、微博、百家号等其他平台可以继续配置发送连接器。</li>
         </ul>
       </div>
       <div class="help-section">
@@ -641,12 +619,18 @@ const autoForm = reactive({
 })
 const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
-const syncForm = reactive({ enabled: false, account_id: 0, interval_seconds: 5, recent_only: true })
+const xhsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
+const channelsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
+const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 5, recent_only: true })
+const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 60, recent_only: true })
+const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 60, recent_only: true })
+const syncPlatform = ref('抖音')
 const savingSync = ref(false)
 const syncing = ref(false)
 const rules = ref([])
 const conversations = ref([])
-const convFilters = reactive({ q: '', platform: '', segment: '', status: '' })
+const convFilters = reactive({ q: '', account: '', platform: '', segment: '', status: '' })
+const accountFilterKey = ref('')
 const loadingConversations = ref(false)
 const currentContact = ref(null)
 const messages = ref([])
@@ -670,11 +654,6 @@ const ruleForm = reactive({
   reply_template: '', priority: 10, cooldown_minutes: 0,
   once_per_contact: false, enabled: true,
 })
-const simulateDialog = ref(false)
-const simulateForm = reactive({ platform: '抖音', nickname: '王姐', content: '' })
-const simulateResult = ref(null)
-const testing = ref(false)
-const writingSimulate = ref(false)
 const importDialog = ref(false)
 const importText = ref('')
 const importAutoReply = ref(false)
@@ -698,24 +677,95 @@ X-YunCe-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未
   "content": "这个产品有哪些规格？多少钱？可以预约吗？",
   "source_content": "产品介绍视频"
 }`)
-const connectorNote = computed(() => currentContact.value?.platform === '抖音'
-  ? '抖音将通过当前登录账号直接发送并校验结果'
+const syncPlatformMeta = {
+  '抖音': {
+    prefix: '/dm/sync', minInterval: 5, defaultInterval: 5,
+    title: '抖音私信本地同步', accountHint: '不选时同步全部已登录且 Cookie 可用的抖音账号',
+  },
+  '小红书': {
+    prefix: '/dm/xhs', minInterval: 30, defaultInterval: 60,
+    title: '小红书私信同步', accountHint: '不选时同步全部已登录且 Cookie 可用的小红书账号',
+  },
+  '视频号': {
+    prefix: '/dm/channels', minInterval: 30, defaultInterval: 60,
+    title: '视频号私信同步', accountHint: '不选时同步全部已登录且 Cookie 可用的视频号账号',
+  },
+}
+const syncRunTargets = [
+  { platform: '抖音', prefix: '/dm/sync' },
+  { platform: '小红书', prefix: '/dm/xhs' },
+  { platform: '视频号', prefix: '/dm/channels' },
+]
+const directPlatforms = new Set(['抖音', '小红书', '视频号'])
+const activeSyncMeta = computed(() => syncPlatformMeta[syncPlatform.value])
+const activeSyncStatus = computed(() => {
+  if (syncPlatform.value === '小红书') return xhsSyncStatus.value
+  if (syncPlatform.value === '视频号') return channelsSyncStatus.value
+  return syncStatus.value
+})
+const activeSyncForm = computed(() => {
+  if (syncPlatform.value === '小红书') return xhsSyncForm
+  if (syncPlatform.value === '视频号') return channelsSyncForm
+  return syncForm
+})
+const activeSyncAdapter = computed(() => syncPlatform.value === '抖音'
+  ? 'Playwright 只读适配器'
+  : '网页 API 只读同步')
+const activeSyncDescription = computed(() => ({
+  '抖音': '支持多账号独立同步，消息按来源账号隔离存储；同步时不会点开会话或标记已读。手动回复会使用该会话所属账号登录并发送。适配器依赖抖音创作者中心网页版结构，平台改版时可能需要维护。',
+  '小红书': '通过小红书主站网页登录态读取私信，消息按来源账号隔离；同步只生成待人工回复。手动回复按会话 ID 精确定位并直接发送，不依赖客户昵称。重新登录时必须使用接收私信的账号扫码。',
+  '视频号': '通过视频号助手网页登录态读取私信，消息按来源账号隔离；同步只生成待人工回复。手动回复按 sessionId 精确定位客户。Cookie 失效时必须重新扫码登录后才能同步或发送。',
+}[syncPlatform.value]))
+const connectorNote = computed(() => directPlatforms.has(currentContact.value?.platform)
+  ? `${currentContact.value?.platform}将通过当前登录账号直接发送并校验结果`
   : (autoForm.outbound_webhook
       ? '已配置发送连接器，发送结果会回写到消息状态'
       : '未配置发送连接器：发送后保存为“待人工发送”，可在消息旁复制回复'))
-const syncAccounts = computed(() => syncStatus.value.accounts || [])
-const syncSelectedAccount = computed(() => syncStatus.value.selected_account || null)
-const syncSkipSummary = computed(() => Object.entries(syncStatus.value.last_skip_reasons || {})
+const syncAccounts = computed(() => activeSyncStatus.value.accounts || [])
+const allMessageAccounts = computed(() => [
+  ...(syncStatus.value.accounts || []).map(account => ({ ...account, platform: '抖音' })),
+  ...(xhsSyncStatus.value.accounts || []).map(account => ({ ...account, platform: '小红书' })),
+  ...(channelsSyncStatus.value.accounts || []).map(account => ({ ...account, platform: '视频号' })),
+].map(account => ({
+  ...account,
+  key: `${account.platform}\u0000${account.name}\u0000${account.id}`,
+  label: `${account.platform} · ${account.name}`,
+})))
+const syncSelectedAccounts = computed(() => {
+  const accounts = activeSyncStatus.value.accounts || []
+  const ids = (activeSyncForm.value.account_ids || []).map(Number)
+  if (ids.length) return accounts.filter(account => ids.includes(Number(account.id)))
+  return accounts.filter(account => account.has_cookie)
+})
+const syncSelectedAccountNames = computed(() => {
+  const names = syncSelectedAccounts.value.map(account => account.name)
+  return names.length ? names.join('、') : '未选择'
+})
+const syncSkipSummary = computed(() => Object.entries(activeSyncStatus.value.last_skip_reasons || {})
   .map(([reason, count]) => `${reason} ${count}`).join(' · '))
+const syncTargetStates = computed(() => [
+  { platform: '抖音', status: syncStatus.value },
+  { platform: '小红书', status: xhsSyncStatus.value },
+  { platform: '视频号', status: channelsSyncStatus.value },
+])
+const syncAnyRunning = computed(() => syncTargetStates.value.some(item => item.status.running))
+const syncAllEnabled = computed(() => syncTargetStates.value.every(item => item.status.enabled))
+const syncEnabledCount = computed(() => syncTargetStates.value.filter(item => item.status.enabled).length)
+const syncAllHasError = computed(() => syncTargetStates.value.some(item => item.status.last_error))
+const syncAccountCount = computed(() => syncTargetStates.value.reduce(
+  (count, item) => count + Number(item.status.account_count || 0), 0,
+))
 const syncTagText = computed(() => {
-  if (syncStatus.value.last_error) return '抖音同步异常'
-  if (syncing.value || syncStatus.value.running) return '抖音同步中'
-  return syncStatus.value.enabled ? '抖音定时同步已开启' : '抖音定时同步已关闭'
+  if (syncAnyRunning.value || syncing.value) return '全部平台同步中'
+  if (syncAllHasError.value) return '部分平台同步异常'
+  if (syncAllEnabled.value) return `全部平台自动同步已开启（${syncAccountCount.value} 个账号）`
+  if (syncEnabledCount.value) return `部分平台自动同步已开启（${syncEnabledCount.value}/${syncTargetStates.value.length}）`
+  return '全部平台自动同步已关闭'
 })
 const syncTagType = computed(() => {
-  if (syncStatus.value.last_error) return 'danger'
-  if (syncing.value || syncStatus.value.running) return 'warning'
-  return syncStatus.value.enabled ? 'success' : 'info'
+  if (syncAllHasError.value) return 'danger'
+  if (syncAnyRunning.value || syncing.value) return 'warning'
+  return syncAllEnabled.value ? 'success' : 'info'
 })
 const availableTemplates = computed(() => {
   const segment = currentContact.value?.segment || 'unknown'
@@ -838,47 +888,136 @@ async function saveSettings() {
   finally { savingSettings.value = false }
 }
 
+function hydrateSyncForm(form, data, defaultInterval) {
+  form.enabled = Boolean(data.enabled)
+  form.account_ids = Array.isArray(data.account_ids)
+    ? data.account_ids.map(Number).filter(Boolean)
+    : []
+  form.interval_seconds = Number(data.interval_seconds || defaultInterval)
+  form.recent_only = Boolean(data.recent_only)
+}
+
+function setSyncStatus(platform, data) {
+  if (platform === '小红书') xhsSyncStatus.value = data
+  else if (platform === '视频号') channelsSyncStatus.value = data
+  else syncStatus.value = data
+}
+
 async function loadSyncStatus() {
-  try {
-    const res = await http.get('/dm/sync/status')
-    const data = res.data || {}
-    syncStatus.value = data
-    syncForm.enabled = Boolean(data.enabled)
-    syncForm.account_id = Number(data.account_id || 0)
-    syncForm.interval_seconds = Number(data.interval_seconds || 5)
-    syncForm.recent_only = Boolean(data.recent_only)
-  } catch (error) { console.error(error) }
+  const targets = [
+    ['抖音', '/dm/sync/status', syncForm, 5],
+    ['小红书', '/dm/xhs/status', xhsSyncForm, 60],
+    ['视频号', '/dm/channels/status', channelsSyncForm, 60],
+  ]
+  const rows = await Promise.all(targets.map(async ([platform, url, form, defaultInterval]) => {
+    try {
+      const res = await http.get(url)
+      const data = res.data || {}
+      setSyncStatus(platform, data)
+      hydrateSyncForm(form, data, defaultInterval)
+      return [platform, data]
+    } catch (error) {
+      console.error(error)
+      return [platform, null]
+    }
+  }))
+  return rows
 }
 
 async function saveSyncSettings() {
   savingSync.value = true
   try {
-    const res = await http.put('/dm/sync/settings', {
-      enabled: syncForm.enabled ? 1 : 0,
-      account_id: Number(syncForm.account_id || 0),
-      interval_seconds: Number(syncForm.interval_seconds || 5),
-      recent_only: syncForm.recent_only ? 1 : 0,
-      max_conversations: Number(syncStatus.value.max_conversations || 20),
+    const meta = activeSyncMeta.value
+    const form = activeSyncForm.value
+    const res = await http.put(`${meta.prefix}/settings`, {
+      enabled: form.enabled ? 1 : 0,
+      account_ids: (form.account_ids || []).map(Number).filter(Boolean),
+      interval_seconds: Number(form.interval_seconds || meta.defaultInterval),
+      recent_only: form.recent_only ? 1 : 0,
+      max_conversations: Number(activeSyncStatus.value.max_conversations || 50),
     })
-    syncStatus.value = res.data || syncStatus.value
-    ElMessage.success('抖音同步设置已保存')
+    setSyncStatus(syncPlatform.value, res.data || activeSyncStatus.value)
+    ElMessage.success(`${syncPlatform.value}同步设置已保存`)
   } catch (error) { console.error(error) }
   finally { savingSync.value = false }
 }
 
-async function runDouyinSync() {
+async function runPlatformSync() {
   if (syncing.value) return
   syncing.value = true
   try {
-    const res = await http.post('/dm/sync/run', {}, { timeout: 120000 })
+    const platform = syncPlatform.value
+    const res = await http.post(`${activeSyncMeta.value.prefix}/run`, {}, { timeout: 600000 })
     const data = res.data || {}
-    ElMessage.success(`同步完成：扫描 ${data.scanned || 0}，新增 ${data.imported || 0}，重复 ${data.duplicates || 0}`)
+    const summary = `扫描 ${data.scanned || 0}，新增 ${data.imported || 0}，重复 ${data.duplicates || 0}`
+    if (data.partial) ElMessage.warning(`部分账号同步失败：${summary}。${data.error || ''}`)
+    else ElMessage.success(`${platform}同步完成：${summary}`)
     await Promise.all([loadSyncStatus(), loadConversations(), loadAnalytics(), loadLeads()])
     if (currentContact.value?.id) await loadConversation(currentContact.value.id)
   } catch (error) {
     console.error(error)
     await loadSyncStatus()
   } finally { syncing.value = false }
+}
+
+async function runAllPlatformSync() {
+  if (syncing.value || syncAnyRunning.value) return
+  syncing.value = true
+  try {
+    const results = await Promise.all(syncRunTargets.map(async target => {
+      try {
+        const res = await http.post(`${target.prefix}/run`, {}, {
+          timeout: 600000,
+          silent: true,
+        })
+        return { platform: target.platform, ok: true, data: res.data || {} }
+      } catch (error) {
+        return {
+          platform: target.platform,
+          ok: false,
+          error: error.response?.data?.msg || error.message || '同步失败',
+        }
+      }
+    }))
+    const succeeded = results.filter(item => item.ok)
+    const failed = results.filter(item => !item.ok)
+    const partial = succeeded.filter(item => item.data.partial)
+    const scanned = succeeded.reduce((sum, item) => sum + Number(item.data.scanned || 0), 0)
+    const imported = succeeded.reduce((sum, item) => sum + Number(item.data.imported || 0), 0)
+    const duplicates = succeeded.reduce((sum, item) => sum + Number(item.data.duplicates || 0), 0)
+
+    await Promise.all([loadSyncStatus(), loadConversations(), loadAnalytics(), loadLeads()])
+    if (currentContact.value?.id) await loadConversation(currentContact.value.id)
+
+    if (failed.length || partial.length) {
+      const details = [
+        ...failed.map(item => `${item.platform}：${item.error}`),
+        ...partial.map(item => `${item.platform}：部分账号失败`),
+      ].join('；')
+      ElMessage.warning(`全平台同步完成 ${succeeded.length} 个平台；${details}。扫描 ${scanned}，新增 ${imported}，重复 ${duplicates}`)
+    } else {
+      ElMessage.success(`全部平台同步完成：扫描 ${scanned}，新增 ${imported}，重复 ${duplicates}`)
+    }
+  } finally {
+    syncing.value = false
+  }
+}
+
+function handleAccountFilterChange(key) {
+  const account = allMessageAccounts.value.find(item => item.key === key)
+  if (account) {
+    convFilters.account = account.name
+    convFilters.platform = account.platform
+  } else {
+    convFilters.account = ''
+  }
+  loadConversations()
+}
+
+function handlePlatformFilterChange() {
+  accountFilterKey.value = ''
+  convFilters.account = ''
+  loadConversations()
 }
 
 async function refreshLive() {
@@ -923,6 +1062,11 @@ async function loadConversations(silent = false) {
     if (currentContact.value) {
       const latest = conversations.value.find(item => item.id === currentContact.value.id)
       if (latest) currentContact.value = { ...currentContact.value, ...latest }
+      else {
+        currentContact.value = null
+        messages.value = []
+        replyText.value = ''
+      }
     } else if (conversations.value.length) {
       selectConversation(conversations.value[0], false)
     }
@@ -1004,7 +1148,10 @@ async function sendReply() {
   try {
     const res = await http.post(`/dm/conversations/${currentContact.value.id}/reply`, { text })
     const status = res.data?.delivery_status
-    if (status === 'sent') ElMessage.success(currentContact.value?.platform === '抖音' ? '回复已发送到抖音' : '回复已通过连接器发送')
+    if (status === 'sent') {
+      const message = { '抖音': '回复已发送到抖音', '小红书': '回复已发送到小红书', '视频号': '回复已发送到视频号' }[currentContact.value?.platform]
+      ElMessage.success(message || '回复已通过连接器发送')
+    }
     else if (status === 'failed') {
       replyText.value = text
       ElMessage.error(res.data?.delivery_error || '回复发送失败')
@@ -1124,55 +1271,6 @@ async function removeRule(row) {
     ElMessage.success('规则已删除')
     loadRules()
   } catch (error) { console.error(error) }
-}
-
-function openSimulate() {
-  simulateForm.platform = '抖音'
-  simulateForm.nickname = '王姐'
-  simulateForm.content = ''
-  simulateResult.value = null
-  simulateDialog.value = true
-}
-
-async function testSimulate() {
-  if (!simulateForm.content.trim()) return ElMessage.warning('请先输入一条客户来信')
-  testing.value = true
-  try {
-    const res = await http.post('/dm/simulate', simulateForm)
-    simulateResult.value = res.data
-  } catch (error) { console.error(error) }
-  finally { testing.value = false }
-}
-
-async function writeSimulate() {
-  if (!simulateForm.content.trim()) return ElMessage.warning('请先输入一条客户来信')
-  writingSimulate.value = true
-  try {
-    const now = Date.now()
-    const res = await http.post('/dm/inbound', {
-      platform: simulateForm.platform,
-      account: '规则测试账号',
-      external_user_id: `sim-user-${now}`,
-      external_message_id: `sim-msg-${now}`,
-      author: simulateForm.nickname || '模拟客户',
-      msg_type: 'dm',
-      content: simulateForm.content,
-      source_content: '规则测试',
-      auto_reply: true,
-    })
-    const auto = res.data?.auto_reply
-    if (auto?.status === 'sent') ElMessage.success('已写入收件箱，并标记为已发送')
-    else if (auto?.status === 'skipped') ElMessage.warning('已写入收件箱，但未自动回复：' + (auto.reason || '未命中规则'))
-    else ElMessage.success('已写入收件箱，回复为待人工发送')
-    simulateDialog.value = false
-    await Promise.all([loadConversations(), loadAnalytics(), loadLeads()])
-    const conversation = conversations.value.find(item => item.id === res.data.contact_id)
-    if (conversation) {
-      activeTab.value = 'inbox'
-      selectConversation(conversation)
-    }
-  } catch (error) { console.error(error) }
-  finally { writingSimulate.value = false }
 }
 
 async function doImport() {
