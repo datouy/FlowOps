@@ -34,6 +34,7 @@ RECENT_WINDOW = timedelta(hours=48)
 DEFAULT_SYNC_SETTINGS = {
     "enabled": 1,
     "account_id": 0,
+    "account_ids": [],
     "interval_seconds": 5,
     "max_conversations": 100,
     "recent_only": 1,
@@ -41,7 +42,7 @@ DEFAULT_SYNC_SETTINGS = {
 }
 
 SYNC_FIELDS = {
-    "enabled", "account_id", "interval_seconds", "max_conversations", "recent_only",
+    "enabled", "account_id", "account_ids", "interval_seconds", "max_conversations", "recent_only",
     "draft_only", "last_started_at", "last_finished_at", "last_success_at", "last_error",
     "last_scanned", "last_imported", "last_duplicates", "last_skipped", "last_failed",
     "last_duration_ms", "last_account_name", "last_cookie_file", "last_run_trigger",
@@ -85,6 +86,7 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id=1),
             enabled INTEGER DEFAULT 1,
             account_id INTEGER DEFAULT 0,
+            account_ids TEXT DEFAULT '[]',
             interval_seconds INTEGER DEFAULT 5,
             max_conversations INTEGER DEFAULT 100,
             recent_only INTEGER DEFAULT 1,
@@ -106,6 +108,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
         for name, ddl in (
+            ("account_ids", "TEXT DEFAULT '[]'"),
             ("last_scanned", "INTEGER DEFAULT 0"), ("last_imported", "INTEGER DEFAULT 0"),
             ("last_duplicates", "INTEGER DEFAULT 0"), ("last_skipped", "INTEGER DEFAULT 0"),
             ("last_failed", "INTEGER DEFAULT 0"), ("last_duration_ms", "INTEGER DEFAULT 0"),
@@ -135,6 +138,30 @@ def _as_flag(value: Any) -> int:
     return 1 if value else 0
 
 
+def _parse_account_ids(value: Any) -> list[int]:
+    if isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raw = []
+        else:
+            try:
+                parsed = json.loads(text)
+                raw = parsed if isinstance(parsed, list) else re.split(r"[,，\s]+", text)
+            except (TypeError, ValueError):
+                raw = re.split(r"[,，\s]+", text)
+    result = []
+    for item in raw:
+        try:
+            account_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in result:
+            result.append(account_id)
+    return result
+
+
 def _load_settings() -> dict:
     with dm_ops.get_conn() as c:
         row = c.execute("SELECT * FROM douyin_dm_sync_settings WHERE id=1").fetchone()
@@ -145,6 +172,9 @@ def _load_settings() -> dict:
         data["account_id"] = max(0, int(data.get("account_id") or 0))
     except (TypeError, ValueError):
         data["account_id"] = 0
+    data["account_ids"] = _parse_account_ids(data.get("account_ids"))
+    if not data["account_ids"] and data["account_id"]:
+        data["account_ids"] = [data["account_id"]]
     try:
         data["interval_seconds"] = max(5, min(int(data.get("interval_seconds") or 5), 3600))
     except (TypeError, ValueError):
@@ -160,6 +190,10 @@ def _save_settings(**fields):
     fields = {key: value for key, value in fields.items() if key in SYNC_FIELDS}
     if not fields:
         return
+    if "account_ids" in fields:
+        fields["account_ids"] = json.dumps(
+            _parse_account_ids(fields["account_ids"]), ensure_ascii=False
+        )
     fields["updated_at"] = _now_text()
     assignments = ",".join(f"{key}=?" for key in fields)
     with dm_ops.get_conn() as c:
@@ -192,33 +226,49 @@ def _cookie_path(file_path: str) -> Path | None:
     return path if path.exists() else None
 
 
+def _account_name(account: dict | None) -> str:
+    if not account:
+        return ""
+    name = str(account.get("userName") or account.get("name") or "").strip()
+    if name:
+        return name
+    account_id = int(account.get("id") or 0)
+    return f"抖音账号{account_id}" if account_id else "抖音账号"
+
+
 def _public_account(account: dict | None) -> dict | None:
     if not account:
         return None
     path = account.get("cookie_path") or _cookie_path(account.get("filePath"))
     return {
         "id": int(account.get("id") or 0),
-        "name": str(account.get("userName") or "").strip() or f"抖音账号{account.get('id') or ''}",
+        "name": _account_name(account),
         "status": int(account.get("status") or 0),
         "has_cookie": bool(path and Path(path).exists()),
     }
 
 
-def _resolve_account(accounts: list[dict], account_id: int) -> dict | None:
+def _resolve_accounts(accounts: list[dict], settings: dict) -> list[dict]:
     if not accounts:
-        return None
-    selected = None
-    if account_id:
-        selected = next((item for item in accounts if int(item.get("id") or 0) == account_id), None)
-    if not selected:
-        selected = next((item for item in accounts
-                         if int(item.get("status") or 0) == 1 and _cookie_path(item.get("filePath"))), None)
-    if not selected:
-        selected = next((item for item in accounts if _cookie_path(item.get("filePath"))), None)
-    if not selected:
-        selected = accounts[0]
-    result = dict(selected)
-    result["cookie_path"] = _cookie_path(result.get("filePath"))
+        return []
+    selected_ids = _parse_account_ids(settings.get("account_ids"))
+    if selected_ids:
+        by_id = {int(item.get("id") or 0): item for item in accounts}
+        selected = [by_id[account_id] for account_id in selected_ids if account_id in by_id]
+    else:
+        selected = [
+            item for item in accounts
+            if int(item.get("status") or 0) == 1 and _cookie_path(item.get("filePath"))
+        ]
+        if not selected:
+            selected = [item for item in accounts if _cookie_path(item.get("filePath"))]
+        if not selected:
+            selected = list(accounts)
+    result = []
+    for item in selected:
+        prepared = dict(item)
+        prepared["cookie_path"] = _cookie_path(prepared.get("filePath"))
+        result.append(prepared)
     return result
 
 
@@ -233,14 +283,18 @@ def _next_run_text() -> str:
 def _status_payload() -> dict:
     settings = _load_settings()
     accounts = _account_rows()
-    selected = _resolve_account(accounts, settings["account_id"])
+    selected = _resolve_accounts(accounts, settings)
     data = dict(settings)
     try:
         data["last_skip_reasons"] = json.loads(data.get("last_skip_reasons") or "{}")
     except (TypeError, ValueError):
         data["last_skip_reasons"] = {}
     data["accounts"] = [_public_account(item) for item in accounts]
-    data["selected_account"] = _public_account(selected)
+    data["selected_accounts"] = [_public_account(item) for item in selected]
+    data["selected_account"] = _public_account(selected[0]) if selected else None
+    data["account_ids"] = settings.get("account_ids") or []
+    data["effective_account_ids"] = [int(item.get("id") or 0) for item in selected]
+    data["account_count"] = len(selected)
     data["running"] = _sync_lock.locked()
     data["next_run_at"] = _next_run_text()
     data["recent_window_hours"] = int(RECENT_WINDOW.total_seconds() // 3600)
@@ -374,13 +428,13 @@ HISTORY_SCRIPT = r"""
 """
 
 
-def _pending_conversation_unread() -> dict[str, int]:
+def _pending_conversation_unread(account_name: str) -> dict[str, int]:
     try:
         with dm_ops.get_conn() as c:
             rows = c.execute("""SELECT c.external_user_id, c.source_content, COUNT(m.id) unread_count
                 FROM dm_contacts c JOIN messages m ON m.contact_id=c.id
-                WHERE c.platform='抖音' AND m.direction='inbound' AND m.status='new'
-                GROUP BY c.id""").fetchall()
+                WHERE c.platform='抖音' AND c.account=? AND m.direction='inbound' AND m.status='new'
+                GROUP BY c.id""", (account_name,)).fetchall()
             result = {}
             for row in rows:
                 cid = str(row["external_user_id"] or "")
@@ -393,8 +447,9 @@ def _pending_conversation_unread() -> dict[str, int]:
         return {}
 
 
-def _history_marker_key(cid: str) -> str:
-    return "douyin_history_" + hashlib.sha1(cid.encode("utf-8")).hexdigest()
+def _history_marker_key(account_name: str, cid: str) -> str:
+    value = f"{account_name}|{cid}".encode("utf-8")
+    return "douyin_history_" + hashlib.sha1(value).hexdigest()
 
 
 def _history_signature(row: dict) -> str:
@@ -404,20 +459,23 @@ def _history_signature(row: dict) -> str:
     return hashlib.sha1(values.encode("utf-8")).hexdigest()
 
 
-def _history_marker(cid: str) -> str:
+def _history_marker(account_name: str, cid: str) -> str:
     try:
         with dm_ops.get_conn() as c:
-            row = c.execute("SELECT value FROM dm_meta WHERE key=?", (_history_marker_key(cid),)).fetchone()
+            row = c.execute(
+                "SELECT value FROM dm_meta WHERE key=?",
+                (_history_marker_key(account_name, cid),),
+            ).fetchone()
             return str(row["value"] or "") if row else ""
     except Exception:
         return ""
 
 
-def _save_history_marker(cid: str, signature: str):
+def _save_history_marker(account_name: str, cid: str, signature: str):
     try:
         with dm_ops.get_conn() as c:
             c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES (?,?)",
-                      (_history_marker_key(cid), signature))
+                      (_history_marker_key(account_name, cid), signature))
     except Exception:
         pass
 
@@ -513,7 +571,7 @@ def _history_items(row: dict, history: list[dict], account: dict) -> list[dict]:
             source += " · 陌生人会话"
         result.append({
             "platform": "抖音",
-            "account": str(account.get("userName") or "").strip() or "抖音账号",
+            "account": _account_name(account),
             "external_user_id": cid,
             "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
             "author": nickname if direction == "inbound" else "我",
@@ -551,6 +609,7 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
     cookie_path = account.get("cookie_path")
     if not cookie_path or not Path(cookie_path).exists():
         raise SyncError("抖音 Cookie 文件不存在，请重新登录账号")
+    account_name = _account_name(account)
     headless = str(os.environ.get("FLOWOPS_DOUYIN_HEADLESS", "1")).lower() not in (
         "0", "false", "no", "off",
     )
@@ -617,7 +676,7 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
                     break
                 await page.wait_for_timeout(550)
             data = list(collected.values())
-            pending_unread = _pending_conversation_unread()
+            pending_unread = _pending_conversation_unread(account_name)
             for row in data:
                 try:
                     cid = str(row.get("cid") or "")
@@ -627,7 +686,7 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
                     )
                     row["unread"] = effective_unread
                     should_scan_history = effective_unread > 0
-                    if should_scan_history and _history_marker(cid) == signature:
+                    if should_scan_history and _history_marker(account_name, cid) == signature:
                         row["history_synced"] = True
                         continue
                     if not should_scan_history:
@@ -636,7 +695,7 @@ async def _scan_douyin(settings: dict, account: dict) -> dict:
                         history = await page.evaluate(HISTORY_SCRIPT)
                         if isinstance(history, list) and history:
                             row["history"] = history
-                            _save_history_marker(cid, signature)
+                            _save_history_marker(account_name, cid, signature)
                 except Exception:
                     pass
             return {"rows": data, "scanned": len(data)}
@@ -704,7 +763,7 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
     nickname = _clean_text(row.get("name"), 80) or "抖音用户"
     return {
         "platform": "抖音",
-        "account": str(account.get("userName") or "").strip() or "抖音账号",
+        "account": _account_name(account),
         "external_user_id": _clean_text(row.get("cid"), 120),
         "external_message_id": external_message_id,
         "author": nickname,
@@ -725,6 +784,53 @@ def _friendly_error(exc: Exception) -> str:
         return "抖音页面意外关闭，请稍后重试"
     return text[:500]
 
+
+def _sync_account(settings: dict, account: dict) -> dict:
+    name = _account_name(account)
+    if not account.get("cookie_path"):
+        raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
+    scan = asyncio.run(_scan_douyin(settings, account))
+    items = []
+    skipped = 0
+    skip_reasons: dict[str, int] = {}
+    for row in scan.get("rows") or []:
+        if row.get("history_synced"):
+            continue
+        item, reason = _row_to_item(
+            row, account, recent_only=bool(settings.get("recent_only"))
+        )
+        if item:
+            history_items = _history_items(row, row.get("history") or [], account)
+            items.extend(history_items or [item])
+        else:
+            skipped += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+    # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
+    ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
+    for contact_id in {
+        int(result.get("contact_id")) for result in ingest.get("items", [])
+        if result.get("contact_id")
+    }:
+        dm_ops.dedupe_contact_messages(contact_id)
+    ready = sum(
+        1 for result in ingest.get("items", [])
+        if (result.get("auto_reply") or {}).get("status") == "ready"
+    )
+    return {
+        "ok": True,
+        "account": _public_account(account),
+        "scanned": int(scan.get("scanned") or 0),
+        "imported": int(ingest.get("added") or 0),
+        "duplicates": int(ingest.get("duplicates") or 0),
+        "skipped": skipped,
+        "failed": int(ingest.get("failed") or 0),
+        "auto_replies_ready": ready,
+        "skip_reasons": skip_reasons,
+        "items": ingest.get("items", []),
+    }
+
+
 def run_sync(trigger: str = "manual") -> dict:
     global _next_run_at
     if not _sync_lock.acquire(blocking=False):
@@ -732,86 +838,104 @@ def run_sync(trigger: str = "manual") -> dict:
 
     started_mono = time.monotonic()
     started_at = _now_text()
-    account = None
+    selected_accounts: list[dict] = []
+    account_results: list[dict] = []
     settings = _load_settings()
     try:
         accounts = _account_rows()
-        account = _resolve_account(accounts, settings["account_id"])
-        if not account:
+        selected_accounts = _resolve_accounts(accounts, settings)
+        if not selected_accounts:
             raise SyncError("未找到抖音账号，请先在账号管理中登录抖音")
-        if not account.get("cookie_path"):
-            raise SyncError("抖音 Cookie 文件不存在，请重新登录账号")
-
         _save_settings(
             last_started_at=started_at, last_error="", last_run_trigger=trigger,
             last_skip_reasons="{}",
-            last_account_name=str(account.get("userName") or ""),
-            last_cookie_file=Path(str(account.get("cookie_path"))).name,
+            last_account_name="、".join(_account_name(item) for item in selected_accounts),
         )
-        scan = asyncio.run(_scan_douyin(settings, account))
-        items = []
-        skipped = 0
-        skip_reasons: dict[str, int] = {}
-        for row in scan.get("rows") or []:
-            if row.get("history_synced"):
-                continue
-            item, reason = _row_to_item(row, account, recent_only=bool(settings.get("recent_only")))
-            if item:
-                history_items = _history_items(row, row.get("history") or [], account)
-                items.extend(history_items or [item])
-            else:
-                skipped += 1
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+        for account in selected_accounts:
+            try:
+                account_results.append(_sync_account(settings, account))
+            except Exception as exc:
+                message = str(exc) if isinstance(exc, SyncError) else _friendly_error(exc)
+                account_results.append({
+                    "ok": False,
+                    "account": _public_account(account),
+                    "scanned": 0,
+                    "imported": 0,
+                    "duplicates": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "auto_replies_ready": 0,
+                    "skip_reasons": {},
+                    "error": message,
+                    "items": [],
+                })
 
-        # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
-        ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
-        for contact_id in {
-            int(result.get("contact_id")) for result in ingest.get("items", [])
-            if result.get("contact_id")
-        }:
-            dm_ops.dedupe_contact_messages(contact_id)
+        succeeded = [item for item in account_results if item.get("ok")]
+        failed = [item for item in account_results if not item.get("ok")]
+        if not succeeded:
+            raise SyncError("；".join(
+                f"{_account_name(item.get('account'))}：{item.get('error') or '同步失败'}"
+                for item in failed
+            ) or "抖音账号同步失败")
+
+        scanned = sum(int(item.get("scanned") or 0) for item in account_results)
+        imported = sum(int(item.get("imported") or 0) for item in account_results)
+        duplicates = sum(int(item.get("duplicates") or 0) for item in account_results)
+        skipped = sum(int(item.get("skipped") or 0) for item in account_results)
+        ingest_failed = sum(int(item.get("failed") or 0) for item in account_results)
+        ready = sum(int(item.get("auto_replies_ready") or 0) for item in account_results)
+        skip_reasons: dict[str, int] = {}
+        items = []
+        for result in account_results:
+            for reason, count in (result.get("skip_reasons") or {}).items():
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + int(count or 0)
+            items.extend(result.get("items") or [])
+        error_summary = "；".join(
+            f"{_account_name(item.get('account'))}：{item.get('error') or '同步失败'}"
+            for item in failed
+        )
         finished_at = _now_text()
         duration_ms = int((time.monotonic() - started_mono) * 1000)
-        ready = sum(
-            1 for result in ingest.get("items", [])
-            if (result.get("auto_reply") or {}).get("status") == "ready"
-        )
         _save_settings(
             last_finished_at=finished_at, last_success_at=finished_at,
-            last_scanned=int(scan.get("scanned") or 0),
-            last_imported=int(ingest.get("added") or 0),
-            last_duplicates=int(ingest.get("duplicates") or 0),
-            last_skipped=skipped, last_failed=int(ingest.get("failed") or 0),
-            last_duration_ms=duration_ms, last_error="",
+            last_scanned=scanned, last_imported=imported,
+            last_duplicates=duplicates,
+            last_skipped=skipped, last_failed=ingest_failed + len(failed),
+            last_duration_ms=duration_ms, last_error=error_summary,
             last_skip_reasons=json.dumps(skip_reasons, ensure_ascii=False),
-            last_account_name=str(account.get("userName") or ""),
-            last_cookie_file=Path(str(account.get("cookie_path"))).name,
+            last_account_name="、".join(_account_name(item) for item in selected_accounts),
+            last_cookie_file="、".join(
+                Path(str(item.get("cookie_path"))).name
+                for item in selected_accounts if item.get("cookie_path")
+            ),
         )
         print(
-            f"[douyin-dm-sync] trigger={trigger} scanned={scan.get('scanned', 0)} "
-            f"imported={ingest.get('added', 0)} duplicates={ingest.get('duplicates', 0)} "
+            f"[douyin-dm-sync] trigger={trigger} accounts={len(succeeded)}/{len(account_results)} "
+            f"scanned={scanned} imported={imported} duplicates={duplicates} "
             f"skipped={skipped} ready={ready} duration={duration_ms}ms",
             flush=True,
         )
         return {
-            "ok": True, "trigger": trigger,
-            "account": _public_account(account),
-            "scanned": int(scan.get("scanned") or 0),
-            "imported": int(ingest.get("added") or 0),
-            "duplicates": int(ingest.get("duplicates") or 0),
+            "ok": True, "partial": bool(failed), "trigger": trigger,
+            "account": _public_account(selected_accounts[0]),
+            "accounts": account_results,
+            "scanned": scanned,
+            "imported": imported,
+            "duplicates": duplicates,
             "skipped": skipped,
-            "failed": int(ingest.get("failed") or 0),
+            "failed": ingest_failed + len(failed),
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
             "duration_ms": duration_ms,
-            "items": ingest.get("items", []),
+            "error": error_summary,
+            "items": items,
         }
     except Exception as exc:
         message = str(exc) if isinstance(exc, SyncError) else _friendly_error(exc)
         _save_settings(
             last_finished_at=_now_text(), last_error=message, last_run_trigger=trigger,
             last_duration_ms=int((time.monotonic() - started_mono) * 1000),
-            last_account_name=str((account or {}).get("userName") or ""),
+            last_account_name="、".join(_account_name(item) for item in selected_accounts),
         )
         print(f"[douyin-dm-sync] failed trigger={trigger}: {message}", flush=True)
         return {"ok": False, "error": message}
@@ -884,17 +1008,26 @@ def sync_settings():
     try:
         interval = max(5, min(int(data.get("interval_seconds") or 5), 3600))
         max_conversations = max(1, min(int(data.get("max_conversations") or 20), 100))
-        account_id = max(0, int(data.get("account_id") or 0))
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "同步间隔或会话数量格式不正确"}), 400
-    if account_id:
-        accounts = _account_rows()
-        if not any(int(item.get("id") or 0) == account_id for item in accounts):
-            return jsonify({"code": 400, "msg": "所选抖音账号不存在"}), 400
+    if "account_ids" in data:
+        account_ids = _parse_account_ids(data.get("account_ids"))
+    else:
+        try:
+            legacy_id = max(0, int(data.get("account_id") or 0))
+        except (TypeError, ValueError):
+            return jsonify({"code": 400, "msg": "抖音账号格式不正确"}), 400
+        account_ids = [legacy_id] if legacy_id else []
+    accounts = _account_rows()
+    known_ids = {int(item.get("id") or 0) for item in accounts}
+    missing_ids = [item for item in account_ids if item not in known_ids]
+    if missing_ids:
+        return jsonify({"code": 400, "msg": "所选抖音账号不存在或已删除"}), 400
 
     enabled = _as_flag(data.get("enabled", 1))
     _save_settings(
-        enabled=enabled, account_id=account_id, interval_seconds=interval,
+        enabled=enabled, account_id=account_ids[0] if len(account_ids) == 1 else 0,
+        account_ids=account_ids, interval_seconds=interval,
         max_conversations=max_conversations,
         recent_only=_as_flag(data.get("recent_only", 1)), draft_only=1,
     )
