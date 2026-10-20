@@ -268,9 +268,9 @@
                 </el-select>
                 <span class="form-hint">可多选；{{ activeSyncMeta.accountHint }}</span>
               </el-form-item>
-              <el-form-item label="同步间隔">
-                <el-input-number v-model="activeSyncForm.interval_seconds" :min="activeSyncMeta.minInterval" :max="3600" :step="syncPlatform === '抖音' ? 5 : 30" controls-position="right" />
-                <span class="form-hint">秒，最短 {{ activeSyncMeta.minInterval }} 秒</span>
+              <el-form-item label="同步模式">
+                <el-input-number v-model="activeSyncForm.interval_seconds" :min="activeSyncMeta.minInterval" :max="3600" :step="1" controls-position="right" />
+                <span class="form-hint">0 = 持续同步，上一轮结束后立即开始下一轮</span>
               </el-form-item>
               <el-form-item label="同步范围">
                 <el-switch v-model="activeSyncForm.recent_only" />
@@ -621,9 +621,9 @@ const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const xhsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const channelsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
-const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 5, recent_only: true })
-const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 60, recent_only: true })
-const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 60, recent_only: true })
+const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
+const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
+const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
 const syncPlatform = ref('抖音')
 const savingSync = ref(false)
 const syncing = ref(false)
@@ -679,15 +679,15 @@ X-YunCe-Secret: ${settings.value.inbound_secret ? '你的接入密钥' : '（未
 }`)
 const syncPlatformMeta = {
   '抖音': {
-    prefix: '/dm/sync', minInterval: 5, defaultInterval: 5,
+    prefix: '/dm/sync', minInterval: 0, defaultInterval: 0,
     title: '抖音私信本地同步', accountHint: '不选时同步全部已登录且 Cookie 可用的抖音账号',
   },
   '小红书': {
-    prefix: '/dm/xhs', minInterval: 30, defaultInterval: 60,
+    prefix: '/dm/xhs', minInterval: 0, defaultInterval: 0,
     title: '小红书私信同步', accountHint: '不选时同步全部已登录且 Cookie 可用的小红书账号',
   },
   '视频号': {
-    prefix: '/dm/channels', minInterval: 30, defaultInterval: 60,
+    prefix: '/dm/channels', minInterval: 0, defaultInterval: 0,
     title: '视频号私信同步', accountHint: '不选时同步全部已登录且 Cookie 可用的视频号账号',
   },
 }
@@ -893,7 +893,7 @@ function hydrateSyncForm(form, data, defaultInterval) {
   form.account_ids = Array.isArray(data.account_ids)
     ? data.account_ids.map(Number).filter(Boolean)
     : []
-  form.interval_seconds = Number(data.interval_seconds || defaultInterval)
+  form.interval_seconds = Number(data.interval_seconds ?? defaultInterval)
   form.recent_only = Boolean(data.recent_only)
 }
 
@@ -932,7 +932,7 @@ async function saveSyncSettings() {
     const res = await http.put(`${meta.prefix}/settings`, {
       enabled: form.enabled ? 1 : 0,
       account_ids: (form.account_ids || []).map(Number).filter(Boolean),
-      interval_seconds: Number(form.interval_seconds || meta.defaultInterval),
+      interval_seconds: Number(form.interval_seconds ?? meta.defaultInterval),
       recent_only: form.recent_only ? 1 : 0,
       max_conversations: Number(activeSyncStatus.value.max_conversations || 50),
     })
@@ -1318,7 +1318,7 @@ onMounted(async () => {
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(),
   ])
-  liveTimer = window.setInterval(refreshLive, 5000)
+  liveTimer = window.setInterval(refreshLive, 1000)
 })
 
 onBeforeUnmount(() => {

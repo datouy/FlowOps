@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ DEFAULT_SYNC_SETTINGS = {
     "enabled": 1,
     "account_id": 0,
     "account_ids": [],
-    "interval_seconds": 5,
+    "interval_seconds": 0,
     "max_conversations": 100,
     "recent_only": 1,
     "draft_only": 1,
@@ -61,6 +62,11 @@ _state_lock = threading.Lock()
 _wake_event = threading.Event()
 _worker_started = False
 _next_run_at: float | None = None
+_douyin_browser_guard = threading.Lock()
+_douyin_browser_loop = None
+_douyin_browser_loop_thread = None
+_douyin_browser_loop_ready = threading.Event()
+_douyin_browser_runtime = {"playwright": None, "browser": None, "sessions": {}}
 
 
 class SyncError(RuntimeError):
@@ -87,7 +93,7 @@ def init_db():
             enabled INTEGER DEFAULT 1,
             account_id INTEGER DEFAULT 0,
             account_ids TEXT DEFAULT '[]',
-            interval_seconds INTEGER DEFAULT 5,
+            interval_seconds INTEGER DEFAULT 0,
             max_conversations INTEGER DEFAULT 100,
             recent_only INTEGER DEFAULT 1,
             draft_only INTEGER DEFAULT 1,
@@ -176,9 +182,10 @@ def _load_settings() -> dict:
     if not data["account_ids"] and data["account_id"]:
         data["account_ids"] = [data["account_id"]]
     try:
-        data["interval_seconds"] = max(5, min(int(data.get("interval_seconds") or 5), 3600))
+        raw_interval = data.get("interval_seconds")
+        data["interval_seconds"] = max(0, min(int(0 if raw_interval is None else raw_interval), 3600))
     except (TypeError, ValueError):
-        data["interval_seconds"] = 5
+        data["interval_seconds"] = 0
     try:
         data["max_conversations"] = max(1, min(int(data.get("max_conversations") or 100), 200))
     except (TypeError, ValueError):
@@ -509,13 +516,16 @@ def _display_time_to_text(value: str) -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def _click_conversation(page, cid: str) -> bool:
+async def _click_conversation(
+    page, cid: str, max_scrolls: int = 20, settle_ms: int = 1600,
+    click_timeout_ms: int = 5000,
+) -> bool:
     await page.evaluate("""() => {
         const grid = document.querySelector('.ReactVirtualized__Grid');
         if (grid) grid.scrollTop = 0;
     }""")
     await page.wait_for_timeout(350)
-    for _ in range(20):
+    for _ in range(max(1, max_scrolls)):
         index = await page.evaluate("""(cid) => {
             const items = Array.from(document.querySelectorAll('.semi-list-item'));
             for (let index = 0; index < items.length; index++) {
@@ -529,8 +539,10 @@ async def _click_conversation(page, cid: str) -> bool:
             return -1;
         }""", cid)
         if index >= 0:
-            await page.locator('.semi-list-item').nth(index).click()
-            await page.wait_for_timeout(1600)
+            await page.locator('.semi-list-item').nth(index).click(
+                timeout=max(500, click_timeout_ms)
+            )
+            await page.wait_for_timeout(settle_ms)
             return True
         moved = await page.evaluate("""() => {
             const grid = document.querySelector('.ReactVirtualized__Grid');
@@ -599,117 +611,251 @@ async def _page_is_login(page) -> bool:
     return any(marker in body for marker in ("扫码登录", "验证码登录", "请先登录", "登录后查看"))
 
 
-async def _scan_douyin(settings: dict, account: dict) -> dict:
+def _ensure_douyin_browser_loop():
+    global _douyin_browser_loop, _douyin_browser_loop_thread
+    with _douyin_browser_guard:
+        if _douyin_browser_loop is not None and _douyin_browser_loop.is_running():
+            return _douyin_browser_loop
+        _douyin_browser_loop_ready.clear()
+
+        def loop_main():
+            global _douyin_browser_loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            _douyin_browser_loop = loop
+            _douyin_browser_loop_ready.set()
+            loop.run_forever()
+
+        _douyin_browser_loop_thread = threading.Thread(
+            target=loop_main, name="douyin-browser-loop", daemon=True,
+        )
+        _douyin_browser_loop_thread.start()
+    if not _douyin_browser_loop_ready.wait(10):
+        raise SyncError("抖音常驻浏览器初始化超时")
+    return _douyin_browser_loop
+
+
+def _run_douyin_browser_coroutine(coro):
+    loop = _ensure_douyin_browser_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
+
+
+async def _drop_douyin_session(key: str):
+    session = _douyin_browser_runtime["sessions"].pop(key, None)
+    if not session:
+        return
     try:
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        await session["context"].close()
+    except Exception:
+        pass
+
+
+async def _ensure_douyin_browser():
+    runtime = _douyin_browser_runtime
+    browser = runtime.get("browser")
+    if browser is not None and browser.is_connected():
+        return browser
+
+    for key in list(runtime["sessions"]):
+        await _drop_douyin_session(key)
+    if runtime.get("playwright") is not None:
+        try:
+            await runtime["playwright"].stop()
+        except Exception:
+            pass
+    runtime["playwright"] = None
+    runtime["browser"] = None
+
+    try:
         from playwright.async_api import async_playwright
     except Exception as exc:
         raise SyncError("本机未安装 Playwright，请先安装依赖和 Chromium 浏览器") from exc
 
-    cookie_path = account.get("cookie_path")
-    if not cookie_path or not Path(cookie_path).exists():
-        raise SyncError("抖音 Cookie 文件不存在，请重新登录账号")
-    account_name = _account_name(account)
     headless = str(os.environ.get("FLOWOPS_DOUYIN_HEADLESS", "1")).lower() not in (
         "0", "false", "no", "off",
     )
-
-    browser = None
-    context = None
+    playwright = await async_playwright().start()
     try:
-        async with async_playwright() as playwright:
-            try:
-                browser = await playwright.chromium.launch(headless=headless)
-            except Exception as exc:
-                raise SyncError(
-                    "Playwright 浏览器启动失败，请确认已执行 playwright install chromium"
-                ) from exc
-            context = await browser.new_context(
-                storage_state=str(cookie_path), locale="zh-CN",
-                timezone_id="Asia/Shanghai", viewport={"width": 1440, "height": 1000},
-            )
-            page = await context.new_page()
-            try:
-                await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
-            except PlaywrightTimeoutError as exc:
-                raise SyncError("抖音创作者中心加载超时，请检查网络或稍后重试") from exc
+        browser = await playwright.chromium.launch(headless=headless)
+    except Exception as exc:
+        await playwright.stop()
+        raise SyncError(
+            "Playwright 浏览器启动失败，请确认已执行 playwright install chromium"
+        ) from exc
+    runtime["playwright"] = playwright
+    runtime["browser"] = browser
+    return browser
 
-            await page.wait_for_timeout(1500)
-            if await _page_is_login(page):
-                raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-            if not await page.locator(".semi-list-item").count():
+
+async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
+    cookie_path = Path(str(account.get("cookie_path") or ""))
+    if not cookie_path.is_file():
+        raise SyncError("抖音 Cookie 文件不存在，请重新登录账号")
+    key = "|".join((
+        str(account.get("id") or 0), _account_name(account), str(cookie_path.resolve()),
+    ))
+    cookie_mtime = cookie_path.stat().st_mtime_ns
+    session = _douyin_browser_runtime["sessions"].get(key)
+    if session and session.get("cookie_mtime") == cookie_mtime:
+        page = session.get("page")
+        if page is not None and not page.is_closed():
+            return key, session
+    if session:
+        await _drop_douyin_session(key)
+
+    browser = await _ensure_douyin_browser()
+    context = await browser.new_context(
+        storage_state=str(cookie_path), locale="zh-CN",
+        timezone_id="Asia/Shanghai", viewport={"width": 1440, "height": 1000},
+    )
+    page = await context.new_page()
+    try:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
+        except PlaywrightTimeoutError as exc:
+            raise SyncError("抖音创作者中心加载超时，请检查网络或稍后重试") from exc
+        await page.wait_for_timeout(700 if quick else 1500)
+        if await _page_is_login(page):
+            raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+        if not await page.locator(".semi-list-item").count():
+            try:
+                await page.wait_for_selector(".semi-list-item", timeout=12000)
+            except PlaywrightTimeoutError:
+                if await _page_is_login(page):
+                    raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+                body = ""
                 try:
-                    await page.wait_for_selector(".semi-list-item", timeout=12000)
-                except PlaywrightTimeoutError:
-                    if await _page_is_login(page):
-                        raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-                    body = ""
-                    try:
-                        body = await page.locator("body").inner_text(timeout=5000)
-                    except Exception:
-                        pass
-                    if any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
-                        return {"rows": [], "scanned": 0}
-                    raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败")
-            await page.wait_for_timeout(1800)
-            if await _page_is_login(page):
-                raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-            limit = int(settings.get("max_conversations") or 100)
-            collected = {}
-            for _ in range(20):
-                rows = await page.evaluate(SCAN_SCRIPT, limit)
-                batch = rows if isinstance(rows, list) else []
-                added = 0
-                for row in batch:
-                    cid = str(row.get("cid") or "")
-                    if cid and cid not in collected:
-                        collected[cid] = row
-                        added += 1
-                moved = await page.evaluate("""() => {
-                    const grid = document.querySelector('.ReactVirtualized__Grid');
-                    if (!grid) return false;
-                    const before = grid.scrollTop;
-                    grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
-                    return grid.scrollTop !== before;
-                }""")
-                if not moved and added == 0:
-                    break
-                await page.wait_for_timeout(550)
-            data = list(collected.values())
-            pending_unread = _pending_conversation_unread(account_name)
-            for row in data:
-                try:
-                    cid = str(row.get("cid") or "")
-                    signature = _history_signature(row)
-                    effective_unread = max(
-                        int(row.get("unread") or 0), int(pending_unread.get(cid) or 0)
-                    )
-                    row["unread"] = effective_unread
-                    should_scan_history = effective_unread > 0
-                    if should_scan_history and _history_marker(account_name, cid) == signature:
-                        row["history_synced"] = True
-                        continue
-                    if not should_scan_history:
-                        continue
-                    if await _click_conversation(page, cid):
-                        history = await page.evaluate(HISTORY_SCRIPT)
-                        if isinstance(history, list) and history:
-                            row["history"] = history
-                            _save_history_marker(account_name, cid, signature)
+                    body = await page.locator("body").inner_text(timeout=5000)
                 except Exception:
                     pass
-            return {"rows": data, "scanned": len(data)}
-    finally:
-        if context is not None:
+                if not any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
+                    raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败")
+        await page.wait_for_timeout(300 if quick else 1200)
+        if await _page_is_login(page):
+            raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+    except Exception:
+        try:
+            await context.close()
+        except Exception:
+            pass
+        raise
+
+    session = {
+        "context": context, "page": page, "cookie_mtime": cookie_mtime,
+        "created_at": time.monotonic(),
+    }
+    _douyin_browser_runtime["sessions"][key] = session
+    return key, session
+
+
+async def _scan_douyin_in_browser(
+    settings: dict, account: dict, quick: bool = False,
+) -> dict:
+    started_mono = time.monotonic()
+    key, session = await _get_douyin_session(account, quick)
+    page = session["page"]
+    account_name = _account_name(account)
+    timings = {
+        "session_ms": int((time.monotonic() - session["created_at"]) * 1000),
+        "reused": int(session["created_at"] < started_mono),
+    }
+    try:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:
+            raise SyncError("本机未安装 Playwright，请先安装依赖和 Chromium 浏览器") from exc
+
+        await page.evaluate("""() => {
+            const grid = document.querySelector('.ReactVirtualized__Grid');
+            if (grid) grid.scrollTop = 0;
+        }""")
+        if not await page.locator(".semi-list-item").count():
+            body = ""
             try:
-                await context.close()
+                body = await page.locator("body").inner_text(timeout=3000)
             except Exception:
                 pass
-        if browser is not None:
+            if any(marker in body for marker in ("暂无消息", "暂无会话")):
+                return {"rows": [], "scanned": 0, "timings": timings}
             try:
-                await browser.close()
+                await page.reload(wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_selector(".semi-list-item", timeout=6000)
+            except PlaywrightTimeoutError as exc:
+                raise SyncError("抖音私信页面刷新超时") from exc
+        if await _page_is_login(page):
+            raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+        timings["page_ready_ms"] = int((time.monotonic() - started_mono) * 1000)
+
+        limit = int(settings.get("max_conversations") or 100)
+        if quick:
+            limit = min(limit, 20)
+        collected = {}
+        for _ in range(1 if quick else 20):
+            rows = await page.evaluate(SCAN_SCRIPT, limit)
+            batch = rows if isinstance(rows, list) else []
+            added = 0
+            for row in batch:
+                cid = str(row.get("cid") or "")
+                if cid and cid not in collected:
+                    collected[cid] = row
+                    added += 1
+            if len(collected) >= limit:
+                break
+            moved = await page.evaluate("""() => {
+                const grid = document.querySelector('.ReactVirtualized__Grid');
+                if (!grid) return false;
+                const before = grid.scrollTop;
+                grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+                return grid.scrollTop !== before;
+            }""")
+            if not moved and added == 0:
+                break
+            await page.wait_for_timeout(350)
+        timings["list_ms"] = int((time.monotonic() - started_mono) * 1000)
+
+        data = list(collected.values())
+        pending_unread = _pending_conversation_unread(account_name)
+        for row in data:
+            try:
+                cid = str(row.get("cid") or "")
+                signature = _history_signature(row)
+                effective_unread = max(
+                    int(row.get("unread") or 0), int(pending_unread.get(cid) or 0)
+                )
+                row["unread"] = effective_unread
+                should_scan_history = effective_unread > 0
+                if should_scan_history and _history_marker(account_name, cid) == signature:
+                    row["history_synced"] = True
+                    continue
+                if not should_scan_history:
+                    continue
+                if await _click_conversation(
+                    page, cid,
+                    max_scrolls=2 if quick else 20,
+                    settle_ms=400 if quick else 1600,
+                    click_timeout_ms=900 if quick else 5000,
+                ):
+                    history = await page.evaluate(HISTORY_SCRIPT)
+                    if isinstance(history, list) and history:
+                        row["history"] = history
+                        _save_history_marker(account_name, cid, signature)
             except Exception:
                 pass
+        timings["history_ms"] = int((time.monotonic() - started_mono) * 1000)
+        return {"rows": data, "scanned": len(data), "timings": timings}
+    except Exception as exc:
+        if page.is_closed() or "登录" in str(exc):
+            await _drop_douyin_session(key)
+        raise
+
+
+def _scan_douyin(settings: dict, account: dict, quick: bool = False) -> dict:
+    return _run_douyin_browser_coroutine(
+        _scan_douyin_in_browser(settings, account, quick=quick)
+    )
 
 
 def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[dict | None, str]:
@@ -785,11 +931,11 @@ def _friendly_error(exc: Exception) -> str:
     return text[:500]
 
 
-def _sync_account(settings: dict, account: dict) -> dict:
+def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
     name = _account_name(account)
     if not account.get("cookie_path"):
         raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
-    scan = asyncio.run(_scan_douyin(settings, account))
+    scan = _scan_douyin(settings, account, quick=quick)
     items = []
     skipped = 0
     skip_reasons: dict[str, int] = {}
@@ -827,6 +973,7 @@ def _sync_account(settings: dict, account: dict) -> dict:
         "failed": int(ingest.get("failed") or 0),
         "auto_replies_ready": ready,
         "skip_reasons": skip_reasons,
+        "timings": scan.get("timings") or {},
         "items": ingest.get("items", []),
     }
 
@@ -851,12 +998,12 @@ def run_sync(trigger: str = "manual") -> dict:
             last_skip_reasons="{}",
             last_account_name="、".join(_account_name(item) for item in selected_accounts),
         )
-        for account in selected_accounts:
+        def sync_one(account: dict) -> dict:
             try:
-                account_results.append(_sync_account(settings, account))
+                return _sync_account(settings, account, quick=trigger == "auto")
             except Exception as exc:
                 message = str(exc) if isinstance(exc, SyncError) else _friendly_error(exc)
-                account_results.append({
+                return {
                     "ok": False,
                     "account": _public_account(account),
                     "scanned": 0,
@@ -868,7 +1015,14 @@ def run_sync(trigger: str = "manual") -> dict:
                     "skip_reasons": {},
                     "error": message,
                     "items": [],
-                })
+                }
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(12, len(selected_accounts))),
+            thread_name_prefix="douyin-account",
+        ) as executor:
+            futures = [executor.submit(sync_one, account) for account in selected_accounts]
+            account_results = [future.result() for future in futures]
 
         succeeded = [item for item in account_results if item.get("ok")]
         failed = [item for item in account_results if not item.get("ok")]
@@ -912,7 +1066,8 @@ def run_sync(trigger: str = "manual") -> dict:
         print(
             f"[douyin-dm-sync] trigger={trigger} accounts={len(succeeded)}/{len(account_results)} "
             f"scanned={scanned} imported={imported} duplicates={duplicates} "
-            f"skipped={skipped} ready={ready} duration={duration_ms}ms",
+            f"skipped={skipped} ready={ready} duration={duration_ms}ms "
+            f"phases={json.dumps([item.get('timings') for item in account_results], ensure_ascii=False)}",
             flush=True,
         )
         return {
@@ -942,12 +1097,11 @@ def run_sync(trigger: str = "manual") -> dict:
     finally:
         _sync_lock.release()
         try:
-            interval = max(5, int(_load_settings().get("interval_seconds") or 5))
             enabled = bool(_load_settings().get("enabled"))
         except Exception:
-            interval, enabled = 5, False
+            enabled = False
         with _state_lock:
-            _next_run_at = time.time() + interval if enabled else None
+            _next_run_at = time.time() if enabled else None
 
 
 def _background_loop():
@@ -972,11 +1126,8 @@ def _background_loop():
                 continue
 
             result = run_sync("auto")
-            interval = max(5, int(_load_settings().get("interval_seconds") or 5))
-            if not result.get("ok"):
-                interval = max(interval, 300)
             with _state_lock:
-                _next_run_at = time.time() + interval
+                _next_run_at = time.time() + (0 if result.get("ok") else 300)
         except Exception as exc:
             print(f"[douyin-dm-sync] loop error: {exc}", flush=True)
             with _state_lock:
@@ -991,7 +1142,7 @@ def start_background():
         if _worker_started:
             return
         _worker_started = True
-        _next_run_at = time.time() + 5
+        _next_run_at = time.time()
     thread = threading.Thread(target=_background_loop, name="douyin-dm-sync", daemon=True)
     thread.start()
 
@@ -1006,7 +1157,8 @@ def sync_settings():
     global _next_run_at
     data = request.get_json(silent=True) or {}
     try:
-        interval = max(5, min(int(data.get("interval_seconds") or 5), 3600))
+        raw_interval = data.get("interval_seconds")
+        interval = max(0, min(int(0 if raw_interval is None else raw_interval), 3600))
         max_conversations = max(1, min(int(data.get("max_conversations") or 20), 100))
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "同步间隔或会话数量格式不正确"}), 400
@@ -1032,7 +1184,7 @@ def sync_settings():
         recent_only=_as_flag(data.get("recent_only", 1)), draft_only=1,
     )
     with _state_lock:
-        _next_run_at = time.time() + 1 if enabled else None
+        _next_run_at = time.time() if enabled else None
     _wake_event.set()
     return jsonify({"code": 200, "data": _status_payload(), "msg": "同步设置已保存"})
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from flask import Blueprint, jsonify, request
@@ -27,7 +28,7 @@ PRIVATE_SESSION_TYPES = {1, 3}
 DEFAULT_SYNC_SETTINGS = {
     "enabled": 1,
     "account_ids": [],
-    "interval_seconds": 60,
+    "interval_seconds": 0,
     "max_conversations": 50,
     "recent_only": 1,
 }
@@ -61,7 +62,7 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id=1),
             enabled INTEGER DEFAULT 1,
             account_ids TEXT DEFAULT '[]',
-            interval_seconds INTEGER DEFAULT 60,
+            interval_seconds INTEGER DEFAULT 0,
             max_conversations INTEGER DEFAULT 50,
             recent_only INTEGER DEFAULT 1,
             last_started_at TEXT DEFAULT '',
@@ -108,9 +109,10 @@ def _load_settings() -> dict:
     for key in ("enabled", "recent_only"):
         data[key] = as_flag(data.get(key, DEFAULT_SYNC_SETTINGS[key]))
     try:
-        data["interval_seconds"] = max(30, min(int(data.get("interval_seconds") or 60), 3600))
+        raw_interval = data.get("interval_seconds")
+        data["interval_seconds"] = max(0, min(int(0 if raw_interval is None else raw_interval), 3600))
     except (TypeError, ValueError):
-        data["interval_seconds"] = 60
+        data["interval_seconds"] = 0
     try:
         data["max_conversations"] = max(1, min(int(data.get("max_conversations") or 50), 100))
     except (TypeError, ValueError):
@@ -402,17 +404,24 @@ def run_sync(trigger: str = "manual") -> dict:
                 if item.get("cookie_path")
             ),
         )
-        for account in selected_accounts:
+        def sync_one(account: dict) -> dict:
             try:
-                account_results.append(_sync_account(settings, account))
+                return _sync_account(settings, account)
             except Exception as exc:
                 message = str(exc) if isinstance(exc, (SyncError, ChannelsError)) \
                     else _friendly_error(exc)
-                account_results.append({
+                return {
                     "ok": False, "account": public_account(account),
                     "error": message, "scanned": 0, "imported": 0,
                     "duplicates": 0, "skipped": 0, "failed": 1,
-                })
+                }
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(8, len(selected_accounts))),
+            thread_name_prefix="channels-account",
+        ) as executor:
+            futures = [executor.submit(sync_one, account) for account in selected_accounts]
+            account_results = [future.result() for future in futures]
 
         succeeded = [item for item in account_results if item.get("ok")]
         failed = [item for item in account_results if not item.get("ok")]
@@ -466,8 +475,13 @@ def run_sync(trigger: str = "manual") -> dict:
         print(f"[channels-dm-sync] failed trigger={trigger}: {message}", flush=True)
         return {"ok": False, "error": message}
     finally:
-        _next_run_at = None
         _sync_lock.release()
+        try:
+            enabled = bool(_load_settings().get("enabled"))
+        except Exception:
+            enabled = False
+        with _state_lock:
+            _next_run_at = time.time() if enabled else None
 
 
 def _background_loop():
@@ -480,13 +494,12 @@ def _background_loop():
             _wake_event.wait(30)
             _wake_event.clear()
             continue
-        interval = int(settings.get("interval_seconds") or 60)
         with _state_lock:
-            _next_run_at = time.time() + interval
-        if _wake_event.wait(interval):
+            _next_run_at = time.time()
+        result = run_sync("timer")
+        if not result.get("ok"):
+            _wake_event.wait(30)
             _wake_event.clear()
-            continue
-        run_sync("timer")
 
 
 def start_background():
@@ -511,7 +524,8 @@ def sync_settings():
     if missing:
         return jsonify({"code": 400, "msg": "所选视频号账号不存在或已删除"}), 400
     try:
-        interval = max(30, min(int(data.get("interval_seconds") or 60), 3600))
+        raw_interval = data.get("interval_seconds")
+        interval = max(0, min(int(0 if raw_interval is None else raw_interval), 3600))
         max_conversations = max(1, min(int(data.get("max_conversations") or 50), 100))
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "同步间隔或会话数量格式不正确"}), 400
