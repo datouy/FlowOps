@@ -653,21 +653,39 @@ def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
 def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
     platform = _clean(payload.get("platform"), 40)
     nickname = _clean(payload.get("nickname"), 80)
+    external_user_id = _clean(payload.get("external_user_id"), 300)
     text = _clean(payload.get("text"), 2000)
-    if platform == "抖音" and nickname and text:
+    direct_platforms = {
+        "抖音": ("send_douyin", "douyin-web", "抖音网页私信已发送"),
+        "小红书": ("send_xiaohongshu", "xiaohongshu-web", "小红书网页私信已发送"),
+        "视频号": ("send_channels", "channels-web", "视频号网页私信已发送"),
+    }
+    if platform in direct_platforms and text:
+        sender_name, transport, success_reason = direct_platforms[platform]
         try:
             import platform_reply
-            platform_reply.send_douyin(payload.get("account"), nickname, text)
+            if platform == "抖音":
+                if not nickname:
+                    raise ValueError("客户昵称为空，无法定位抖音会话")
+                result = platform_reply.send_douyin(payload.get("account"), nickname, text)
+            else:
+                if not external_user_id:
+                    raise ValueError("缺少平台会话 ID，无法发送回复")
+                result = getattr(platform_reply, sender_name)(
+                    payload.get("account"), external_user_id, text,
+                )
             status, error = "sent", ""
+            transport = _clean((result or {}).get("transport"), 40) or transport
         except Exception as exc:
-            status, error = "failed", f"抖音直发失败：{str(exc)[:300]}"
+            status, error = "failed", f"{platform}直发失败：{str(exc)[:300]}"
+            transport = ""
         with get_conn() as c:
             c.execute("UPDATE messages SET delivery_status=? WHERE id=?", (status, out_id))
             c.execute("""UPDATE dm_reply_logs SET status=?,reason=?
                 WHERE outbound_message_id=?""",
-                (status, error or "抖音网页私信已发送", out_id))
+                (status, error or success_reason, out_id))
         return {"delivery_status": status, "delivery_error": error,
-                "transport": "douyin-web" if status == "sent" else ""}
+                "transport": transport if status == "sent" else ""}
 
     url = _clean(settings.get("outbound_webhook"), 1000)
     if not url:
@@ -837,6 +855,7 @@ def _decorate_contact(data: dict) -> dict:
 
 def list_conversations():
     platform = request.args.get("platform")
+    account = _clean(request.args.get("account"), 120)
     segment = request.args.get("segment")
     stage = request.args.get("stage")
     status = request.args.get("status")
@@ -852,7 +871,10 @@ def list_conversations():
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
         WHERE 1=1"""
     args = []
-    for field, value in (("c.platform", platform), ("c.segment", segment), ("c.stage", stage)):
+    for field, value in (
+        ("c.platform", platform), ("c.account", account),
+        ("c.segment", segment), ("c.stage", stage),
+    ):
         if value:
             sql += f" AND {field}=?"
             args.append(value)
