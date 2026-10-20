@@ -40,6 +40,10 @@ import dm_ops
 app.register_blueprint(dm_ops.bp)
 import douyin_dm_sync
 app.register_blueprint(douyin_dm_sync.bp)
+import xiaohongshu_dm_sync
+app.register_blueprint(xiaohongshu_dm_sync.bp)
+import channels_dm_sync
+app.register_blueprint(channels_dm_sync.bp)
 import compliance
 compliance.register(app)
 import media_ops
@@ -617,6 +621,7 @@ def login():
     type = request.args.get('type')
     # 账号名
     id = request.args.get('id')
+    account_id = request.args.get('account_id', type=int)
 
     # 模拟一个用于异步通信的队列
     status_queue = Queue()
@@ -626,7 +631,9 @@ def login():
         print(f"清理队列: {id}")
         del active_queues[id]
     # 启动异步任务线程
-    thread = threading.Thread(target=run_async_function, args=(type,id,status_queue), daemon=True)
+    thread = threading.Thread(
+        target=run_async_function, args=(type, id, status_queue, account_id), daemon=True,
+    )
     thread.start()
     response = Response(sse_stream(status_queue,), mimetype='text/event-stream')
     response.headers['Cache-Control'] = 'no-cache'
@@ -909,17 +916,19 @@ def download_cookie():
 
 
 # 包装函数：在线程中运行异步函数
-def run_async_function(type,id,status_queue):
+def run_async_function(type, id, status_queue, account_id=None):
     match type:
         case '1':
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(xiaohongshu_cookie_gen(id, status_queue))
+            loop.run_until_complete(
+                xiaohongshu_cookie_gen(id, status_queue, account_id=account_id)
+            )
             loop.close()
         case '2':
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(get_tencent_cookie(id,status_queue))
+            loop.run_until_complete(get_tencent_cookie(id, status_queue, account_id=account_id))
             loop.close()
         case '3':
             loop = asyncio.new_event_loop()
@@ -957,6 +966,8 @@ import publish_jobs
 start_patrol()
 stats_reflow.start_stats_loop(24)
 douyin_dm_sync.start_background()
+xiaohongshu_dm_sync.start_background()
+channels_dm_sync.start_background()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0' ,port=5409)
