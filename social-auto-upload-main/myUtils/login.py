@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 
 from playwright.async_api import async_playwright
 
@@ -91,7 +92,7 @@ async def douyin_cookie_gen(id,status_queue):
 
 
 # 视频号登录
-async def get_tencent_cookie(id,status_queue):
+async def get_tencent_cookie(id, status_queue, account_id=None):
     url_changed_event = asyncio.Event()
     async def on_url_change():
         # 检查是否是主框架的变化
@@ -165,10 +166,16 @@ async def get_tencent_cookie(id,status_queue):
 
         with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                                INSERT INTO user_info (type, filePath, userName, status)
-                                VALUES (?, ?, ?, ?)
-                                ''', (2, f"{uuid_v1}.json", id, 1))
+            if account_id:
+                cursor.execute('''
+                    UPDATE user_info SET type=?, filePath=?, userName=?, status=1
+                    WHERE id=?
+                    ''', (2, f"{uuid_v1}.json", id, account_id))
+            if not account_id or cursor.rowcount == 0:
+                cursor.execute('''
+                    INSERT INTO user_info (type, filePath, userName, status)
+                    VALUES (?, ?, ?, ?)
+                    ''', (2, f"{uuid_v1}.json", id, 1))
             conn.commit()
             print("✅ 用户状态已记录")
         status_queue.put("200")
@@ -248,78 +255,137 @@ async def get_ks_cookie(id,status_queue):
         status_queue.put("200")
 
 # 小红书登录
-async def xiaohongshu_cookie_gen(id,status_queue):
-    url_changed_event = asyncio.Event()
+async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
+    login_state = {"user": None, "chat_ready": False}
 
-    async def on_url_change():
-        # 检查是否是主框架的变化
-        if page.url != original_url:
-            url_changed_event.set()
+    async def on_response(response):
+        try:
+            if response.status != 200:
+                return
+            if "/api/sns/web/v2/user/me" in response.url:
+                payload = await response.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and not data.get("guest") and data.get("user_id"):
+                    login_state["user"] = data
+                return
+            if "/api/im/web/v3/chats" in response.url:
+                payload = await response.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("success") is not False
+                    and isinstance(data, dict)
+                ):
+                    login_state["chat_ready"] = True
+        except Exception:
+            return
 
     async with async_playwright() as playwright:
-        options = {
-            'args': [
-                '--lang en-GB'
-            ],
-            'headless': LOCAL_CHROME_HEADLESS,  # Set headless option here
-        }
-        # Make sure to run headed.
+        options = get_browser_options()
+        # 主站匿名扫码在无头模式下会触发 IP 安全限制，登录时必须使用有头浏览器。
+        options['headless'] = False
         browser = await playwright.chromium.launch(**options)
-        # Setup context however you like.
-        context = await browser.new_context()  # Pass any options
+        context = await browser.new_context(
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1440, "height": 1000},
+        )
         context = await set_init_script(context)
-        # Pause the page, and start recording manually.
         page = await context.new_page()
-        await page.goto("https://creator.xiaohongshu.com/")
-        await page.locator('img.css-wemwzq').click()
-
-        img_locator = page.get_by_role("img").nth(2)
-        # 获取 src 属性值
-        src = await img_locator.get_attribute("src")
-        original_url = page.url
-        print("✅ 图片地址:", src)
-        status_queue.put(src)
-        # 监听页面的 'framenavigated' 事件，只关注主框架的变化
-        page.on('framenavigated',
-                lambda frame: asyncio.create_task(on_url_change()) if frame == page.main_frame else None)
-
+        page.on("response", on_response)
         try:
-            # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
-        except asyncio.TimeoutError:
-            status_queue.put("500")
-            print("监听页面跳转超时")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
-        # 确保cookiesFile目录存在
-        cookies_dir = Path(BASE_DIR / "cookiesFile")
-        cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
-        result = await check_cookie(1, f"{uuid_v1}.json")
-        if not result:
-            status_queue.put("500")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        await page.close()
-        await context.close()
-        await browser.close()
+            await page.goto(
+                "https://www.xiaohongshu.com/explore",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            qr = page.locator(".qrcode-img").first
+            await qr.wait_for(state="visible", timeout=30000)
+            src = await qr.get_attribute("src")
+            if not src:
+                raise RuntimeError("未获取到小红书登录二维码")
+            print("✅ 图片地址:", src[:80])
+            status_queue.put(src)
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                           INSERT INTO user_info (type, filePath, userName, status)
-                           VALUES (?, ?, ?, ?)
-                           ''', (1, f"{uuid_v1}.json", id, 1))
-            conn.commit()
-            print("✅ 用户状态已记录")
-        status_queue.put("200")
+            deadline = time.monotonic() + 200
+            while time.monotonic() < deadline and not login_state["user"]:
+                body = (await page.locator("body").inner_text())[:500]
+                if "安全限制" in body:
+                    raise RuntimeError("小红书登录页触发安全限制，请更换网络后重试")
+                await page.wait_for_timeout(1000)
+            if not login_state["user"]:
+                raise TimeoutError("小红书扫码登录超时")
+
+            # 主站登录态会自动同步到创作服务平台。进入私信页并拿到会话列表，
+            # 才能确认这份 Cookie 同时具备发布和私信能力。
+            login_state["chat_ready"] = False
+            await page.goto(
+                "https://www.xiaohongshu.com/chat",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            deadline = time.monotonic() + 40
+            while time.monotonic() < deadline and not login_state["chat_ready"]:
+                await page.wait_for_timeout(500)
+            if not login_state["chat_ready"]:
+                raise RuntimeError("小红书主站私信会话加载失败，请重新扫码")
+
+            await page.goto(
+                "https://creator.xiaohongshu.com/creator/home",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await page.wait_for_timeout(3000)
+            body = await page.locator("body").inner_text()
+            if "/login" in page.url or "手机号登录" in body or "扫码登录" in body:
+                raise RuntimeError("小红书创作服务平台登录态未建立，请重新扫码")
+
+            uuid_v1 = uuid.uuid1()
+            print(f"UUID v1: {uuid_v1}")
+            cookies_dir = Path(BASE_DIR / "cookiesFile")
+            cookies_dir.mkdir(exist_ok=True)
+            await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+
+            with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+                cursor = conn.cursor()
+                if account_id:
+                    cursor.execute('''
+                        UPDATE user_info SET type=?, filePath=?, userName=?, status=1
+                        WHERE id=?
+                        ''', (1, f"{uuid_v1}.json", id, account_id))
+                if not account_id or cursor.rowcount == 0:
+                    cursor.execute('''
+                        INSERT INTO user_info (type, filePath, userName, status)
+                        VALUES (?, ?, ?, ?)
+                        ''', (1, f"{uuid_v1}.json", id, 1))
+                conn.commit()
+                print("✅ 用户状态已记录")
+            user = login_state["user"]
+            print(
+                "✅ 小红书主站账号:",
+                user.get("nickname"),
+                user.get("red_id"),
+                user.get("user_id"),
+            )
+            status_queue.put("200")
+        except Exception as exc:
+            print("❌ 小红书登录失败:", str(exc))
+            status_queue.put("500")
+            return None
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+    return True
 
 # a = asyncio.run(xiaohongshu_cookie_gen(4,None))
 # print(a)
