@@ -20,26 +20,41 @@ DOUYIN_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 _send_lock = threading.Lock()
 
 
-def _account(account_name: str):
+def _account_by_type(account_type: int, account_name: str):
     if not MAIN_DB.exists():
         return None
     with sqlite3.connect(MAIN_DB, timeout=15) as conn:
         conn.row_factory = sqlite3.Row
         rows = [dict(row) for row in conn.execute(
-            "SELECT id,type,userName,filePath,status FROM user_info WHERE type=3 ORDER BY id"
+            "SELECT id,type,userName,filePath,status FROM user_info WHERE type=? ORDER BY id",
+            (int(account_type),),
         ).fetchall()]
     available = []
     for row in rows:
-        cookie = COOKIE_DIR / str(row.get("filePath") or "")
+        cookie = COOKIE_DIR / Path(str(row.get("filePath") or "")).name
         if cookie.is_file() and cookie.stat().st_size > 2:
             row["cookie_path"] = cookie
             available.append(row)
     target = str(account_name or "").strip()
     if target:
-        for row in available:
-            if str(row.get("userName") or "").strip() == target:
-                return row
+        matches = [
+            row for row in available
+            if str(row.get("userName") or "").strip() == target
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            labels = {1: "小红书", 2: "视频号", 3: "抖音"}
+            label = labels.get(int(account_type), "平台")
+            raise RuntimeError(
+                f"存在多个同名{label}账号“{target}”，请先修改账号名称后再发送"
+            )
+        return None
     return available[0] if available else None
+
+
+def _account(account_name: str):
+    return _account_by_type(3, account_name)
 
 
 def _snapshot_rows(cdp):
@@ -229,3 +244,43 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
                     context.close()
                 finally:
                     browser.close()
+
+
+def send_xiaohongshu(account_name: str, external_user_id: str, text: str) -> dict:
+    """Reply to one Xiaohongshu main-site conversation through the web client."""
+    text = str(text or "").strip()
+    external_user_id = str(external_user_id or "").strip()
+    if not text:
+        raise ValueError("回复内容不能为空")
+    if not external_user_id:
+        raise ValueError("缺少小红书会话 ID，无法发送回复")
+    account = _account_by_type(1, account_name)
+    if not account:
+        raise RuntimeError("未找到可用的小红书登录账号，请先在账号管理中登录")
+    from xiaohongshu_dm import XhsClient
+
+    client = XhsClient(account)
+    try:
+        return client.send_text(external_user_id, text)
+    finally:
+        client.close()
+
+
+def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
+    """Reply to one WeChat Channels private-message session."""
+    text = str(text or "").strip()
+    external_user_id = str(external_user_id or "").strip()
+    if not text:
+        raise ValueError("回复内容不能为空")
+    if not external_user_id:
+        raise ValueError("缺少视频号会话 ID，无法发送回复")
+    account = _account_by_type(2, account_name)
+    if not account:
+        raise RuntimeError("未找到可用的视频号登录账号，请先扫码登录")
+    from channels_dm import ChannelsClient
+
+    client = ChannelsClient(account)
+    try:
+        return client.send_text(external_user_id, text)
+    finally:
+        client.close()
