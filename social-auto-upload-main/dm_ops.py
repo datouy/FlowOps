@@ -853,6 +853,127 @@ def _decorate_contact(data: dict) -> dict:
     return data
 
 
+def _parse_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip().replace("T", " ").replace("Z", "")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _score_priority_lead(row: dict, now: datetime | None = None) -> dict:
+    """按真实运营动作价值给线索排序，供今日优先跟进队列使用。"""
+    now = now or datetime.now()
+    item = dict(row)
+    score = {"high": 46, "medium": 22, "low": 6}.get(item.get("intent"), 6)
+    score += {"qualified": 28, "engaged": 18, "contacted": 17, "new": 10}.get(item.get("stage"), 8)
+    unread = max(0, int(item.get("unread_count") or 0))
+    score += min(30, unread * 15)
+    if item.get("needs_reply") and not unread:
+        score += 12
+    score += min(6, int(item.get("message_count") or 0))
+    score += min(6, int(item.get("pending_delivery") or 0) * 3)
+
+    reasons = []
+    if item.get("intent") == "high":
+        reasons.append("高意向")
+    if unread:
+        reasons.append(f"{unread} 条未回复")
+    elif item.get("needs_reply"):
+        reasons.append("最新消息待回复")
+    if item.get("stage") == "qualified":
+        reasons.append("已留资")
+    if item.get("contact_info"):
+        score += 20
+        reasons.append("已留联系方式")
+    if item.get("travel_date"):
+        score += 12
+        reasons.append("有出行日期")
+    if item.get("traveler_count"):
+        score += 8
+        reasons.append(f"{item['traveler_count']} 人")
+    if item.get("budget"):
+        score += 10
+        reasons.append("有预算")
+    if item.get("origin"):
+        score += 5
+        reasons.append("有出发地")
+    if item.get("company_name"):
+        score += 5
+
+    last_at = _parse_datetime(item.get("last_inbound_at") or item.get("last_message_time"))
+    if last_at:
+        age_hours = max(0.0, (now - last_at).total_seconds() / 3600)
+        if age_hours <= 1:
+            score += 20
+            reasons.insert(0, "刚刚咨询")
+        elif age_hours <= 6:
+            score += 16
+            reasons.append("6 小时内咨询")
+        elif age_hours <= 24:
+            score += 12
+            reasons.append("今天咨询")
+        elif age_hours <= 72:
+            score += 8
+        elif age_hours <= 24 * 7:
+            score += 4
+        elif age_hours > 24 * 30:
+            score -= 15
+
+    if item.get("intent") == "high" and item.get("stage") == "qualified":
+        score += 8
+    score = max(0, min(100, score))
+    if score >= 80:
+        priority, priority_label = "urgent", "立即联系"
+    elif score >= 55:
+        priority, priority_label = "high", "优先跟进"
+    else:
+        priority, priority_label = "normal", "今日跟进"
+
+    if not item.get("contact_info") and item.get("intent") == "high":
+        action = "回复并优先确认联系方式、出行日期和人数"
+    elif item.get("intent") == "high":
+        action = "立即回复，确认日期、人数、预算和下一步安排"
+    elif item.get("needs_reply"):
+        action = "尽快回复最新咨询，并补齐关键需求"
+    else:
+        action = "继续跟进并补充出行日期、人数和预算"
+
+    item.update({
+        "lead_score": score,
+        "priority": priority,
+        "priority_label": priority_label,
+        "priority_reasons": reasons[:5],
+        "recommended_action": action,
+    })
+    return item
+
+
+def priority_leads(limit: int = 8) -> list[dict]:
+    """返回当前最值得跟进的线索，排除已成交和已流失客户。"""
+    limit = max(1, min(int(limit or 8), 20))
+    sql = """SELECT c.*, m.content AS last_content, m.direction AS last_direction,
+        m.created_at AS last_message_time,
+        CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply,
+        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='inbound'
+            AND x.status='new') AS unread_count,
+        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id) AS message_count,
+        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='outbound'
+            AND x.delivery_status='ready') AS pending_delivery
+        FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
+        WHERE c.stage NOT IN ('converted','lost')
+        ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"""
+    with get_conn() as c:
+        rows = [_decorate_contact(dict(r)) for r in c.execute(sql).fetchall()]
+    ranked = [_score_priority_lead(row) for row in rows]
+    ranked.sort(key=lambda row: (row["lead_score"], row.get("last_message_time") or ""), reverse=True)
+    return ranked[:limit]
+
+
 def list_conversations():
     platform = request.args.get("platform")
     account = _clean(request.args.get("account"), 120)
@@ -1202,6 +1323,15 @@ def _check_inbound_secret(settings: dict, body: dict):
 @bp.route("/dm/conversations", methods=["GET"])
 def dm_conversations():
     return list_conversations()
+
+
+@bp.route("/dm/priority-leads", methods=["GET"])
+def dm_priority_leads():
+    try:
+        limit = int(request.args.get("limit") or 8)
+    except (TypeError, ValueError):
+        limit = 8
+    return jsonify({"code": 200, "data": priority_leads(limit), "msg": None})
 
 
 @bp.route("/dm/conversations/<int:cid>", methods=["GET"])

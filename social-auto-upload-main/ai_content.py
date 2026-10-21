@@ -111,7 +111,8 @@ def _call_llm(prompt: str, max_tokens: int = 1200) -> str:
     payload = json.dumps({
         "model": env.get("WB_MODEL", DEFAULTS["WB_MODEL"]),
         "input": prompt,
-        "max_output_tokens": max_tokens,
+        # 当前默认模型会先消耗推理 token，预留不足时正文会被截断。
+        "max_output_tokens": max(max_tokens, 5000),
     }, ensure_ascii=False).encode("utf-8")
     realm = env.get("WB_REALM", "cn")
     url = env.get("WB_BASE_URL", DEFAULTS["WB_BASE_URL"]).rstrip("/") + "/responses?realm=" + realm
