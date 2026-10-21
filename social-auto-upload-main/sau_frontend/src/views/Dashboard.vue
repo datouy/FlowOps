@@ -1,7 +1,8 @@
 <template>
   <div class="dashboard">
     <div class="page-header">
-      <h1>自媒体自动化运营系统</h1>
+      <h1>多平台内容与私信获客工作台</h1>
+      <p>集中管理抖音、小红书、视频号账号；一次生成各平台内容；私信统一进入收件箱。</p>
     </div>
 
     <div class="dashboard-content">
@@ -279,6 +280,12 @@ onMounted(() => {
       font-size: 24px;
       color: $text-primary;
       margin: 0;
+    }
+
+    p {
+      margin: 7px 0 0;
+      color: $text-secondary;
+      font-size: 13px;
     }
   }
 

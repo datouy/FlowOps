@@ -588,9 +588,11 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { http } from '@/utils/request'
 
+const route = useRoute()
 const requestBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
 const apiBase = requestBase.startsWith('http')
   ? requestBase.replace(/\/$/, '')
@@ -1318,6 +1320,14 @@ onMounted(async () => {
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(),
   ])
+  const contactId = Number(route.query.contact || 0)
+  if (contactId) {
+    const target = conversations.value.find(item => Number(item.id) === contactId)
+    if (target) {
+      activeTab.value = 'inbox'
+      await selectConversation(target, false)
+    }
+  }
   liveTimer = window.setInterval(refreshLive, 1000)
 })
 

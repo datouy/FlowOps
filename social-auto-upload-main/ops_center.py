@@ -179,7 +179,20 @@ def todo_summary():
         unused_assets = len(unused_materials(30))
     except Exception:
         unused_assets = 0
+    priority_items = []
+    try:
+        import dm_ops
+        priority_items = dm_ops.priority_leads(6)
+    except Exception:
+        priority_items = []
     items = []
+    urgent_leads = sum(1 for lead in priority_items if lead.get("priority") == "urgent")
+    if priority_items:
+        items.append({
+            "type": "lead", "level": "high" if urgent_leads else "normal",
+            "text": f"今天优先跟进 {len(priority_items)} 个线索"
+                    + (f"，其中 {urgent_leads} 个建议立即联系" if urgent_leads else ""),
+        })
     if high_intent:
         items.append({"type": "message", "level": "high", "text": f"{high_intent} 条高意向留言待回复"})
     if pending_messages:
@@ -204,7 +217,9 @@ def todo_summary():
                    "failed_jobs": failed_jobs, "pending_review": pending_review,
                    "scheduled_today": scheduled_today, "last_sync": last_sync,
                    "expired_accounts": expired, "unused_assets": unused_assets,
-                   "auto_ready": auto_ready}
+                   "auto_ready": auto_ready, "priority_leads": len(priority_items),
+                   "urgent_leads": urgent_leads},
+        "priority_leads": priority_items,
     }, "msg": None})
 
 

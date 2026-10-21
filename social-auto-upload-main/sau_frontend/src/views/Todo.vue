@@ -11,7 +11,7 @@
     <div class="metric-grid">
       <div class="metric" @click="go('/messages')">
         <span>待回复私信/留言</span><strong>{{ todo.counts.messages || 0 }}</strong>
-        <small>高意向 {{ todo.counts.high_intent || 0 }} · 自动回复待发送 {{ todo.counts.auto_ready || 0 }}</small>
+        <small>高意向 {{ todo.counts.high_intent || 0 }} · 建议优先跟进 {{ todo.counts.priority_leads || 0 }}</small>
       </div>
       <div class="metric" @click="go('/publish-records')">
         <span>失败发布任务</span><strong class="danger">{{ todo.counts.failed_jobs || 0 }}</strong>
@@ -26,6 +26,58 @@
         <small>查看发布日历</small>
       </div>
     </div>
+
+    <el-card shadow="never" class="priority-card">
+      <template #header>
+        <div class="card-title">
+          <span>今日优先跟进</span>
+          <span class="card-sub">按意向、未回复、留资完整度和最近咨询时间排序</span>
+        </div>
+      </template>
+      <el-table
+        v-if="todo.priority_leads && todo.priority_leads.length"
+        :data="todo.priority_leads"
+        class="priority-table"
+        @row-click="openLead"
+      >
+        <el-table-column label="优先级" width="100">
+          <template #default="scope">
+            <el-tag :type="priorityTag(scope.row.priority)" effect="dark" size="small">
+              {{ scope.row.priority_label }}
+            </el-tag>
+            <span class="score">{{ scope.row.lead_score }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="客户" width="150">
+          <template #default="scope">
+            <div class="lead-name">{{ scope.row.nickname || '匿名用户' }}</div>
+            <div class="muted">{{ scope.row.platform }} · {{ scope.row.account || '未填写账号' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="需求信息" min-width="210">
+          <template #default="scope">
+            <div>{{ leadInfo(scope.row) }}</div>
+            <div class="muted last-message">{{ scope.row.last_content || '暂无最近消息' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="推荐动作" min-width="250">
+          <template #default="scope">
+            <div>{{ scope.row.recommended_action }}</div>
+            <div class="reason-row">
+              <el-tag v-for="reason in scope.row.priority_reasons" :key="reason" size="small" effect="plain">
+                {{ reason }}
+              </el-tag>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="" width="94">
+          <template #default="scope">
+            <el-button type="primary" link @click.stop="openLead(scope.row)">去跟进</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-else description="暂时没有需要优先跟进的线索" :image-size="70" />
+    </el-card>
 
     <el-card shadow="never">
       <template #header><span>待办清单</span></template>
@@ -70,6 +122,21 @@ async function load() {
 }
 
 function go(path) { router.push(path) }
+function priorityTag(priority) {
+  return { urgent: 'danger', high: 'warning', normal: 'info' }[priority] || 'info'
+}
+function leadInfo(lead) {
+  const parts = []
+  if (lead.travel_date) parts.push(lead.travel_date)
+  if (lead.traveler_count) parts.push(`${lead.traveler_count} 人`)
+  if (lead.budget) parts.push(lead.budget)
+  if (lead.origin) parts.push(`从${lead.origin}出发`)
+  if (lead.stage_label) parts.push(lead.stage_label)
+  return parts.join(' · ') || '出行需求待确认'
+}
+function openLead(lead) {
+  router.push({ path: '/messages', query: { contact: lead.id, platform: lead.platform || '' } })
+}
 onMounted(load)
 </script>
 
@@ -84,6 +151,15 @@ onMounted(load)
 .metric strong { font-size: 26px; }
 .metric strong.danger { color: #f56c6c; }
 .metric small { color: #909399; font-size: 12px; }
+.priority-card { margin-bottom: 16px; }
+.card-title { display: flex; align-items: baseline; gap: 12px; }
+.card-sub { color: #909399; font-size: 12px; }
+.priority-table :deep(.el-table__row) { cursor: pointer; }
+.score { color: #909399; font-size: 11px; margin-left: 6px; }
+.lead-name { font-weight: 600; color: #303133; }
+.muted { color: #909399; font-size: 12px; margin-top: 3px; }
+.last-message { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reason-row { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
 .todo-list { display: flex; flex-direction: column; gap: 8px; }
 .todo-item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 6px; background: #f5f7fa; }
 .todo-item.high { background: #fef0f0; color: #f56c6c; }
