@@ -1,14 +1,42 @@
+<div align="center">
+
 # 云策 YunCe
+
+**国内新媒体运营一体化工作台**
+
+集中管理多平台账号 · AI 内容生产 · 统一私信收件箱 · 线索自动提取与优先跟进
+
+[![简体中文](https://img.shields.io/badge/语言-简体中文-FF4D4F?style=for-the-badge&logo=readme&logoColor=white)](./README.md)
+[![English](https://img.shields.io/badge/Lang-English-1677FF?style=for-the-badge&logo=readme&logoColor=white)](./README.en.md)
+
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](./LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Vue](https://img.shields.io/badge/Vue-3-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white)](https://vuejs.org/)
+[![Flask](https://img.shields.io/badge/Flask-API-000000?style=flat-square&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+[![Playwright](https://img.shields.io/badge/Playwright-Automation-2EAD33?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev/)
+[![Windows](https://img.shields.io/badge/OS-Windows%2010%2F11-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+
+[![抖音](https://img.shields.io/badge/抖音-FE2C55?style=flat-square&logo=tiktok&logoColor=white)](#-支持平台)
+[![快手](https://img.shields.io/badge/快手-FF4906?style=flat-square&logo=kuaishou&logoColor=white)](#-支持平台)
+[![视频号](https://img.shields.io/badge/视频号-07C160?style=flat-square&logo=wechat&logoColor=white)](#-支持平台)
+[![小红书](https://img.shields.io/badge/小红书-FF2442?style=flat-square&logo=xiaohongshu&logoColor=white)](#-支持平台)
+[![微博](https://img.shields.io/badge/微博-E6162D?style=flat-square&logo=sinaweibo&logoColor=white)](#-支持平台)
+[![百家号](https://img.shields.io/badge/百家号-2932E1?style=flat-square&logo=baidu&logoColor=white)](#-支持平台)
+
+</div>
+
+---
 
 > 集中管理抖音、小红书、视频号账号；一次生成各平台内容；所有私信进入一个收件箱；自动提取出行日期、人数和预算；每天告诉运营哪些询盘该优先跟进。
 
-## 项目定位
+## 🎯 项目定位
 
-云策是一个面向国内新媒体运营的开箱即用工具，覆盖抖音、快手、视频号、小红书、微博、百家号六个平台。它不是单一的“群发脚本”，而是围绕运营日常工作流，提供从内容生产到发布复盘的一体化工作台。
+云策是一个面向国内新媒体运营的开箱即用工具，覆盖抖音、快手、视频号、小红书、微博、百家号六个平台。它不是单一的"群发脚本"，而是围绕运营日常工作流，提供从内容生产到发布复盘的一体化工作台。
 
 本项目基于开源项目 **[dreammis/social-auto-upload](https://github.com/dreammis/social-auto-upload)** 进行二次开发。原项目提供了成熟的多平台浏览器自动化上传能力，云策在此基础上新增了 AI 文案、内容包、合规检查、任务队列、审核流、多平台统一私信、数据回流、运营周报等运营功能。
 
-## 二次开发声明
+## 📌 二次开发声明
 
 - 上游项目：`dreammis/social-auto-upload`
 - 上游地址：https://github.com/dreammis/social-auto-upload
@@ -19,16 +47,16 @@
 
 本项目与上游作者没有隶属关系。二次开发部分的问题和功能建议请提交到本仓库。
 
-## 新增功能
+## ✨ 新增功能
 
-### 内容生产
+### ✍️ 内容生产
 
 - **AI 文案生成**：按平台风格生成标题、正文、话题和发布建议；默认使用通用模板，并支持餐饮美食、美妆个护、教育培训、健身运动、本地生活、电商零售、房产家居等常见行业及自定义行业。
 - **多平台内容包**：一次输入行业和主题，生成 6 个平台的差异化内容；支持后台任务、实时进度、24 小时缓存，AI 接口不可用时自动使用本地模板兜底。
 - **自动封面**：从视频首帧生成 3:4 和 9:16 封面。
 - **发布前合规检查**：检查标题长度、绝对化用语、联系方式、外链、话题数量、素材和封面要求。
 
-### 发布与审核
+### 🚀 发布与审核
 
 - **后台任务队列**：发布立即入队，不阻塞页面。
 - **失败自动重试**：失败自动重试一次，并记录完整失败原因。
@@ -37,7 +65,7 @@
 - **智能排期建议**：根据历史作品表现推荐发布时间，并提示撞车。
 - **团队审核流**：内容可先提交审核，通过后才进入发布队列。
 
-### 账号与数据
+### 📊 账号与数据
 
 - **多账号管理**：支持扫码登录、登录态保存和有效性巡检。
 - **账号过期提醒**：登录失效后在发布记录页和今日待办中提示。
@@ -46,7 +74,7 @@
 - **运营周报**：汇总发布量、成功失败、播放、互动和最佳内容，支持复制和 CSV 导出。
 - **异常通知**：发布失败、账号过期、AI 内容包失败可推送到企业微信机器人、飞书机器人或通用 webhook。
 
-### 多平台统一私信
+### 💬 多平台统一私信
 
 - **统一收件箱**：集中查看抖音、小红书、视频号私信，可按平台、账号和客户筛选；每条会话带来源账号，多个账号同时运营时不会混淆消息归属。
 - **多账号隔离**：同一平台可登录多个账号。账号 Cookie、同步游标、会话、消息和线索按账号分别保存；重新登录已有账号会更新原记录，不会重复新增。
@@ -57,14 +85,14 @@
 - **工作台直接回复**：抖音、小红书、视频号均可基于本机已登录账号直接发送文本回复，并把发送结果回写为「已发送」或失败原因。
 - **自动回复草稿保护**：三个平台的定时同步命中自动回复规则后，只生成「待人工发送」草稿，不会后台静默真实发送；需人工确认后再发送。
 - **意向识别与线索**：识别购买意向并提取规格、预算、时间、公司、联系方式等线索；支持自定义关键词规则、标签、跟进阶段、备注与 CSV 导出。
-- **自动回复引擎**：按客群、关键词、平台和优先级匹配规则，支持冷却时间、每日上限、发送时段、评论开关、转人工词、AI 兜底与单客只回一次。
+- **自动回复引擎**：按客群、关键词、平台和优先级匹配规则，支持固定模板与 AI 智能回复两种模式，以及冷却时间、每日上限、发送时段、评论开关、转人工词、AI 兜底、AI 每日用量上限与单客只回一次。
 - **私信 Webhook 接入**：通过 `/dm/inbound` 接收外部私信事件，支持接入密钥、消息幂等去重和发送结果回写。
-- **今日优先跟进**：按意向、未回复消息、跟进阶段、留资完整度和最近咨询时间给线索评分，直接提示“立即联系 / 优先跟进 / 今日跟进”和下一步动作。
+- **今日优先跟进**：按意向、未回复消息、跟进阶段、留资完整度和最近咨询时间给线索评分，直接提示"立即联系 / 优先跟进 / 今日跟进"和下一步动作。
 - **今日运营待办**：汇总优先线索、待回复、失败发布、待审核、定时任务、账号过期和数据同步提醒。
 - **素材标签与去重**：按标签筛选素材，MD5 检测重复文件，显示发布状态，并支持按未使用天数清理。
 - **日志轮转**：按 10MB 自动轮转，保留 14 天。
 
-### 私信同步与回复
+### 🔄 私信同步与回复
 
 #### 使用步骤
 
@@ -93,7 +121,7 @@
 - 重新登录后先点「立即同步」，再检查同步设置中的账号是否选中、账号状态是否正常。平台未展示、被折叠或受陌生人私信限制的会话无法被读取。
 - 视频号若登录后仍无新消息，先确认登录的是接收私信的账号，并执行一次「立即同步」；只刷新前端页面不会重新拉取平台会话。
 
-### 自动回复与 Webhook
+### 🤖 自动回复与 Webhook
 
 在「私信中心 → 自动回复规则」里设置总开关、发送时段、关键词规则和连接器。外部系统也可以把新私信 POST 到：
 
@@ -124,7 +152,9 @@ http://127.0.0.1:5409/dm/inbound
 - **定时同步触发的自动回复**：固定生成「待人工发送」，不会自动真实发送。
 - **Webhook 触发的自动回复**：按自动回复规则、发送开关和账号登录态处理；未满足发送条件时保存为「待人工发送」。
 
-## 支持平台
+回复规则支持两种生成方式：**固定模板**（支持 `{nickname}`、`{origin}`、`{travelers}` 等变量）和 **AI 智能回复**（按命中关键词调用 AI，可附加回复口径，例如"不要提价格，先要联系方式"）。未命中任何规则且开启 AI 兜底时，也会用 AI 生成回复。AI 生成会把已沉淀的线索（人数、出发地、日期、预算、来源内容）带入提示词，避免重复提问；AI 模式下生成失败会回退到规则里的固定文案。AI 生成的回复会做一次安全过滤，疑似编造手机号、微信号或绝对化承诺（如"保证""全网最低"）时自动改标「需人工」并保留草稿，不会直接发送。设置中的「AI 每日上限」按天统计全局 AI 回复数量，用于控制接口费用。
+
+## 🧩 支持平台
 
 | 平台 | 登录 | 视频发布 | 图文/笔记 | 定时发布 | 数据回流 | 私信同步 | 工作台直发 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -137,16 +167,16 @@ http://127.0.0.1:5409/dm/inbound
 
 本地私信同步和工作台直发目前覆盖抖音、小红书、视频号。平台页面和风控策略会变化，具体可用性以实际运行结果为准。
 
-## 快速开始（Windows）
+## ⚡ 快速开始（Windows）
 
-### 环境要求
+### 📋 环境要求
 
 - Python 3.10+（建议 3.12）
 - Node.js 18+
 - Google Chrome（建议保持最新版，小红书登录和工作台发送会使用本机浏览器）
 - Windows 10/11
 
-### 安装
+### 📦 安装
 
 ```powershell
 python -m venv venv
@@ -159,7 +189,11 @@ npm install
 cd ..\..
 ```
 
-### 配置 AI
+`requirements.txt` 只声明直接依赖；如需复现当前已验证的完整环境，可改用
+`social-auto-upload-main\requirements.lock`。开发与测试依赖见
+`social-auto-upload-main\requirements-dev.txt`。
+
+### 🔑 配置 AI
 
 复制配置模板并填入自己的 API Key：
 
@@ -175,7 +209,7 @@ OPS_WEBHOOK_URL=你的企业微信/飞书机器人地址
 OPS_WEBHOOK_TYPE=auto
 ```
 
-### 启动
+### 🏃 启动
 
 双击根目录的 `start.bat`。脚本会自动：
 
@@ -186,7 +220,7 @@ OPS_WEBHOOK_TYPE=auto
 
 也可以分别运行 `run_backend.bat` 和 `run_frontend.bat`。
 
-## 目录结构
+## 📁 目录结构
 
 ```text
 FlowOps/
@@ -217,9 +251,12 @@ FlowOps/
 └─ README.md
 ```
 
-## 安全说明
+## 🔒 安全说明
 
+- 后端和前端默认只监听 `127.0.0.1`，同局域网设备无法直接打开工作台。确需远程访问时，必须在 `.env` 中同时设置 `YUNCE_HOST`、`YUNCE_ALLOW_REMOTE=1` 和 `YUNCE_ACCESS_TOKEN`；缺少令牌时后端会拒绝启动。前端请求会自动携带 `X-YunCe-Token`。
+- 设置访问令牌后，在浏览器控制台执行 `localStorage.setItem('yunce_access_token', '你的令牌')` 即可让前端携带令牌；不要把令牌写进 `VITE_*` 变量，否则会被打包进前端代码。
 - `.env`、数据库、Cookie、日志、上传素材、虚拟环境和前端构建产物均不进入仓库。
+- `cookiesFile/` 中的登录凭证仍是明文 JSON，请勿复制、提交或通过网盘共享；工作台默认仅限本机访问正是为了避免这些凭证被同网段设备滥用。
 - 数据库首次启动会自动建表；账号登录态请在本机重新扫码生成。
 - 请仅操作自己拥有或获授权的账号。
 - 本项目通过浏览器自动化模拟人工操作，平台没有面向个人开放的统一发布或私信 API。请遵守各平台用户协议，控制发布和回复频率。
@@ -227,7 +264,7 @@ FlowOps/
 - 小红书主站登录必须使用可见浏览器完成；遇到 IP 或账号风控时，请停止高频操作并人工检查，不要尝试绕过平台限制。
 - AI 生成内容需要人工复核，尤其是价格、库存、效果、服务承诺和广告用语。
 
-## 已知边界
+## ⚠️ 已知边界
 
 - 平台页面改版可能导致自动化选择器失效，需要跟随上游或本仓库更新。
 - 微博、百家号的数据回流和定时能力受平台后台限制。
@@ -237,12 +274,11 @@ FlowOps/
 - 定时同步产生的自动回复只有「待人工发送」草稿，不会自动真实发送；Webhook 的发送行为仍受规则和账号登录态限制。
 - 真实发布、扫码登录和私信发送需要在你的本机账号环境中验证，平台风控或页面改版可能导致临时不可用。
 
-## 仓库
+## 🔗 仓库
 
 - Gitee：https://gitee.com/tokyi/flowops
 - GitHub：https://github.com/datouy/FlowOps
 
-## 许可证
+## 📄 许可证
 
 本项目遵循 MIT License，详见 [LICENSE](./LICENSE)。原项目版权归 dreammis 所有。
-
