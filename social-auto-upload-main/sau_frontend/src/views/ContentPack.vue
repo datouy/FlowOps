@@ -92,6 +92,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
+import { API_BASE, withToken } from '@/config'
 
 const router = useRouter()
 const industries = ['通用', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '旅行社', '其他']
@@ -115,10 +116,10 @@ const covers = ref([])
 const items = ref([])
 const activePlatform = ref('小红书')
 const tagsText = ref({})
-const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
+const apiBase = API_BASE
 
 function fileUrl(url) {
-  return url.startsWith('http') ? url : apiBase.replace('/api', '') + url
+  return withToken(url.startsWith('http') ? url : apiBase + url)
 }
 
 async function loadMaterials() {

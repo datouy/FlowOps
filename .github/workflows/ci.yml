@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests and lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: social-auto-upload-main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: social-auto-upload-main/requirements*.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest
+      - name: Run Ruff
+        run: >-
+          python -m ruff check
+          app_logging.py db_utils.py runtime_config.py dm_platform_common.py
+          douyin_dm_sync.py xiaohongshu_dm_sync.py channels_dm_sync.py
+          dm_ops.py compliance.py schedule_suggest.py publish_jobs.py
+          ai_pack_jobs.py material_ops.py ops_center.py platform_reply.py
+          stats_reflow.py travel_ops.py sau_backend.py myUtils/login.py
+          myUtils/auth.py myUtils/postVideo.py utils/network.py
+          uploader/ks_uploader/main.py uploader/weibo_uploader/main.py tests
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: social-auto-upload-main/sau_frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: social-auto-upload-main/sau_frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build

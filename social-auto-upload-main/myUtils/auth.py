@@ -1,15 +1,9 @@
-import asyncio
-import configparser
-import os
-
 from playwright.async_api import async_playwright
-from xhs import XhsClient
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
-from utils.log import tencent_logger, kuaishou_logger, douyin_logger
+from utils.log import tencent_logger, kuaishou_logger, douyin_logger, xiaohongshu_logger
 from pathlib import Path
-from uploader.xhs_uploader.main import sign_local
 
 
 async def cookie_auth_douyin(account_file):
@@ -30,10 +24,10 @@ async def cookie_auth_douyin(account_file):
                 await page.get_by_text("扫码登录").wait_for(timeout=5000)
                 douyin_logger.error("[+] cookie 失效，需要扫码登录")
                 return False
-            except:
+            except Exception:
                 douyin_logger.success("[+]  cookie 有效")
                 return True
-        except:
+        except Exception:
             douyin_logger.error("[+] 等待5秒 cookie 失效")
             await context.close()
             await browser.close()
@@ -53,7 +47,7 @@ async def cookie_auth_tencent(account_file):
             await page.wait_for_selector('div.title-name:has-text("微信小店")', timeout=5000)  # 等待5秒
             tencent_logger.error("[+] 等待5秒 cookie 失效")
             return False
-        except:
+        except Exception:
             tencent_logger.success("[+] cookie 有效")
             return True
 
@@ -72,7 +66,7 @@ async def cookie_auth_ks(account_file):
 
             kuaishou_logger.info("[+] 等待5秒 cookie 失效")
             return False
-        except:
+        except Exception:
             kuaishou_logger.success("[+] cookie 有效")
             return True
 
@@ -88,17 +82,17 @@ async def cookie_auth_xhs(account_file):
         await page.goto("https://creator.xiaohongshu.com/creator-micro/content/upload")
         try:
             await page.wait_for_url("https://creator.xiaohongshu.com/creator-micro/content/upload", timeout=5000)
-        except:
-            print("[+] 等待5秒 cookie 失效")
+        except Exception:
+            xiaohongshu_logger.error("[+] 等待5秒 cookie 失效")
             await context.close()
             await browser.close()
             return False
         # 2024.06.17 抖音创作者中心改版
         if await page.get_by_text('手机号登录').count() or await page.get_by_text('扫码登录').count():
-            print("[+] 等待5秒 cookie 失效")
+            xiaohongshu_logger.error("[+] 等待5秒 cookie 失效")
             return False
         else:
-            print("[+] cookie 有效")
+            xiaohongshu_logger.success("[+] cookie 有效")
             return True
 
 

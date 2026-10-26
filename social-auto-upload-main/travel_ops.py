@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
-import sqlite3
 from pathlib import Path
 from flask import Blueprint, request, jsonify
 from conf import BASE_DIR
+from db_utils import connect, record_schema_version
 
 bp = Blueprint('travel_ops', __name__)
 DB = Path(BASE_DIR / 'db' / 'travel_ops.db')
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 def init_db():
     with get_conn() as c:
@@ -31,6 +29,7 @@ def init_db():
             customer_contact TEXT DEFAULT '', intent_tour TEXT DEFAULT '',
             follow_status TEXT DEFAULT 'new', note TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        record_schema_version(c, "travel_ops", 1)
 
 init_db()
 
@@ -103,9 +102,11 @@ def generate_content():
         '{days}': str(tour['days']), '{price}': str(tour['price']),
         '{highlights}': tour['highlights'], '{itinerary}': tour['itinerary'], '{tags}': tour['tags'],
     }
-    title = tpl['title_tpl']; body = tpl['body_tpl']
+    title = tpl['title_tpl']
+    body = tpl['body_tpl']
     for k, v in mapping.items():
-        title = title.replace(k, v); body = body.replace(k, v)
+        title = title.replace(k, v)
+        body = body.replace(k, v)
     return jsonify({'code':200,'data':{'title':title,'body':body,'tags':tour['tags'],'platform':tpl['platform']},'msg':'ok'})
 
 @bp.route('/leads', methods=['GET'])
@@ -148,7 +149,8 @@ def lead_stats():
                          'FROM leads GROUP BY platform ORDER BY total DESC').fetchall()
     stats = []
     for r in rows:
-        total = r['total']; converted = r['converted'] or 0
+        total = r['total']
+        converted = r['converted'] or 0
         stats.append({
             'platform': r['platform'] or '未知',
             'total': total,

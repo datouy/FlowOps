@@ -1,4 +1,5 @@
 import { http } from '@/utils/request'
+import { API_BASE, withToken } from '@/config'
 
 // 素材管理API
 export const materialApi = {
@@ -20,11 +21,11 @@ export const materialApi = {
   
   // 下载素材
   downloadMaterial: (filePath) => {
-    return `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'}/download/${filePath}`
+    return withToken(`${API_BASE}/download/${filePath}`)
   },
   
   // 获取素材预览URL
   getMaterialPreviewUrl: (filename) => {
-    return `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'}/getFile?filename=${filename}`
+    return withToken(`${API_BASE}/getFile?filename=${filename}`)
   }
 }

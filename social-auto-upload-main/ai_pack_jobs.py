@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import threading
 import traceback
 from pathlib import Path
 
 from conf import BASE_DIR
 import ai_content
+from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR) / "db" / "ai_pack_jobs.db"
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 
 def init_db():
@@ -33,6 +31,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pack_cache ON pack_jobs(cache_key, status)")
+        record_schema_version(c, "ai_pack_jobs", 1)
 
 
 init_db()

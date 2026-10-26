@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 1,
+  "backend": "native",
+  "rasterEngine": "libreoffice",
+  "source": "saved",
+  "inputPath": "E:\\project\\Dtou\\flowOps\\桂林地接社-自媒体矩阵自动化推广执行手册.docx",
+  "sourceSha256": "3a49716cac4a655fbff6a3ddb4f97b991232d4db06e8ed41eb5809e32df8c73b",
+  "dpi": 120,
+  "pageCount": 7,
+  "images": [
+    {
+      "index": 1,
+      "page": 1,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0001.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 142305
+    },
+    {
+      "index": 2,
+      "page": 2,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0002.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 107698
+    },
+    {
+      "index": 3,
+      "page": 3,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0003.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 133817
+    },
+    {
+      "index": 4,
+      "page": 4,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0004.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 103686
+    },
+    {
+      "index": 5,
+      "page": 5,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0005.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 113338
+    },
+    {
+      "index": 6,
+      "page": 6,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0006.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 123576
+    },
+    {
+      "index": 7,
+      "page": 7,
+      "path": "E:\\project\\Dtou\\flowOps\\preview\\page-0007.png",
+      "width": 1020,
+      "height": 1320,
+      "rectangle": {
+        "x": 0,
+        "y": 0,
+        "width": 816,
+        "height": 1056
+      },
+      "byteLength": 70232
+    }
+  ],
+  "missingFonts": [
+    "Courier"
+  ]
+}

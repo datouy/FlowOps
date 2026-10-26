@@ -21,6 +21,19 @@ frontend*.log
 /*-check.json
 social-auto-upload-main/*-check.json
 social-auto-upload-main/verify_code.txt
+*.db-wal
+*.db-shm
+
+# ---- local browser probes / downloaded bundles ----
+/debug/
+/xhs_*
+/flowops_xhs_*.png
+/bundler-runtime.*.js
+/library-launcher.*.js
+/.workbuddy-ai/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # ---- Python ----
 venv/

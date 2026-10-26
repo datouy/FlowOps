@@ -13,7 +13,9 @@ REM cmd /k runs the command and keeps the window open to show logs.
 START "SAU Backend" cmd /k "python sau_backend.py"
 
 ECHO [2/2] Starting Vue.js Frontend Server in another new window...
-START "SAU Frontend" cmd /k "cd sau_frontend && npm run dev -- --host 0.0.0.0"
+REM The frontend binds to loopback by default. For LAN access, opt in here as
+REM well as setting YUNCE_HOST, YUNCE_ALLOW_REMOTE=1 and YUNCE_ACCESS_TOKEN.
+START "SAU Frontend" cmd /k "cd sau_frontend && npm run dev"
 
 ECHO.
 ECHO ==================================================

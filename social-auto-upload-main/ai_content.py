@@ -103,7 +103,7 @@ def config_status() -> dict:
     }
 
 
-def _call_llm(prompt: str, max_tokens: int = 1200) -> str:
+def _call_llm(prompt: str, max_tokens: int = 1200, timeout: int = 120) -> str:
     env = _load_env()
     key = env.get("WB_API_KEY")
     if not key:
@@ -122,7 +122,7 @@ def _call_llm(prompt: str, max_tokens: int = 1200) -> str:
         "X-Realm": realm,
     })
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
@@ -140,14 +140,15 @@ def _call_llm(prompt: str, max_tokens: int = 1200) -> str:
     return result.strip()
 
 
-def _call_with_retry(prompt: str, max_tokens: int = 1200) -> str:
+def _call_with_retry(prompt: str, max_tokens: int = 1200, timeout: int = 120,
+                     attempts: int = 3) -> str:
     last_error = None
-    for attempt in range(3):
+    for attempt in range(max(1, attempts)):
         try:
-            return _call_llm(prompt, max_tokens)
+            return _call_llm(prompt, max_tokens, timeout=timeout)
         except RuntimeError as exc:
             last_error = exc
-            if attempt < 2:
+            if attempt < max(1, attempts) - 1:
                 time.sleep(1)
     raise last_error
 

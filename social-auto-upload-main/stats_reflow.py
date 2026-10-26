@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sqlite3
 import threading
 import time
 import traceback
@@ -18,6 +17,7 @@ from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
+from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
 MAIN_DB = Path(BASE_DIR / 'db' / 'database.db')
@@ -36,9 +36,7 @@ _state = {
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 
 def _db_prepare():
@@ -70,13 +68,13 @@ def _db_prepare():
                 c.execute(f'ALTER TABLE content_stats ADD COLUMN {name} {definition}')
         c.execute('CREATE INDEX IF NOT EXISTS idx_content_stats_record ON content_stats(record_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_content_stats_key ON content_stats(content_key)')
+        record_schema_version(c, "stats_reflow", 1)
 
 
 def _account_rows():
     if not MAIN_DB.exists():
         return []
-    conn = sqlite3.connect(MAIN_DB)
-    conn.row_factory = sqlite3.Row
+    conn = connect(MAIN_DB)
     try:
         return [dict(r) for r in conn.execute(
             'SELECT id,type,userName,filePath,status FROM user_info ORDER BY id'

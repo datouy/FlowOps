@@ -14,7 +14,7 @@ if errorlevel 1 (
   echo [1/2] Backend already running on port 5409.
 )
 echo Checking backend readiness ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ok=$false; for($i=0;$i -lt 40;$i++){ try { $r=Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:5409/dm/settings' -TimeoutSec 2; if($r.StatusCode -eq 200){$ok=$true; break} } catch {}; Start-Sleep -Milliseconds 500 }; if(-not $ok){Write-Host '[ERROR] Backend did not respond on http://127.0.0.1:5409'; exit 1}"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ok=$false; for($i=0;$i -lt 40;$i++){ try { $r=Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:5409/health' -TimeoutSec 2; if($r.StatusCode -eq 200){$ok=$true; break} } catch {}; Start-Sleep -Milliseconds 500 }; if(-not $ok){Write-Host '[ERROR] Backend did not respond on http://127.0.0.1:5409'; exit 1}"
 if errorlevel 1 (
   echo.
   echo [ERROR] Backend failed to start. Check the "YunCe Backend" window for details.

@@ -218,6 +218,14 @@
                 <el-switch v-model="autoForm.ai_fallback" />
                 <span class="form-hint">没有命中规则时调用 AI，会产生接口费用</span>
               </el-form-item>
+              <el-form-item label="AI 每日上限">
+                <el-input-number v-model="autoForm.ai_max_per_day" :min="0" :max="500" :step="5" controls-position="right" />
+                <span class="form-hint">0 不限制；全局按天计数，防止 AI 接口费用失控</span>
+              </el-form-item>
+              <el-form-item label="AI 配置">
+                <el-tag size="small" :type="aiStatus.configured ? 'success' : 'warning'" effect="plain">{{ aiStatusText }}</el-tag>
+                <span class="form-hint">未配置时 AI 兜底与 AI 规则会自动跳过，请在 .env 设置 WB_API_KEY</span>
+              </el-form-item>
               <el-form-item label="转人工词">
                 <el-input v-model="autoForm.stop_keywords" placeholder="人工,转人工,投诉" />
               </el-form-item>
@@ -270,7 +278,7 @@
               </el-form-item>
               <el-form-item label="同步模式">
                 <el-input-number v-model="activeSyncForm.interval_seconds" :min="activeSyncMeta.minInterval" :max="3600" :step="1" controls-position="right" />
-                <span class="form-hint">0 = 持续同步，上一轮结束后立即开始下一轮</span>
+                <span class="form-hint">0 = 持续同步，上一轮结束后立即开始下一轮；&gt;0 为间隔秒数</span>
               </el-form-item>
               <el-form-item label="同步范围">
                 <el-switch v-model="activeSyncForm.recent_only" />
@@ -342,7 +350,7 @@
             <div class="card-head">
               <div>
                 <span>回复规则</span>
-                <span class="card-sub">按优先级从高到低匹配；未命中时走“首次承接”或 AI 兜底</span>
+                <span class="card-sub">按优先级从高到低匹配；AI 规则按关键词命中后调用 AI，未命中时走 AI 兜底</span>
               </div>
               <div>
                 <el-button size="small" type="primary" @click="openRule()">新建规则</el-button>
@@ -353,6 +361,11 @@
             <el-table-column prop="name" label="规则" min-width="170" show-overflow-tooltip />
             <el-table-column label="类型" width="82">
               <template #default="scope"><el-tag size="small" :type="segmentTagType(scope.row.segment)">{{ scope.row.segment_label }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="回复方式" width="92">
+              <template #default="scope">
+                <el-tag size="small" :type="scope.row.reply_mode === 'ai' ? 'success' : 'info'">{{ scope.row.reply_mode === 'ai' ? 'AI 智能' : '固定模板' }}</el-tag>
+              </template>
             </el-table-column>
             <el-table-column prop="keywords" label="关键词" min-width="220" show-overflow-tooltip>
               <template #default="scope">{{ scope.row.keywords || '兜底：全部来信' }}</template>
@@ -456,6 +469,16 @@
           </el-select>
           <span class="form-hint">具体客户类型规则会优先于通用规则</span>
         </el-form-item>
+        <el-form-item label="回复方式">
+          <el-radio-group v-model="ruleForm.reply_mode">
+            <el-radio label="template">固定模板</el-radio>
+            <el-radio label="ai">AI 智能回复</el-radio>
+          </el-radio-group>
+          <span class="form-hint">AI 模式按关键词命中后调用 AI 生成，每日用量受全局上限约束</span>
+        </el-form-item>
+        <el-form-item v-if="ruleForm.reply_mode === 'ai'" label="AI 口径">
+          <el-input v-model="ruleForm.ai_prompt" type="textarea" :rows="2" placeholder="可选，例如：不要提价格，先要联系方式" />
+        </el-form-item>
         <el-form-item label="关键词">
           <el-input v-model="ruleForm.keywords" type="textarea" :rows="3" placeholder="用逗号或换行分隔，例如：多少钱,价格,报价" />
           <span class="form-hint">留空表示该类型的所有来信都匹配</span>
@@ -467,8 +490,8 @@
           </el-radio-group>
         </el-form-item>
         <el-form-item label="回复内容">
-          <el-input v-model="ruleForm.reply_template" type="textarea" :rows="6" placeholder="支持变量：{greeting} {nickname} {origin} {travelers} {travel_date} {company} {budget}" />
-          <div class="token-row">
+          <el-input v-model="ruleForm.reply_template" type="textarea" :rows="6" :placeholder="ruleForm.reply_mode === 'ai' ? 'AI 模式可选：生成失败时回退使用这段固定文案' : '支持变量：{greeting} {nickname} {origin} {travelers} {travel_date} {company} {budget}'" />
+          <div v-if="ruleForm.reply_mode !== 'ai'" class="token-row">
             <el-tag v-for="token in tokens" :key="token" size="small" effect="plain">{{ token }}</el-tag>
           </div>
         </el-form-item>
@@ -587,18 +610,19 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { http } from '@/utils/request'
+import { dmApi } from '@/api/dm'
+import { API_BASE, withToken } from '@/config'
+import {
+  avatarText, deliveryTagType, deliveryText, intentTagType, intentText,
+  segmentTagType, shortDateTime, shortTime,
+} from '@/utils/dm-format'
+import { useLivePolling } from '@/composables/useLivePolling'
 
 const route = useRoute()
-const requestBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
-const apiBase = requestBase.startsWith('http')
-  ? requestBase.replace(/\/$/, '')
-  : (/^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)
-      ? 'http://127.0.0.1:5409'
-      : `${window.location.origin}${requestBase.replace(/\/$/, '')}`)
+const apiBase = API_BASE
 const platforms = ['抖音', '快手', '视频号', '小红书', '微博', '百家号']
 const weekdays = [
   { value: '1', label: '一' }, { value: '2', label: '二' }, { value: '3', label: '三' },
@@ -614,10 +638,12 @@ const tokens = ['{greeting}', '{nickname}', '{origin}', '{travelers}', '{travel_
 const activeTab = ref('inbox')
 const analytics = ref({})
 const settings = ref({ enabled: 0 })
+const aiStatus = ref({ configured: false, model: '', base_url: '' })
 const autoForm = reactive({
   enabled: false, reply_comments: false, weekdayList: ['1', '2', '3', '4', '5', '6', '7'],
   working_start: '08:00', working_end: '23:00', cooldown_minutes: 30, max_per_day: 3,
-  ai_fallback: false, stop_keywords: '人工,转人工,投诉,退款', outbound_webhook: '', inbound_secret: '',
+  ai_fallback: false, ai_max_per_day: 50, stop_keywords: '人工,转人工,投诉,退款',
+  outbound_webhook: '', inbound_secret: '',
 })
 const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
@@ -638,6 +664,8 @@ const currentContact = ref(null)
 const messages = ref([])
 const loadingMessages = ref(false)
 const messageList = ref(null)
+const lastMessageId = ref(0)
+const liveTick = ref(0)
 const templates = ref([])
 const templateId = ref(null)
 const replyText = ref('')
@@ -653,7 +681,7 @@ const ruleDialog = ref(false)
 const savingRule = ref(false)
 const ruleForm = reactive({
   id: null, name: '', segment: '', keywords: '', match_type: 'any',
-  reply_template: '', priority: 10, cooldown_minutes: 0,
+  reply_mode: 'template', ai_prompt: '', reply_template: '', priority: 10, cooldown_minutes: 0,
   once_per_contact: false, enabled: true,
 })
 const importDialog = ref(false)
@@ -661,9 +689,6 @@ const importText = ref('')
 const importAutoReply = ref(false)
 const importing = ref(false)
 const helpDialog = ref(false)
-let liveTimer = null
-let liveRefreshing = false
-
 const webhookUrl = computed(() => `${apiBase}/dm/inbound`)
 const webhookExample = computed(() => `POST ${webhookUrl.value}
 Content-Type: application/json
@@ -769,6 +794,9 @@ const syncTagType = computed(() => {
   if (syncAnyRunning.value || syncing.value) return 'warning'
   return syncAllEnabled.value ? 'success' : 'info'
 })
+const aiStatusText = computed(() => aiStatus.value.configured
+  ? `已配置（${aiStatus.value.model || '默认模型'}）`
+  : '未配置 API Key，AI 回复不可用')
 const availableTemplates = computed(() => {
   const segment = currentContact.value?.segment || 'unknown'
   const items = [
@@ -776,7 +804,7 @@ const availableTemplates = computed(() => {
       id: 'template-' + item.id, name: item.name, content: item.content,
       label: item.name, text: item.content, segment: item.segment || ''
     })),
-    ...rules.value.filter(item => item.enabled).map(item => ({
+    ...rules.value.filter(item => item.enabled && item.reply_mode !== 'ai').map(item => ({
       id: 'rule-' + item.id, name: item.name, content: item.reply_template,
       label: item.name, text: item.reply_template, segment: item.segment || ''
     }))
@@ -785,48 +813,10 @@ const availableTemplates = computed(() => {
 })
 const quickReplies = computed(() => availableTemplates.value.slice(0, 6))
 
-function segmentTagType(segment) {
-  return { new: 'success', interested: 'warning', existing: 'info' }[segment] || 'info'
-}
-
-function intentText(intent) {
-  return { high: '高意向', medium: '中意向', low: '低意向' }[intent] || intent || '未识别'
-}
-
-function intentTagType(intent) {
-  return { high: 'danger', medium: 'warning', low: 'info' }[intent] || 'info'
-}
-
 function handleComposerKeydown(event) {
   if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter' || event.shiftKey) return
   event.preventDefault()
   sendReply()
-}
-
-function deliveryText(status) {
-  return { sent: '已发送', ready: '待发送', pending: '发送中', failed: '失败', received: '已接收' }[status] || status || ''
-}
-
-function deliveryTagType(status) {
-  return { sent: 'success', ready: 'warning', pending: 'info', failed: 'danger' }[status] || 'info'
-}
-
-function avatarText(name) {
-  return String(name || '客').trim().slice(0, 1).toUpperCase()
-}
-
-function shortTime(value) {
-  if (!value) return ''
-  const text = String(value)
-  const today = new Date().toISOString().slice(0, 10)
-  if (text.slice(0, 10) === today) return text.slice(11, 16)
-  return text.slice(5, 10)
-}
-
-function shortDateTime(value) {
-  if (!value) return ''
-  const text = String(value)
-  return text.slice(0, 16)
 }
 
 async function copyText(text, success = '已复制') {
@@ -847,14 +837,21 @@ async function copyText(text, success = '已复制') {
 
 async function loadAnalytics() {
   try {
-    const res = await http.get('/dm/analytics')
+    const res = await dmApi.getAnalytics()
     analytics.value = res.data || {}
+  } catch (error) { console.error(error) }
+}
+
+async function loadAiStatus() {
+  try {
+    const res = await dmApi.getAiStatus()
+    aiStatus.value = res.data || {}
   } catch (error) { console.error(error) }
 }
 
 async function loadSettings() {
   try {
-    const res = await http.get('/dm/settings')
+    const res = await dmApi.getSettings()
     const data = res.data || {}
     settings.value = data
     autoForm.enabled = Boolean(data.enabled)
@@ -865,9 +862,11 @@ async function loadSettings() {
     autoForm.cooldown_minutes = Number(data.cooldown_minutes || 0)
     autoForm.max_per_day = Number(data.max_per_day || 0)
     autoForm.ai_fallback = Boolean(data.ai_fallback)
+    autoForm.ai_max_per_day = Number(data.ai_max_per_day ?? 50)
     autoForm.stop_keywords = data.stop_keywords || ''
     autoForm.outbound_webhook = data.outbound_webhook || ''
     autoForm.inbound_secret = data.inbound_secret || ''
+    loadAiStatus()
   } catch (error) { console.error(error) }
 }
 
@@ -880,9 +879,10 @@ async function saveSettings() {
       enabled: autoForm.enabled ? 1 : 0,
       reply_comments: autoForm.reply_comments ? 1 : 0,
       ai_fallback: autoForm.ai_fallback ? 1 : 0,
+      ai_max_per_day: Number(autoForm.ai_max_per_day || 0),
     }
     delete payload.weekdayList
-    const res = await http.put('/dm/settings', payload)
+    const res = await dmApi.saveSettings(payload)
     settings.value = res.data || settings.value
     ElMessage.success('自动回复设置已保存')
     loadAnalytics()
@@ -907,13 +907,13 @@ function setSyncStatus(platform, data) {
 
 async function loadSyncStatus() {
   const targets = [
-    ['抖音', '/dm/sync/status', syncForm, 5],
-    ['小红书', '/dm/xhs/status', xhsSyncForm, 60],
-    ['视频号', '/dm/channels/status', channelsSyncForm, 60],
+    ['抖音', '/dm/sync/status', syncForm, 0],
+    ['小红书', '/dm/xhs/status', xhsSyncForm, 0],
+    ['视频号', '/dm/channels/status', channelsSyncForm, 0],
   ]
   const rows = await Promise.all(targets.map(async ([platform, url, form, defaultInterval]) => {
     try {
-      const res = await http.get(url)
+      const res = await dmApi.getSyncStatus(url)
       const data = res.data || {}
       setSyncStatus(platform, data)
       hydrateSyncForm(form, data, defaultInterval)
@@ -931,7 +931,7 @@ async function saveSyncSettings() {
   try {
     const meta = activeSyncMeta.value
     const form = activeSyncForm.value
-    const res = await http.put(`${meta.prefix}/settings`, {
+    const res = await dmApi.saveSyncSettings(meta.prefix, {
       enabled: form.enabled ? 1 : 0,
       account_ids: (form.account_ids || []).map(Number).filter(Boolean),
       interval_seconds: Number(form.interval_seconds ?? meta.defaultInterval),
@@ -949,7 +949,7 @@ async function runPlatformSync() {
   syncing.value = true
   try {
     const platform = syncPlatform.value
-    const res = await http.post(`${activeSyncMeta.value.prefix}/run`, {}, { timeout: 600000 })
+    const res = await dmApi.runSync(activeSyncMeta.value.prefix)
     const data = res.data || {}
     const summary = `扫描 ${data.scanned || 0}，新增 ${data.imported || 0}，重复 ${data.duplicates || 0}`
     if (data.partial) ElMessage.warning(`部分账号同步失败：${summary}。${data.error || ''}`)
@@ -968,10 +968,7 @@ async function runAllPlatformSync() {
   try {
     const results = await Promise.all(syncRunTargets.map(async target => {
       try {
-        const res = await http.post(`${target.prefix}/run`, {}, {
-          timeout: 600000,
-          silent: true,
-        })
+        const res = await dmApi.runSync(target.prefix, { silent: true })
         return { platform: target.platform, ok: true, data: res.data || {} }
       } catch (error) {
         return {
@@ -1023,33 +1020,34 @@ function handlePlatformFilterChange() {
 }
 
 async function refreshLive() {
-  if (document.hidden || liveRefreshing || activeTab.value !== 'inbox') return
-  liveRefreshing = true
   const contactId = currentContact.value?.id
+  liveTick.value += 1
   try {
-    await Promise.all([loadSyncStatus(), loadConversations(true), loadAnalytics()])
+    await Promise.all([loadSyncStatus(), loadConversations(true)])
+    if (liveTick.value % 10 === 1) loadAnalytics()
     if (contactId) {
-      const hadUnread = Number(currentContact.value?.unread_count || 0) > 0
-      await loadConversation(contactId, true)
-      if (hadUnread) await markConversationRead(contactId)
+      const latest = conversations.value.find(item => item.id === contactId)
+      const latestId = Number(latest?.last_message_id || 0)
+      if (latestId > lastMessageId.value) {
+        await loadConversation(contactId, true, true)
+      }
+      if (Number(currentContact.value?.unread_count || 0) > 0) {
+        await markConversationRead(contactId)
+      }
     }
-  } catch (error) {
-    console.error(error)
-  } finally {
-    liveRefreshing = false
-  }
+  } catch (error) { console.error(error) }
 }
 
 async function loadRules() {
   try {
-    const res = await http.get('/dm/rules')
+    const res = await dmApi.getRules()
     rules.value = res.data || []
   } catch (error) { console.error(error) }
 }
 
 async function loadTemplates() {
   try {
-    const res = await http.get('/message-templates')
+    const res = await dmApi.getTemplates()
     templates.value = res.data || []
   } catch (error) { console.error(error) }
 }
@@ -1059,7 +1057,7 @@ async function loadConversations(silent = false) {
   try {
     const params = {}
     Object.entries(convFilters).forEach(([key, value]) => { if (value) params[key] = value })
-    const res = await http.get('/dm/conversations', params)
+    const res = await dmApi.getConversations(params)
     conversations.value = res.data || []
     if (currentContact.value) {
       const latest = conversations.value.find(item => item.id === currentContact.value.id)
@@ -1081,7 +1079,7 @@ async function loadLeads() {
   try {
     const params = {}
     Object.entries(leadFilters).forEach(([key, value]) => { if (value) params[key] = value })
-    const res = await http.get('/dm/conversations', params)
+    const res = await dmApi.getLeads(params)
     leads.value = res.data || []
   } catch (error) { console.error(error) }
   finally { loadingLeads.value = false }
@@ -1090,6 +1088,7 @@ async function loadLeads() {
 async function selectConversation(item, markRead = true) {
   currentContact.value = item
   templateId.value = null
+  lastMessageId.value = 0
   await loadConversation(item.id)
   if (markRead && Number(item.unread_count || 0) > 0) {
     await markConversationRead(item.id)
@@ -1098,7 +1097,7 @@ async function selectConversation(item, markRead = true) {
 
 async function markConversationRead(id) {
   try {
-    await http.post(`/dm/conversations/${id}/read`, {}, { silent: true })
+    await dmApi.markConversationRead(id)
     const item = conversations.value.find(conversation => conversation.id === id)
     if (item) item.unread_count = 0
     if (currentContact.value?.id === id) currentContact.value.unread_count = 0
@@ -1108,12 +1107,26 @@ async function markConversationRead(id) {
   }
 }
 
-async function loadConversation(id, silent = false) {
+async function loadConversation(id, silent = false, incremental = false) {
   if (!silent) loadingMessages.value = true
   try {
-    const res = await http.get(`/dm/conversations/${id}`)
+    const params = incremental && lastMessageId.value
+      ? { after: lastMessageId.value }
+      : undefined
+    const res = await dmApi.getConversation(id, params)
     currentContact.value = res.data.contact
-    messages.value = res.data.messages || []
+    const incoming = res.data.messages || []
+    if (incremental && messages.value.length) {
+      messages.value = [...messages.value, ...incoming]
+    } else {
+      messages.value = incoming
+    }
+    if (incoming.length) {
+      lastMessageId.value = Math.max(
+        lastMessageId.value,
+        ...incoming.map(item => Number(item.id || 0)),
+      )
+    }
     await nextTick()
     scrollToBottom()
   } catch (error) { console.error(error) }
@@ -1133,7 +1146,7 @@ async function generateDraft() {
   if (!currentContact.value) return
   drafting.value = true
   try {
-    const res = await http.post(`/dm/conversations/${currentContact.value.id}/ai-draft`)
+    const res = await dmApi.generateDraft(currentContact.value.id)
     replyText.value = res.data.reply || ''
     ElMessage.success('AI 草稿已生成，请核对价格和承诺')
   } catch (error) { console.error(error) }
@@ -1148,7 +1161,7 @@ async function sendReply() {
   replyText.value = ''
   templateId.value = null
   try {
-    const res = await http.post(`/dm/conversations/${currentContact.value.id}/reply`, { text })
+    const res = await dmApi.sendReply(currentContact.value.id, text)
     const status = res.data?.delivery_status
     if (status === 'sent') {
       const message = { '抖音': '回复已发送到抖音', '小红书': '回复已发送到小红书', '视频号': '回复已发送到视频号' }[currentContact.value?.platform]
@@ -1192,7 +1205,7 @@ async function saveProfile() {
   if (!profileForm.value) return
   savingProfile.value = true
   try {
-    await http.put(`/dm/contacts/${profileForm.value.id}`, profileForm.value)
+    await dmApi.updateContact(profileForm.value.id, profileForm.value)
     ElMessage.success('客户资料已保存')
     profileVisible.value = false
     await Promise.all([loadConversation(profileForm.value.id), loadConversations(), loadLeads(), loadAnalytics()])
@@ -1230,6 +1243,8 @@ function openRule(row = null) {
   ruleForm.id = row?.id || null
   ruleForm.name = row?.name || ''
   ruleForm.segment = row?.segment || ''
+  ruleForm.reply_mode = row?.reply_mode || 'template'
+  ruleForm.ai_prompt = row?.ai_prompt || ''
   ruleForm.keywords = row?.keywords || ''
   ruleForm.match_type = row?.match_type || 'any'
   ruleForm.reply_template = row?.reply_template || ''
@@ -1242,12 +1257,13 @@ function openRule(row = null) {
 
 async function saveRule() {
   if (!ruleForm.name.trim()) return ElMessage.warning('请填写规则名称')
-  if (!ruleForm.reply_template.trim()) return ElMessage.warning('请填写回复内容')
+  if (ruleForm.reply_mode === 'template' && !ruleForm.reply_template.trim()) {
+    return ElMessage.warning('请填写回复内容')
+  }
   savingRule.value = true
   try {
     const payload = { ...ruleForm }
-    if (ruleForm.id) await http.put(`/dm/rules/${ruleForm.id}`, payload)
-    else await http.post('/dm/rules', payload)
+    await dmApi.saveRule(ruleForm.id, payload)
     ElMessage.success('规则已保存')
     ruleDialog.value = false
     loadRules()
@@ -1257,7 +1273,7 @@ async function saveRule() {
 
 async function toggleRule(row) {
   try {
-    await http.put(`/dm/rules/${row.id}`, row)
+    await dmApi.saveRule(row.id, row)
     ElMessage.success(row.enabled ? '规则已启用' : '规则已停用')
   } catch (error) {
     row.enabled = row.enabled ? 0 : 1
@@ -1269,7 +1285,7 @@ async function removeRule(row) {
     await ElMessageBox.confirm(`确定删除规则「${row.name}」吗？`, '删除规则', { type: 'warning' })
   } catch { return }
   try {
-    await http.delete(`/dm/rules/${row.id}`)
+    await dmApi.deleteRule(row.id)
     ElMessage.success('规则已删除')
     loadRules()
   } catch (error) { console.error(error) }
@@ -1299,7 +1315,7 @@ async function doImport() {
   if (!items.length) return ElMessage.warning('请按“平台|账号|用户|留言内容”的格式填写')
   importing.value = true
   try {
-    const res = await http.post('/dm/import', { items, auto_reply: importAutoReply.value })
+    const res = await dmApi.importMessages({ items, auto_reply: importAutoReply.value })
     const data = res.data || {}
     ElMessage.success(`导入 ${data.added || 0} 条${data.duplicates ? `，跳过重复 ${data.duplicates} 条` : ''}`)
     if (failed.length) ElMessage.warning(`第 ${failed.join('、')} 行格式不完整，已跳过`)
@@ -1312,14 +1328,17 @@ async function doImport() {
 
 function exportLeads() {
   const query = leadFilters.segment ? `?segment=${encodeURIComponent(leadFilters.segment)}` : ''
-  window.open(`${apiBase}/dm/export${query}`, '_blank')
+  window.open(withToken(`${apiBase}/dm/export${query}`), '_blank')
 }
+
+useLivePolling(refreshLive, { interval: 1000, isActive: () => activeTab.value === 'inbox' })
 
 onMounted(async () => {
   await Promise.all([
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(),
   ])
+  // 从「今日优先跟进」跳转时携带 ?contact=<id>，直接打开对应会话。
   const contactId = Number(route.query.contact || 0)
   if (contactId) {
     const target = conversations.value.find(item => Number(item.id) === contactId)
@@ -1328,11 +1347,6 @@ onMounted(async () => {
       await selectConversation(target, false)
     }
   }
-  liveTimer = window.setInterval(refreshLive, 1000)
-})
-
-onBeforeUnmount(() => {
-  if (liveTimer) window.clearInterval(liveTimer)
 })
 </script>
 

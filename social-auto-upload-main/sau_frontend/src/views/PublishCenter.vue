@@ -129,7 +129,7 @@
               :on-error="handleUploadError"
               multiple
               accept="video/*"
-              :headers="authHeaders"
+              :headers="uploadHeaders"
             >
               <el-icon class="el-icon--upload"><Upload /></el-icon>
               <div class="el-upload__text">
@@ -565,15 +565,14 @@ import { useRoute } from 'vue-router'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { materialApi } from '@/api/material'
-import { http } from '@/utils/request'
+import { publishApi } from '@/api/publish'
+import { API_BASE, authHeaders } from '@/config'
 
 // API base URL
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
+const apiBaseUrl = API_BASE
 
 // Authorization headers
-const authHeaders = computed(() => ({
-  'Authorization': `Bearer ${localStorage.getItem('token') || ''}`
-}))
+const uploadHeaders = computed(() => authHeaders())
 
 // 当前激活的tab
 const activeTab = ref('tab1')
@@ -901,7 +900,7 @@ const confirmPublish = async (tab) => {
 
   // 调用后端发布API（使用统一的http封装）
   try {
-    const check = await http.post('/compliance/check', publishData)
+    const check = await publishApi.checkCompliance(publishData)
     if (check.data && !check.data.passed) {
       const errors = (check.data.errors || []).join('；')
       tab.publishStatus = { message: '检查未通过：' + errors, type: 'error' }
@@ -912,7 +911,7 @@ const confirmPublish = async (tab) => {
     if (check.data && check.data.warnings && check.data.warnings.length) {
       ElMessage.warning(check.data.warnings.join('；'))
     }
-    const data = await http.post('/postVideo', publishData)
+    const data = await publishApi.submit(publishData)
     tab.publishStatus = {
       message: '已加入发布队列，可在「发布记录」查看进度',
       type: 'success'
@@ -1134,7 +1133,7 @@ const openVerifyDialog = () => {
 
 const fetchPendingVerify = async () => {
   try {
-    const res = await http.get('/verify/pending', null, { silent: true })
+    const res = await publishApi.getPendingVerify()
     const pending = res.data || null
     if (!pending) {
       verifyRequest.value = null
@@ -1170,10 +1169,7 @@ const submitVerifyCode = async () => {
 
   verifySubmitting.value = true
   try {
-    await http.post('/verify/submit', {
-      request_id: verifyRequest.value.id,
-      code
-    })
+    await publishApi.submitVerify(verifyRequest.value.id, code)
     ElMessage.success('验证码已提交，发布任务将继续')
     verifyDialogVisible.value = false
     verifyRequest.value = null
@@ -1190,7 +1186,7 @@ const resendVerifyCode = async () => {
   if (!verifyRequest.value || verifyResending.value) return
   verifyResending.value = true
   try {
-    await http.post('/verify/resend', { request_id: verifyRequest.value.id })
+    await publishApi.resendVerify(verifyRequest.value.id)
     ElMessage.success('已请求重新发送验证码，请稍候查收短信')
   } catch (error) {
     console.error('重新发送验证码失败:', error)

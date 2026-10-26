@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 # 发布任务队列 + 发布记录 + 账号巡检
-import sqlite3
 import threading
 import time
 import traceback
 import queue as _queue
 from pathlib import Path
+from loguru import logger
 from conf import BASE_DIR
 import verify_codes
+from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
 _lock = threading.Lock()
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 def init_db():
     with get_conn() as c:
@@ -62,6 +61,7 @@ def init_db():
             scheduled_at DATETIME NOT NULL,
             status TEXT DEFAULT 'pending'
         )''')
+        record_schema_version(c, "publish_jobs", 1)
 
 init_db()
 
@@ -97,10 +97,9 @@ def recover_pending_jobs():
         _start_workers()
         for job_id in job_ids:
             _q.put(job_id)
-        print(
-            "[publish_jobs] recovered %s pending job(s): %s"
-            % (len(job_ids), ", ".join(map(str, job_ids))),
-            flush=True,
+        logger.info(
+            "recovered {} pending job(s): {}",
+            len(job_ids), ", ".join(map(str, job_ids)),
         )
     return job_ids
 
@@ -320,8 +319,7 @@ def run_patrol_once():
     if not db_main.exists():
         return []
     results = []
-    conn = sqlite3.connect(db_main)
-    conn.row_factory = sqlite3.Row
+    conn = connect(db_main)
     rows = conn.execute('SELECT * FROM user_info').fetchall()
     conn.close()
     loop = asyncio.new_event_loop()

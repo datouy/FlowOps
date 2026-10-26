@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -12,6 +11,7 @@ from pathlib import Path
 from patchright.sync_api import sync_playwright
 
 from conf import BASE_DIR
+from db_utils import connect
 
 MAIN_DB = Path(BASE_DIR / "db" / "database.db")
 COOKIE_DIR = Path(BASE_DIR / "cookiesFile")
@@ -23,8 +23,7 @@ _send_lock = threading.Lock()
 def _account_by_type(account_type: int, account_name: str):
     if not MAIN_DB.exists():
         return None
-    with sqlite3.connect(MAIN_DB, timeout=15) as conn:
-        conn.row_factory = sqlite3.Row
+    with connect(MAIN_DB, timeout=15) as conn:
         rows = [dict(row) for row in conn.execute(
             "SELECT id,type,userName,filePath,status FROM user_info WHERE type=? ORDER BY id",
             (int(account_type),),

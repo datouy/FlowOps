@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import jsonify, request
 
 from conf import BASE_DIR
+from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR) / "db" / "database.db"
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 
 def init_db():
@@ -28,6 +26,7 @@ def init_db():
         if "md5" not in cols:
             c.execute("ALTER TABLE file_records ADD COLUMN md5 TEXT DEFAULT ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_file_md5 ON file_records(md5)")
+        record_schema_version(c, "material_ops", 1)
 
 
 init_db()
@@ -50,7 +49,7 @@ def _used_names() -> set:
     try:
         path = Path(BASE_DIR) / "db" / "publish_jobs.db"
         if path.exists():
-            c = sqlite3.connect(path)
+            c = connect(path)
             try:
                 for (files,) in c.execute("SELECT files FROM publish_records"):
                     for name in str(files or "").split(","):

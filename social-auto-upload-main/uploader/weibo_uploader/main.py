@@ -130,7 +130,7 @@ async def _grab_qr(page: Page, account_file: str) -> dict:
 
     weibo_logger.info(_msg("🖼️", f"二维码已保存到: {qrcode_path}"))
     # 终端不渲染二维码，只给出文件位置，用微博APP打开图片扫码
-    print(f"请打开 {qrcode_path}，用微博APP扫描该二维码登录")
+    weibo_logger.info("请打开 {}，用微博APP扫描该二维码登录", qrcode_path)
     return {"image_path": str(qrcode_path), "image_data_url": ""}
 
 

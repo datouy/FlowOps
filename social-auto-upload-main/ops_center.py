@@ -2,8 +2,7 @@
 """运营中心：统一消息、今日待办、周报。"""
 from __future__ import annotations
 
-import json
-import sqlite3
+import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,9 +12,13 @@ from flask import Blueprint, jsonify, request
 from conf import BASE_DIR
 import ai_content
 import publish_jobs
+from db_utils import connect, record_schema_version
 
 bp = Blueprint("ops_center", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
+
+_TODO_CACHE: dict = {"at": 0.0, "payload": None}
+TODO_CACHE_TTL = 10.0
 
 INTENT_WORDS = {
     "high": ["价格", "多少钱", "报价", "费用", "报名", "行程", "几天", "优惠", "怎么去", "联系", "微信", "电话"],
@@ -33,9 +36,7 @@ PLATFORM_URLS = {
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 
 def init_db():
@@ -54,6 +55,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_messages_intent ON messages(intent)")
+        record_schema_version(c, "ops_center", 1)
 
 
 init_db()
@@ -147,6 +149,8 @@ def add_template():
 
 
 def todo_summary():
+    if _TODO_CACHE["payload"] is not None and time.monotonic() - _TODO_CACHE["at"] < TODO_CACHE_TTL:
+        return jsonify({"code": 200, "data": _TODO_CACHE["payload"], "msg": None})
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     with get_conn() as c:
@@ -211,7 +215,7 @@ def todo_summary():
         items.append({"type": "storage", "level": "info", "text": f"有 {unused_assets} 个超过 30 天未使用的素材可清理"})
     if not last_sync or str(last_sync)[:10] < today:
         items.append({"type": "stats", "level": "info", "text": "今天还没有同步平台数据"})
-    return jsonify({"code": 200, "data": {
+    payload = {
         "date": today, "items": items,
         "counts": {"messages": pending_messages, "high_intent": high_intent,
                    "failed_jobs": failed_jobs, "pending_review": pending_review,
@@ -220,7 +224,9 @@ def todo_summary():
                    "auto_ready": auto_ready, "priority_leads": len(priority_items),
                    "urgent_leads": urgent_leads},
         "priority_leads": priority_items,
-    }, "msg": None})
+    }
+    _TODO_CACHE.update(at=time.monotonic(), payload=payload)
+    return jsonify({"code": 200, "data": payload, "msg": None})
 
 
 @bp.route("/messages", methods=["GET"])

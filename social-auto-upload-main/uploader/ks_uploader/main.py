@@ -463,7 +463,7 @@ class KSBaseUploader(BaseVideoUploader):
         # 方式1：点击 tooltip 的关闭/跳过按钮
         joyride_tooltip = page.locator('div[id^="react-joyride-step"] div[role="alertdialog"]')
         if await joyride_tooltip.count() > 0 and await joyride_tooltip.first.is_visible():
-            print("检测到 Joyride 引导遮罩，正在关闭...")
+            kuaishou_logger.info("检测到 Joyride 引导遮罩，正在关闭...")
             # 尝试多种关闭按钮 selector
             close_selectors = [
                 '[aria-label="Skip"], [data-action="skip"], button[title="Skip"]',
@@ -485,7 +485,7 @@ class KSBaseUploader(BaseVideoUploader):
         if await joyride_portal.count() > 0:
             try:
                 await page.evaluate("document.getElementById('react-joyride-portal')?.remove()")
-                print("✅ 已移除 Joyride portal 遮罩")
+                kuaishou_logger.info("已移除 Joyride portal 遮罩")
                 closed = True
             except Exception:
                 pass
@@ -495,13 +495,13 @@ class KSBaseUploader(BaseVideoUploader):
         if await spotlight.count() > 0:
             try:
                 await page.evaluate("document.querySelectorAll('.react-joyride__spotlight').forEach(e => e.remove())")
-                print("✅ 已移除 Joyride spotlight")
+                kuaishou_logger.info("已移除 Joyride spotlight")
                 closed = True
             except Exception:
                 pass
 
         if not closed:
-            print("未检测到 Joyride 遮罩，继续执行")
+            kuaishou_logger.debug("未检测到 Joyride 遮罩，继续执行")
         else:
             await asyncio.sleep(0.5)
 

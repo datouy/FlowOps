@@ -7,7 +7,6 @@ import hashlib
 import io
 import json
 import re
-import sqlite3
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,6 +15,7 @@ from flask import Blueprint, Response, jsonify, request
 
 from conf import BASE_DIR
 import ai_content
+from db_utils import apply_migrations, connect
 
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
@@ -51,15 +51,13 @@ STOP_WORDS_DEFAULT = "人工,转人工,投诉,退款"
 DEFAULT_SETTINGS = {
     "enabled": 1, "working_start": "08:00", "working_end": "23:00",
     "weekdays": "1,2,3,4,5,6,7", "cooldown_minutes": 30, "max_per_day": 3,
-    "reply_comments": 0, "ai_fallback": 0, "outbound_webhook": "",
+    "reply_comments": 0, "ai_fallback": 0, "ai_max_per_day": 50, "outbound_webhook": "",
     "inbound_secret": "", "stop_keywords": STOP_WORDS_DEFAULT,
 }
 
 
 def get_conn():
-    conn = sqlite3.connect(DB, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect(DB, timeout=30)
 
 
 def _now() -> str:
@@ -75,91 +73,189 @@ def _ensure_column(c, table: str, name: str, ddl: str):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def _initialize_schema(c):
+    c.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT DEFAULT '', account TEXT DEFAULT '',
+        msg_type TEXT DEFAULT 'comment', author TEXT DEFAULT '',
+        content TEXT NOT NULL, source_content TEXT DEFAULT '',
+        intent TEXT DEFAULT 'low', status TEXT DEFAULT 'new',
+        reply_text TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        handled_at DATETIME, contact_id INTEGER,
+        external_user_id TEXT DEFAULT '', external_message_id TEXT DEFAULT '',
+        direction TEXT DEFAULT 'inbound', delivery_status TEXT DEFAULT 'received',
+        auto_reply_status TEXT DEFAULT '', matched_rule_id INTEGER)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS message_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, content TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS dm_contacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL DEFAULT '', account TEXT NOT NULL DEFAULT '',
+        external_user_id TEXT NOT NULL DEFAULT '', nickname TEXT DEFAULT '',
+        segment TEXT DEFAULT 'unknown', intent TEXT DEFAULT 'low',
+        stage TEXT DEFAULT 'new', source_content TEXT DEFAULT '',
+        contact_info TEXT DEFAULT '', traveler_count INTEGER DEFAULT 0,
+        origin TEXT DEFAULT '', travel_date TEXT DEFAULT '', notes TEXT DEFAULT '',
+        company_name TEXT DEFAULT '', budget TEXT DEFAULT '',
+        tags TEXT DEFAULT '', auto_reply_enabled INTEGER DEFAULT 1,
+        first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_inbound_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        unread_count INTEGER DEFAULT 0,
+        message_count INTEGER DEFAULT 0,
+        pending_delivery INTEGER DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(platform, account, external_user_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS dm_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, enabled INTEGER DEFAULT 1,
+        platform TEXT DEFAULT '', segment TEXT DEFAULT '',
+        keywords TEXT DEFAULT '', match_type TEXT DEFAULT 'any',
+        priority INTEGER DEFAULT 10, reply_mode TEXT DEFAULT 'template',
+        ai_prompt TEXT DEFAULT '', reply_template TEXT NOT NULL,
+        cooldown_minutes INTEGER DEFAULT 0, once_per_contact INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS dm_settings (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        enabled INTEGER DEFAULT 1, working_start TEXT DEFAULT '08:00',
+        working_end TEXT DEFAULT '23:00', weekdays TEXT DEFAULT '1,2,3,4,5,6,7',
+        cooldown_minutes INTEGER DEFAULT 30, max_per_day INTEGER DEFAULT 3,
+        reply_comments INTEGER DEFAULT 0, ai_fallback INTEGER DEFAULT 0,
+        ai_max_per_day INTEGER DEFAULT 50,
+        outbound_webhook TEXT DEFAULT '', inbound_secret TEXT DEFAULT '',
+        stop_keywords TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS dm_reply_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact_id INTEGER, inbound_message_id INTEGER,
+        outbound_message_id INTEGER, rule_id INTEGER,
+        status TEXT DEFAULT '', reason TEXT DEFAULT '', reply_text TEXT DEFAULT '',
+        ai_used INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS dm_meta (
+        key TEXT PRIMARY KEY, value TEXT DEFAULT '')""")
+
+    for name, ddl in (
+        ("contact_id", "INTEGER"), ("external_user_id", "TEXT DEFAULT ''"),
+        ("external_message_id", "TEXT DEFAULT ''"), ("direction", "TEXT DEFAULT 'inbound'"),
+        ("delivery_status", "TEXT DEFAULT 'received'"), ("auto_reply_status", "TEXT DEFAULT ''"),
+        ("matched_rule_id", "INTEGER"),
+    ):
+        _ensure_column(c, "messages", name, ddl)
+    for name, ddl in (
+        ("segment", "TEXT DEFAULT ''"), ("category", "TEXT DEFAULT ''"),
+        ("platform", "TEXT DEFAULT ''"),
+    ):
+        _ensure_column(c, "message_templates", name, ddl)
+    for name, ddl in (
+        ("company_name", "TEXT DEFAULT ''"), ("budget", "TEXT DEFAULT ''"),
+    ):
+        _ensure_column(c, "dm_contacts", name, ddl)
+    for name, ddl in (
+        ("reply_mode", "TEXT DEFAULT 'template'"), ("ai_prompt", "TEXT DEFAULT ''"),
+    ):
+        _ensure_column(c, "dm_rules", name, ddl)
+    _ensure_column(c, "dm_settings", "ai_max_per_day", "INTEGER DEFAULT 50")
+    _ensure_column(c, "dm_reply_logs", "ai_used", "INTEGER DEFAULT 0")
+
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_intent ON messages(intent)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_external ON messages(platform, account, external_message_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_dm_contacts_last ON dm_contacts(last_message_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_dm_contacts_segment ON dm_contacts(segment)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_dm_logs_contact ON dm_reply_logs(contact_id)")
+
+    _seed_defaults(c)
+
+
+def _migrate_message_counters(c):
+    for name, ddl in (
+        ("unread_count", "INTEGER DEFAULT 0"),
+        ("message_count", "INTEGER DEFAULT 0"),
+        ("pending_delivery", "INTEGER DEFAULT 0"),
+    ):
+        _ensure_column(c, "dm_contacts", name, ddl)
+    c.execute("""UPDATE dm_contacts SET
+        unread_count=(SELECT COUNT(*) FROM messages x
+            WHERE x.contact_id=dm_contacts.id AND x.direction='inbound' AND x.status='new'),
+        message_count=(SELECT COUNT(*) FROM messages x
+            WHERE x.contact_id=dm_contacts.id),
+        pending_delivery=(SELECT COUNT(*) FROM messages x
+            WHERE x.contact_id=dm_contacts.id AND x.direction='outbound'
+              AND x.delivery_status='ready')""")
+    c.execute("""CREATE TRIGGER IF NOT EXISTS trg_messages_count_insert
+        AFTER INSERT ON messages WHEN NEW.contact_id IS NOT NULL
+        BEGIN
+            UPDATE dm_contacts SET
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id),
+                unread_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id
+                    AND x.direction='inbound' AND x.status='new'),
+                pending_delivery=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id
+                    AND x.direction='outbound' AND x.delivery_status='ready')
+            WHERE id=NEW.contact_id;
+        END""")
+    c.execute("""CREATE TRIGGER IF NOT EXISTS trg_messages_count_update
+        AFTER UPDATE OF contact_id,status,direction,delivery_status ON messages
+        BEGIN
+            UPDATE dm_contacts SET
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id),
+                unread_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id
+                    AND x.direction='inbound' AND x.status='new'),
+                pending_delivery=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id
+                    AND x.direction='outbound' AND x.delivery_status='ready')
+            WHERE id=OLD.contact_id AND OLD.contact_id IS NOT NEW.contact_id;
+            UPDATE dm_contacts SET
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id),
+                unread_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id
+                    AND x.direction='inbound' AND x.status='new'),
+                pending_delivery=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=NEW.contact_id
+                    AND x.direction='outbound' AND x.delivery_status='ready')
+            WHERE id=NEW.contact_id;
+        END""")
+    c.execute("""CREATE TRIGGER IF NOT EXISTS trg_messages_count_delete
+        AFTER DELETE ON messages WHEN OLD.contact_id IS NOT NULL
+        BEGIN
+            UPDATE dm_contacts SET
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id),
+                unread_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id
+                    AND x.direction='inbound' AND x.status='new'),
+                pending_delivery=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=OLD.contact_id
+                    AND x.direction='outbound' AND x.delivery_status='ready')
+            WHERE id=OLD.contact_id;
+        END""")
+
+
+def _migrate_ai_reply(c):
+    for name, ddl in (
+        ("reply_mode", "TEXT DEFAULT 'template'"), ("ai_prompt", "TEXT DEFAULT ''"),
+    ):
+        _ensure_column(c, "dm_rules", name, ddl)
+    _ensure_column(c, "dm_settings", "ai_max_per_day", "INTEGER DEFAULT 50")
+    _ensure_column(c, "dm_reply_logs", "ai_used", "INTEGER DEFAULT 0")
+
+
+def _migrate_perf_indexes(c):
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_messages_contact_dir_status
+        ON messages(contact_id, direction, status)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_messages_contact_dir_delivery
+        ON messages(contact_id, direction, delivery_status)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_dm_reply_logs_contact_time
+        ON dm_reply_logs(contact_id, created_at)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_dm_reply_logs_ai_time
+        ON dm_reply_logs(ai_used, created_at)""")
+
+
 def init_db():
     with get_conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT DEFAULT '', account TEXT DEFAULT '',
-            msg_type TEXT DEFAULT 'comment', author TEXT DEFAULT '',
-            content TEXT NOT NULL, source_content TEXT DEFAULT '',
-            intent TEXT DEFAULT 'low', status TEXT DEFAULT 'new',
-            reply_text TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            handled_at DATETIME, contact_id INTEGER,
-            external_user_id TEXT DEFAULT '', external_message_id TEXT DEFAULT '',
-            direction TEXT DEFAULT 'inbound', delivery_status TEXT DEFAULT 'received',
-            auto_reply_status TEXT DEFAULT '', matched_rule_id INTEGER)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS message_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, content TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS dm_contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL DEFAULT '', account TEXT NOT NULL DEFAULT '',
-            external_user_id TEXT NOT NULL DEFAULT '', nickname TEXT DEFAULT '',
-            segment TEXT DEFAULT 'unknown', intent TEXT DEFAULT 'low',
-            stage TEXT DEFAULT 'new', source_content TEXT DEFAULT '',
-            contact_info TEXT DEFAULT '', traveler_count INTEGER DEFAULT 0,
-            origin TEXT DEFAULT '', travel_date TEXT DEFAULT '', notes TEXT DEFAULT '',
-            company_name TEXT DEFAULT '', budget TEXT DEFAULT '',
-            tags TEXT DEFAULT '', auto_reply_enabled INTEGER DEFAULT 1,
-            first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_inbound_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(platform, account, external_user_id))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS dm_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, enabled INTEGER DEFAULT 1,
-            platform TEXT DEFAULT '', segment TEXT DEFAULT '',
-            keywords TEXT DEFAULT '', match_type TEXT DEFAULT 'any',
-            priority INTEGER DEFAULT 10, reply_template TEXT NOT NULL,
-            cooldown_minutes INTEGER DEFAULT 0, once_per_contact INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS dm_settings (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            enabled INTEGER DEFAULT 1, working_start TEXT DEFAULT '08:00',
-            working_end TEXT DEFAULT '23:00', weekdays TEXT DEFAULT '1,2,3,4,5,6,7',
-            cooldown_minutes INTEGER DEFAULT 30, max_per_day INTEGER DEFAULT 3,
-            reply_comments INTEGER DEFAULT 0, ai_fallback INTEGER DEFAULT 0,
-            outbound_webhook TEXT DEFAULT '', inbound_secret TEXT DEFAULT '',
-            stop_keywords TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS dm_reply_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            contact_id INTEGER, inbound_message_id INTEGER,
-            outbound_message_id INTEGER, rule_id INTEGER,
-            status TEXT DEFAULT '', reason TEXT DEFAULT '', reply_text TEXT DEFAULT '',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS dm_meta (
-            key TEXT PRIMARY KEY, value TEXT DEFAULT '')""")
-
-        for name, ddl in (
-            ("contact_id", "INTEGER"), ("external_user_id", "TEXT DEFAULT ''"),
-            ("external_message_id", "TEXT DEFAULT ''"), ("direction", "TEXT DEFAULT 'inbound'"),
-            ("delivery_status", "TEXT DEFAULT 'received'"), ("auto_reply_status", "TEXT DEFAULT ''"),
-            ("matched_rule_id", "INTEGER"),
-        ):
-            _ensure_column(c, "messages", name, ddl)
-        for name, ddl in (
-            ("segment", "TEXT DEFAULT ''"), ("category", "TEXT DEFAULT ''"),
-            ("platform", "TEXT DEFAULT ''"),
-        ):
-            _ensure_column(c, "message_templates", name, ddl)
-        for name, ddl in (
-            ("company_name", "TEXT DEFAULT ''"), ("budget", "TEXT DEFAULT ''"),
-        ):
-            _ensure_column(c, "dm_contacts", name, ddl)
-
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_intent ON messages(intent)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_external ON messages(platform, account, external_message_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_dm_contacts_last ON dm_contacts(last_message_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_dm_contacts_segment ON dm_contacts(segment)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_dm_logs_contact ON dm_reply_logs(contact_id)")
-
-        _seed_defaults(c)
+        apply_migrations(c, "dm_ops", {
+            1: _initialize_schema,
+            2: _migrate_message_counters,
+            3: _migrate_ai_reply,
+            4: _migrate_perf_indexes,
+        })
         _backfill_contacts(c)
 
 
@@ -247,6 +343,24 @@ def _as_bool(value, default=True) -> bool:
 
 def _split_keywords(value: str) -> list[str]:
     return [x.strip().lower() for x in re.split(r"[,，、;；\n|]+", value or "") if x.strip()]
+
+
+AI_SAFE_PATTERNS = (
+    (re.compile(r"1[3-9]\d{9}"), "手机号"),
+    (re.compile(r"(?:微信|v信|vx|薇信|wx)\s*[:：]?\s*[a-zA-Z][a-zA-Z0-9_-]{4,}"), "微信号"),
+    (re.compile(r"(?:微信|v信|vx|薇信|wx)\s*[:：]?\s*\d{5,}"), "微信号"),
+    (re.compile(r"(?:加微|微我|私我|加v)\b"), "引导加联系方式"),
+    (re.compile(r"(?:保证|承诺|包治|根治|绝对|100%|全网最低|最低价|仅此一天|限时抢购|名额有限|先到先得)"), "绝对化承诺"),
+)
+
+
+def _ai_text_issues(text: str) -> list[str]:
+    """检查 AI 生成的回复是否疑似编造联系方式或做出绝对化承诺。"""
+    issues = []
+    for pattern, label in AI_SAFE_PATTERNS:
+        if pattern.search(text or ""):
+            issues.append(label)
+    return issues
 
 
 _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
@@ -434,6 +548,7 @@ def _get_settings(c) -> dict:
     data = dict(row)
     for key in ("enabled", "reply_comments", "ai_fallback"):
         data[key] = int(data.get(key) or 0)
+    data["ai_max_per_day"] = int(data.get("ai_max_per_day") or 0)
     return data
 
 
@@ -554,11 +669,12 @@ def _auto_state(c, contact: dict, settings: dict, content: str, msg_type: str,
 
 
 def _log_reply(c, contact_id: int, inbound_id: int, outbound_id: int | None,
-               rule_id: int | None, status: str, reason: str, text: str):
+               rule_id: int | None, status: str, reason: str, text: str,
+               ai_used: int = 0):
     c.execute("""INSERT INTO dm_reply_logs
-        (contact_id,inbound_message_id,outbound_message_id,rule_id,status,reason,reply_text,created_at)
-        VALUES (?,?,?,?,?,?,?,?)""",
-        (contact_id, inbound_id, outbound_id, rule_id, status, reason, text, _now()))
+        (contact_id,inbound_message_id,outbound_message_id,rule_id,status,reason,reply_text,ai_used,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (contact_id, inbound_id, outbound_id, rule_id, status, reason, text, ai_used, _now()))
 
 
 def _insert_outbound(c, contact: dict, text: str, status: str, rule_id: int | None,
@@ -576,21 +692,57 @@ def _insert_outbound(c, contact: dict, text: str, status: str, rule_id: int | No
     return out_id
 
 
-def _build_ai_reply(c, contact: dict, content: str, platform: str) -> str:
+def _build_ai_reply(c, contact: dict, content: str, platform: str,
+                    instructions: str = "") -> str:
     history = c.execute("""SELECT direction,content FROM messages WHERE contact_id=?
         ORDER BY id DESC LIMIT 4""", (contact["id"],)).fetchall()
     history_text = "\n".join(
         ("客户：" if row["direction"] == "inbound" else "客服：") + str(row["content"])
         for row in reversed(history)
     )
+    known = []
+    for label, value in (
+        ("客户称呼", contact.get("nickname")),
+        ("出行人数", contact.get("traveler_count")),
+        ("出发地", contact.get("origin")),
+        ("意向日期", contact.get("travel_date")),
+        ("预算", contact.get("budget")),
+        ("公司/单位", contact.get("company_name")),
+        ("联系方式", contact.get("contact_info")),
+    ):
+        if value:
+            known.append(f"{label}：{value}")
+    if contact.get("source_content"):
+        known.append(f"客户关注内容：{contact['source_content']}")
+    known_text = "\n".join(known) or "暂未掌握其他线索信息"
+    extra = ""
+    if instructions and instructions.strip():
+        extra = "\n回复口径/额外要求：" + instructions.strip()
     prompt = (
         "你是品牌私信客服。请用中文回复最后一条客户私信，60-100字。" + "\n"
         f"平台：{platform}；平台语气：{_reply_style(platform)}。\n"
-        "要求：先回应客户关注点；只追问1-2个关键信息，例如规格、预算、时间、使用场景或联系方式；不要编造价格、库存、优惠、效果、资质或服务承诺；不要硬推。只输出回复正文。" + "\n"
+        "已知客户线索：\n" + known_text + "\n"
+        "要求：先回应客户关注点；已知信息不要重复提问；只追问1-2个仍缺少的关键信息"
+        "（例如人数、出发地、日期、预算或联系方式）；不要编造价格、库存、优惠、效果、"
+        "资质或服务承诺；不要硬推。只输出回复正文。" + extra + "\n"
         f"对话记录：\n{history_text}\n"
     )
-    text = ai_content._call_llm(prompt, max_tokens=500)
+    text = ai_content._call_with_retry(prompt, max_tokens=500, timeout=30)
     return _clean(text, 260)
+
+
+def _ai_quota_ok(c, settings: dict) -> tuple[bool, str]:
+    cap = int(settings.get("ai_max_per_day") or 0)
+    if not cap:
+        return True, ""
+    today_start = datetime.now().strftime("%Y-%m-%d 00:00:00")
+    tomorrow_start = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    used = c.execute("""SELECT COUNT(*) FROM dm_reply_logs
+        WHERE ai_used=1 AND created_at>=? AND created_at<?""",
+        (today_start, tomorrow_start)).fetchone()[0]
+    if used >= cap:
+        return False, f"今日 AI 自动回复已达 {cap} 条上限"
+    return True, ""
 
 
 def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
@@ -611,12 +763,43 @@ def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
                 "rule_name": rule["name"] if rule else "",
                 "outbound_message_id": None, "send": False}
 
+    use_ai = bool(rule and rule.get("reply_mode") == "ai") or (
+        not rule and bool(settings.get("ai_fallback")))
+    if use_ai:
+        allowed, quota_reason = _ai_quota_ok(c, settings)
+        if not allowed:
+            _log_reply(c, contact["id"], inbound["id"], None,
+                       rule["id"] if rule else None, "skipped", quota_reason, "")
+            return {"status": "skipped", "reason": quota_reason, "reply": "",
+                    "rule_id": rule["id"] if rule else None,
+                    "rule_name": rule["name"] if rule else "",
+                    "outbound_message_id": None, "send": False}
+
     text = ""
-    if rule:
+    ai_used = 0
+    if rule and rule.get("reply_mode") == "ai":
+        try:
+            text = _build_ai_reply(c, contact, content, platform,
+                                   instructions=rule.get("ai_prompt") or "")
+            ai_used = 1
+        except Exception as exc:
+            fallback_template = (rule.get("reply_template") or "").strip()
+            if fallback_template:
+                text = _render_reply(fallback_template, contact, platform)
+                reason = "AI 生成失败，已回退固定模板"
+            else:
+                reason = "AI 生成失败：" + str(exc)[:120]
+                _log_reply(c, contact["id"], inbound["id"], None, rule["id"],
+                           "skipped", reason, "")
+                return {"status": "skipped", "reason": reason, "reply": "",
+                        "rule_id": rule["id"], "rule_name": rule["name"],
+                        "outbound_message_id": None, "send": False}
+    elif rule:
         text = _render_reply(rule["reply_template"], contact, platform)
     elif settings.get("ai_fallback"):
         try:
             text = _build_ai_reply(c, contact, content, platform)
+            ai_used = 1
         except Exception as exc:
             reason = "AI 兜底生成失败：" + str(exc)[:120]
             _log_reply(c, contact["id"], inbound["id"], None, None, "skipped", reason, "")
@@ -637,13 +820,32 @@ def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
                 "rule_name": rule["name"] if rule else "",
                 "outbound_message_id": None, "send": False}
 
+    if ai_used:
+        issues = _ai_text_issues(text)
+        if issues:
+            reason = "AI 回复疑似含敏感内容（" + "、".join(issues) + "），已转人工"
+            out_id = _insert_outbound(c, contact, text, "auto",
+                                      rule["id"] if rule else None, auto=True)
+            c.execute("UPDATE messages SET delivery_status='ready', auto_reply_status='ready' WHERE id=?", (out_id,))
+            c.execute("UPDATE messages SET auto_reply_status=? WHERE id=?",
+                      ("ready", inbound["id"]))
+            row = c.execute("SELECT tags FROM dm_contacts WHERE id=?", (contact["id"],)).fetchone()
+            c.execute("UPDATE dm_contacts SET tags=?,updated_at=? WHERE id=?",
+                      (_merge_tags(row["tags"] if row else "", "需人工"), _now(), contact["id"]))
+            _log_reply(c, contact["id"], inbound["id"], out_id,
+                       rule["id"] if rule else None, "ready", reason, text, ai_used=1)
+            return {"status": "ready", "reason": reason, "reply": text,
+                    "rule_id": rule["id"] if rule else None,
+                    "rule_name": rule["name"] if rule else "AI 兜底",
+                    "outbound_message_id": out_id, "send": False}
+
     out_id = _insert_outbound(c, contact, text, "auto", rule["id"] if rule else None, auto=True)
     if state == "draft":
         c.execute("UPDATE messages SET delivery_status='ready', auto_reply_status='ready' WHERE id=?", (out_id,))
     c.execute("UPDATE messages SET auto_reply_status=? WHERE id=?",
               ("ready" if state == "draft" else "pending", inbound["id"]))
     _log_reply(c, contact["id"], inbound["id"], out_id, rule["id"] if rule else None,
-               "ready" if state == "draft" else "pending", reason, text)
+               "ready" if state == "draft" else "pending", reason, text, ai_used=ai_used)
     return {"status": "ready" if state == "draft" else "pending", "reason": reason,
             "reply": text, "rule_id": rule["id"] if rule else None,
             "rule_name": rule["name"] if rule else "AI 兜底",
@@ -981,14 +1183,9 @@ def list_conversations():
     stage = request.args.get("stage")
     status = request.args.get("status")
     q = _clean(request.args.get("q"), 120)
-    sql = """SELECT c.*, m.content AS last_content, m.direction AS last_direction,
+    sql = """SELECT c.*, m.id AS last_message_id, m.content AS last_content, m.direction AS last_direction,
         m.created_at AS last_message_time, m.delivery_status AS last_delivery_status,
-        CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply,
-        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='inbound'
-            AND x.status='new') AS unread_count,
-        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id) AS message_count,
-        (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='outbound'
-            AND x.delivery_status='ready') AS pending_delivery
+        CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
         WHERE 1=1"""
     args = []
@@ -1000,8 +1197,7 @@ def list_conversations():
             sql += f" AND {field}=?"
             args.append(value)
     if status == "pending":
-        sql += """ AND EXISTS (SELECT 1 FROM messages x WHERE x.contact_id=c.id
-            AND x.direction='inbound' AND x.status='new')"""
+        sql += " AND c.unread_count > 0"
     elif status == "high":
         sql += " AND c.intent='high'"
     if q:
@@ -1017,15 +1213,19 @@ def list_conversations():
 
 
 def conversation_detail(cid: int):
+    try:
+        after = max(0, int(request.args.get("after") or 0))
+    except (TypeError, ValueError):
+        after = 0
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = _decorate_contact(dict(row))
         messages = [dict(r) for r in c.execute("""SELECT * FROM (
-            SELECT * FROM messages WHERE contact_id=?
+            SELECT * FROM messages WHERE contact_id=? AND id>?
             ORDER BY datetime(created_at) DESC, id DESC LIMIT 200
-        ) ORDER BY datetime(created_at) ASC, id ASC""", (cid,)).fetchall()]
+        ) ORDER BY datetime(created_at) ASC, id ASC""", (cid, after)).fetchall()]
         contact["needs_reply"] = bool(
             messages and messages[-1].get("direction") == "inbound"
             and messages[-1].get("status") in ("new", "read")
@@ -1063,7 +1263,12 @@ def simulate_inbound():
         "segment": segment, "intent": intent, "platform": platform,
         **extract_lead_fields(content),
     }
-    reply = _render_reply(rule["reply_template"], contact, platform) if rule else ""
+    if rule and rule.get("reply_mode") == "ai":
+        reply = "（AI 智能回复：命中该规则后按口径调用 AI 生成）"
+    elif rule:
+        reply = _render_reply(rule["reply_template"], contact, platform)
+    else:
+        reply = ""
     return jsonify({"code": 200, "data": {
         "platform": platform, "segment": segment, "segment_label": SEGMENTS.get(segment),
         "intent": intent, "rule": dict(rule) if rule else None,
@@ -1084,12 +1289,18 @@ def list_rules():
 def save_rule(rule_id: int | None = None):
     data = request.get_json(silent=True) or {}
     name = _clean(data.get("name"), 100)
-    template = _clean(data.get("reply_template"), 2000)
-    if not name or not template:
-        return jsonify({"code": 400, "msg": "规则名称和回复内容不能为空"}), 400
     segment = _clean(data.get("segment"), 20)
-    if segment not in ("", "silver", "family", "team"):
+    if segment in ("silver", "family", "team"):
         segment = ""
+    elif segment not in SEGMENTS:
+        segment = ""
+    reply_mode = "ai" if data.get("reply_mode") == "ai" else "template"
+    ai_prompt = _clean(data.get("ai_prompt"), 1000)
+    template = _clean(data.get("reply_template"), 2000)
+    if not name:
+        return jsonify({"code": 400, "msg": "规则名称不能为空"}), 400
+    if reply_mode == "template" and not template:
+        return jsonify({"code": 400, "msg": "固定模板回复需要填写回复内容"}), 400
     match_type = "all" if data.get("match_type") == "all" else "any"
     try:
         priority = max(0, min(int(data.get("priority") or 10), 9999))
@@ -1098,7 +1309,8 @@ def save_rule(rule_id: int | None = None):
         return jsonify({"code": 400, "msg": "优先级或冷却时间格式不正确"}), 400
     values = (
         name, 1 if data.get("enabled", True) else 0, _clean(data.get("platform"), 40),
-        segment, _clean(data.get("keywords"), 1000), match_type, priority, template,
+        segment, _clean(data.get("keywords"), 1000), match_type, priority,
+        reply_mode, ai_prompt, template,
         cooldown, 1 if data.get("once_per_contact") else 0, _now(),
     )
     with get_conn() as c:
@@ -1107,14 +1319,16 @@ def save_rule(rule_id: int | None = None):
             if not exists:
                 return jsonify({"code": 404, "msg": "rule not found"}), 404
             c.execute("""UPDATE dm_rules SET name=?,enabled=?,platform=?,segment=?,keywords=?,
-                match_type=?,priority=?,reply_template=?,cooldown_minutes=?,once_per_contact=?,
+                match_type=?,priority=?,reply_mode=?,ai_prompt=?,reply_template=?,cooldown_minutes=?,once_per_contact=?,
                 updated_at=? WHERE id=?""", values + (rule_id,))
+            saved_id = rule_id
         else:
-            c.execute("""INSERT INTO dm_rules
-                (name,enabled,platform,segment,keywords,match_type,priority,reply_template,
-                 cooldown_minutes,once_per_contact,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", values)
-    return jsonify({"code": 200, "msg": "ok"})
+            cur = c.execute("""INSERT INTO dm_rules
+                (name,enabled,platform,segment,keywords,match_type,priority,reply_mode,
+                 ai_prompt,reply_template,cooldown_minutes,once_per_contact,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", values)
+            saved_id = cur.lastrowid
+    return jsonify({"code": 200, "data": {"id": saved_id}, "msg": "ok"})
 
 
 def delete_rule(rule_id: int):
@@ -1143,8 +1357,9 @@ def update_settings():
         try:
             updated["cooldown_minutes"] = max(0, min(int(updated.get("cooldown_minutes") or 0), 1440))
             updated["max_per_day"] = max(0, min(int(updated.get("max_per_day") or 0), 100))
+            updated["ai_max_per_day"] = max(0, min(int(updated.get("ai_max_per_day") or 0), 500))
         except (TypeError, ValueError):
-            return jsonify({"code": 400, "msg": "冷却时间或每日上限格式不正确"}), 400
+            return jsonify({"code": 400, "msg": "冷却时间、每日上限或 AI 每日上限格式不正确"}), 400
         for key in ("working_start", "working_end"):
             try:
                 datetime.strptime(str(updated.get(key)), "%H:%M")
@@ -1158,12 +1373,12 @@ def update_settings():
         updated["inbound_secret"] = _clean(updated.get("inbound_secret"), 200)
         updated["stop_keywords"] = _clean(updated.get("stop_keywords"), 500)
         c.execute("""UPDATE dm_settings SET enabled=?,working_start=?,working_end=?,weekdays=?,
-            cooldown_minutes=?,max_per_day=?,reply_comments=?,ai_fallback=?,outbound_webhook=?,
-            inbound_secret=?,stop_keywords=?,updated_at=? WHERE id=1""",
+            cooldown_minutes=?,max_per_day=?,reply_comments=?,ai_fallback=?,ai_max_per_day=?,
+            outbound_webhook=?,inbound_secret=?,stop_keywords=?,updated_at=? WHERE id=1""",
             (updated["enabled"], updated["working_start"], updated["working_end"], updated["weekdays"],
              updated["cooldown_minutes"], updated["max_per_day"], updated["reply_comments"],
-             updated["ai_fallback"], updated["outbound_webhook"], updated["inbound_secret"],
-             updated["stop_keywords"], _now()))
+             updated["ai_fallback"], updated["ai_max_per_day"], updated["outbound_webhook"],
+             updated["inbound_secret"], updated["stop_keywords"], _now()))
     return jsonify({"code": 200, "data": _public_settings(updated), "msg": "ok"})
 
 

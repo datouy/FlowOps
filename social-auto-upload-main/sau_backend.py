@@ -1,7 +1,6 @@
 import asyncio
 import os
 os.environ.setdefault("FLOWOPS_BACKEND", "1")
-import sqlite3
 import threading
 import time
 import uuid
@@ -9,20 +8,25 @@ from pathlib import Path
 from queue import Queue
 from flask_cors import CORS
 from myUtils.auth import check_cookie
-from flask import Flask, request, jsonify, Response, render_template, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.utils import secure_filename
 from publish_jobs import enqueue_job, start_patrol, run_patrol_once, latest_account_status
 import verify_codes
 from travel_ops import bp as travel_ops_bp
 from conf import BASE_DIR
+from db_utils import connect as db_connect
+import runtime_config
+from app_logging import logger, setup_request_logging
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
 from myUtils.postVideo import (post_video_tencent, post_video_DouYin, post_video_ks,
                                post_video_xhs, post_video_weibo, post_video_baijiahao)
 
+runtime_config.validate_server_config()
 
 active_queues = {}
 app = Flask(__name__)
+setup_request_logging(app)
 app.register_blueprint(travel_ops_bp)
 import schedule_ops
 schedule_ops.register(app)
@@ -53,11 +57,32 @@ schedule_suggest.register(app)
 import material_ops
 material_ops.register(app)
 
-#允许所有来源跨域访问
-CORS(app)
+# 默认只允许本机前端跨域，避免任意站点在浏览器里调用本机接口
+CORS(
+    app,
+    resources={r"/*": {"origins": runtime_config.CORS_ORIGINS}},
+    allow_headers=["Content-Type", "Authorization", "X-YunCe-Token"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
 
 # 限制上传文件大小为160MB
 app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024
+
+
+@app.before_request
+def _guard_access_token():
+    """可选访问令牌：仅在设置了 YUNCE_ACCESS_TOKEN 时生效。"""
+    if runtime_config.access_allowed(
+        request.method, request.path, request.headers, request.args
+    ):
+        return None
+    return jsonify({"code": 401, "msg": "未授权：缺少或错误的访问令牌", "data": None}), 401
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """启动探针：不返回任何业务数据，便于 start.bat 判断服务是否就绪。"""
+    return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
 
 # 获取当前目录（假设 index.html 和 assets 在这里）
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,7 +124,7 @@ def upload_file():
     try:
         # 保存文件到指定位置
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("upload uuid={}", uuid_v1)
         safe_name = secure_filename(file.filename)
         if not safe_name:
             return jsonify({"code": 400, "data": None, "msg": "Invalid filename"}), 400
@@ -157,7 +182,7 @@ def upload_save():
     try:
         # 生成 UUID v1
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("chunk upload uuid={}", uuid_v1)
 
         # 构造文件名和路径
         final_filename = f"{uuid_v1}_{filename}"
@@ -168,14 +193,14 @@ def upload_save():
         file_md5 = material_ops.file_md5(filepath)
         duplicate = material_ops.duplicate_count(file_md5) > 0
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                 INSERT INTO file_records (filename, filesize, file_path, md5, tags)
             VALUES (?, ?, ?, ?, ?)
                                 ''', (filename, round(float(os.path.getsize(filepath)) / (1024 * 1024),2), final_filename, file_md5, ''))
             conn.commit()
-            print("✅ 上传文件已记录")
+            logger.info("上传文件已记录")
 
         return jsonify({
             "code": 200,
@@ -189,7 +214,7 @@ def upload_save():
         }), 200
 
     except Exception as e:
-        print(f"Upload failed: {e}")
+        logger.exception("Upload failed: {}", e)
         return jsonify({
             "code": 500,
             "msg": f"upload failed: {e}",
@@ -200,8 +225,7 @@ def upload_save():
 def get_all_files():
     try:
         # 使用 with 自动管理数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row  # 允许通过列名访问结果
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
 
             # 查询所有记录
@@ -236,7 +260,7 @@ def get_all_files():
                 "msg": "success",
                 "data": data
             }), 200
-    except Exception as e:
+    except Exception:
         return jsonify({
             "code": 500,
             "msg": str("get file failed!"),
@@ -248,17 +272,16 @@ def get_all_files():
 def getAccounts():
     """快速获取所有账号信息，不进行cookie验证"""
     try:
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             cursor.execute('''
             SELECT * FROM user_info''')
             rows = cursor.fetchall()
             rows_list = [list(row) for row in rows]
 
-            print("\n📋 当前数据表内容（快速获取）：")
+            logger.debug("当前数据表内容（快速获取）：")
             for row in rows:
-                print(row)
+                logger.debug("{}", row)
 
             return jsonify(
                 {
@@ -267,7 +290,7 @@ def getAccounts():
                     "data": rows_list
                 }), 200
     except Exception as e:
-        print(f"获取账号列表时出错: {str(e)}")
+        logger.exception("获取账号列表时出错: {}", e)
         return jsonify({
             "code": 500,
             "msg": f"获取账号列表失败: {str(e)}",
@@ -277,15 +300,15 @@ def getAccounts():
 
 @app.route("/getValidAccounts",methods=['GET'])
 async def getValidAccounts():
-    with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+    with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
         cursor = conn.cursor()
         cursor.execute('''
         SELECT * FROM user_info''')
         rows = cursor.fetchall()
         rows_list = [list(row) for row in rows]
-        print("\n📋 当前数据表内容：")
+        logger.debug("当前数据表内容：")
         for row in rows:
-            print(row)
+            logger.debug("{}", row)
         for row in rows_list:
             flag = await check_cookie(row[1],row[2])
             if not flag:
@@ -296,9 +319,9 @@ async def getValidAccounts():
                 WHERE id = ?
                 ''', (0,row[0]))
                 conn.commit()
-                print("✅ 用户状态已更新")
+                logger.info("用户状态已更新")
         for row in rows:
-            print(row)
+            logger.debug("{}", row)
         return jsonify(
                         {
                             "code": 200,
@@ -319,8 +342,7 @@ def delete_file():
 
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
 
             # 查询要删除的记录
@@ -341,12 +363,12 @@ def delete_file():
             if file_path.exists():
                 try:
                     file_path.unlink()  # 删除文件
-                    print(f"✅ 实际文件已删除: {file_path}")
+                    logger.info("实际文件已删除: {}", file_path)
                 except Exception as e:
-                    print(f"⚠️ 删除实际文件失败: {e}")
+                    logger.warning("删除实际文件失败: {}", e)
                     # 即使删除文件失败，也要继续删除数据库记录，避免数据不一致
             else:
-                print(f"⚠️ 实际文件不存在: {file_path}")
+                logger.warning("实际文件不存在: {}", file_path)
 
             # 删除数据库记录
             cursor.execute("DELETE FROM file_records WHERE id = ?", (file_id,))
@@ -361,7 +383,7 @@ def delete_file():
             }
         }), 200
 
-    except Exception as e:
+    except Exception:
         return jsonify({
             "code": 500,
             "msg": str("delete failed!"),
@@ -383,8 +405,7 @@ def delete_account():
 
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
 
             # 查询要删除的记录
@@ -406,9 +427,9 @@ def delete_account():
                 if cookie_file_path.exists():
                     try:
                         cookie_file_path.unlink()
-                        print(f"✅ Cookie文件已删除: {cookie_file_path}")
+                        logger.info("Cookie 文件已删除: {}", cookie_file_path)
                     except Exception as e:
-                        print(f"⚠️ 删除Cookie文件失败: {e}")
+                        logger.warning("删除 Cookie 文件失败: {}", e)
 
             # 删除数据库记录
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
@@ -450,8 +471,7 @@ def _verify_request_payload(item):
     account_file = os.path.basename(str(data.get('account_file') or ''))
     if account_file:
         try:
-            conn = sqlite3.connect(Path(BASE_DIR / "db" / "database.db"))
-            conn.row_factory = sqlite3.Row
+            conn = db_connect(Path(BASE_DIR / "db" / "database.db"))
             row = conn.execute('SELECT userName, type FROM user_info WHERE filePath=?', (account_file,)).fetchone()
             conn.close()
             if row:
@@ -538,7 +558,8 @@ def trigger_patrol():
         try:
             run_patrol_once()
         except Exception:
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
     _t.Thread(target=_run, daemon=True).start()
     return jsonify({'code': 200, 'msg': 'patrol started in background'}), 200
 
@@ -628,7 +649,7 @@ def login():
     active_queues[id] = status_queue
 
     def on_close():
-        print(f"清理队列: {id}")
+        logger.debug("清理队列: {}", id)
         del active_queues[id]
     # 启动异步任务线程
     thread = threading.Thread(
@@ -680,8 +701,8 @@ def postVideo():
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
 
     # 打印获取到的数据（仅作为示例）
-    print("File List:", file_list)
-    print("Account List:", account_list)
+    logger.debug("File List: {}", file_list)
+    logger.debug("Account List: {}", account_list)
 
     check_result = compliance.check_content(data)
     if not check_result["passed"]:
@@ -716,8 +737,7 @@ def updateUserinfo():
     userName = data.get('userName')
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
 
             # 更新数据库记录
@@ -735,7 +755,7 @@ def updateUserinfo():
             "data": None
         }), 200
 
-    except Exception as e:
+    except Exception:
         return jsonify({
             "code": 500,
             "msg": str("update failed!"),
@@ -767,8 +787,8 @@ def postVideoBatch():
         daily_times = data.get('dailyTimes')
         start_days = data.get('startDays')
         # 打印获取到的数据（仅作为示例）
-        print("File List:", file_list)
-        print("Account List:", account_list)
+        logger.debug("File List: {}", file_list)
+        logger.debug("Account List: {}", account_list)
         match type:
             case 1:
                 post_video_xhs(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
@@ -832,8 +852,7 @@ def upload_cookie():
             }), 400
 
         # 从数据库获取账号的文件路径
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.row_factory = sqlite3.Row
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT filePath FROM user_info WHERE id = ?', (account_id,))
             result = cursor.fetchone()
@@ -861,7 +880,7 @@ def upload_cookie():
         }), 200
 
     except Exception as e:
-        print(f"上传Cookie文件时出错: {str(e)}")
+        logger.exception("上传 Cookie 文件时出错: {}", e)
         return jsonify({
             "code": 500,
             "msg": f"上传Cookie文件失败: {str(e)}",
@@ -907,7 +926,7 @@ def download_cookie():
         )
 
     except Exception as e:
-        print(f"下载Cookie文件时出错: {str(e)}")
+        logger.exception("下载 Cookie 文件时出错: {}", e)
         return jsonify({
             "code": 500,
             "msg": f"下载Cookie文件失败: {str(e)}",
@@ -970,4 +989,9 @@ xiaohongshu_dm_sync.start_background()
 channels_dm_sync.start_background()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0' ,port=5409)
+    if not runtime_config.is_loopback_host(runtime_config.HOST):
+        logger.warning(
+            "后端正在监听 {}，远程访问已开启且要求 X-YunCe-Token。",
+            runtime_config.HOST,
+        )
+    app.run(host=runtime_config.HOST, port=runtime_config.PORT, threaded=True)

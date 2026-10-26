@@ -161,6 +161,7 @@ import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'
+import { API_BASE, withToken } from '@/config'
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -412,8 +413,8 @@ const handleDelete = (row) => {
 // 下载Cookie文件
 const handleDownloadCookie = (row) => {
   // 从后端获取Cookie文件
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
-  const downloadUrl = `${baseUrl}/downloadCookie?filePath=${encodeURIComponent(row.filePath)}`
+  const baseUrl = API_BASE
+  const downloadUrl = withToken(`${baseUrl}/downloadCookie?filePath=${encodeURIComponent(row.filePath)}`)
 
   // 创建一个隐藏的链接来触发下载
   const link = document.createElement('a')
@@ -525,9 +526,9 @@ const connectSSE = (platform, name, accountId = null) => {
   const type = platformMeta[platform]?.type || 1
 
   // 创建SSE连接
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
+  const baseUrl = API_BASE
   const accountParam = accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''
-  const url = `${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}${accountParam}`
+  const url = withToken(`${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}${accountParam}`)
 
   eventSource = new EventSource(url)
 

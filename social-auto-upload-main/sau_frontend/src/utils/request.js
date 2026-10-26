@@ -1,9 +1,10 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import { API_BASE, authHeaders } from '@/config'
 
 // 创建axios实例
 const request = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409',
+  baseURL: API_BASE,
   headers: {
     'Content-Type': 'application/json'
   }
@@ -12,7 +13,8 @@ const request = axios.create({
 // 请求拦截器
 request.interceptors.request.use(
   (config) => {
-    // 可以在这里添加token等认证信息
+    // 可选访问令牌（后端设置 YUNCE_ACCESS_TOKEN 时生效）
+    Object.assign(config.headers, authHeaders())
     const token = localStorage.getItem('token')
     if (token) {
       config.headers.Authorization = `Bearer ${token}`

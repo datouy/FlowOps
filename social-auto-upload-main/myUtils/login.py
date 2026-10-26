@@ -1,14 +1,15 @@
 import asyncio
-import sqlite3
 import time
 
 from playwright.async_api import async_playwright
+from loguru import logger
 
 from myUtils.auth import check_cookie
 from utils.base_social_media import set_init_script
 import uuid
 from pathlib import Path
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from db_utils import connect as db_connect
 
 # 统一获取浏览器启动配置（防风控+引入本地浏览器）
 def get_browser_options():
@@ -48,7 +49,7 @@ async def douyin_cookie_gen(id,status_queue):
         img_locator = page.get_by_role("img", name="二维码")
         # 获取 src 属性值
         src = await img_locator.get_attribute("src")
-        print("✅ 图片地址:", src)
+        logger.info("抖音登录二维码地址: {}", src)
         status_queue.put(src)
         # 监听页面的 'framenavigated' 事件，只关注主框架的变化
         page.on('framenavigated',
@@ -56,16 +57,16 @@ async def douyin_cookie_gen(id,status_queue):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            logger.info("抖音登录页面跳转成功")
         except asyncio.TimeoutError:
-            print("监听页面跳转超时")
+            logger.warning("抖音登录页面跳转超时")
             await page.close()
             await context.close()
             await browser.close()
             status_queue.put("500")
             return None
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("登录凭证文件名: {}", uuid_v1)
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
@@ -80,14 +81,14 @@ async def douyin_cookie_gen(id,status_queue):
         await page.close()
         await context.close()
         await browser.close()
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                 INSERT INTO user_info (type, filePath, userName, status)
                                 VALUES (?, ?, ?, ?)
                                 ''', (3, f"{uuid_v1}.json", id, 1))
             conn.commit()
-            print("✅ 用户状态已记录")
+            logger.info("抖音账号状态已记录")
         status_queue.put("200")
 
 
@@ -126,10 +127,10 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
             src = await img_locator.evaluate("el => el.src", timeout=20000)
             if not src:
                 raise RuntimeError("QR code src is empty")
-            print("QR code URL:", src)
+            logger.info("视频号登录二维码地址: {}", src)
             status_queue.put(src)
         except Exception as exc:
-            print(f"Failed to get WeChat Channels QR code: {exc}")
+            logger.error("获取视频号登录二维码失败: {}", exc)
             status_queue.put("500")
             await page.close()
             await context.close()
@@ -139,16 +140,16 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            logger.info("视频号登录页面跳转成功")
         except asyncio.TimeoutError:
             status_queue.put("500")
-            print("监听页面跳转超时")
+            logger.warning("视频号登录页面跳转超时")
             await page.close()
             await context.close()
             await browser.close()
             return None
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("登录凭证文件名: {}", uuid_v1)
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
@@ -164,7 +165,7 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             if account_id:
                 cursor.execute('''
@@ -177,7 +178,7 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
                     VALUES (?, ?, ?, ?)
                     ''', (2, f"{uuid_v1}.json", id, 1))
             conn.commit()
-            print("✅ 用户状态已记录")
+            logger.info("视频号账号状态已记录")
         status_queue.put("200")
 
 # 快手登录
@@ -210,7 +211,7 @@ async def get_ks_cookie(id,status_queue):
         # 获取 src 属性值
         src = await img_locator.get_attribute("src")
         original_url = page.url
-        print("✅ 图片地址:", src)
+        logger.info("快手登录二维码地址: {}", src)
         status_queue.put(src)
         # 监听页面的 'framenavigated' 事件，只关注主框架的变化
         page.on('framenavigated',
@@ -219,16 +220,16 @@ async def get_ks_cookie(id,status_queue):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            logger.info("快手登录页面跳转成功")
         except asyncio.TimeoutError:
             status_queue.put("500")
-            print("监听页面跳转超时")
+            logger.warning("快手登录页面跳转超时")
             await page.close()
             await context.close()
             await browser.close()
             return None
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("登录凭证文件名: {}", uuid_v1)
         # 确保cookiesFile目录存在
         cookies_dir = Path(BASE_DIR / "cookiesFile")
         cookies_dir.mkdir(exist_ok=True)
@@ -244,14 +245,14 @@ async def get_ks_cookie(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                         INSERT INTO user_info (type, filePath, userName, status)
                                         VALUES (?, ?, ?, ?)
                                         ''', (4, f"{uuid_v1}.json", id, 1))
             conn.commit()
-            print("✅ 用户状态已记录")
+            logger.info("快手账号状态已记录")
         status_queue.put("200")
 
 # 小红书登录
@@ -304,7 +305,7 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
             src = await qr.get_attribute("src")
             if not src:
                 raise RuntimeError("未获取到小红书登录二维码")
-            print("✅ 图片地址:", src[:80])
+            logger.info("小红书登录二维码地址: {}", src[:80])
             status_queue.put(src)
 
             deadline = time.monotonic() + 200
@@ -341,12 +342,12 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
                 raise RuntimeError("小红书创作服务平台登录态未建立，请重新扫码")
 
             uuid_v1 = uuid.uuid1()
-            print(f"UUID v1: {uuid_v1}")
+            logger.debug("登录凭证文件名: {}", uuid_v1)
             cookies_dir = Path(BASE_DIR / "cookiesFile")
             cookies_dir.mkdir(exist_ok=True)
             await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
 
-            with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
                 if account_id:
                     cursor.execute('''
@@ -359,17 +360,15 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
                         VALUES (?, ?, ?, ?)
                         ''', (1, f"{uuid_v1}.json", id, 1))
                 conn.commit()
-                print("✅ 用户状态已记录")
+                logger.info("小红书账号状态已记录")
             user = login_state["user"]
-            print(
-                "✅ 小红书主站账号:",
-                user.get("nickname"),
-                user.get("red_id"),
-                user.get("user_id"),
+            logger.info(
+                "小红书主站账号: {} {} {}",
+                user.get("nickname"), user.get("red_id"), user.get("user_id"),
             )
             status_queue.put("200")
         except Exception as exc:
-            print("❌ 小红书登录失败:", str(exc))
+            logger.error("小红书登录失败: {}", exc)
             status_queue.put("500")
             return None
         finally:
@@ -395,7 +394,6 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
 async def weibo_cookie_gen_sse(user_id, status_queue):
     from uploader.weibo_uploader.main import weibo_cookie_gen
     import base64
-    import sqlite3 as _sq
     async def qrcode_callback(payload):
         p = payload.get("image_path")
         if p and Path(p).exists():
@@ -403,7 +401,7 @@ async def weibo_cookie_gen_sse(user_id, status_queue):
             status_queue.put("data:image/png;base64," + b64)
     result = await weibo_cookie_gen(str(Path(BASE_DIR / "cookiesFile" / ("weibo_" + str(user_id) + ".json"))), qrcode_callback=qrcode_callback)
     if result.get("success"):
-        with _sq.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             conn.execute('INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)',
                          (5, "weibo_" + str(user_id) + ".json", user_id, 1))
             conn.commit()
@@ -415,7 +413,6 @@ async def weibo_cookie_gen_sse(user_id, status_queue):
 async def baijiahao_cookie_gen_sse(user_id, status_queue):
     from uploader.baijiahao_uploader.main import baijiahao_cookie_gen
     import base64
-    import sqlite3 as _sq
     async def qrcode_callback(payload):
         p = payload.get("image_path")
         if p and Path(p).exists():
@@ -423,7 +420,7 @@ async def baijiahao_cookie_gen_sse(user_id, status_queue):
             status_queue.put("data:image/png;base64," + b64)
     result = await baijiahao_cookie_gen(str(Path(BASE_DIR / "cookiesFile" / ("bjh_" + str(user_id) + ".json"))), qrcode_callback=qrcode_callback)
     if result.get("success"):
-        with _sq.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             conn.execute('INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)',
                          (6, "bjh_" + str(user_id) + ".json", user_id, 1))
             conn.commit()

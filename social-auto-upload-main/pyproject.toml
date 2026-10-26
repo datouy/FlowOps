@@ -9,12 +9,15 @@ description = "Social media auto uploader"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+  "numpy>=1.26",
   "loguru==0.7.3",
-  "opencv-python>=4.13.0.92",
-  "patchright==1.58.2",
-  "qrcode==8.2",
-  "requests==2.32.3",
-  "segno>=1.6.6",
+  "opencv-python-headless>=4.10",
+  "patchright>=1.64,<2",
+  "playwright>=1.52,<2",
+  "qrcode>=8,<9",
+  "requests>=2.32,<3",
+  "segno>=1.6,<2",
+  "xhs>=0.2,<0.3",
 ]
 
 [project.scripts]
@@ -28,6 +31,21 @@ web = [
 
 [tool.uv]
 package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"sau_backend.py" = ["E402"]
 
 [tool.setuptools]
 py-modules = ["cli_main", "conf", "sau_cli"]
