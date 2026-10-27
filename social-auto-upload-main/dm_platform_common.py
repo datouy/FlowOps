@@ -23,6 +23,28 @@ from db_utils import apply_migrations, connect
 ACCOUNT_DB = Path(BASE_DIR) / "db" / "database.db"
 COOKIE_DIR = Path(BASE_DIR) / "cookiesFile"
 
+# 历史回补窗口：默认 7 天，前端可调；0 表示不按时间过滤（尽量把平台给的全收进来）。
+DEFAULT_HISTORY_DAYS = 7
+MIN_HISTORY_DAYS = 0
+MAX_HISTORY_DAYS = 30
+
+
+def clamp_history_days(value: Any, default: int = DEFAULT_HISTORY_DAYS) -> int:
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_HISTORY_DAYS, min(days, MAX_HISTORY_DAYS))
+
+
+def history_window_hours(settings: dict | None, default_days: int = DEFAULT_HISTORY_DAYS) -> int:
+    """按设置算出同步窗口（小时）。``recent_only`` 关掉时返回 0 表示不过滤。"""
+    data = settings or {}
+    if not as_flag(data.get("recent_only", 1)):
+        return 0
+    days = clamp_history_days(data.get("history_days", default_days), default_days)
+    return days * 24
+
 
 class SyncError(RuntimeError):
     """可直接展示给用户的同步错误。"""
@@ -221,6 +243,7 @@ class BaseDmSync:
         max_conversations_load: int | None = None,
         max_interval: int = 3600,
         recent_hours: int = 48,
+        default_history_days: int = DEFAULT_HISTORY_DAYS,
         auto_trigger: str = "timer",
         initial_delay: float = 5,
         prefer_active_accounts: bool = False,
@@ -247,6 +270,7 @@ class BaseDmSync:
             int(max_conversations_load or self.max_conversations),
         )
         self.recent_hours = max(1, int(recent_hours))
+        self.default_history_days = clamp_history_days(default_history_days)
         self.auto_trigger = auto_trigger
         self.initial_delay = max(0.0, float(initial_delay))
         self.prefer_active_accounts = prefer_active_accounts
@@ -265,11 +289,12 @@ class BaseDmSync:
             "interval_seconds": self.default_interval,
             "max_conversations": self.default_max_conversations,
             "recent_only": 1,
+            "history_days": self.default_history_days,
             "draft_only": 1,
         }
         self.sync_fields = {
             "enabled", "account_id", "account_ids", "interval_seconds",
-            "max_conversations", "recent_only", "draft_only",
+            "max_conversations", "recent_only", "history_days", "draft_only",
             "last_started_at", "last_finished_at", "last_success_at", "last_error",
             "last_scanned", "last_imported", "last_duplicates", "last_skipped",
             "last_failed", "last_duration_ms", "last_account_name",
@@ -297,6 +322,13 @@ class BaseDmSync:
     def init_extra(self, conn: sqlite3.Connection) -> None:
         """创建平台特有的表或执行一次性迁移。"""
 
+    def reset_history_state(self) -> None:
+        """历史窗口变大后清掉平台侧的“已同步”标记，让下一轮重新回补历史。"""
+
+    def extra_migrations(self) -> dict:
+        """平台可追加迁移；版本号从 3 开始，避免和公共迁移冲突。"""
+        return {}
+
     def friendly_error(self, exc: Exception) -> str:
         return friendly_error(exc)
 
@@ -316,6 +348,7 @@ class BaseDmSync:
             interval_seconds INTEGER DEFAULT 60,
             max_conversations INTEGER DEFAULT 50,
             recent_only INTEGER DEFAULT 1,
+            history_days INTEGER DEFAULT 7,
             draft_only INTEGER DEFAULT 1,
             last_started_at TEXT DEFAULT '',
             last_finished_at TEXT DEFAULT '',
@@ -337,6 +370,7 @@ class BaseDmSync:
             ("account_id", "INTEGER DEFAULT 0"),
             ("account_ids", "TEXT DEFAULT '[]'"),
             ("draft_only", "INTEGER DEFAULT 1"),
+            ("history_days", f"INTEGER DEFAULT {self.default_history_days}"),
             ("last_scanned", "INTEGER DEFAULT 0"),
             ("last_imported", "INTEGER DEFAULT 0"),
             ("last_duplicates", "INTEGER DEFAULT 0"),
@@ -352,8 +386,8 @@ class BaseDmSync:
         conn.execute(
             f"""INSERT OR IGNORE INTO {self.settings_table}
             (id,enabled,account_id,account_ids,interval_seconds,max_conversations,
-             recent_only,draft_only)
-            VALUES (1,?,?,?,?,?,?,?)""",
+             recent_only,history_days,draft_only)
+            VALUES (1,?,?,?,?,?,?,?,?)""",
             (
                 self.default_settings["enabled"],
                 self.default_settings["account_id"],
@@ -361,17 +395,32 @@ class BaseDmSync:
                 self.default_settings["interval_seconds"],
                 self.default_settings["max_conversations"],
                 self.default_settings["recent_only"],
+                self.default_settings["history_days"],
                 self.default_settings["draft_only"],
             ),
         )
         self.init_extra(conn)
 
+    def _migrate_history_days(self, conn: sqlite3.Connection) -> None:
+        """老库补 history_days 列：历史窗口从硬编码 48 小时改成可配置天数。"""
+        ensure_column(
+            conn, self.settings_table, "history_days",
+            f"INTEGER DEFAULT {self.default_history_days}",
+        )
+        conn.execute(
+            f"UPDATE {self.settings_table} SET history_days=? "
+            "WHERE history_days IS NULL OR history_days<0",
+            (self.default_history_days,),
+        )
+
     def init_db(self) -> None:
+        migrations = {1: self._create_schema, 2: self._migrate_history_days}
+        migrations.update(self.extra_migrations())
         with dm_ops.get_conn() as conn:
             apply_migrations(
                 conn,
                 f"dm_sync:{self.settings_table}",
-                {1: self._create_schema},
+                migrations,
             )
 
     def load_settings(self) -> dict:
@@ -385,6 +434,12 @@ class BaseDmSync:
         data["account_ids"] = parse_account_ids(data.get("account_ids"))
         for key in ("enabled", "recent_only", "draft_only"):
             data[key] = as_flag(data.get(key, self.default_settings[key]))
+        data["history_days"] = clamp_history_days(
+            data.get("history_days", self.default_history_days), self.default_history_days,
+        )
+        data["history_window_hours"] = history_window_hours(
+            data, self.default_history_days,
+        )
         try:
             data["account_id"] = max(0, int(data.get("account_id") or 0))
         except (TypeError, ValueError):
@@ -495,7 +550,9 @@ class BaseDmSync:
         data["account_count"] = len(selected)
         data["running"] = self._sync_lock.locked()
         data["next_run_at"] = self.next_run_text()
-        data["recent_window_hours"] = self.recent_hours
+        data["history_days"] = int(settings.get("history_days") or self.default_history_days)
+        data["history_window_hours"] = int(settings.get("history_window_hours") or 0)
+        data["recent_window_hours"] = data["history_window_hours"]
         data["parallel_workers"] = min(self.max_workers, max(1, len(selected)))
         data["sync_mode"] = (
             "continuous" if int(settings.get("interval_seconds") or 0) <= 0 else "interval"
@@ -559,15 +616,29 @@ class BaseDmSync:
             }), 400
 
         enabled = as_flag(data.get("enabled", 1))
+        recent_only = as_flag(data.get("recent_only", 1))
+        history_days = clamp_history_days(
+            data.get("history_days", self.default_history_days),
+            self.default_history_days,
+        )
+        previous = self.load_settings()
+        window_changed = (
+            int(previous.get("history_days") or 0) != int(history_days)
+            or bool(previous.get("recent_only")) != bool(recent_only)
+        )
         self.save_settings(
             enabled=enabled,
             account_id=account_ids[0] if len(account_ids) == 1 else 0,
             account_ids=account_ids,
             interval_seconds=interval,
             max_conversations=max_conversations,
-            recent_only=as_flag(data.get("recent_only", 1)),
+            recent_only=recent_only,
+            history_days=history_days,
             draft_only=1,
         )
+        if window_changed:
+            # 窗口变大后必须让下一轮重新回补，否则旧的“已同步”标记会挡住历史。
+            self.reset_history_state()
         with self._state_lock:
             # 保存后立即触发一轮，持续模式下由 finally 继续排下一轮。
             self._next_run_at = time.time() if enabled else None
@@ -577,7 +648,7 @@ class BaseDmSync:
         })
 
     def run_view(self):
-        result = self.run_sync("manual")
+        result = self.run_sync("manual", wait_seconds=60)
         if not result.get("ok"):
             status = 409 if result.get("busy") else 400
             return jsonify({
@@ -631,8 +702,12 @@ class BaseDmSync:
             ]
             return [future.result() for future in futures]
 
-    def run_sync(self, trigger: str = "manual") -> dict:
-        if not self._sync_lock.acquire(blocking=False):
+    def run_sync(self, trigger: str = "manual", wait_seconds: float = 0) -> dict:
+        acquired = self._sync_lock.acquire(blocking=False)
+        if not acquired and wait_seconds > 0:
+            # 手动"立即同步"遇到后台持续轮询时，等一轮结束再执行，而不是直接报忙。
+            acquired = self._sync_lock.acquire(timeout=float(wait_seconds))
+        if not acquired:
             return {
                 "ok": False,
                 "busy": True,

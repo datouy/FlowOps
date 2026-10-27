@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from dm_platform_common import account_name, clean_text
+from dm_platform_common import account_name, clean_text, normalize_timestamp
 
 XHS_CHAT_URL = "https://www.xiaohongshu.com/chat"
 XHS_CHAT_LIST_PATH = "/api/im/web/v3/chats"
@@ -99,6 +100,8 @@ class XhsClient:
         self._me_payload: dict | None = None
         self._chats_payload: dict | None = None
         self._history_payloads: dict[str, dict] = {}
+        self._history_pages: dict[str, list[dict]] = {}
+        self._history_seen: dict[str, set] = {}
         self._identity: dict | None = None
         self._start()
 
@@ -170,9 +173,32 @@ class XhsClient:
                 query = parse_qs(urlparse(url).query)
                 chat_user_id = clean_text((query.get("chat_user_id") or [""])[0], 200)
                 if chat_user_id:
-                    self._history_payloads[chat_user_id] = response.json()
+                    payload = response.json()
+                    self._history_payloads[chat_user_id] = payload
+                    self._store_history_page(chat_user_id, payload)
         except Exception:
             return
+
+    def _store_history_page(self, chat_user_id: str, payload: Any) -> None:
+        """把每一页历史消息按 id 去重后累积，向上翻页时可拼成完整会话。"""
+        if not _is_success(payload):
+            return
+        rows = _payload_data(payload).get("out_message_list") or []
+        if not isinstance(rows, list):
+            return
+        pages = self._history_pages.setdefault(chat_user_id, [])
+        seen = self._history_seen.setdefault(chat_user_id, set())
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            key = str(
+                raw.get("id") or raw.get("store_id") or raw.get("uuid")
+                or f"{raw.get('created_at')}|{str(raw.get('content'))[:80]}|{raw.get('sender_id')}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            pages.append(raw)
 
     def _wait_ready(self):
         deadline = time.monotonic() + 25
@@ -313,6 +339,95 @@ class XhsClient:
                 normalized = self._normalize_message(raw)
                 if normalized:
                     result.append(normalized)
+        return result
+
+    SCROLL_HISTORY_SCRIPT = """() => {
+        const list = document.querySelector('.xhs-im-msg-list');
+        if (!list) return 0;
+        let el = list;
+        while (el && el !== document.body) {
+            const style = window.getComputedStyle(el);
+            const oy = (style.overflowY || '').toLowerCase();
+            if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 8) break;
+            el = el.parentElement;
+        }
+        if (!el || el === document.body) return 0;
+        const before = el.scrollTop;
+        el.scrollTop = Math.max(0, before - Math.max(240, el.clientHeight * 0.8));
+        return el.scrollTop === before ? 0 : 1;
+    }"""
+
+    def _open_for_history(self, chat_user_id: str) -> None:
+        """点开会话并接住首屏历史接口；已经打开过就直接返回。"""
+        if self._history_pages.get(chat_user_id):
+            return
+        item = self._find_conversation(chat_user_id)
+        try:
+            with self._page.expect_response(
+                lambda response: (
+                    XHS_HISTORY_PATH in response.url and chat_user_id in response.url
+                ),
+                timeout=15000,
+            ) as response_info:
+                item.click()
+            payload = response_info.value.json()
+            self._history_payloads[chat_user_id] = payload
+            self._store_history_page(chat_user_id, payload)
+        except Exception:
+            # 会话本来就在打开状态时不会再发首屏请求，退化成直接点击 + 轮询。
+            try:
+                item.click()
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not self._history_pages.get(chat_user_id):
+            self._page.wait_for_timeout(200)
+
+    def history_loaded(self, chat_user_id: str) -> bool:
+        """该会话是否已经真的抓到过至少一页历史（用于判断能不能写同步标记）。"""
+        return bool(self._history_pages.get(clean_text(chat_user_id, 200)))
+
+    def _oldest_history_time(self, chat_user_id: str) -> datetime | None:
+        oldest = None
+        for raw in self._history_pages.get(chat_user_id) or []:
+            if not isinstance(raw, dict):
+                continue
+            stamp = normalize_timestamp(
+                raw.get("created_at") or raw.get("createdAt") or raw.get("ts")
+            )
+            if stamp and (oldest is None or stamp < oldest):
+                oldest = stamp
+        return oldest
+
+    def get_history_messages(
+        self, chat: dict, hours: int = 0, max_rounds: int = 8,
+    ) -> list[dict]:
+        """读取会话历史：首屏 + 向上翻页，尽量覆盖最近 ``hours`` 小时。"""
+        chat_user_id = _chat_id(chat)
+        if not chat_user_id:
+            return []
+        self._open_for_history(chat_user_id)
+        if not self.history_loaded(chat_user_id):
+            raise XhsError("小红书会话历史加载超时，请稍后重试")
+        cutoff = None
+        if hours and int(hours) > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours))
+        for _ in range(max(0, min(int(max_rounds or 0), 30))):
+            oldest = self._oldest_history_time(chat_user_id)
+            if cutoff is not None and oldest is not None and oldest < cutoff:
+                break
+            try:
+                moved = int(self._page.evaluate(self.SCROLL_HISTORY_SCRIPT) or 0)
+            except Exception:
+                moved = 0
+            if not moved:
+                break
+            self._page.wait_for_timeout(600)
+        result = []
+        for raw in self._history_pages.get(chat_user_id) or []:
+            normalized = self._normalize_message(raw)
+            if normalized:
+                result.append(normalized)
         return result
 
     def _normalize_message(self, raw: dict) -> dict | None:

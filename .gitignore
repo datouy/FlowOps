@@ -8,6 +8,7 @@
 # ---- local data / account state ----
 *.db
 social-auto-upload-main/db/*.db
+social-auto-upload-main/db/backups/
 social-auto-upload-main/cookies/
 social-auto-upload-main/cookiesFile/
 social-auto-upload-main/videoFile/
@@ -53,6 +54,12 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# ---- 部署产物（deploy/ 下的运行期数据，不进仓库）----
+deploy/data/
+deploy/backups/
+deploy/.env.deploy
+deploy/out/
 
 # ---- keep empty runtime directories ----
 !social-auto-upload-main/cookies/.gitkeep

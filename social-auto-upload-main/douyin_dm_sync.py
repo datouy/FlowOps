@@ -27,14 +27,16 @@ from dm_platform_common import (
 bp = Blueprint("douyin_dm_sync", __name__)
 
 CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
-RECENT_WINDOW = timedelta(hours=48)
+# 历史窗口不再写死：由同步设置里的 history_days 换算成小时（0 = 不限）。
+# 同一会话签名在这么长时间内不重复回补历史，避免每轮都点开所有会话。
+HISTORY_RESCAN_SECONDS = 1800
 
 PLACEHOLDER_TEXTS = (
     "你收到一条新类型消息，请打开抖音app查看",
     "你收到一条新类型消息，请打开抖音查看",
-    "[分享视频]",
+    "请打开抖音查看详情",
 )
-EMOJI_ONLY_RE = re.compile(r"^\[[^\[\]\r\n]{1,20}\]$")
+UNPARSEABLE_CONTENT = "当前内容无法在平台上展示"
 
 # 常驻浏览器：单独一条 asyncio 事件循环线程承载 Playwright，
 # 每个账号一个 context/page 会话，按 Cookie 修改时间失效重建。
@@ -77,7 +79,47 @@ def _is_placeholder(text: str) -> bool:
         return True
     if any(marker in value for marker in PLACEHOLDER_TEXTS):
         return True
-    return bool(EMOJI_ONLY_RE.fullmatch(value))
+    return bool(UNREAD_PLACEHOLDER_RE.fullmatch(value))
+
+
+BAD_NAME_MARKERS = (
+    "收到一条新类型消息", "您有", "请打开抖音", "未读消息",
+    "分享视频无法查看", UNPARSEABLE_CONTENT,
+)
+
+
+def _display_name(row: dict) -> str:
+    """只用真实昵称或群名；拿不到时直接显示对方 ID，绝不拼接消息预览。"""
+    name = _clean_text(row.get("name"), 120)
+    preview = _clean_text(row.get("preview"), 120)
+    bad = any(marker in name for marker in BAD_NAME_MARKERS)
+    if name and preview and name.startswith(preview[:12]):
+        bad = True
+    if bad:
+        cut = re.split(r"\d{1,2}:\d{2}", name)[0].strip()
+        name = cut if cut and not any(marker in cut for marker in BAD_NAME_MARKERS) else ""
+    if len(name) > 40:
+        name = ""
+    if not name:
+        name = _stable_user_id(row.get("cid")) or "抖音用户"
+    return name
+
+
+def _stable_user_id(cid: str) -> str:
+    """从抖音会话 ID 提取对方用户的稳定标识，避免同人拆成多个联系人。"""
+    value = str(cid or "")
+    if value.startswith("0:1:") and value.count(":") == 3:
+        parts = value.split(":")
+        return parts[2]
+    return value
+
+
+UNREAD_PLACEHOLDER_RE = re.compile(r"^您有 [0-9]+ 条未读消息，请打开抖音查看详情$")
+
+
+def _is_unread_placeholder(text: str) -> bool:
+    return bool(UNREAD_PLACEHOLDER_RE.fullmatch(str(text or "").strip()))
+
 
 SCAN_SCRIPT = r"""
 (limit) => {
@@ -104,7 +146,10 @@ SCAN_SCRIPT = r"""
     const timeIndex = lines.findIndex(line => timePattern.test(line));
     const nameLines = lines.slice(0, timeIndex >= 0 ? timeIndex : lines.length)
       .filter(line => !/^\d{1,3}$/.test(line));
-    const name = String(conversation.coreInfo?.name || '').trim() || nameLines[0] || '';
+    const rawName = String(
+      conversation.coreInfo?.name || conversation.coreInfo?.nickname ||
+      conversation.groupName || conversation.name || ''
+    ).trim();
 
     let preview = String(content.text || content.push_detail || content.description ||
       content.content_title || '').trim();
@@ -126,7 +171,7 @@ SCAN_SCRIPT = r"""
       cid: String(conversation.id || conversation.shortId || ''),
       short_id: String(conversation.shortId || ''),
       sec_uid: String(conversation.secUid || ''),
-      name: name,
+      name: rawName || nameLines[0] || '',
       display_time: timeIndex >= 0 ? lines[timeIndex] : '',
       preview: preview.slice(0, 300),
       created_at: createdAt,
@@ -158,23 +203,62 @@ HISTORY_SCRIPT = r"""
     if (cls.includes('tip-skRp_9')) continue;
     const textNode = el.querySelector('.text-prz9K6, .text-item-message-zUNhSB');
     const text = String(textNode?.innerText || '').trim();
-    if (!text) continue;
-    let displayTime = '';
-    for (let next = index + 1; next < Math.min(nodes.length, index + 4); next++) {
-      const nextCls = String(nodes[next].className || '');
-      if (nextCls.includes('time-Tl7Z4j')) {
-        displayTime = String(nodes[next].innerText || '').trim();
-        break;
+    const direction = cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound';
+    if (!text) {
+      const hasMedia = Boolean(el.querySelector('video')) ||
+        Array.from(el.querySelectorAll('img')).some(
+          img => (img.naturalWidth || img.width || 0) >= 80
+        );
+      if (!hasMedia) continue;
+      rows.push({
+        text: '', media: true, direction, display_time: currentTime,
+      });
+      continue;
+    }
+    let displayTime = currentTime;
+    if (!displayTime) {
+      for (let next = index + 1; next < Math.min(nodes.length, index + 4); next++) {
+        const nextCls = String(nodes[next].className || '');
+        if (nextCls.includes('time-Tl7Z4j')) {
+          displayTime = String(nodes[next].innerText || '').trim();
+          break;
+        }
       }
     }
-    if (!displayTime) displayTime = currentTime;
     rows.push({
       text: text.slice(0, 4000),
-      direction: cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound',
+      direction: direction,
       display_time: displayTime,
     });
   }
   return rows;
+}
+"""
+
+
+SCROLL_HISTORY_SCRIPT = r"""
+() => {
+  const item = document.querySelector('.box-item-W0TV01');
+  if (!item) return false;
+  let el = item.parentElement;
+  while (el && el !== document.body) {
+    const style = window.getComputedStyle(el);
+    const scrollable = /(auto|scroll)/.test(style.overflowY);
+    if (scrollable && el.scrollHeight > el.clientHeight + 40) {
+      const before = el.scrollTop;
+      el.scrollTop = Math.max(0, el.scrollTop - el.clientHeight * 0.9);
+      return el.scrollTop !== before;
+    }
+    el = el.parentElement;
+  }
+  const candidates = Array.from(document.querySelectorAll('div'))
+    .filter(node => node.scrollHeight > node.clientHeight + 120)
+    .filter(node => getComputedStyle(node).overflowY !== 'hidden');
+  const target = candidates[candidates.length - 1];
+  if (!target) return false;
+  const before = target.scrollTop;
+  target.scrollTop = Math.max(0, target.scrollTop - target.clientHeight * 0.9);
+  return target.scrollTop !== before;
 }
 """
 
@@ -191,6 +275,7 @@ def _pending_conversation_unread(account_name: str) -> dict[str, int]:
                 cid = str(row["external_user_id"] or "")
                 if not cid:
                     continue
+                cid = _stable_user_id(cid)
                 match = re.search(r"未读\s*(\d+)", str(row["source_content"] or ""))
                 result[cid] = max(int(row["unread_count"] or 0), int(match.group(1)) if match else 0)
             return result
@@ -200,7 +285,7 @@ def _pending_conversation_unread(account_name: str) -> dict[str, int]:
 
 def _history_marker_key(account_name: str, cid: str) -> str:
     value = f"{account_name}|{cid}".encode("utf-8")
-    return "douyin_history_" + hashlib.sha1(value).hexdigest()
+    return "douyin_history_v3_" + hashlib.sha1(value).hexdigest()
 
 
 def _history_signature(row: dict) -> str:
@@ -226,14 +311,76 @@ def _save_history_marker(account_name: str, cid: str, signature: str):
     try:
         with dm_ops.get_conn() as c:
             c.execute("INSERT OR REPLACE INTO dm_meta (key,value) VALUES (?,?)",
-                      (_history_marker_key(account_name, cid), signature))
+                      (_history_marker_key(account_name, cid),
+                       f"{signature}@{int(time.time())}"))
     except Exception:
         pass
+
+
+def _parse_history_marker(value: str) -> tuple[str, float]:
+    text = str(value or "")
+    if "@" not in text:
+        return text, 0.0
+    signature, _, stamp = text.rpartition("@")
+    try:
+        return signature, float(stamp)
+    except (TypeError, ValueError):
+        return signature, 0.0
+
+
+def _history_marker_fresh(account_name: str, cid: str, signature: str) -> bool:
+    """签名一致且距上次回补未超过冷却时间，才算"这份历史已经同步过"。"""
+    saved_signature, saved_at = _parse_history_marker(
+        _history_marker(account_name, cid)
+    )
+    if saved_signature != signature:
+        return False
+    return (time.time() - saved_at) < HISTORY_RESCAN_SECONDS
+
+
+def _window_hours(settings: dict | None) -> int:
+    try:
+        return max(0, int((settings or {}).get("history_window_hours") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _window_cutoff(hours: int) -> datetime | None:
+    return datetime.now() - timedelta(hours=hours) if hours > 0 else None
+
+
+def _window_label(hours: int) -> str:
+    hours = max(0, int(hours or 0))
+    if hours <= 0:
+        return "全部历史"
+    if hours % 24 == 0:
+        return f"{hours // 24} 天"
+    return f"{hours} 小时"
 
 
 def _display_time_to_text(value: str) -> str:
     label = _clean_text(value, 40)
     now = datetime.now()
+    if not label or label == "刚刚":
+        return now.strftime("%Y-%m-%d %H:%M:%S")
+    # 抖音常见的“昨天 22:26 / 前天 10:17 / 星期三 15:12”组合格式。
+    match = re.fullmatch(
+        r"(昨天|前天|星期[一二三四五六日天])\s*(\d{1,2}):(\d{2})", label
+    )
+    if match:
+        prefix, hour, minute = match.group(1), int(match.group(2)), int(match.group(3))
+        if prefix == "昨天":
+            day = now - timedelta(days=1)
+        elif prefix == "前天":
+            day = now - timedelta(days=2)
+        else:
+            weekdays = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+            target = weekdays.get(prefix[-1])
+            days = (now.weekday() - target) % 7 or 7
+            day = now - timedelta(days=days)
+        return day.replace(hour=hour, minute=minute, second=0, microsecond=0).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     match = re.fullmatch(r"(\d{1,2}):(\d{2})", label)
     if match:
         candidate = now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
@@ -242,19 +389,36 @@ def _display_time_to_text(value: str) -> str:
         return candidate.strftime("%Y-%m-%d %H:%M:%S")
     if label == "昨天":
         return (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    if label == "前天":
+        return (now - timedelta(days=2)).strftime("%Y-%m-%d 00:00:00")
     if label.startswith("星期"):
         weekdays = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
         target = weekdays.get(label[-1])
         if target is not None:
             days = (now.weekday() - target) % 7 or 7
             return (now - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
-    match = re.fullmatch(r"(\d{1,2})-(\d{1,2})", label)
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?", label)
     if match:
         try:
-            value = datetime(now.year, int(match.group(1)), int(match.group(2)))
+            value = datetime(
+                int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                int(match.group(4) or 0), int(match.group(5) or 0),
+            )
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    match = re.fullmatch(
+        r"(\d{1,2})[月-](\d{1,2})日?(?:\s+(\d{1,2}):(\d{2}))?", label
+    )
+    if match:
+        try:
+            value = datetime(
+                now.year, int(match.group(1)), int(match.group(2)),
+                int(match.group(3) or 0), int(match.group(4) or 0),
+            )
             if value > now:
                 value = value.replace(year=now.year - 1)
-            return value.strftime("%Y-%m-%d 00:00:00")
+            return value.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
     return now.strftime("%Y-%m-%d %H:%M:%S")
@@ -301,23 +465,85 @@ async def _click_conversation(
     return False
 
 
-def _history_items(row: dict, history: list[dict], account: dict) -> list[dict]:
+def _history_time(value: str) -> datetime | None:
+    label = _clean_text(value, 40)
+    if not label:
+        return None
+    try:
+        return datetime.strptime(_display_time_to_text(label), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+async def _collect_history(page, quick: bool = False, hours: int = 0) -> list[dict]:
+    """向上滚动聊天窗口，收集最近 ``hours`` 小时（0=不限）的完整历史消息。"""
+    merged: dict[tuple, dict] = {}
+    rounds = 4 if quick else 16
+    cutoff = _window_cutoff(hours)
+    idle = 0
+    for _ in range(rounds):
+        batch = await page.evaluate(HISTORY_SCRIPT)
+        added = 0
+        oldest = None
+        for item in batch if isinstance(batch, list) else []:
+            text = _clean_text(item.get("text"), 4000)
+            if not text and not item.get("media"):
+                continue
+            key = (
+                item.get("direction"), item.get("display_time"), text,
+                bool(item.get("media")),
+            )
+            if key not in merged:
+                merged[key] = item
+                added += 1
+            stamp = _history_time(item.get("display_time"))
+            if stamp and (oldest is None or stamp < oldest):
+                oldest = stamp
+        if added == 0:
+            idle += 1
+            if idle >= 1:
+                break
+        if cutoff and oldest and oldest < cutoff:
+            break
+        moved = await page.evaluate(SCROLL_HISTORY_SCRIPT)
+        if not moved:
+            break
+        await page.wait_for_timeout(450 if quick else 700)
+    return list(merged.values())
+
+
+def _history_items(row: dict, history: list[dict], account: dict,
+                   hours: int = 0) -> list[dict]:
     cid = str(row.get("cid") or "")
-    nickname = _clean_text(row.get("name"), 80) or "抖音用户"
+    user_id = _stable_user_id(cid)
+    nickname = _display_name(row)
     unread = max(0, int(row.get("unread") or 0))
     inbound_positions = [index for index, item in enumerate(history) if item.get("direction") == "inbound"]
     first_unread = max(0, len(inbound_positions) - unread)
     inbound_seen = 0
+    cutoff = _window_cutoff(hours)
     result = []
     for item in history:
         text = _clean_text(item.get("text"), 4000)
-        if not text:
+        if not text and not item.get("media"):
             continue
+        if text and _is_unread_placeholder(text):
+            continue
+        if not text:
+            text = UNPARSEABLE_CONTENT
+        if _is_placeholder(text):
+            text = UNPARSEABLE_CONTENT
         direction = "outbound" if item.get("direction") == "outbound" else "inbound"
         display_time = _clean_text(item.get("display_time"), 40)
         created_at = _display_time_to_text(display_time)
+        stamp = _history_time(display_time)
+        if cutoff and stamp and stamp < cutoff:
+            continue
         marker = "outbound" if direction == "outbound" else ""
-        fingerprint = "|".join((cid, display_time, "7", text, marker))
+        # 指纹用换算后的绝对时间，避免"昨天 22:26"变成"22:26"后同一条消息被当成新消息。
+        fingerprint = "|".join((cid, created_at or display_time, "7", text, marker))
+        if text == UNPARSEABLE_CONTENT:
+            fingerprint = "|".join((cid, "unparseable-content", marker))
         status = "replied"
         if direction == "inbound":
             status = "new" if inbound_seen >= first_unread else "replied"
@@ -328,7 +554,8 @@ def _history_items(row: dict, history: list[dict], account: dict) -> list[dict]:
         result.append({
             "platform": "抖音",
             "account": _account_name(account),
-            "external_user_id": cid,
+            "external_user_id": user_id,
+            "is_group": bool(row.get("is_group")),
             "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
             "author": nickname if direction == "inbound" else "我",
             "content": text,
@@ -562,16 +789,29 @@ async def _scan_douyin_in_browser(
 
         data = list(collected.values())
         pending_unread = _pending_conversation_unread(account_name)
+        seen_history_users: set[str] = set()
+        history_hours = _window_hours(settings)
         for row in data:
             try:
                 cid = str(row.get("cid") or "")
+                user_id = _stable_user_id(cid)
+                raw_unread = int(row.get("unread") or 0)
+                if raw_unread == 0:
+                    # 用户在抖音端已读完时，本地未读也必须同步归零。
+                    dm_ops.mark_read_by_external("抖音", account_name, user_id)
+                    pending_unread[user_id] = 0
                 signature = _history_signature(row)
                 effective_unread = max(
-                    int(row.get("unread") or 0), int(pending_unread.get(cid) or 0)
+                    raw_unread, int(pending_unread.get(user_id) or 0)
                 )
                 row["unread"] = effective_unread
-                should_scan_history = effective_unread > 0
-                if should_scan_history and _history_marker(account_name, cid) == signature:
+                # 手动“同步全部私信”扫描所有会话；定时增量只看有未读的会话。
+                should_scan_history = (not quick) or effective_unread > 0
+                if should_scan_history and user_id in seen_history_users:
+                    continue
+                if should_scan_history and _history_marker_fresh(
+                    account_name, cid, signature
+                ):
                     row["history_synced"] = True
                     continue
                 if not should_scan_history:
@@ -582,9 +822,12 @@ async def _scan_douyin_in_browser(
                     settle_ms=400 if quick else 1600,
                     click_timeout_ms=900 if quick else 5000,
                 ):
-                    history = await page.evaluate(HISTORY_SCRIPT)
+                    history = await _collect_history(
+                        page, quick=quick, hours=history_hours,
+                    )
                     if isinstance(history, list) and history:
                         row["history"] = history
+                        seen_history_users.add(user_id)
                         _save_history_marker(account_name, cid, signature)
             except Exception:
                 pass
@@ -604,11 +847,9 @@ def _scan_douyin(settings: dict, account: dict, quick: bool = False) -> dict:
 
 
 
-def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[dict | None, str]:
+def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict | None, str]:
     if not row.get("cid"):
         return None, "缺少会话 ID"
-    if row.get("is_group"):
-        return None, "群聊"
     if row.get("is_recalled"):
         return None, "消息已撤回"
     try:
@@ -623,27 +864,38 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
         message_type = 0
     text = _clean_text(row.get("text"), 4000)
     preview = _clean_text(row.get("preview"), 300)
-    allow_auto_reply = message_type == 7 and bool(text) and not _is_placeholder(text)
+    if not text and preview:
+        text = preview
+    allow_auto_reply = (
+        message_type == 7 and bool(text) and not _is_placeholder(text)
+        and not row.get("is_group")
+    )
     if _is_placeholder(text):
-        if not unread:
-            return None, "占位或表情消息"
-        text = f"您有 {unread} 条未读消息，请打开抖音查看详情"
+        # 平台只给了“收到一条新类型消息”这类占位文案时，展示中性提示，
+        # 不伪造未读数量，也不把它当成客户发来的正文。
+        text = UNPARSEABLE_CONTENT
     elif not text:
-        if not unread and not preview:
+        if preview:
+            text = preview
+        elif not unread:
             return None, "非文本消息"
-        labels = {3: "[图片]", 5: "[表情]", 8: "[视频]", 77: "[图片]", 110: "[分享内容]"}
-        text = preview or labels.get(message_type, "[非文本消息]")
+        else:
+            labels = {3: "[图片]", 5: "[表情]", 8: "[视频]", 77: "[图片]", 110: "[分享内容]"}
+            text = labels.get(message_type, UNPARSEABLE_CONTENT)
 
     created_at = _parse_iso(row.get("created_at"))
     display_time = _clean_text(row.get("display_time"), 40)
-    if recent_only and created_at and not unread:
+    if history_hours and created_at and not unread:
         age = datetime.now(timezone.utc) - created_at
-        if age > RECENT_WINDOW:
-            return None, "超出近 48 小时"
+        if age > timedelta(hours=history_hours):
+            return None, f"超出近 {_window_label(history_hours)}"
     fingerprint = "|".join((
         str(row.get("cid") or ""), str(row.get("created_at") or display_time),
         str(message_type), text,
     ))
+    if text == UNPARSEABLE_CONTENT:
+        # 同一会话只保留一条“无法展示”提示，读完或后续拿到真实内容后被清理。
+        fingerprint = "|".join((str(row.get("cid") or ""), "unparseable-content"))
     external_message_id = "dy-sync-" + hashlib.sha1(
         fingerprint.encode("utf-8")
     ).hexdigest()[:24]
@@ -652,17 +904,22 @@ def _row_to_item(row: dict, account: dict, recent_only: bool = True) -> tuple[di
         source += " · 陌生人会话"
     if unread:
         source += f" · 未读 {unread}"
-    nickname = _clean_text(row.get("name"), 80) or "抖音用户"
+    nickname = _display_name(row)
     return {
         "platform": "抖音",
         "account": _account_name(account),
-        "external_user_id": _clean_text(row.get("cid"), 120),
+        "external_user_id": _clean_text(_stable_user_id(row.get("cid")), 120),
+        "is_group": bool(row.get("is_group")),
         "external_message_id": external_message_id,
         "author": nickname,
         "content": text,
         "source_content": source,
         "msg_type": "dm",
         "auto_reply": allow_auto_reply,
+        "status": (
+            ("read" if not unread else "new")
+            if text == UNPARSEABLE_CONTENT else "new"
+        ),
         "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
     }, ""
 
@@ -672,17 +929,33 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
     if not account.get("cookie_path"):
         raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
     scan = _scan_douyin(settings, account, quick=quick)
+    # 时间窗口统一由同步设置的 history_days 决定；0 表示不限。
+    history_hours = _window_hours(settings)
     items = []
     skipped = 0
     skip_reasons: dict[str, int] = {}
+    collapsed_rows = []
     for row in scan.get("rows") or []:
+        if collapsed_rows and not row.get("history"):
+            user_id = _stable_user_id(row.get("cid"))
+            target = next((
+                item for item in collapsed_rows
+                if _stable_user_id(item.get("cid")) == user_id
+            ), None)
+            if target is not None:
+                target["unread"] = max(
+                    int(target.get("unread") or 0), int(row.get("unread") or 0)
+                )
+                continue
+        collapsed_rows.append(row)
+    for row in collapsed_rows:
         if row.get("history_synced"):
             continue
-        item, reason = _row_to_item(
-            row, account, recent_only=bool(settings.get("recent_only"))
-        )
+        item, reason = _row_to_item(row, account, history_hours=history_hours)
         if item:
-            history_items = _history_items(row, row.get("history") or [], account)
+            history_items = _history_items(
+                row, row.get("history") or [], account, history_hours,
+            )
             items.extend(history_items or [item])
         else:
             skipped += 1
@@ -695,6 +968,7 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
         if result.get("contact_id")
     }:
         dm_ops.dedupe_contact_messages(contact_id)
+    dm_ops.prune_placeholder_messages("抖音")
     ready = sum(
         1 for result in ingest.get("items", [])
         if (result.get("auto_reply") or {}).get("status") == "ready"
@@ -732,6 +1006,14 @@ class DouyinDmSync(BaseDmSync):
     def init_extra(self, conn):
         _init_extra(conn)
 
+    def reset_history_state(self) -> None:
+        """历史窗口调整后清掉会话级回补标记，下一轮重新抓完整历史。"""
+        try:
+            with dm_ops.get_conn() as c:
+                c.execute("DELETE FROM dm_meta WHERE key LIKE 'douyin_history%'")
+        except Exception:
+            pass
+
     def scan_account(self, settings: dict, account: dict, quick: bool = False) -> dict:
         return _sync_account(settings, account, quick=quick)
 
@@ -747,7 +1029,7 @@ sync_manager = DouyinDmSync(
     default_max_conversations=100,
     max_conversations=100,
     max_conversations_load=200,
-    recent_hours=int(RECENT_WINDOW.total_seconds() // 3600),
+    default_history_days=7,
     auto_trigger="auto",
     initial_delay=0,
     prefer_active_accounts=True,

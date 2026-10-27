@@ -17,8 +17,17 @@ bp = Blueprint("channels_dm_sync", __name__)
 
 PLATFORM = "视频号"
 ACCOUNT_TYPE = 2
-RECENT_HOURS = 48
+DEFAULT_HISTORY_DAYS = 7
 PRIVATE_SESSION_TYPES = {1, 3}
+
+
+def _window_label(hours: int) -> str:
+    hours = max(0, int(hours or 0))
+    if hours <= 0:
+        return "全部历史"
+    if hours % 24 == 0:
+        return f"{hours // 24} 天"
+    return f"{hours} 小时"
 
 
 def _message_text(message: dict) -> tuple[str, bool]:
@@ -93,7 +102,7 @@ def _nickname(session_info: dict) -> str:
 
 
 def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
-                 finder_username: str, recent_only: bool,
+                 finder_username: str, history_hours: int,
                  max_conversations: int) -> tuple[list[dict], int, dict]:
     grouped: dict[str, list[dict]] = {}
     skipped: dict[str, int] = {}
@@ -130,6 +139,7 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
 
     items = []
     scanned = 0
+    label = _window_label(history_hours)
     for session_id, analyzed in sessions:
         scanned += 1
         info = infos.get(session_id) or {}
@@ -145,17 +155,20 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
         latest_inbound = inbound_indexes[-1] if inbound_indexes else -1
         latest_outbound = outbound_indexes[-1] if outbound_indexes else -1
         unanswered = latest_inbound >= 0 and latest_inbound > latest_outbound
-        for index in inbound_indexes:
-            entry = analyzed[index]
+        for index, entry in enumerate(analyzed):
             text = entry["text"]
+            inbound = entry["direction"] == "inbound"
             if not text:
                 skipped["空消息"] = skipped.get("空消息", 0) + 1
                 continue
-            if recent_only and not is_recent(_created_at(entry["raw"]), RECENT_HOURS):
-                skipped["超出近 48 小时"] = skipped.get("超出近 48 小时", 0) + 1
+            if history_hours and not is_recent(_created_at(entry["raw"]), history_hours):
+                key = f"超出近 {label}"
+                skipped[key] = skipped.get(key, 0) + 1
                 continue
-            status = "new" if index == latest_inbound and unanswered else "replied"
-            allow_auto_reply = status == "new" and not entry["placeholder"]
+            status = "replied"
+            if inbound:
+                status = "new" if index == latest_inbound and unanswered else "replied"
+            allow_auto_reply = inbound and status == "new" and not entry["placeholder"]
             items.append({
                 "platform": PLATFORM,
                 "account": account_name(account),
@@ -163,13 +176,13 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
                 "external_message_id": _message_id(
                     entry["raw"], session_id, entry["created_at"], text, entry["sender_id"],
                 ),
-                "author": nickname,
+                "author": nickname if inbound else "我",
                 "content": text,
                 "source_content": "视频号私信同步",
                 "msg_type": "dm",
-                "direction": "inbound",
+                "direction": "inbound" if inbound else "outbound",
                 "status": status,
-                "delivery_status": "received",
+                "delivery_status": "received" if inbound else "sent",
                 "created_at": entry["created_at"],
                 "auto_reply": allow_auto_reply,
                 "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
@@ -193,7 +206,8 @@ def _sync_account(settings: dict, account: dict) -> dict:
                 session_ids.append(session_id)
         infos = client.get_session_infos(session_ids)
         items, scanned, skip_reasons = _build_items(
-            messages, infos, account, finder_username, bool(settings.get("recent_only")),
+            messages, infos, account, finder_username,
+            int(settings.get("history_window_hours") or 0),
             int(settings.get("max_conversations") or 50),
         )
         ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
@@ -238,7 +252,7 @@ sync_manager = ChannelsDmSync(
     min_interval=0,
     default_interval=0,
     default_max_conversations=50,
-    recent_hours=RECENT_HOURS,
+    default_history_days=DEFAULT_HISTORY_DAYS,
     error_types=(ChannelsError, ChannelsAuthError),
     max_workers=8,
     failure_backoff=30,

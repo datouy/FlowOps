@@ -1,0 +1,50 @@
+# 云策 YunCe 单容器编排
+# 用法（在 deploy/ 目录里执行）：
+#   cp .env.deploy.example .env.deploy && vi .env.deploy
+#   docker compose up -d --build
+#
+# 状态目录全部落在 ./data 下，删容器不丢数据：
+#   data/db/          4 个 SQLite 库（账号、发布队列、私信、线索）
+#   data/cookiesFile/ 各平台登录 Cookie JSON（最值钱的东西）
+#   data/videoFile/   上传的视频素材
+#   data/uploadFile/  上传的图文素材
+#   data/cookies/     uploader 模块缓存
+#   data/logs/        loguru app.log
+
+name: yunce
+
+services:
+  yunce:
+    build:
+      context: ../social-auto-upload-main
+      dockerfile: ../deploy/Dockerfile
+      args:
+        # 同源部署保持 "/"；前后端不同域名时改成 https://api.example.com
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/}
+        # 根路径部署保持 "/"；挂在 /flowops/ 子路径时设为 /flowops/
+        VITE_PUBLIC_BASE: ${VITE_PUBLIC_BASE:-/}
+    image: yunce:${YUNCE_TAG:-latest}
+    container_name: yunce
+    restart: unless-stopped
+    env_file:
+      - ./.env.deploy
+    ports:
+      # 只绑本机回环，外网入口交给 Nginx（TLS + 大文件 + SSE）
+      # 没有 Nginx 又想直接访问时改成 "5409:5409"
+      - "127.0.0.1:5409:5409"
+    volumes:
+      - ./data/db:/app/db
+      - ./data/cookies:/app/cookies
+      - ./data/cookiesFile:/app/cookiesFile
+      - ./data/videoFile:/app/videoFile
+      - ./data/uploadFile:/app/uploadFile
+      - ./data/logs:/app/logs
+    environment:
+      TZ: Asia/Shanghai
+    # Chromium 需要足够的 /dev/shm，否则会随机崩在发布/私信同步上
+    shm_size: "1gb"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

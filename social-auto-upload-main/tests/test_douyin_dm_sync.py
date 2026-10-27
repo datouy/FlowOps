@@ -60,11 +60,14 @@ def test_get_session_rejects_missing_cookie(tmp_path):
         dy._run_douyin_browser_coroutine(call())
 
 
-def test_row_to_item_skips_group_and_recalled():
+def test_row_to_item_keeps_group_history_without_auto_reply():
     base = {"cid": "c1", "text": "你好", "message_type": 7, "unread": 1}
-    assert dy._row_to_item({**base, "is_group": True}, {"id": 1})[1] == "群聊"
+    # 群聊消息保留下来当历史，但绝不自动回复。
+    group, reason = dy._row_to_item({**base, "is_group": True}, {"id": 1})
+    assert reason == ""
+    assert group["auto_reply"] is False
     assert dy._row_to_item({**base, "is_recalled": True}, {"id": 1})[1] == "消息已撤回"
-    item, reason = dy._row_to_item(base, {"id": 1, "userName": "账号"}, recent_only=False)
+    item, reason = dy._row_to_item(base, {"id": 1, "userName": "账号"}, history_hours=0)
     assert reason == ""
     assert item["platform"] == "抖音"
     assert item["external_user_id"] == "c1"

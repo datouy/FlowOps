@@ -45,7 +45,7 @@
         <div class="inbox-layout">
           <aside class="conversation-pane">
             <div class="conversation-filters">
-              <el-input v-model="convFilters.q" clearable placeholder="搜索昵称 / 公司 / 标签 / 内容" @keyup.enter="loadConversations">
+              <el-input v-model="convFilters.q" clearable placeholder="搜索用户 ID / 昵称 / 群名 / 内容" @keyup.enter="loadConversations">
                 <template #prefix>搜</template>
               </el-input>
               <div class="filter-row">
@@ -88,11 +88,13 @@
                 <el-avatar :size="40" class="avatar">{{ avatarText(item.nickname) }}</el-avatar>
                 <div class="conversation-main">
                   <div class="conversation-top">
-                    <strong>{{ item.nickname || '匿名用户' }}</strong>
+                    <strong>{{ item.nickname || item.external_user_id || '未知用户' }}</strong>
                     <span class="conversation-time">{{ shortTime(item.last_message_time) }}</span>
                   </div>
+                  <div class="conversation-id">ID：{{ item.external_user_id || '未获取' }}</div>
                   <div class="conversation-tags">
                     <el-tag size="small" effect="plain">{{ item.platform }}</el-tag>
+                    <el-tag v-if="item.is_group" size="small" type="warning" effect="dark">群聊</el-tag>
                     <el-tag size="small" type="warning" effect="plain">账号：{{ item.account || '未填写' }}</el-tag>
                     <el-tag size="small" :type="segmentTagType(item.segment)" effect="light">{{ item.segment_label }}</el-tag>
                     <el-tag size="small" :type="intentTagType(item.intent)" effect="light">{{ intentText(item.intent) }}</el-tag>
@@ -116,13 +118,14 @@
                   <el-avatar :size="42">{{ avatarText(currentContact.nickname) }}</el-avatar>
                   <div>
                     <div class="chat-name">
-                      {{ currentContact.nickname || '匿名用户' }}
+                      {{ currentContact.nickname || currentContact.external_user_id || '未知用户' }}
+                      <el-tag v-if="currentContact.is_group" size="small" type="warning" effect="dark">群聊</el-tag>
                       <el-tag size="small" type="warning" effect="plain">账号：{{ currentContact.account || '未填写' }}</el-tag>
                       <el-tag size="small" :type="segmentTagType(currentContact.segment)">{{ currentContact.segment_label }}</el-tag>
                       <el-tag size="small" :type="intentTagType(currentContact.intent)">{{ intentText(currentContact.intent) }}</el-tag>
                       <el-tag v-if="currentContact.needs_reply" size="small" type="danger" effect="dark">未回复</el-tag>
                     </div>
-                    <div class="chat-sub">{{ currentContact.platform }} · {{ currentContact.stage_label }}</div>
+                    <div class="chat-sub">ID：{{ currentContact.external_user_id || '未获取' }} · {{ currentContact.platform }} · {{ currentContact.contact_type_label || '私聊' }} · {{ currentContact.stage_label }}</div>
                   </div>
                 </div>
                 <div class="chat-actions">
@@ -281,8 +284,27 @@
                 <span class="form-hint">0 = 持续同步，上一轮结束后立即开始下一轮；&gt;0 为间隔秒数</span>
               </el-form-item>
               <el-form-item label="同步范围">
-                <el-switch v-model="activeSyncForm.recent_only" />
-                <span class="form-hint">只处理近 {{ activeSyncStatus.recent_window_hours || 48 }} 小时有更新的会话</span>
+                <div class="sync-range">
+                  <el-switch
+                    v-model="activeSyncForm.recent_only"
+                    active-text="按时间范围"
+                    inline-prompt
+                  />
+                  <el-input-number
+                    v-model="activeSyncForm.history_days"
+                    :min="1"
+                    :max="30"
+                    :step="1"
+                    size="small"
+                    controls-position="right"
+                    :disabled="!activeSyncForm.recent_only"
+                  />
+                  <span class="form-hint">
+                    {{ activeSyncForm.recent_only
+                      ? `天；每次回补最近 ${activeSyncForm.history_days || 7} 天的聊天记录`
+                      : '关闭后尽量拉取平台能给出的全部历史' }}
+                  </span>
+                </div>
               </el-form-item>
               <el-form-item>
                 <el-button :loading="savingSync" @click="saveSyncSettings">保存同步设置</el-button>
@@ -297,9 +319,15 @@
             </div>
             <div class="sync-meta">
               <span>同步账号：{{ syncSelectedAccountNames }}</span>
+              <span>历史窗口：{{ activeSyncStatus.recent_only ? `近 ${activeSyncStatus.history_days || 7} 天` : '不限' }}</span>
               <span>上次成功：{{ activeSyncStatus.last_success_at || '尚未同步' }}</span>
               <span>下次计划：{{ activeSyncStatus.next_run_at || '未安排' }}</span>
               <span v-if="syncSkipSummary">本次跳过：{{ syncSkipSummary }}</span>
+              <span v-if="storageHealth" :title="storageHealth.path">
+                聊天记录已落库 {{ storageHealth.counts?.messages || 0 }} 条
+                · 最新 {{ storageHealth.latest_message_at || '—' }}
+                · WAL {{ storageHealth.wal_size || 0 }} B
+              </span>
             </div>
             <el-alert
               v-if="activeSyncStatus.last_error"
@@ -421,7 +449,7 @@
             </el-table-column>
             <el-table-column label="线索信息" min-width="230">
               <template #default="scope">
-                <template v-if="scope.row.segment === 'team' && (scope.row.company_name || scope.row.origin || scope.row.traveler_count || scope.row.budget || scope.row.travel_date)">
+                <template v-if="scope.row.company_name || scope.row.budget">
                   <div>{{ scope.row.company_name || '公司待确认' }} · {{ scope.row.traveler_count ? scope.row.traveler_count + '人' : '人数待确认' }}</div>
                   <div class="muted">{{ scope.row.budget || '预算待确认' }} · {{ scope.row.travel_date || '档期待确认' }} · {{ scope.row.origin || '出发地待确认' }}</div>
                 </template>
@@ -649,13 +677,14 @@ const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const xhsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const channelsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
-const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
-const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
-const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true })
+const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
+const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
+const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
 const syncPlatform = ref('抖音')
 const savingSync = ref(false)
 const syncing = ref(false)
 const rules = ref([])
+const storageHealth = ref(null)
 const conversations = ref([])
 const convFilters = reactive({ q: '', account: '', platform: '', segment: '', status: '' })
 const accountFilterKey = ref('')
@@ -897,6 +926,7 @@ function hydrateSyncForm(form, data, defaultInterval) {
     : []
   form.interval_seconds = Number(data.interval_seconds ?? defaultInterval)
   form.recent_only = Boolean(data.recent_only)
+  form.history_days = Number(data.history_days ?? 7)
 }
 
 function setSyncStatus(platform, data) {
@@ -936,6 +966,7 @@ async function saveSyncSettings() {
       account_ids: (form.account_ids || []).map(Number).filter(Boolean),
       interval_seconds: Number(form.interval_seconds ?? meta.defaultInterval),
       recent_only: form.recent_only ? 1 : 0,
+      history_days: Number(form.history_days ?? 7),
       max_conversations: Number(activeSyncStatus.value.max_conversations || 50),
     })
     setSyncStatus(syncPlatform.value, res.data || activeSyncStatus.value)
@@ -1025,6 +1056,7 @@ async function refreshLive() {
   try {
     await Promise.all([loadSyncStatus(), loadConversations(true)])
     if (liveTick.value % 10 === 1) loadAnalytics()
+    if (liveTick.value % 30 === 1) loadStorageHealth()
     if (contactId) {
       const latest = conversations.value.find(item => item.id === contactId)
       const latestId = Number(latest?.last_message_id || 0)
@@ -1049,6 +1081,13 @@ async function loadTemplates() {
   try {
     const res = await dmApi.getTemplates()
     templates.value = res.data || []
+  } catch (error) { console.error(error) }
+}
+
+async function loadStorageHealth() {
+  try {
+    const res = await dmApi.getStorageHealth()
+    storageHealth.value = res.data || null
   } catch (error) { console.error(error) }
 }
 
@@ -1336,7 +1375,7 @@ useLivePolling(refreshLive, { interval: 1000, isActive: () => activeTab.value ==
 onMounted(async () => {
   await Promise.all([
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
-    loadSyncStatus(),
+    loadSyncStatus(), loadStorageHealth(),
   ])
   // 从「今日优先跟进」跳转时携带 ?contact=<id>，直接打开对应会话。
   const contactId = Number(route.query.contact || 0)
@@ -1382,6 +1421,7 @@ onMounted(async () => {
 .conversation-top { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
 .conversation-top strong { font-size: 14px; color: #303133; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-time { flex: none; font-size: 11px; color: #a0a4ab; }
+.conversation-id { margin-top: 3px; color: #8a8f98; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-tags { display: flex; gap: 4px; margin: 4px 0; flex-wrap: wrap; }
 .conversation-preview { color: #7a7f87; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .reply-mark { color: #409eff; }
@@ -1438,6 +1478,8 @@ onMounted(async () => {
 .sync-summary strong { font-size: 18px; }
 .sync-summary strong.success { color: #67c23a; }
 .sync-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: #909399; font-size: 12px; margin-bottom: 10px; }
+.sync-range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sync-range .el-input-number { width: 108px; }
 .sync-note { margin-top: 10px; }
 .lead-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .muted { color: #a0a4ab; }

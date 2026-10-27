@@ -17,7 +17,17 @@ bp = Blueprint("xiaohongshu_dm_sync", __name__)
 
 PLATFORM = "小红书"
 ACCOUNT_TYPE = 1
-RECENT_HOURS = 48
+# 默认回补天数；实际窗口由同步设置里的 history_days 决定。
+DEFAULT_HISTORY_DAYS = 7
+
+
+def _window_label(hours: int) -> str:
+    hours = max(0, int(hours or 0))
+    if hours <= 0:
+        return "全部历史"
+    if hours % 24 == 0:
+        return f"{hours // 24} 天"
+    return f"{hours} 小时"
 
 
 def _message_parts(message: dict) -> tuple[dict, dict, dict]:
@@ -54,17 +64,23 @@ def _message_text(sixin: dict) -> tuple[str, bool]:
     return label, True
 
 
-def _direction(message: dict, sixin: dict, extension: dict, porch_user_id: str) -> str:
+def _direction_detail(message: dict, sixin: dict, extension: dict,
+                      porch_user_id: str) -> tuple[str, bool]:
+    """返回 (方向, 是否可信)。可信才回写 outbound，避免把客户消息复制成自己发的。"""
     sender_id = clean_text(sixin.get("senderId"), 120)
     if porch_user_id and sender_id:
-        return "outbound" if sender_id == porch_user_id else "inbound"
+        return ("outbound" if sender_id == porch_user_id else "inbound"), True
     sender_type = extension.get("senderType")
     # 小红书前端枚举：0=csa（客服/自己），1=customer（客户）。
     if sender_type in (0, "0"):
-        return "outbound"
+        return "outbound", True
     if sender_type in (1, "1"):
-        return "inbound"
-    return "inbound"
+        return "inbound", True
+    return "inbound", False
+
+
+def _direction(message: dict, sixin: dict, extension: dict, porch_user_id: str) -> str:
+    return _direction_detail(message, sixin, extension, porch_user_id)[0]
 
 
 def _created_at(sixin: dict, message: dict) -> str:
@@ -93,7 +109,8 @@ def _chat_id(chat: dict) -> str:
 
 
 def _chat_items(chat: dict, messages: list[dict], account: dict,
-                porch_user_id: str, recent_only: bool) -> tuple[list[dict], dict[str, int]]:
+                porch_user_id: str, history_hours: int) -> tuple[list[dict], dict[str, int]]:
+    """把一个会话的历史整理成待入库消息；窗口内双向都收，回复类只标 inbound。"""
     sixin_chat = chat.get("sixinChat") or chat.get("sixin_chat") or {}
     session = chat.get("session") or {}
     chat_id = _chat_id(chat)
@@ -102,10 +119,13 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
     for raw in messages:
         message, sixin, extension = _message_parts(raw)
         text, placeholder = _message_text(sixin)
+        direction, confident = _direction_detail(
+            message, sixin, extension, porch_user_id,
+        )
         analyzed.append({
             "raw": message, "sixin": sixin, "extension": extension,
             "text": text, "placeholder": placeholder,
-            "direction": _direction(message, sixin, extension, porch_user_id),
+            "direction": direction, "confident": confident,
             "created_at": _created_at(sixin, message),
         })
     analyzed.sort(key=lambda item: item["created_at"])
@@ -121,43 +141,53 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
     if session.get("isReplied") is True:
         unanswered = False
 
+    label = _window_label(history_hours)
     items = []
     skip_reasons: dict[str, int] = {}
-    for index in inbound_indexes:
-        entry = analyzed[index]
+    for index, entry in enumerate(analyzed):
         sixin = entry["sixin"]
         text = entry["text"]
+        direction = entry["direction"]
         if not text:
             skip_reasons["空消息"] = skip_reasons.get("空消息", 0) + 1
             continue
-        if recent_only and not is_recent(sixin.get("createdAt"), RECENT_HOURS):
-            skip_reasons["超出近 48 小时"] = skip_reasons.get("超出近 48 小时", 0) + 1
+        if direction == "outbound" and not entry["confident"]:
+            # 方向判不出来时不回写，宁可少一条也不要伪造客户消息。
+            skip_reasons["方向未知"] = skip_reasons.get("方向未知", 0) + 1
             continue
-        status = "new" if index == latest_inbound and unanswered else "replied"
+        if history_hours and not is_recent(sixin.get("createdAt"), history_hours):
+            reason = f"超出近 {label}"
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+        if direction == "inbound":
+            status = "new" if index == latest_inbound and unanswered else "replied"
+        else:
+            status = "replied"
         raw_message_id = clean_text(sixin.get("id") or entry["raw"].get("messageId"), 160)
         if raw_message_id:
             external_message_id = f"xhs-{raw_message_id}"
         else:
             fingerprint = "|".join((
-                chat_id, entry["created_at"], text,
+                chat_id, entry["created_at"], direction, text,
                 clean_text(sixin.get("senderId"), 120),
             ))
             external_message_id = "xhs-sync-" + hashlib.sha1(
                 fingerprint.encode("utf-8")
             ).hexdigest()[:24]
-        allow_auto_reply = status == "new" and not entry["placeholder"]
+        inbound = direction == "inbound"
+        allow_auto_reply = inbound and status == "new" and not entry["placeholder"]
         items.append({
             "platform": PLATFORM,
             "account": account_name(account),
             "external_user_id": chat_id,
             "external_message_id": external_message_id,
-            "author": nickname,
+            "author": nickname if inbound else "我",
             "content": text,
             "source_content": "小红书主站私信同步",
             "msg_type": "dm",
-            "direction": "inbound",
+            "direction": direction,
             "status": status,
-            "delivery_status": "received",
+            "delivery_status": "received" if inbound else "sent",
             "created_at": entry["created_at"],
             "auto_reply": allow_auto_reply,
             "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
@@ -190,6 +220,8 @@ def _sync_account(settings: dict, account: dict) -> dict:
     name = account_name(account)
     if not account.get("cookie_path"):
         raise SyncError(f"账号 {name} 的小红书 Cookie 文件不存在，请重新登录")
+    history_hours = int(settings.get("history_window_hours") or 0)
+    label = _window_label(history_hours)
     client = XhsClient(account)
     try:
         identity = client.get_identity()
@@ -197,31 +229,24 @@ def _sync_account(settings: dict, account: dict) -> dict:
         markers = _account_markers(account)
         items: list[dict] = []
         pending_markers: dict[str, str] = {}
-        skipped = 0
         failed = 0
         messages_read = 0
         skip_reasons: dict[str, int] = {}
         for chat in chats:
             chat_id = _chat_id(chat)
             if not chat_id:
-                skipped += 1
                 skip_reasons["缺少会话 ID"] = skip_reasons.get("缺少会话 ID", 0) + 1
                 continue
             marker = _marker_value(chat)
             if marker and markers.get(chat_id) == marker:
                 continue
-            if settings.get("recent_only") and not is_recent(
-                chat.get("last_message_at"), RECENT_HOURS
-            ):
-                skipped += 1
-                skip_reasons["会话超出近 48 小时"] = (
-                    skip_reasons.get("会话超出近 48 小时", 0) + 1
-                )
-                if marker:
-                    pending_markers[chat_id] = marker
+            if history_hours and not is_recent(chat.get("last_message_at"), history_hours):
+                # 超窗会话直接跳过，但**不写标记**：窗口调大后还能补回来。
+                key = f"会话超出近 {label}"
+                skip_reasons[key] = skip_reasons.get(key, 0) + 1
                 continue
             try:
-                messages = client.get_messages(chat, limit=20)
+                messages = client.get_history_messages(chat, hours=history_hours)
             except XhsAuthError:
                 raise
             except XhsError as exc:
@@ -234,12 +259,12 @@ def _sync_account(settings: dict, account: dict) -> dict:
             messages_read += len(messages)
             chat_items, chat_skips = _chat_items(
                 chat, messages, account, identity.get("porch_user_id") or "",
-                bool(settings.get("recent_only")),
+                history_hours,
             )
             items.extend(chat_items)
             for reason, count in chat_skips.items():
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + count
-            if marker:
+            if marker and client.history_loaded(chat_id):
                 pending_markers[chat_id] = marker
 
         ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
@@ -261,7 +286,7 @@ def _sync_account(settings: dict, account: dict) -> dict:
             "messages_read": messages_read,
             "imported": int(ingest.get("added") or 0),
             "duplicates": int(ingest.get("duplicates") or 0),
-            "skipped": skipped + sum(skip_reasons.values()),
+            "skipped": sum(skip_reasons.values()),
             "failed": failed + int(ingest.get("failed") or 0),
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
@@ -284,6 +309,22 @@ class XiaohongshuDmSync(BaseDmSync):
     def init_extra(self, conn):
         _init_extra(conn)
 
+    def extra_migrations(self) -> dict:
+        def _reset_legacy_markers(conn):
+            # 旧版本把"超出 48 小时"的会话也写成了已同步标记，导致 7 天历史永远补不回来；
+            # 这里清空一次，让升级后的第一轮重新回补。
+            conn.execute("DELETE FROM xiaohongshu_dm_markers")
+
+        return {3: _reset_legacy_markers}
+
+    def reset_history_state(self) -> None:
+        """历史窗口调整后清空已同步标记，让下一轮重新回补更早的会话。"""
+        try:
+            with dm_ops.get_conn() as c:
+                c.execute("DELETE FROM xiaohongshu_dm_markers")
+        except Exception:
+            pass
+
     def scan_account(self, settings: dict, account: dict) -> dict:
         return _sync_account(settings, account)
 
@@ -298,7 +339,7 @@ sync_manager = XiaohongshuDmSync(
     min_interval=0,
     default_interval=0,
     default_max_conversations=50,
-    recent_hours=RECENT_HOURS,
+    default_history_days=DEFAULT_HISTORY_DAYS,
     error_types=(XhsError, XhsAuthError),
     max_workers=8,
     failure_backoff=30,

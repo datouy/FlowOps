@@ -14,6 +14,7 @@ export const dmApi = {
   getRules: () => http.get('/dm/rules'),
   getTemplates: () => http.get('/message-templates'),
   getConversations: params => http.get('/dm/conversations', params),
+  getStorageHealth: () => http.get('/dm/storage/health'),
   getLeads: params => http.get('/dm/conversations', params),
   markConversationRead: id => http.post(`/dm/conversations/${id}/read`, {}, { silent: true }),
   getConversation: (id, params) => http.get(`/dm/conversations/${id}`, params),

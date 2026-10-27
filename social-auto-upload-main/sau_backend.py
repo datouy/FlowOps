@@ -1,33 +1,34 @@
 import asyncio
+import atexit
 import os
 os.environ.setdefault("FLOWOPS_BACKEND", "1")
+import signal
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from flask_cors import CORS
 from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, send_from_directory
+from werkzeug.exceptions import NotFound
 from werkzeug.utils import secure_filename
 from publish_jobs import enqueue_job, start_patrol, run_patrol_once, latest_account_status
 import verify_codes
-from travel_ops import bp as travel_ops_bp
 from conf import BASE_DIR
 from db_utils import connect as db_connect
 import runtime_config
 from app_logging import logger, setup_request_logging
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
-from myUtils.postVideo import (post_video_tencent, post_video_DouYin, post_video_ks,
-                               post_video_xhs, post_video_weibo, post_video_baijiahao)
+# 平台发布统一走 myUtils.platform_registry，避免这里重复维护平台清单。
 
 runtime_config.validate_server_config()
 
 active_queues = {}
 app = Flask(__name__)
 setup_request_logging(app)
-app.register_blueprint(travel_ops_bp)
 import schedule_ops
 schedule_ops.register(app)
 import publish_jobs
@@ -65,8 +66,8 @@ CORS(
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 
-# 限制上传文件大小为160MB
-app.config['MAX_CONTENT_LENGTH'] = 160 * 1024 * 1024
+# 限制上传文件大小（与 runtime_config.MAX_CONTENT_LENGTH、Nginx 的 200m 一致）
+app.config['MAX_CONTENT_LENGTH'] = runtime_config.MAX_CONTENT_LENGTH
 
 
 @app.before_request
@@ -151,6 +152,31 @@ def get_file():
 
     # 返回文件
     return send_from_directory(file_path,filename)
+
+
+@app.route('/download/<path:file_path>', methods=['GET'])
+def download_file(file_path):
+    """下载素材（前端 materialApi.downloadMaterial 调用此路由）。
+
+    与 /getFile 一样只允许访问 videoFile 目录内的文件，
+    并显式拦截路径穿越，避免 ../ 读到目录外的文件。
+    """
+    if not file_path:
+        return jsonify({"code": 400, "msg": "file path is required", "data": None}), 400
+
+    # 防止路径穿越攻击（Windows 下也要防反斜杠）
+    normalized = str(file_path).replace('\\', '/')
+    if '..' in normalized or normalized.startswith('/'):
+        return jsonify({"code": 400, "msg": "Invalid file path", "data": None}), 400
+
+    try:
+        return send_from_directory(
+            str(Path(BASE_DIR / "videoFile")),
+            normalized,
+            as_attachment=True,
+        )
+    except NotFound:
+        return jsonify({"code": 404, "msg": "File not found", "data": None}), 404
 
 
 @app.route('/uploadSave', methods=['POST'])
@@ -644,19 +670,23 @@ def login():
     id = request.args.get('id')
     account_id = request.args.get('account_id', type=int)
 
+    # id 会作为 active_queues 的键，必须限制长度，避免被恶意参数撑爆内存
+    id = (id or '').strip()[:64]
+    if not id:
+        return jsonify({"code": 400, "msg": "id is required", "data": None}), 400
+    if type not in ('1', '2', '3', '4', '5', '6'):
+        return jsonify({"code": 400, "msg": "invalid platform type", "data": None}), 400
+
     # 模拟一个用于异步通信的队列
     status_queue = Queue()
     active_queues[id] = status_queue
 
-    def on_close():
-        logger.debug("清理队列: {}", id)
-        del active_queues[id]
     # 启动异步任务线程
     thread = threading.Thread(
         target=run_async_function, args=(type, id, status_queue, account_id), daemon=True,
     )
     thread.start()
-    response = Response(sse_stream(status_queue,), mimetype='text/event-stream')
+    response = Response(sse_stream(status_queue, id), mimetype='text/event-stream')
     response.headers['Cache-Control'] = 'no-cache'
     response.headers['X-Accel-Buffering'] = 'no'  # 关键：禁用 Nginx 缓冲
     response.headers['Content-Type'] = 'text/event-stream'
@@ -676,6 +706,7 @@ def postVideo():
     account_list = data.get('accountList', [])
     type = data.get('type')
     title = data.get('title')
+    desc = data.get('desc', '') or ''  # 正文描述，与标题分开（AI 生成的长文案走这里）
     tags = data.get('tags')
     category = data.get('category')
     enableTimer = data.get('enableTimer')
@@ -716,7 +747,8 @@ def postVideo():
     extra = {
         'category': category, 'enableTimer': enableTimer, 'videosPerDay': videos_per_day,
         'dailyTimes': daily_times, 'startDays': start_days, 'isDraft': is_draft,
-        'thumbnail': thumbnail_path, 'productLink': productLink, 'productTitle': productTitle
+        'thumbnail': thumbnail_path, 'productLink': productLink, 'productTitle': productTitle,
+        'desc': desc
     }
     job_id = enqueue_job(type, title, tags, file_list, account_list, extra,
                          review_required=bool(data.get('reviewRequired')))
@@ -764,6 +796,7 @@ def updateUserinfo():
 
 @app.route('/postVideoBatch', methods=['POST'])
 def postVideoBatch():
+    from myUtils.platform_registry import dispatch_publish
     data_list = request.get_json()
 
     if not isinstance(data_list, list):
@@ -774,6 +807,7 @@ def postVideoBatch():
         account_list = data.get('accountList', [])
         type = data.get('type')
         title = data.get('title')
+        desc = data.get('desc', '') or ''
         tags = data.get('tags')
         category = data.get('category')
         enableTimer = data.get('enableTimer')
@@ -789,23 +823,16 @@ def postVideoBatch():
         # 打印获取到的数据（仅作为示例）
         logger.debug("File List: {}", file_list)
         logger.debug("Account List: {}", account_list)
-        match type:
-            case 1:
-                post_video_xhs(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
-                               start_days)
-            case 2:
-                post_video_tencent(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
-                                   start_days, is_draft)
-            case 3:
-                post_video_DouYin(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
-                          start_days, productLink, productTitle)
-            case 4:
-                post_video_ks(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
-                          start_days)
-            case 5:
-                post_video_weibo(title, file_list, tags, account_list)
-            case 6:
-                post_video_baijiahao(title, file_list, tags, account_list)
+        # 统一走平台注册表分发，避免各平台参数错位（历史上漏传 publish_strategy
+        # 导致定时发布被静默降级成立即发布）。
+        dispatch_publish(
+            type,
+            title=title, files=file_list, tags=tags, account_list=account_list,
+            category=category, enableTimer=enableTimer,
+            videosPerDay=videos_per_day, dailyTimes=daily_times, startDays=start_days,
+            desc=desc, isDraft=is_draft,
+            productLink=productLink, productTitle=productTitle,
+        )
     # 返回响应给客户端
     return jsonify(
         {
@@ -971,14 +998,33 @@ def run_async_function(type, id, status_queue, account_id=None):
             loop.close()
 
 # SSE 流生成器函数
-def sse_stream(status_queue):
-    while True:
-        if not status_queue.empty():
-            msg = status_queue.get()
+def sse_stream(status_queue, queue_id=None):
+    """把扫码登录的状态消息以 SSE 形式推给前端。
+
+    - 收到终态（200/500）后主动结束流，避免客户端与线程一直挂着。
+    - 用 Queue.get(timeout=...) 阻塞等待，取代 empty()+sleep 的轮询，
+      既消除竞态，也避免空转占 CPU。
+    - 无论正常结束还是客户端断开，都在 finally 里清理 active_queues，
+      否则每扫码一次就会泄漏一个 Queue 和一个工作线程。
+    """
+    try:
+        while True:
+            try:
+                msg = status_queue.get(timeout=15)
+            except Empty:
+                # 心跳注释帧，避免 Nginx/浏览器因空闲断开长连接
+                yield ": keep-alive\n\n"
+                continue
             yield f"data: {msg}\n\n"
-        else:
-            # 避免 CPU 占满
-            time.sleep(0.1)
+            if msg in ("200", "500"):
+                break
+    except GeneratorExit:
+        # 客户端主动断开
+        raise
+    finally:
+        if queue_id is not None:
+            active_queues.pop(queue_id, None)
+            logger.debug("清理队列: {}", queue_id)
 
 import publish_jobs
 
@@ -988,10 +1034,77 @@ douyin_dm_sync.start_background()
 xiaohongshu_dm_sync.start_background()
 channels_dm_sync.start_background()
 
+
+def _dm_storage_maintenance():
+    """启动即 checkpoint + 当天首次备份，保证重启不会读到"只存在于 WAL"的聊天记录。"""
+    try:
+        result = dm_ops.maintain_storage()
+        health = dm_ops.storage_health()
+        logger.info(
+            "私信库落盘检查：checkpoint={} backup={} messages={} latest={}",
+            result.get("checkpoint", {}).get("ok"),
+            result.get("backup") or "-",
+            health.get("counts", {}).get("messages"),
+            health.get("latest_message_at") or "-",
+        )
+    except Exception as exc:
+        logger.warning("私信库落盘检查失败：{}", exc)
+
+
+def _dm_storage_loop(interval_seconds: int = 600):
+    """定期做 PASSIVE checkpoint，把 WAL 内容持续合并回主库文件。"""
+    while True:
+        time.sleep(max(60, int(interval_seconds)))
+        try:
+            dm_ops.checkpoint_storage("PASSIVE")
+        except Exception:
+            continue
+
+
+def _dm_storage_shutdown():
+    try:
+        dm_ops.maintain_storage()
+    except Exception:
+        pass
+
+
+_dm_storage_maintenance()
+threading.Thread(
+    target=_dm_storage_loop, name="dm-storage-checkpoint", daemon=True,
+).start()
+atexit.register(_dm_storage_shutdown)
+for _signal in ("SIGINT", "SIGTERM", "SIGBREAK"):
+    handler = getattr(signal, _signal, None)
+    if handler is None:
+        continue
+    try:
+        signal.signal(handler, lambda *_args: (_dm_storage_shutdown(), sys.exit(0)))
+    except (ValueError, OSError):
+        continue
+
 if __name__ == '__main__':
     if not runtime_config.is_loopback_host(runtime_config.HOST):
         logger.warning(
             "后端正在监听 {}，远程访问已开启且要求 X-YunCe-Token。",
             runtime_config.HOST,
         )
-    app.run(host=runtime_config.HOST, port=runtime_config.PORT, threaded=True)
+    # 用 waitress 承载生产流量：Flask 自带的开发服务器没有超时/线程治理，
+    # 大文件上传和 SSE 长连接下容易出现连接堆积。
+    # 仍然保持单进程模型——内存队列、发布 worker、巡检线程、SSE 都在进程内。
+    try:
+        from waitress import serve
+    except ImportError:
+        logger.warning("未安装 waitress，回退到 Flask 开发服务器（仅建议本地使用）")
+        app.run(host=runtime_config.HOST, port=runtime_config.PORT, threaded=True)
+    else:
+        serve(
+            app,
+            host=runtime_config.HOST,
+            port=runtime_config.PORT,
+            threads=16,
+            # SSE 长连接需要较长的空闲超时
+            channel_timeout=1800,
+            # 单个请求允许的上传体积与后端 MAX_CONTENT_LENGTH 对齐
+            max_request_body_size=runtime_config.MAX_CONTENT_LENGTH,
+            ident="yunce",
+        )

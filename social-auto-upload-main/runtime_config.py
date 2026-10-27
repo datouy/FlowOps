@@ -14,6 +14,8 @@ from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5409
+# 单个请求允许的最大体积（160MB），与 Nginx client_max_body_size 200m 匹配。
+MAX_CONTENT_LENGTH = 160 * 1024 * 1024
 DEFAULT_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",

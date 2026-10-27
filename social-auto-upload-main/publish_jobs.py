@@ -118,9 +118,7 @@ def _worker(worker_id):
             _q.task_done()
 
 def _run_job(job_id):
-    from myUtils.postVideo import (post_video_tencent, post_video_DouYin,
-                                   post_video_ks, post_video_xhs,
-                                   post_video_weibo, post_video_baijiahao)
+    from myUtils.platform_registry import dispatch_publish, platform_name
     with get_conn() as c:
         job = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
     if not job:
@@ -131,8 +129,7 @@ def _run_job(job_id):
     file_list = json_loads(job['file_list'])
     account_list = json_loads(job['account_list'])
     extra = json_loads(job['extra'] or '{}')
-    platform_names = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
-    verify_codes.set_job_context(job_id=job_id, title=title, platform=platform_names.get(type, ''))
+    verify_codes.set_job_context(job_id=job_id, title=title, platform=platform_name(type))
 
     if extra.get('enableTimer'):
         _expand_schedule(job_id)
@@ -144,20 +141,15 @@ def _run_job(job_id):
 
     error = ''
     try:
-        if type == 1:
-            post_video_xhs(title, file_list, tags, account_list, extra.get('category'), extra.get('enableTimer'), extra.get('videosPerDay'), extra.get('dailyTimes'), extra.get('startDays', 0))
-        elif type == 2:
-            post_video_tencent(title, file_list, tags, account_list, extra.get('category'), extra.get('enableTimer'), extra.get('videosPerDay'), extra.get('dailyTimes'), extra.get('startDays', 0), extra.get('isDraft', False))
-        elif type == 3:
-            post_video_DouYin(title, file_list, tags, account_list, extra.get('category'), extra.get('enableTimer'), extra.get('videosPerDay'), extra.get('dailyTimes'), extra.get('startDays', 0), extra.get('thumbnail',''), extra.get('productLink',''), extra.get('productTitle',''))
-        elif type == 4:
-            post_video_ks(title, file_list, tags, account_list, extra.get('category'), extra.get('enableTimer'), extra.get('videosPerDay'), extra.get('dailyTimes'), extra.get('startDays', 0))
-        elif type == 5:
-            post_video_weibo(title, file_list, tags, account_list, thumbnail_path=_ensure_thumbnail(file_list, extra))
-        elif type == 6:
-            post_video_baijiahao(title, file_list, tags, account_list, thumbnail_path=_ensure_thumbnail(file_list, extra))
-        else:
-            raise ValueError('unsupported type: %s' % type)
+        dispatch_publish(
+            type,
+            title=title, files=file_list, tags=tags, account_list=account_list,
+            category=extra.get('category'), enableTimer=extra.get('enableTimer'),
+            videosPerDay=extra.get('videosPerDay'), dailyTimes=extra.get('dailyTimes'),
+            startDays=extra.get('startDays', 0), desc=extra.get('desc', ''),
+            isDraft=extra.get('isDraft', False), thumbnail=extra.get('thumbnail', ''),
+            productLink=extra.get('productLink', ''), productTitle=extra.get('productTitle', ''),
+        )
     except Exception as e:
         error = str(e)[:500]
         traceback.print_exc()
@@ -239,7 +231,12 @@ def backfill_scheduled_items():
 
 
 def _expand_schedule(job_id):
-    """Expand a timer-enabled job into concrete (account, file, datetime) rows."""
+    """Expand a timer-enabled job into concrete (account, file, datetime) rows.
+
+    排期时间在这里一次性算准并落库，之后就是唯一事实来源：
+    重启、重试、巡检都不再重算，避免每次重启排期顺延一天。
+    已经存在排期行的任务不会被覆盖。
+    """
     with get_conn() as c:
         job = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
     if not job:
@@ -247,6 +244,14 @@ def _expand_schedule(job_id):
     extra = json_loads(job['extra'] or '{}')
     if not extra.get('enableTimer'):
         return
+
+    # 已经展开过就不重算（重算是历史 bug：每次重启都会顺延一天）
+    with get_conn() as c:
+        existing = c.execute(
+            'SELECT COUNT(*) FROM scheduled_items WHERE job_id=?', (job_id,)).fetchone()[0]
+    if existing:
+        return
+
     file_list = json_loads(job['file_list'])
     account_list = json_loads(job['account_list'])
     try:
@@ -258,7 +263,6 @@ def _expand_schedule(job_id):
     except Exception:
         dts = []
     with get_conn() as c:
-        c.execute('DELETE FROM scheduled_items WHERE job_id=?', (job_id,))
         for fi, f in enumerate(file_list):
             dt = dts[fi] if fi < len(dts) else None
             for acc in account_list:
@@ -277,6 +281,13 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
         cur = c.execute('INSERT INTO jobs (type,title,tags,file_list,account_list,extra,status) VALUES (?,?,?,?,?,?,?)',
             (type, title, json.dumps(tags, ensure_ascii=False), json.dumps(file_list), json.dumps(account_list), json.dumps(extra or {}), status))
         job_id = cur.lastrowid
+    # 排期在任务创建时就算好并落库，之后不再重算，
+    # 这样重启/重试/巡检都不会把发布时间顺延。
+    if (extra or {}).get('enableTimer'):
+        try:
+            _expand_schedule(job_id)
+        except Exception:
+            logger.exception("展开定时排期失败: job_id={}", job_id)
     if not review_required:
         _start_workers()
         _q.put(job_id)

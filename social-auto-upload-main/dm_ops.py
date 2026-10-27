@@ -15,10 +15,15 @@ from flask import Blueprint, Response, jsonify, request
 
 from conf import BASE_DIR
 import ai_content
-from db_utils import apply_migrations, connect
+from db_utils import (
+    apply_migrations, backup as db_backup, checkpoint as db_checkpoint,
+    connect, integrity_ok, stats as db_stats,
+)
 
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
+BACKUP_DIR = Path(BASE_DIR / "db" / "backups")
+BACKUP_KEEP = 7
 
 SEGMENTS = {"general": "通用", "new": "新客户", "interested": "意向客户", "existing": "老客户", "unknown": "未分类"}
 STAGES = {
@@ -93,6 +98,7 @@ def _initialize_schema(c):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         platform TEXT NOT NULL DEFAULT '', account TEXT NOT NULL DEFAULT '',
         external_user_id TEXT NOT NULL DEFAULT '', nickname TEXT DEFAULT '',
+        is_group INTEGER DEFAULT 0,
         segment TEXT DEFAULT 'unknown', intent TEXT DEFAULT 'low',
         stage TEXT DEFAULT 'new', source_content TEXT DEFAULT '',
         contact_info TEXT DEFAULT '', traveler_count INTEGER DEFAULT 0,
@@ -151,6 +157,7 @@ def _initialize_schema(c):
         _ensure_column(c, "message_templates", name, ddl)
     for name, ddl in (
         ("company_name", "TEXT DEFAULT ''"), ("budget", "TEXT DEFAULT ''"),
+        ("is_group", "INTEGER DEFAULT 0"),
     ):
         _ensure_column(c, "dm_contacts", name, ddl)
     for name, ddl in (
@@ -248,6 +255,12 @@ def _migrate_perf_indexes(c):
         ON dm_reply_logs(ai_used, created_at)""")
 
 
+def _migrate_group_metadata(c):
+    """旧库补群聊标记，并触发一次会话重新扫描以回填真实群聊类型。"""
+    _ensure_column(c, "dm_contacts", "is_group", "INTEGER DEFAULT 0")
+    c.execute("DELETE FROM dm_meta WHERE key LIKE 'douyin_history%'")
+
+
 def init_db():
     with get_conn() as c:
         apply_migrations(c, "dm_ops", {
@@ -255,8 +268,71 @@ def init_db():
             2: _migrate_message_counters,
             3: _migrate_ai_reply,
             4: _migrate_perf_indexes,
+            5: _merge_douyin_contacts,
+            6: _migrate_douyin_cleanup,
+            7: _migrate_group_metadata,
         })
         _backfill_contacts(c)
+
+
+# ---- 落盘维护 ---------------------------------------------------------
+def message_range() -> list[dict]:
+    """各平台/账号的消息条数与时间跨度，用来确认历史窗口真的补进来了。"""
+    with get_conn() as c:
+        rows = c.execute("""
+            SELECT platform, account, COUNT(*) AS messages,
+                   MIN(created_at) AS oldest, MAX(created_at) AS newest
+            FROM messages GROUP BY platform, account
+            ORDER BY messages DESC""").fetchall()
+    return [dict(row) for row in rows]
+
+
+def storage_health() -> dict:
+    """库文件、WAL 体积、完整性、各表行数与最近备份，一眼看出是否落盘。"""
+    data = db_stats(DB)
+    data["integrity_ok"] = integrity_ok(DB)
+    data["backup_dir"] = str(BACKUP_DIR)
+    backups = []
+    if BACKUP_DIR.exists():
+        for path in sorted(BACKUP_DIR.glob("ops_center-*.db"))[-BACKUP_KEEP:]:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            backups.append({
+                "name": path.name,
+                "size": stat.st_size,
+                "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+    data["backups"] = backups
+    try:
+        data["message_range"] = message_range()
+    except Exception:
+        data["message_range"] = []
+    return data
+
+
+def checkpoint_storage(mode: str = "TRUNCATE") -> dict:
+    """把 WAL 里已提交的聊天记录合并回主库文件。"""
+    return db_checkpoint(DB, mode=mode)
+
+
+def backup_storage(keep: int = BACKUP_KEEP) -> str:
+    path = db_backup(DB, BACKUP_DIR, keep=keep, prefix="ops_center")
+    return str(path) if path else ""
+
+
+def maintain_storage(force_backup: bool = False, keep: int = BACKUP_KEEP) -> dict:
+    """启动/退出时的落盘维护：先 checkpoint，再保证当天有一份可用备份。"""
+    checkpoint_result = checkpoint_storage()
+    day = datetime.now().strftime("%Y%m%d")
+    daily = BACKUP_DIR / f"ops_center-{day}.db"
+    created = ""
+    if force_backup or not daily.exists():
+        made = db_backup(DB, BACKUP_DIR, keep=keep, prefix="ops_center", stamp=day)
+        created = str(made) if made else ""
+    backup_path = created or (str(daily) if daily.exists() else "")
+    return {"checkpoint": checkpoint_result, "backup": backup_path}
 
 
 DEFAULT_RULES = []
@@ -307,6 +383,127 @@ def _backfill_contacts(c):
         )
         c.execute("UPDATE messages SET contact_id=?, external_user_id=? WHERE id=?",
                   (contact_id, external, item["id"]))
+
+
+def prune_placeholder_messages(platform: str) -> int:
+    """清掉伪造的未读占位；有真实内容时也移除“无法展示”提示。"""
+    with get_conn() as c:
+        legacy = c.execute(
+            """SELECT id, contact_id FROM messages
+               WHERE platform=? AND (
+                   content LIKE '您有 % 条未读消息%' OR
+                   content LIKE '%收到一条新类型消息%')""",
+            (platform,),
+        ).fetchall()
+        neutral = c.execute(
+            """SELECT m.id, m.contact_id FROM messages m
+               WHERE m.platform=? AND m.content='当前内容无法在平台上展示'
+                 AND EXISTS (
+                     SELECT 1 FROM messages x
+                     WHERE x.contact_id=m.contact_id AND x.id<>m.id
+                       AND x.direction='inbound'
+                       AND x.content<>'当前内容无法在平台上展示'
+                       AND x.content NOT LIKE '您有 % 条未读消息%'
+                 )""",
+            (platform,),
+        ).fetchall()
+        rows = [*legacy, *neutral]
+        removed_ids = [row["id"] for row in rows]
+        if not removed_ids:
+            return 0
+        marks = ",".join("?" for _ in removed_ids)
+        c.execute(f"DELETE FROM messages WHERE id IN ({marks})", removed_ids)
+        c.execute(
+            f"DELETE FROM dm_reply_logs WHERE inbound_message_id IN ({marks})",
+            removed_ids,
+        )
+        contact_ids = {row["contact_id"] for row in rows if row["contact_id"]}
+        for contact_id in contact_ids:
+            c.execute("""UPDATE dm_contacts SET
+                unread_count=(SELECT COUNT(*) FROM messages x
+                    WHERE x.contact_id=dm_contacts.id AND x.direction='inbound' AND x.status='new'),
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=dm_contacts.id),
+                pending_delivery=(SELECT COUNT(*) FROM messages x
+                    WHERE x.contact_id=dm_contacts.id AND x.direction='outbound'
+                      AND x.delivery_status='ready')
+                WHERE id=?""", (contact_id,))
+    return len(removed_ids)
+
+
+def _merge_douyin_contacts(c):
+    """把历史联系人 external_user_id 归一成抖音用户 ID，合并同一人的多个会话。"""
+    rows = c.execute(
+        "SELECT id, external_user_id FROM dm_contacts WHERE platform='抖音'"
+    ).fetchall()
+    for row in rows:
+        value = str(row["external_user_id"] or "")
+        if not value.startswith("0:1:") or value.count(":") != 3:
+            continue
+        parts = value.split(":")
+        stable = parts[2]
+        keep = c.execute(
+            "SELECT id FROM dm_contacts WHERE platform='抖音' AND external_user_id=?",
+            (stable,),
+        ).fetchone()
+        if keep and keep["id"] != row["id"]:
+            old_id, new_id = row["id"], keep["id"]
+            c.execute(
+                "UPDATE messages SET contact_id=?, external_user_id=? WHERE contact_id=?",
+                (new_id, stable, old_id),
+            )
+            c.execute(
+                "UPDATE dm_reply_logs SET contact_id=? WHERE contact_id=?",
+                (new_id, old_id),
+            )
+            c.execute("DELETE FROM dm_contacts WHERE id=?", (old_id,))
+        elif not keep:
+            c.execute(
+                "UPDATE dm_contacts SET external_user_id=? WHERE id=?",
+                (stable, row["id"]),
+            )
+
+
+def _migrate_douyin_cleanup(c):
+    """删除历史伪造的未读占位，并修正把消息预览拼进昵称的联系人。"""
+    rows = c.execute(
+        """SELECT id, contact_id FROM messages
+           WHERE platform='抖音' AND (
+               content LIKE '您有 % 条未读消息%' OR
+               content LIKE '%收到一条新类型消息%')"""
+    ).fetchall()
+    if rows:
+        ids = [row["id"] for row in rows]
+        marks = ",".join("?" for _ in ids)
+        c.execute(f"DELETE FROM messages WHERE id IN ({marks})", ids)
+        c.execute(
+            f"DELETE FROM dm_reply_logs WHERE inbound_message_id IN ({marks})",
+            ids,
+        )
+        contact_ids = {row["contact_id"] for row in rows if row["contact_id"]}
+        for contact_id in contact_ids:
+            c.execute("""UPDATE dm_contacts SET
+                unread_count=(SELECT COUNT(*) FROM messages x
+                    WHERE x.contact_id=dm_contacts.id AND x.direction='inbound' AND x.status='new'),
+                message_count=(SELECT COUNT(*) FROM messages x WHERE x.contact_id=dm_contacts.id),
+                pending_delivery=(SELECT COUNT(*) FROM messages x
+                    WHERE x.contact_id=dm_contacts.id AND x.direction='outbound'
+                      AND x.delivery_status='ready')
+                WHERE id=?""", (contact_id,))
+    markers = ("收到一条新类型消息", "您有", "请打开抖音", "未读消息", "当前内容无法在平台上展示")
+    for row in c.execute(
+        "SELECT id, nickname, external_user_id FROM dm_contacts WHERE platform='抖音'"
+    ).fetchall():
+        name = str(row["nickname"] or "")
+        if not any(marker in name for marker in markers):
+            continue
+        cut = re.split(r"\d{1,2}:\d{2}", name)[0].strip()
+        new_name = (
+            cut if cut and not any(marker in cut for marker in markers)
+            else str(row["external_user_id"] or "抖音用户")
+        )
+        c.execute(
+            "UPDATE dm_contacts SET nickname=? WHERE id=?", (new_name, row["id"])
+        )
 
 
 def detect_segment(text: str, explicit: str = "") -> str:
@@ -501,6 +698,7 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
     account = _clean(item.get("account"), 120)
     external = _external_id(item, content)
     nickname = _clean(item.get("nickname") or item.get("author"), 80)
+    is_group = 1 if item.get("is_group") else 0
     fields = extract_lead_fields(content)
     row = c.execute(
         "SELECT * FROM dm_contacts WHERE platform=? AND account=? AND external_user_id=?",
@@ -509,11 +707,11 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
     if not row:
         stage = "qualified" if fields["contact_info"] and intent == "high" else ("engaged" if intent == "high" else "new")
         cur = c.execute("""INSERT INTO dm_contacts
-            (platform,account,external_user_id,nickname,segment,intent,stage,source_content,
+            (platform,account,external_user_id,nickname,is_group,segment,intent,stage,source_content,
              contact_info,traveler_count,origin,travel_date,company_name,budget,
              first_seen_at,last_message_at,last_inbound_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (platform, account, external, nickname or "匿名用户", segment, intent, stage,
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (platform, account, external, nickname or "匿名用户", is_group, segment, intent, stage,
              _clean(source_content, 500), fields["contact_info"], fields["traveler_count"],
              fields["origin"], fields["travel_date"], fields["company_name"], fields["budget"],
              ts, ts, ts if direction == "inbound" else None, ts, ts))
@@ -526,10 +724,11 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
     new_stage = row["stage"]
     if new_stage in ("new", "engaged") and new_intent == "high":
         new_stage = "qualified" if (fields["contact_info"] or row["contact_info"]) else "engaged"
-    c.execute("""UPDATE dm_contacts SET nickname=?,segment=?,intent=?,stage=?,source_content=?,
+    c.execute("""UPDATE dm_contacts SET nickname=?,is_group=?,segment=?,intent=?,stage=?,source_content=?,
         contact_info=?,traveler_count=?,origin=?,travel_date=?,company_name=?,budget=?,last_message_at=?,
         last_inbound_at=?,updated_at=? WHERE id=?""",
-        (nickname or row["nickname"], new_segment, new_intent, new_stage,
+        (nickname or row["nickname"], 1 if item.get("is_group") else row["is_group"],
+         new_segment, new_intent, new_stage,
          _clean(source_content, 500) or row["source_content"],
          fields["contact_info"] or row["contact_info"],
          fields["traveler_count"] or row["traveler_count"],
@@ -1027,10 +1226,14 @@ def dedupe_contact_messages(contact_id: int) -> int:
         kept = {}
         for row in rows:
             item = dict(row)
-            key = (
-                item["direction"], item["content"],
-                str(item.get("created_at") or "")[:16],
-            )
+            if item["content"] == "当前内容无法在平台上展示":
+                # 平台内容不可读的提示每会话只保留一条，不按分钟重复堆积。
+                key = (item["direction"], item["content"], "")
+            else:
+                key = (
+                    item["direction"], item["content"],
+                    str(item.get("created_at") or "")[:16],
+                )
             current = kept.get(key)
             if current is None:
                 kept[key] = item
@@ -1049,7 +1252,29 @@ def dedupe_contact_messages(contact_id: int) -> int:
     return len(removed_ids)
 
 
+def mark_read_by_external(platform: str, account: str, external_user_id: str) -> int:
+    """平台会话已归零时，把本地对应会话的未读消息同步标为已读。"""
+    if not external_user_id:
+        return 0
+    with get_conn() as c:
+        contact = c.execute(
+            "SELECT id FROM dm_contacts WHERE platform=? AND account=? AND external_user_id=?",
+            (platform, account, external_user_id),
+        ).fetchone()
+        if not contact:
+            return 0
+        cur = c.execute(
+            """UPDATE messages SET status='read', handled_at=COALESCE(handled_at,?)
+               WHERE contact_id=? AND direction='inbound' AND status='new'""",
+            (_now(), contact["id"]),
+        )
+        marked = int(cur.rowcount or 0)
+    return marked
+
+
 def _decorate_contact(data: dict) -> dict:
+    data["is_group"] = bool(data.get("is_group"))
+    data["contact_type_label"] = "群聊" if data["is_group"] else "私聊"
     data["segment_label"] = SEGMENTS.get(data.get("segment"), "未分类")
     data["stage_label"] = STAGES.get(data.get("stage"), data.get("stage") or "")
     return data
@@ -1244,7 +1469,8 @@ def mark_conversation_read(cid: int):
             return jsonify({"code": 404, "data": None, "msg": "conversation not found"}), 404
         cur = c.execute("""UPDATE messages SET status='read', handled_at=COALESCE(handled_at,?)
             WHERE contact_id=? AND direction='inbound' AND status='new'""", (_now(), cid))
-    return jsonify({"code": 200, "data": {"marked": int(cur.rowcount or 0)}, "msg": "ok"})
+        marked = int(cur.rowcount or 0)
+    return jsonify({"code": 200, "data": {"marked": marked}, "msg": "ok"})
 
 
 def simulate_inbound():
@@ -1470,9 +1696,7 @@ def analytics():
             "pending": one("""SELECT COUNT(*) FROM dm_contacts c WHERE EXISTS
                 (SELECT 1 FROM messages m WHERE m.contact_id=c.id AND m.direction='inbound' AND m.status='new')"""),
             "high_intent": one("SELECT COUNT(*) FROM dm_contacts WHERE intent='high'"),
-            "silver": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='silver'"),
-            "family": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='family'"),
-            "team": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='team'"),
+            "interested": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='interested'"),
             "qualified": one("""SELECT COUNT(*) FROM dm_contacts WHERE stage IN ('qualified','contacted','converted')
                 OR (intent='high' AND (contact_info!='' OR traveler_count>0 OR origin!=''
                     OR travel_date!='' OR company_name!='' OR budget!=''))"""),
@@ -1654,6 +1878,36 @@ def dm_analytics():
 @bp.route("/dm/export", methods=["GET"])
 def dm_export():
     return export_contacts()
+
+
+@bp.route("/dm/storage/health", methods=["GET"])
+def dm_storage_health():
+    """聊天记录落盘自检：库文件/ WAL 体积、完整性、行数与备份列表。"""
+    return jsonify({"code": 200, "data": storage_health(), "msg": None})
+
+
+@bp.route("/dm/storage/checkpoint", methods=["POST"])
+def dm_storage_checkpoint():
+    data = request.get_json(silent=True) or {}
+    result = checkpoint_storage(_clean(data.get("mode"), 20) or "TRUNCATE")
+    return jsonify({
+        "code": 200 if result.get("ok") else 409,
+        "data": result,
+        "msg": "已合并到主库文件" if result.get("ok") else "WAL 仍被其它连接占用，稍后再试",
+    }), (200 if result.get("ok") else 409)
+
+
+@bp.route("/dm/storage/backup", methods=["POST"])
+def dm_storage_backup():
+    data = request.get_json(silent=True) or {}
+    try:
+        keep = max(1, min(int(data.get("keep") or BACKUP_KEEP), 60))
+    except (TypeError, ValueError):
+        keep = BACKUP_KEEP
+    path = backup_storage(keep=keep)
+    if not path:
+        return jsonify({"code": 500, "data": None, "msg": "备份失败：数据库文件不存在"}), 500
+    return jsonify({"code": 200, "data": {"path": path}, "msg": "备份完成"})
 
 
 init_db()

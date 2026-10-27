@@ -9,14 +9,18 @@ from flask import jsonify, request
 
 from conf import BASE_DIR
 import publish_jobs
+from myUtils.platform_registry import PLATFORM_META, get_platform_meta
 
+# 平台规则统一从 myUtils.platform_registry 取，避免多处维护导致不一致。
+# 保留 PLATFORM_RULES 这个名字是为了兼容既有调用方与测试。
 PLATFORM_RULES = {
-    1: {"name": "小红书", "title_max": 30, "tags_max": 10},
-    2: {"name": "视频号", "title_max": 30, "tags_max": 8},
-    3: {"name": "抖音", "title_max": 55, "tags_max": 10},
-    4: {"name": "快手", "title_max": 30, "tags_max": 8},
-    5: {"name": "微博", "title_max": 30, "tags_max": 8},
-    6: {"name": "百家号", "title_max": 30, "tags_max": 8},
+    key: {
+        "name": meta["name"],
+        "title_max": meta["title_max"],
+        "tags_max": meta["tags_max"],
+        "desc_max": meta["desc_max"],
+    }
+    for key, meta in PLATFORM_META.items()
 }
 
 ABSOLUTE_WORDS = ["最低价", "全网第一", "保证", "百分百", "100%", "绝对", "唯一", "顶级", "国家级", "永久", "最强", "最好"]
@@ -24,8 +28,10 @@ ABSOLUTE_WORDS = ["最低价", "全网第一", "保证", "百分百", "100%", "�
 
 def check_content(data: dict) -> dict:
     platform = int(data.get("type") or 0)
-    rules = PLATFORM_RULES.get(platform, {"name": "未知平台", "title_max": 30, "tags_max": 8})
+    rules = get_platform_meta(platform)
     title = str(data.get("title") or "").strip()
+    # 正文描述单独承载，不占用标题的字数配额
+    desc = str(data.get("desc") or "").strip()
     tags = data.get("tags") or []
     files = data.get("fileList") or []
     errors, warnings = [], []
@@ -34,6 +40,8 @@ def check_content(data: dict) -> dict:
         errors.append("标题不能为空")
     if len(title) > rules["title_max"]:
         errors.append(f"标题 {len(title)} 字，超过{rules['name']}上限 {rules['title_max']} 字")
+    if len(desc) > rules.get("desc_max", 1000):
+        errors.append(f"正文 {len(desc)} 字，超过上限 {rules['desc_max']} 字")
     if not files:
         errors.append("没有选择素材")
     if len(tags) > rules["tags_max"]:
@@ -43,7 +51,7 @@ def check_content(data: dict) -> dict:
         if word.lower() in title.lower():
             errors.append(f"标题含绝对化/承诺性用语：{word}")
 
-    combined = title + " " + " ".join(map(str, tags))
+    combined = title + " " + desc + " " + " ".join(map(str, tags))
     if re.search(r"1[3-9]\d{9}", combined):
         errors.append("文案中包含手机号，平台可能判定为站外导流")
     if re.search(r"(微信|vx|wx|qq)\s*[:：]?\s*[a-zA-Z0-9_-]{5,}", combined, re.I):

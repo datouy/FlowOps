@@ -34,8 +34,9 @@ jobs:
           douyin_dm_sync.py xiaohongshu_dm_sync.py channels_dm_sync.py
           dm_ops.py compliance.py schedule_suggest.py publish_jobs.py
           ai_pack_jobs.py material_ops.py ops_center.py platform_reply.py
-          stats_reflow.py travel_ops.py sau_backend.py myUtils/login.py
-          myUtils/auth.py myUtils/postVideo.py utils/network.py
+          stats_reflow.py sau_backend.py myUtils/login.py
+          myUtils/auth.py myUtils/postVideo.py myUtils/platform_registry.py
+          utils/network.py
           uploader/ks_uploader/main.py uploader/weibo_uploader/main.py tests
 
   frontend:

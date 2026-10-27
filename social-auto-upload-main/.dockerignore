@@ -1,8 +1,27 @@
 .venv
+venv
 .git
 .idea
 cookies
+cookiesFile
 conf.py
+.env
+data
+# 真实账号数据与业务库不进镜像（容器里用卷挂载）
+# 注意只排除库文件，db/createTable.py 镜像启动时还要用
+db/*.db
+db/*.db-wal
+db/*.db-shm
+database.db
+videoFile
+uploadFile
+logs
+*.log
+__pycache__
+.pytest_cache
+.ruff_cache
+.workbuddy-ai
 sau_frontend/dist
 sau_frontend/node_modules
-sau_frontend/package-lock.json
+sau_frontend/.vite
+tests

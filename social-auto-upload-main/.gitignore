@@ -178,7 +178,8 @@ cookies
 .vite/
 dist/
 node_modules/
-package-lock.json
+# package-lock.json 必须入库：CI 与 Dockerfile 都用 npm ci，
+# 缺少 lock 文件会直接构建失败，且无法保证依赖版本可复现。
 
 # database
 db/database.db

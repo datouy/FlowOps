@@ -350,9 +350,23 @@
             <el-input
               v-model="tab.title"
               type="textarea"
-              :rows="3"
+              :rows="2"
               placeholder="请输入标题"
-              maxlength="100"
+              :maxlength="titleMaxLength(tab)"
+              show-word-limit
+              class="title-input"
+            />
+          </div>
+
+          <!-- 正文描述输入 -->
+          <div class="title-section">
+            <h3>正文描述<span class="section-hint">（选填，AI 生成的内容会自动填入这里）</span></h3>
+            <el-input
+              v-model="tab.desc"
+              type="textarea"
+              :rows="5"
+              placeholder="请输入正文描述"
+              maxlength="1000"
               show-word-limit
               class="title-input"
             />
@@ -585,17 +599,33 @@ const appStore = useAppStore()
 
 // ---- 从其他页面带入文案预填（内容生成→一键去发布）----
 const route = useRoute()
+
+// 按目标平台裁剪标题到合规长度（与后端 compliance.PLATFORM_RULES 一致）
+function fitTitle(text, platformKey) {
+  const max = PLATFORM_TITLE_MAX[platformKey] || 30
+  const value = String(text || '').trim()
+  if (value.length <= max) return value
+  return value.slice(0, max)
+}
+
+// 标题输入框的字数上限随平台变化
+function titleMaxLength(tab) {
+  return PLATFORM_TITLE_MAX[tab?.selectedPlatform] || 30
+}
+
 onMounted(() => {
   const q = route.query
   if (q.title || q.body) {
     const tab = tabs[0] || (tabs[0] = makeNewTab())
-    if (q.title) tab.title = String(q.title)
-    if (q.body) tab.title = (tab.title ? tab.title + '\n\n' : '') + String(q.body)
-    if (q.tags) tab.selectedTopics = String(q.tags).split(',').map(t => t.trim()).filter(Boolean)
+    // 先解析平台，才能按该平台的标题上限裁剪标题
     if (q.platform) {
       const p = platforms.find(p => p.name === q.platform)
       if (p) tab.selectedPlatform = p.key
     }
+    // 标题与正文分开承载：正文再长也不会撑爆标题字数上限
+    if (q.title) tab.title = fitTitle(q.title, tab.selectedPlatform)
+    if (q.body) tab.desc = String(q.body)
+    if (q.tags) tab.selectedTopics = String(q.tags).split(',').map(t => t.trim()).filter(Boolean)
   }
 })
 
@@ -622,6 +652,16 @@ const platforms = [
   { key: 6, name: '百家号' }
 ]
 
+// 各平台标题字数上限，必须与后端 compliance.PLATFORM_RULES 保持一致
+const PLATFORM_TITLE_MAX = {
+  1: 30, // 小红书
+  2: 30, // 视频号
+  3: 55, // 抖音
+  4: 30, // 快手
+  5: 30, // 微博
+  6: 30  // 百家号
+}
+
 const defaultTabInit = {
   name: 'tab1',
   label: '发布1',
@@ -630,6 +670,7 @@ const defaultTabInit = {
   selectedAccounts: [], // 选中的账号ID列表
   selectedPlatform: 1, // 选中的平台（单选）
   title: '',
+  desc: '', // 正文描述（与标题分开，避免 AI 长文案撑爆标题上限）
   productLink: '', // 商品链接
   productTitle: '', // 商品名称
   selectedTopics: [], // 话题列表（不带#号）
@@ -881,6 +922,7 @@ const confirmPublish = async (tab) => {
   const publishData = {
     type: tab.selectedPlatform,
     title: tab.title,
+    desc: (tab.desc || '').trim(), // 正文描述，与标题分开传递
     tags: tab.selectedTopics, // 不带#号的话题列表
     fileList: tab.fileList.map(file => file.path), // 只发送文件路径
     accountList: tab.selectedAccounts.map(accountId => {
@@ -920,6 +962,7 @@ const confirmPublish = async (tab) => {
     tab.fileList = []
     tab.displayFileList = []
     tab.title = ''
+    tab.desc = ''
     tab.selectedTopics = []
     tab.selectedAccounts = []
     tab.scheduleEnabled = false
@@ -1106,6 +1149,16 @@ const verifyResending = ref(false)
 const verifyInputRef = ref(null)
 const dismissedVerifyId = ref('')
 let verifyPollTimer = null
+// 没有待验证任务时用低频轮询（10s），有任务时切回高频（3s），
+// 避免在没有任何验证码待处理时也持续高频请求后端。
+const VERIFY_POLL_FAST = 3000
+const VERIFY_POLL_SLOW = 10000
+
+const scheduleVerifyPoll = () => {
+  if (verifyPollTimer) clearInterval(verifyPollTimer)
+  const interval = verifyRequest.value ? VERIFY_POLL_FAST : VERIFY_POLL_SLOW
+  verifyPollTimer = setInterval(fetchPendingVerify, interval)
+}
 
 const focusVerifyInput = () => {
   setTimeout(() => verifyInputRef.value?.focus?.(), 100)
@@ -1138,6 +1191,7 @@ const fetchPendingVerify = async () => {
     if (!pending) {
       verifyRequest.value = null
       if (verifyDialogVisible.value) verifyDialogVisible.value = false
+      scheduleVerifyPoll()
       return
     }
 
@@ -1145,6 +1199,7 @@ const fetchPendingVerify = async () => {
     const isNew = !previous || previous.id !== pending.id
     const errorChanged = Boolean(pending.error) && pending.error !== (previous && previous.error)
     verifyRequest.value = pending
+    scheduleVerifyPoll()
 
     if (isNew || errorChanged) {
       dismissedVerifyId.value = ''
@@ -1197,7 +1252,7 @@ const resendVerifyCode = async () => {
 
 onMounted(() => {
   fetchPendingVerify()
-  verifyPollTimer = setInterval(fetchPendingVerify, 3000)
+  scheduleVerifyPoll()
 })
 
 onUnmounted(() => {
@@ -1377,6 +1432,13 @@ onUnmounted(() => {
           font-weight: 500;
           color: $text-primary;
           margin: 0 0 10px 0;
+
+          .section-hint {
+            font-size: 12px;
+            font-weight: 400;
+            color: $text-secondary;
+            margin-left: 6px;
+          }
         }
         
         .upload-section,

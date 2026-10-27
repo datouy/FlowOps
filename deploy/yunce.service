@@ -1,0 +1,41 @@
+[Unit]
+Description=YunCe (flowOps / social-auto-upload) backend
+Documentation=https://localhost/health
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yunce
+Group=yunce
+WorkingDirectory=/opt/yunce/app
+
+# .env 里的 YUNCE_HOST / YUNCE_ALLOW_REMOTE / YUNCE_ACCESS_TOKEN 缺一项就起不来
+EnvironmentFile=/opt/yunce/app/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/yunce/.playwright
+Environment=TZ=Asia/Shanghai
+
+# 单进程运行：内存队列 + 发布 worker + 巡检 + SSE 都在进程内
+ExecStart=/opt/yunce/venv/bin/python sau_backend.py
+
+Restart=always
+RestartSec=5
+# 发布任务收尾需要时间，别立刻 SIGKILL
+TimeoutStopSec=60
+LimitNOFILE=65535
+
+# loguru 已把日志写到 /opt/yunce/app/logs/app.log，这里只兜住 stdout
+StandardOutput=append:/opt/yunce/app/logs/stdout.log
+StandardError=append:/opt/yunce/app/logs/stderr.log
+
+# 只允许写自己的目录
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/yunce/app
+
+[Install]
+WantedBy=multi-user.target

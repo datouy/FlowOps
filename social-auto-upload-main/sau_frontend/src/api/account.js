@@ -13,9 +13,8 @@ export const accountApi = {
   },
 
   // 添加账号
-  addAccount(data) {
-    return http.post('/account', data)
-  },
+  // 注意：后端没有 /account 路由，账号统一通过扫码登录（SSE /login）创建，
+  // 因此这里不提供 addAccount，避免调用方踩到 404。
 
   // 更新账号
   updateAccount(data) {

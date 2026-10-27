@@ -78,7 +78,7 @@ This project is not affiliated with the upstream author. Please submit issues an
 
 - **Unified inbox**: View Douyin, Xiaohongshu, and WeChat Channels DMs in one place, filterable by platform, account, and customer. Every conversation carries its source account so messages are never mixed up across accounts.
 - **Multi-account isolation**: Multiple accounts per platform are supported. Account cookies, sync cursors, conversations, messages, and leads are stored per account; re-logging into an existing account updates the original record rather than duplicating it.
-- **All-account sync**: Sync settings support multi-select accounts; when no specific account is checked, all logged-in accounts on that platform are synced by default. Each platform can have its own sync interval, per-sync conversation limit, and a 48-hour recency filter.
+- **All-account sync**: Sync settings support multi-select accounts; when no specific account is checked, all logged-in accounts on that platform are synced by default. Each platform can have its own sync interval, per-sync conversation limit, and history look-back window (7 days by default, up to 30).
 - **Douyin DM sync**: Uses local Playwright with saved login state to read creator-center web DMs; does not open conversations or mark them as read, and automatically skips group chats, self-sent messages, video/share cards, recalled messages, and platform placeholder prompts.
 - **Xiaohongshu main-site DM sync**: Reads real DM conversations from `www.xiaohongshu.com/chat` on the Xiaohongshu main site — not the professional account backend message pool. DMs from regular user accounts also arrive here.
 - **WeChat Channels DM sync**: Reads conversations and messages via the Channels Assistant login state, with per-account sync support.
@@ -111,7 +111,16 @@ When no account is checked in sync settings, all accounts with valid cookies on 
 | Xiaohongshu | Xiaohongshu main-site DMs `/chat` | Scan QR on the main site with the Xiaohongshu account that receives DMs | Yes | Yes |
 | WeChat Channels | Channels Assistant DMs | Scan QR with the WeChat/Channels account that receives DMs | Yes | Yes |
 
-Sync on all three platforms reads only conversations updated within the last 48 hours by default and deduplicates repeated messages. Sync results show account, scan count, stored count, duplicate count, and failure reasons.
+Sync reads the last 7 days of conversations by default (configurable 1–30 days; turning the time range off pulls as much history as the platform exposes) and deduplicates repeated messages. Raising the window clears the per-conversation "history already synced" markers so the next run backfills the older conversations. Sync results show account, scan count, stored count, duplicate count, and failure reasons.
+
+#### Chat history persistence
+
+Chat history lives in a local SQLite database (`social-auto-upload-main/db/ops_center.db`) and survives restarts:
+
+- **Connections are closed immediately** after each read/write, so leaked handles can no longer lock the WAL (the old behaviour caused silently dropped writes).
+- **WAL checkpointing** on startup, on shutdown, and every 10 minutes merges committed history into the main database file, so a hard kill cannot leave records stranded in the `-wal` file.
+- **Daily backup** into `social-auto-upload-main/db/backups/`, keeping the last 7 copies.
+- **Health endpoints**: `GET /dm/storage/health` reports file/WAL size, integrity, message counts, per-platform oldest/newest message times, and the backup list; `POST /dm/storage/checkpoint` and `POST /dm/storage/backup` force a merge or a backup.
 
 #### Xiaohongshu Login & Conversation Troubleshooting
 
@@ -225,8 +234,9 @@ FlowOps/
 ├─ start.bat                     # One-click launcher
 ├─ run_backend.bat               # Start backend only
 ├─ run_frontend.bat              # Start frontend only
+├─ deploy/                       # Server deployment scripts & docs (Docker / bare metal / Nginx)
 ├─ social-auto-upload-main/      # Main app (forked from upstream)
-│  ├─ sau_backend.py             # Flask API
+│  ├─ sau_backend.py             # Flask API (served by waitress in production)
 │  ├─ publish_jobs.py            # Publish queue, retry, health checks
 │  ├─ stats_reflow.py            # Platform data reflow
 │  ├─ ops_center.py              # Message center, to-do, weekly report
@@ -239,7 +249,8 @@ FlowOps/
 │  ├─ channels_dm_sync.py        # WeChat Channels scheduled DM sync
 │  ├─ platform_reply.py          # Unified reply sender for 3 platforms
 │  ├─ ai_content.py              # AI copywriting & content packs
-│  ├─ compliance.py              # Pre-publish compliance checks
+│  ├─ compliance.py              # Pre-publish compliance checks (rules shared with platform registry)
+│  ├─ myUtils/platform_registry.py  # Platform adapter registry (single source of truth for publishing)
 │  ├─ schedule_ops.py            # Publishing calendar
 │  ├─ schedule_suggest.py        # Smart scheduling suggestions
 │  ├─ material_ops.py            # Asset tagging & dedup
@@ -248,6 +259,19 @@ FlowOps/
 │  └─ uploader/                  # Upstream browser-automation implementations
 └─ README.md
 ```
+
+## 🚢 Server Deployment
+
+Beyond running locally on Windows, the repo ships a set of server deployment scripts:
+
+- `deploy/docker-compose.yml` + `deploy/Dockerfile`: containerized deployment;
+- `deploy/install-baremetal.sh`: one-shot Linux bare-metal install (generates the access token and writes a systemd service);
+- `deploy/nginx-yunce.conf`: reference Nginx reverse-proxy config;
+- `deploy/yunce.service`: systemd service template;
+- `deploy/backup.sh`: daily database backup script;
+- `deploy/smoke.sh`: post-deployment smoke-test script.
+
+See [deploy/README.md](./deploy/README.md) for full steps and parameters. Production serves backend traffic through waitress (still a single-process model) instead of the Flask development server.
 
 ## 🔒 Security Notes
 
