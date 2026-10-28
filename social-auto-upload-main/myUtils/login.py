@@ -28,68 +28,68 @@ def get_browser_options():
 
     return options
 
-# 抖音登录
-async def douyin_cookie_gen(id,status_queue):
-    url_changed_event = asyncio.Event()
-    async def on_url_change():
-        # 检查是否是主框架的变化
-        if page.url != original_url:
-            url_changed_event.set()
-    async with async_playwright() as playwright:
-        options = get_browser_options()
-        # Make sure to run headed.
-        browser = await playwright.chromium.launch(**options)
-        # Setup context however you like.
-        context = await browser.new_context()  # Pass any options
-        context = await set_init_script(context)
-        # Pause the page, and start recording manually.
-        page = await context.new_page()
-        await page.goto("https://creator.douyin.com/")
-        original_url = page.url
-        img_locator = page.get_by_role("img", name="二维码")
-        # 获取 src 属性值
-        src = await img_locator.get_attribute("src")
-        logger.info("抖音登录二维码地址: {}", src)
-        status_queue.put(src)
-        # 监听页面的 'framenavigated' 事件，只关注主框架的变化
-        page.on('framenavigated',
-                lambda frame: asyncio.create_task(on_url_change()) if frame == page.main_frame else None)
+# 抖音登录：复用发布模块中已验证的登录实现。
+# 旧实现只监听页面跳转，扫码后页面不跳转时会一直等到 200 秒。
+async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None):
+    from uploader.douyin_uploader.main import douyin_cookie_gen as wait_for_douyin_login
+
+    cookie_name = f"{uuid.uuid4().hex}.json"
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    cookie_path = cookies_dir / cookie_name
+
+    async def qrcode_callback(payload):
+        image_data_url = payload.get("image_data_url")
+        if image_data_url:
+            status_queue.put(image_data_url)
+
+    async def second_verify_callback(phase):
+        status_queue.put("SECOND_VERIFY_PHONE" if phase == "phone" else "SECOND_VERIFY_CODE")
+        if verify_queue is None:
+            return None
         try:
-            # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            logger.info("抖音登录页面跳转成功")
-        except asyncio.TimeoutError:
-            logger.warning("抖音登录页面跳转超时")
-            await page.close()
-            await context.close()
-            await browser.close()
-            status_queue.put("500")
+            return await asyncio.wait_for(
+                asyncio.to_thread(verify_queue.get, timeout=180),
+                timeout=185,
+            )
+        except Exception:
             return None
-        uuid_v1 = uuid.uuid1()
-        logger.debug("登录凭证文件名: {}", uuid_v1)
-        # 确保cookiesFile目录存在
-        cookies_dir = Path(BASE_DIR / "cookiesFile")
-        cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
-        result = await check_cookie(3, f"{uuid_v1}.json")
-        if not result:
-            status_queue.put("500")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        await page.close()
-        await context.close()
-        await browser.close()
+
+    try:
+        result = await wait_for_douyin_login(
+            str(cookie_path),
+            qrcode_callback=qrcode_callback,
+            second_verify_callback=second_verify_callback,
+            poll_interval=2,
+            timeout_seconds=90,
+        )
+        if not result.get("success"):
+            raise RuntimeError(result.get("message") or "抖音扫码登录失败")
+
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                                INSERT INTO user_info (type, filePath, userName, status)
-                                VALUES (?, ?, ?, ?)
-                                ''', (3, f"{uuid_v1}.json", id, 1))
+            if account_id:
+                cursor.execute(
+                    "UPDATE user_info SET type=?, filePath=?, userName=?, status=1 WHERE id=?",
+                    (3, cookie_name, id, account_id),
+                )
+            if not account_id or cursor.rowcount == 0:
+                cursor.execute(
+                    "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
+                    (3, cookie_name, id, 1),
+                )
             conn.commit()
-            logger.info("抖音账号状态已记录")
+        logger.info("抖音账号状态已记录")
         status_queue.put("200")
+        return True
+    except Exception as exc:
+        logger.warning("抖音扫码登录失败: {}", exc)
+        try:
+            cookie_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        status_queue.put("500")
+        return False
 
 
 # 视频号登录

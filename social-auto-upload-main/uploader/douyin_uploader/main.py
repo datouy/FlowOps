@@ -6,6 +6,7 @@ import inspect
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from patchright.async_api import Page
@@ -25,6 +26,16 @@ import verify_codes
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+DOUYIN_AUTH_COOKIE_NAMES = {
+    "sessionid",
+    "sessionid_ss",
+    "sid_guard",
+    "sid_tt",
+    "sid_ucp_v1",
+    "ssid_ucp_v1",
+    "uid_tt",
+    "uid_tt_ss",
+}
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -218,7 +229,14 @@ async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_pat
 
 
 async def _is_douyin_login_completed(page: Page) -> bool:
-    # 登录后会跳到 creator-micro 下任意页（home/content 等）；登录页是 creator.douyin.com/ 根路径
+    # 抖音会按版本写入不同的登录态 Cookie，所以这里不能只盯 sessionid。
+    try:
+        cookies = await page.context.cookies()
+        if any(c.get("name") in DOUYIN_AUTH_COOKIE_NAMES and c.get("value") for c in cookies):
+            return True
+    except Exception:
+        pass
+
     if "creator.douyin.com/creator-micro" not in page.url:
         return False
 
@@ -241,23 +259,105 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     return True
 
 
-async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100) -> dict:
+async def _wait_for_douyin_login(
+    page: Page,
+    account_file: str,
+    qrcode_info: dict,
+    qrcode_callback=None,
+    second_verify_callback=None,
+    qr_connect_state: dict | None = None,
+    poll_interval: int = 3,
+    timeout_seconds: float = 90,
+) -> dict:
     qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
     original_url = page.url
     saw_2fa = False
-    for _ in range(max_checks):
+    second_verify_waiting = False
+    deadline = time.monotonic() + timeout_seconds
+    poll_count = 0
+    while time.monotonic() < deadline:
+        poll_count += 1
+        if poll_count % 10 == 0:
+            try:
+                cookie_names = sorted({c.get("name") for c in await page.context.cookies()})
+                login_status = await page.evaluate("localStorage.getItem('LOGIN_STATUS')")
+                body_text = await page.locator("body").inner_text()
+                verify_markers = ["验证码", "短信", "安全验证", "滑块", "拖动"]
+                verify_hit = [m for m in verify_markers if m in body_text]
+                input_placeholders = await page.locator("input").evaluate_all(
+                    "els => els.map(e => e.getAttribute('placeholder')).filter(Boolean)"
+                )
+                douyin_logger.debug(
+                    "抖音登录等待中: url={} cookie_names={} login_status={} verify_markers={} inputs={}",
+                    page.url,
+                    cookie_names,
+                    login_status,
+                    verify_hit,
+                    input_placeholders,
+                )
+            except Exception:
+                pass
         if await _is_douyin_login_completed(page):
             douyin_logger.info(_msg("🥳", f"扫码成功，已经跳转到登录后页面: {page.url}"))
             return _build_login_result(True, "success", "抖音扫码登录成功", account_file, qrcode_info, page.url)
+
+        # 抖音账号安全策略：扫码确认后可能要求短信二次验证。
+        # 页面 URL 不变，因此要主动识别手机号/验证码输入框；
+        # 必须先看到抖音接口返回 scanned，避免登录页自带的短信表单误触发。
+        phone_input = page.locator('input[placeholder*="手机号"]').first
+        code_input = page.locator('input[placeholder*="验证码"]').first
+        scanned = bool(qr_connect_state and qr_connect_state.get("scanned"))
+        phone_visible = (await phone_input.count() > 0) and (await phone_input.is_visible())
+        code_visible = (await code_input.count() > 0) and (await code_input.is_visible())
+        has_second_verify = scanned and phone_visible and code_visible
+        if has_second_verify:
+            # 二次验证是交互式的，进来就把整体等待窗口放宽。
+            deadline = max(deadline, time.monotonic() + 240)
+            if not second_verify_waiting:
+                second_verify_waiting = True
+                try:
+                    if second_verify_callback:
+                        phone_data = await second_verify_callback("phone")
+                        if not phone_data:
+                            raise RuntimeError("等待抖音短信验证输入超时")
+                        phone = (phone_data or {}).get("phone", "")
+                        if phone:
+                            await phone_input.fill(phone)
+                            send_button = page.get_by_role(
+                                "button", name=re.compile(r"获取验证码|发送验证码|获取短信|发送短信")
+                            ).first
+                            if await send_button.count() and await send_button.is_visible():
+                                await send_button.click()
+                            else:
+                                await phone_input.press("Enter")
+                        code_data = await second_verify_callback("code")
+                        if not code_data:
+                            raise RuntimeError("等待抖音短信验证码输入超时")
+                        code = (code_data or {}).get("code", "")
+                        if code:
+                            await code_input.fill(code)
+                            submit_button = page.get_by_role(
+                                "button", name=re.compile(r"确认|确定|提交|验证|登录")
+                            ).first
+                            if await submit_button.count() and await submit_button.is_visible():
+                                await submit_button.click()
+                            else:
+                                await code_input.press("Enter")
+                except Exception as exc:
+                    douyin_logger.warning(_msg("⚠️", f"短信二次验证处理失败: {exc}"))
+                finally:
+                    second_verify_waiting = False
+            await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+            continue
 
         # URL 变化 + sessionid 未到位 → 二验流程，继续等
         if page.url != original_url and not await _is_douyin_login_completed(page):
             sms_input = page.locator('input[placeholder*="验证码"], input[type="tel"], input[placeholder*="短信"], input[placeholder*="手机号"]')
             if await sms_input.count() > 0:
                 if not saw_2fa:
-                    douyin_logger.warning(_msg("⚠️", f"检测到抖音短信/安全二次验证，请在弹出的浏览器中手动输入。等待 sessionid ({_}/{max_checks})"))
+                    douyin_logger.warning(_msg("⚠️", "检测到抖音短信/安全二次验证，请在浏览器中完成验证"))
                     saw_2fa = True
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
             continue
 
         expired_box = page.get_by_text("二维码失效", exact=True).locator("..").first
@@ -268,15 +368,16 @@ async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dic
             qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_path, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
 
-        await asyncio.sleep(poll_interval)
+        await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
     return _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
 
 async def douyin_cookie_gen(
     account_file,
     qrcode_callback=None,
+    second_verify_callback=None,
     poll_interval: int = 2,
-    max_checks: int = 60,
+    timeout_seconds: float = 90,
     headless: bool = LOCAL_CHROME_HEADLESS,
     cdp_url: str | None = None,
 ):
@@ -292,8 +393,36 @@ async def douyin_cookie_gen(
         context = await set_init_script(context)
         qrcode_path = None
         result = _build_login_result(False, "failed", "抖音登录失败", account_file)
+        qr_connect_state = {"scanned": False}
         try:
             page = await context.new_page()
+            async def log_login_response(response):
+                try:
+                    from urllib.parse import urlsplit
+                    path = urlsplit(response.url).path
+                    keywords = ("passport", "scan", "qrcode", "login", "check", "session")
+                    if any(keyword in path.lower() for keyword in keywords):
+                        douyin_logger.debug("抖音登录相关响应: {} status={}", path, response.status)
+                    if path.endswith("/passport/web/check_qrconnect/"):
+                        payload = await response.json()
+                        data = payload.get("data") if isinstance(payload, dict) else None
+                        if isinstance(data, dict):
+                            if data.get("status") == "scanned":
+                                qr_connect_state["scanned"] = True
+                            douyin_logger.debug(
+                                "check_qrconnect: keys={} data_keys={} status={} redirect={} message={}",
+                                sorted(payload.keys()),
+                                sorted(data.keys()),
+                                data.get("status"),
+                                bool(data.get("redirect_url")),
+                                payload.get("message"),
+                            )
+                        else:
+                            douyin_logger.debug("check_qrconnect payload: {}", payload)
+                except Exception:
+                    pass
+
+            page.on("response", log_login_response)
             await page.goto("https://creator.douyin.com/")
             qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"]) if qrcode_info.get("image_path") else None
@@ -303,8 +432,10 @@ async def douyin_cookie_gen(
                 account_file,
                 qrcode_info,
                 qrcode_callback=qrcode_callback,
+                second_verify_callback=second_verify_callback,
+                qr_connect_state=qr_connect_state,
                 poll_interval=poll_interval,
-                max_checks=max_checks,
+                timeout_seconds=timeout_seconds,
             )
             if result["success"]:
                 await asyncio.sleep(2)
@@ -315,7 +446,7 @@ async def douyin_cookie_gen(
                 try:
                     import json as _json
                     _d = _json.load(open(account_file))
-                    _has_sess = any(c.get("name") == "sessionid" and c.get("value") for c in _d.get("cookies", []))
+                    _has_sess = any(c.get("name") in DOUYIN_AUTH_COOKIE_NAMES and c.get("value") for c in _d.get("cookies", []))
                     if not _has_sess:
                         result = _build_login_result(
                             False,

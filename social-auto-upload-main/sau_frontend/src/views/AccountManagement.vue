@@ -118,9 +118,48 @@
         
         <!-- 二维码显示区域 -->
         <div v-if="sseConnecting" class="qrcode-container">
-          <div v-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
-            <p class="qrcode-tip">请使用对应平台APP扫描二维码登录</p>
+          <div v-if="needSecondVerify && !loginStatus" class="verify-wrapper">
+            <p class="qrcode-tip">抖音要求短信二次验证，请按提示完成</p>
+            <el-input
+              v-model="verifyPhone"
+              placeholder="请输入手机号"
+              :disabled="verifyStage !== 'phone' || verifySubmitting"
+            />
+            <el-input
+              v-model="verifyCode"
+              placeholder="请输入短信验证码"
+              :disabled="verifyStage !== 'code' || verifySubmitting"
+            />
+            <el-button
+              v-if="verifyStage === 'phone'"
+              type="primary"
+              :loading="verifySubmitting"
+              @click="submitSecondVerify('phone')"
+            >
+              发送验证码
+            </el-button>
+            <el-button
+              v-else
+              type="primary"
+              :loading="verifySubmitting"
+              @click="submitSecondVerify('code')"
+            >
+              提交验证
+            </el-button>
+          </div>
+          <div v-else-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
+            <p class="qrcode-tip">二维码已生成，请在 90 秒内使用对应平台 APP 扫码</p>
             <img :src="qrCodeData" alt="登录二维码" class="qrcode-image" />
+            <el-button
+              class="refresh-qrcode-button"
+              type="info"
+              text
+              bg
+              @click="refreshLogin"
+            >
+              <el-icon><Refresh /></el-icon>
+              二维码过期？刷新二维码
+            </el-button>
           </div>
           <div v-else-if="!qrCodeData && !loginStatus" class="loading-wrapper">
             <el-icon class="is-loading"><Refresh /></el-icon>
@@ -132,20 +171,20 @@
           </div>
           <div v-else-if="loginStatus === '500'" class="error-wrapper">
             <el-icon><CircleCloseFilled /></el-icon>
-            <span>添加失败，请稍后再试</span>
+            <span>登录失败或扫码超时，请重新发起登录</span>
           </div>
         </div>
       </el-form>
       <template #footer>
         <span class="dialog-footer">
-          <el-button @click="dialogVisible = false">取消</el-button>
+          <el-button @click="cancelLogin">取消</el-button>
           <el-button 
             type="primary" 
             @click="submitAccountForm" 
-            :loading="sseConnecting" 
+            :loading="sseConnecting && !qrCodeData"
             :disabled="sseConnecting"
           >
-            {{ sseConnecting ? '请求中' : '确认' }}
+            {{ sseConnecting ? (qrCodeData ? '等待扫码' : '获取二维码') : '确认' }}
           </el-button>
         </span>
       </template>
@@ -343,6 +382,15 @@ const rules = {
 const sseConnecting = ref(false)
 const qrCodeData = ref('')
 const loginStatus = ref('')
+const needSecondVerify = ref(false)
+const verifyStage = ref('phone')
+const verifyPhone = ref('')
+const verifyCode = ref('')
+const verifySubmitting = ref(false)
+const currentLoginId = ref('')
+const currentPlatform = ref('')
+const currentAccountName = ref('')
+const currentAccountId = ref(null)
 
 // 添加账号
 const handleAddAccount = () => {
@@ -359,6 +407,12 @@ const handleAddAccount = () => {
   sseConnecting.value = false
   qrCodeData.value = ''
   loginStatus.value = ''
+  needSecondVerify.value = false
+  verifyStage.value = 'phone'
+  verifyPhone.value = ''
+  verifyCode.value = ''
+  verifySubmitting.value = false
+  currentLoginId.value = ''
   dialogVisible.value = true
 }
 
@@ -485,6 +539,12 @@ const handleReLogin = (row) => {
   sseConnecting.value = false
   qrCodeData.value = ''
   loginStatus.value = ''
+  needSecondVerify.value = false
+  verifyStage.value = 'phone'
+  verifyPhone.value = ''
+  verifyCode.value = ''
+  verifySubmitting.value = false
+  currentLoginId.value = ''
 
   // 显示对话框
   dialogVisible.value = true
@@ -512,6 +572,20 @@ const closeSSEConnection = () => {
   }
 }
 
+const cancelLogin = () => {
+  closeSSEConnection()
+  sseConnecting.value = false
+  qrCodeData.value = ''
+  loginStatus.value = ''
+  needSecondVerify.value = false
+  verifyStage.value = 'phone'
+  verifyPhone.value = ''
+  verifyCode.value = ''
+  verifySubmitting.value = false
+  currentLoginId.value = ''
+  dialogVisible.value = false
+}
+
 // 建立SSE连接
 const connectSSE = (platform, name, accountId = null) => {
   // 关闭可能存在的连接
@@ -521,6 +595,15 @@ const connectSSE = (platform, name, accountId = null) => {
   sseConnecting.value = true
   qrCodeData.value = ''
   loginStatus.value = ''
+  needSecondVerify.value = false
+  verifyStage.value = 'phone'
+  verifyPhone.value = ''
+  verifyCode.value = ''
+  verifySubmitting.value = false
+  currentPlatform.value = platform
+  currentAccountName.value = name
+  currentAccountId.value = accountId
+  currentLoginId.value = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`
 
   // 获取平台类型编号
   const type = platformMeta[platform]?.type || 1
@@ -528,7 +611,8 @@ const connectSSE = (platform, name, accountId = null) => {
   // 创建SSE连接
   const baseUrl = API_BASE
   const accountParam = accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''
-  const url = withToken(`${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}${accountParam}`)
+  const sessionParam = `&session=${encodeURIComponent(currentLoginId.value)}`
+  const url = withToken(`${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}${accountParam}${sessionParam}`)
 
   eventSource = new EventSource(url)
 
@@ -536,8 +620,16 @@ const connectSSE = (platform, name, accountId = null) => {
   eventSource.onmessage = (event) => {
     const data = event.data
 
+    // 抖音二次验证：先收集手机号，再收集短信验证码
+    if (data === 'SECOND_VERIFY_PHONE' || data === 'SECOND_VERIFY_CODE') {
+      needSecondVerify.value = true
+      verifyStage.value = data === 'SECOND_VERIFY_PHONE' ? 'phone' : 'code'
+      verifySubmitting.value = false
+      return
+    }
+
     // 二维码可能是 data URI、普通 URL 或纯 base64
-    if (!qrCodeData.value && data && data !== '200' && data !== '500') {
+    if (data && data !== '200' && data !== '500') {
       try {
         if (data.startsWith('data:image') || data.startsWith('http://') || data.startsWith('https://')) {
           qrCodeData.value = data
@@ -551,13 +643,11 @@ const connectSSE = (platform, name, accountId = null) => {
     // 如果收到状态码
     else if (data === '200' || data === '500') {
       loginStatus.value = data
+      closeSSEConnection()
 
       // 如果登录成功
       if (data === '200') {
         setTimeout(() => {
-          // 关闭连接
-          closeSSEConnection()
-
           // 1秒后关闭对话框并开始刷新
           setTimeout(() => {
             dialogVisible.value = false
@@ -582,10 +672,7 @@ const connectSSE = (platform, name, accountId = null) => {
           }, 1000)
         }, 1000)
       } else {
-        // 登录失败，关闭连接
-        closeSSEConnection()
-
-        // 2秒后重置状态，允许重试
+        // 保留失败原因，短暂展示后允许用户重新扫码
         setTimeout(() => {
           sseConnecting.value = false
           qrCodeData.value = ''
@@ -597,10 +684,54 @@ const connectSSE = (platform, name, accountId = null) => {
 
   // 监听错误
   eventSource.onerror = (error) => {
+    if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+      return
+    }
     console.error('SSE连接错误:', error)
     ElMessage.error('连接服务器失败，请稍后再试')
     closeSSEConnection()
     sseConnecting.value = false
+  }
+}
+
+// 手动刷新二维码：重新开一个独立登录会话
+const refreshLogin = () => {
+  if (!currentPlatform.value || !currentAccountName.value) {
+    return
+  }
+  ElMessage.info('正在刷新二维码')
+  connectSSE(currentPlatform.value, currentAccountName.value, currentAccountId.value)
+}
+
+// 提交抖音短信二次验证
+const submitSecondVerify = async (stage) => {
+  if (!currentLoginId.value) {
+    ElMessage.error('登录会话已失效，请重新发起登录')
+    return
+  }
+  if (stage === 'phone' && !verifyPhone.value.trim()) {
+    ElMessage.warning('请先输入手机号')
+    return
+  }
+  if (stage === 'code' && !verifyCode.value.trim()) {
+    ElMessage.warning('请先输入短信验证码')
+    return
+  }
+
+  verifySubmitting.value = true
+  try {
+    await http.post('/loginVerify', {
+      id: currentLoginId.value,
+      phone: verifyPhone.value.trim(),
+      code: verifyCode.value.trim()
+    })
+    if (stage === 'phone') {
+      ElMessage.success('验证码已发送，请查看短信')
+    }
+  } catch (error) {
+    // 请求工具已经统一弹出错误提示
+  } finally {
+    verifySubmitting.value = false
   }
 }
 
@@ -757,6 +888,24 @@ onBeforeUnmount(() => {
         max-height: 200px;
         border: 1px solid #ebeef5;
         background-color: black;
+      }
+
+      .refresh-qrcode-button {
+        margin-top: 10px;
+      }
+    }
+
+    .verify-wrapper {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 12px;
+      padding: 0 20px;
+
+      .qrcode-tip {
+        text-align: center;
+        color: #606266;
       }
     }
     

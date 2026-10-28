@@ -27,6 +27,7 @@ from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
 runtime_config.validate_server_config()
 
 active_queues = {}
+active_verify_queues = {}
 app = Flask(__name__)
 setup_request_logging(app)
 import schedule_ops
@@ -704,22 +705,46 @@ def login():
     if type not in ('1', '2', '3', '4', '5', '6'):
         return jsonify({"code": 400, "msg": "invalid platform type", "data": None}), 400
 
+    # 每次登录使用独立会话；刷新二维码会开新会话，避免旧会话清掉新会话的验证队列。
+    queue_id = (request.args.get('session') or '').strip()[:64]
+    if not queue_id:
+        queue_id = f"{id}-{uuid.uuid4().hex[:12]}"
+
     # 模拟一个用于异步通信的队列
     status_queue = Queue()
-    active_queues[id] = status_queue
+    verify_queue = Queue()
+    active_queues[queue_id] = status_queue
+    active_verify_queues[queue_id] = verify_queue
 
     # 启动异步任务线程
     thread = threading.Thread(
-        target=run_async_function, args=(type, id, status_queue, account_id), daemon=True,
+        target=run_async_function, args=(type, id, status_queue, account_id, verify_queue), daemon=True,
     )
     thread.start()
-    response = Response(sse_stream(status_queue, id), mimetype='text/event-stream')
+    response = Response(sse_stream(status_queue, queue_id), mimetype='text/event-stream')
     response.headers['Cache-Control'] = 'no-cache'
     response.headers['X-Accel-Buffering'] = 'no'  # 关键：禁用 Nginx 缓冲
     response.headers['Content-Type'] = 'text/event-stream'
     # 注意：不能设置 Connection 头，WSGI/waitress 禁止逐跳头（PEP 3333），
     # 否则 /login 会直接 500，导致前端“连接服务器失败”。
     return response
+
+@app.route('/loginVerify', methods=['POST'])
+def login_verify():
+    """接收抖音二次验证（手机号 + 短信验证码）并转发给正在等待的登录线程。"""
+    data = request.get_json(force=True) or {}
+    key = str(data.get('id') or '').strip()[:64]
+    verify_queue = active_verify_queues.get(key)
+    if verify_queue is None:
+        return jsonify({"code": 404, "msg": "登录验证会话不存在或已结束", "data": None}), 404
+
+    phone = str(data.get('phone') or '').strip()[:32]
+    code = str(data.get('code') or '').strip()[:32]
+    if not phone and not code:
+        return jsonify({"code": 400, "msg": "验证信息不能为空", "data": None}), 400
+
+    verify_queue.put({"phone": phone, "code": code})
+    return jsonify({"code": 200, "msg": "已提交验证信息", "data": None}), 200
 
 @app.route('/postVideo', methods=['POST'])
 def postVideo():
@@ -990,43 +1015,36 @@ def download_cookie():
 
 
 # 包装函数：在线程中运行异步函数
-def run_async_function(type, id, status_queue, account_id=None):
-    match type:
-        case '1':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                xiaohongshu_cookie_gen(id, status_queue, account_id=account_id)
-            )
-            loop.close()
-        case '2':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(get_tencent_cookie(id, status_queue, account_id=account_id))
-            loop.close()
-        case '3':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(douyin_cookie_gen(id,status_queue))
-            loop.close()
-        case '4':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(get_ks_cookie(id,status_queue))
-            loop.close()
-        case '5':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(weibo_cookie_gen_sse(id, status_queue))
-            loop.close()
-        case '6':
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(baijiahao_cookie_gen_sse(id, status_queue))
-            loop.close()
+def run_async_function(type, id, status_queue, account_id=None, verify_queue=None):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        match type:
+            case '1':
+                coroutine = xiaohongshu_cookie_gen(id, status_queue, account_id=account_id)
+            case '2':
+                coroutine = get_tencent_cookie(id, status_queue, account_id=account_id)
+            case '3':
+                coroutine = douyin_cookie_gen(id, status_queue, account_id=account_id, verify_queue=verify_queue)
+            case '4':
+                coroutine = get_ks_cookie(id, status_queue)
+            case '5':
+                coroutine = weibo_cookie_gen_sse(id, status_queue)
+            case '6':
+                coroutine = baijiahao_cookie_gen_sse(id, status_queue)
+            case _:
+                raise ValueError(f"unsupported login platform type: {type}")
+        loop.run_until_complete(coroutine)
+    except Exception:
+        # 工作线程异常也必须给 SSE 一个终态，否则前端会一直显示“请求中”。
+        logger.exception("登录工作线程异常: type={} id={}", type, id)
+        status_queue.put("500")
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 # SSE 流生成器函数
-def sse_stream(status_queue, queue_id=None):
+def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
     """把扫码登录的状态消息以 SSE 形式推给前端。
 
     - 收到终态（200/500）后主动结束流，避免客户端与线程一直挂着。
@@ -1035,10 +1053,15 @@ def sse_stream(status_queue, queue_id=None):
     - 无论正常结束还是客户端断开，都在 finally 里清理 active_queues，
       否则每扫码一次就会泄漏一个 Queue 和一个工作线程。
     """
+    deadline = time.monotonic() + max_wait_seconds
     try:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                yield "data: 500\n\n"
+                break
             try:
-                msg = status_queue.get(timeout=15)
+                msg = status_queue.get(timeout=min(15, remaining))
             except Empty:
                 # 心跳注释帧，避免 Nginx/浏览器因空闲断开长连接
                 yield ": keep-alive\n\n"
@@ -1052,6 +1075,7 @@ def sse_stream(status_queue, queue_id=None):
     finally:
         if queue_id is not None:
             active_queues.pop(queue_id, None)
+            active_verify_queues.pop(queue_id, None)
             logger.debug("清理队列: {}", queue_id)
 
 import publish_jobs
