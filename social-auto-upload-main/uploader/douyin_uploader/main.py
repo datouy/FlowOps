@@ -332,8 +332,6 @@ async def _wait_for_douyin_login(
                             except Exception:
                                 pre_value = ""
                             douyin_logger.info(_msg("📱", f"填写前手机号框内容={_mask_phone(pre_value)!r}"))
-                            await phone_input.click()
-                            await phone_input.fill("")
                             await phone_input.fill(phone)
                             try:
                                 after_value = await phone_input.input_value()
@@ -371,8 +369,13 @@ async def _wait_for_douyin_login(
                             await code_input.fill(code)
                             verify_btn = page.locator('div.uc-ui-verify_sms-verify_button:has-text("验证")').first
                             if await verify_btn.count() and await verify_btn.is_visible():
-                                await verify_btn.click(force=True)
-                                douyin_logger.success(_msg("✅", "已点击「验证」按钮"))
+                                try:
+                                    await verify_btn.click(force=True)
+                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮"))
+                                except Exception as verify_exc:
+                                    douyin_logger.warning(_msg("⚠️", f"force点击「验证」失败，改JS点击: {verify_exc}"))
+                                    await verify_btn.evaluate("el => el.click()")
+                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮(JS)"))
                             else:
                                 verify_by_text = page.get_by_text("验证", exact=True).first
                                 if await verify_by_text.count() and await verify_by_text.is_visible():

@@ -47,13 +47,22 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         status_queue.put("SECOND_VERIFY_PHONE" if phase == "phone" else "SECOND_VERIFY_CODE")
         if verify_queue is None:
             return None
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(verify_queue.get, timeout=180),
-                timeout=185,
-            )
-        except Exception:
-            return None
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            try:
+                item = await asyncio.wait_for(
+                    asyncio.to_thread(verify_queue.get, timeout=10),
+                    timeout=12,
+                )
+            except Exception:
+                return None
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("phone") if phase == "phone" else item.get("code") or "").strip()
+            if value:
+                return item
+            # 前端重复点击会把不完整的旧数据塞进队列，丢弃后继续等正确阶段的数据
+        return None
 
     try:
         result = await wait_for_douyin_login(
