@@ -325,12 +325,13 @@ async def _wait_for_douyin_login(
                             await phone_input.fill(phone)
                             send_button = page.get_by_text("获取验证码").first
                             if await send_button.count() and await send_button.is_visible():
-                                if await send_button.is_enabled():
-                                    await send_button.click()
+                                try:
+                                    await send_button.evaluate("el => el.click()")
                                     douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
-                                else:
-                                    douyin_logger.warning(_msg("⚠️", "「获取验证码」按钮不可点击，尝试按Enter"))
-                                    await phone_input.press("Enter")
+                                except Exception as click_exc:
+                                    douyin_logger.warning(_msg("⚠️", f"JS点击「获取验证码」失败，改用force点击: {click_exc}"))
+                                    await send_button.click(force=True, timeout=5000)
+                                    douyin_logger.info(_msg("📤", "已点击「获取验证码」(force)，请查看手机短信"))
                             else:
                                 douyin_logger.warning(_msg("⚠️", "未找到「获取验证码」按钮，尝试按Enter"))
                                 await phone_input.press("Enter")
