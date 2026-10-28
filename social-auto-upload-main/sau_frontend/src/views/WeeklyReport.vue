@@ -1,5 +1,14 @@
 <template>
   <div class="report-page">
+    <el-alert
+      v-if="hasNoAccounts"
+      title="当前没有登录账号，无法生成运营周报"
+      description="请先到「账号管理」添加并登录账号，发布数据同步后即可查看周报。"
+      type="info"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
     <div class="page-head">
       <div>
         <h2>运营周报</h2>
@@ -60,7 +69,10 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
+import { useAccountStore } from '@/stores/account'
 
+const accountStore = useAccountStore()
+const hasNoAccounts = computed(() => !accountStore.accounts.length)
 const days = ref(7)
 const loading = ref(false)
 const report = ref({ jobs: 0, success: 0, failed: 0, totals: { plays: 0, likes: 0, comments: 0 }, platforms: [], top_contents: [], text: '' })
@@ -78,6 +90,7 @@ function formatNum(n) {
 }
 
 async function load() {
+  if (hasNoAccounts.value) return
   loading.value = true
   try {
     const r = await http.get('/report/weekly', { days: days.value })
@@ -102,7 +115,14 @@ function exportCsv() {
   a.click()
 }
 
-onMounted(load)
+onMounted(async () => {
+  try {
+    await accountStore.loadAccounts()
+  } catch (error) {
+    console.error('加载账号列表失败:', error)
+  }
+  load()
+})
 </script>
 
 <style scoped>

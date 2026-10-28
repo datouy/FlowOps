@@ -158,6 +158,7 @@ def _initialize_schema(c):
     for name, ddl in (
         ("company_name", "TEXT DEFAULT ''"), ("budget", "TEXT DEFAULT ''"),
         ("is_group", "INTEGER DEFAULT 0"),
+        ("account_deleted", "INTEGER DEFAULT 0"),
     ):
         _ensure_column(c, "dm_contacts", name, ddl)
     for name, ddl in (
@@ -272,6 +273,8 @@ def init_db():
             6: _migrate_douyin_cleanup,
             7: _migrate_group_metadata,
         })
+        # account_deleted 独立于迁移版本补齐，保证旧库升级后删除账号可用
+        _ensure_column(c, "dm_contacts", "account_deleted", "INTEGER DEFAULT 0")
         _backfill_contacts(c)
 
 
@@ -725,7 +728,7 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
     if new_stage in ("new", "engaged") and new_intent == "high":
         new_stage = "qualified" if (fields["contact_info"] or row["contact_info"]) else "engaged"
     c.execute("""UPDATE dm_contacts SET nickname=?,is_group=?,segment=?,intent=?,stage=?,source_content=?,
-        contact_info=?,traveler_count=?,origin=?,travel_date=?,company_name=?,budget=?,last_message_at=?,
+        contact_info=?,traveler_count=?,origin=?,travel_date=?,company_name=?,budget=?,account_deleted=0,last_message_at=?,
         last_inbound_at=?,updated_at=? WHERE id=?""",
         (nickname or row["nickname"], 1 if item.get("is_group") else row["is_group"],
          new_segment, new_intent, new_stage,
@@ -1392,7 +1395,7 @@ def priority_leads(limit: int = 8) -> list[dict]:
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='outbound'
             AND x.delivery_status='ready') AS pending_delivery
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
-        WHERE c.stage NOT IN ('converted','lost')
+        WHERE c.stage NOT IN ('converted','lost') AND COALESCE(c.account_deleted,0)=0
         ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"""
     with get_conn() as c:
         rows = [_decorate_contact(dict(r)) for r in c.execute(sql).fetchall()]
@@ -1412,7 +1415,7 @@ def list_conversations():
         m.created_at AS last_message_time, m.delivery_status AS last_delivery_status,
         CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
-        WHERE 1=1"""
+        WHERE COALESCE(c.account_deleted,0)=0"""
     args = []
     for field, value in (
         ("c.platform", platform), ("c.account", account),
@@ -1692,14 +1695,15 @@ def analytics():
         def one(sql, args=()):
             return c.execute(sql, args).fetchone()[0]
         data = {
-            "contacts": one("SELECT COUNT(*) FROM dm_contacts"),
-            "pending": one("""SELECT COUNT(*) FROM dm_contacts c WHERE EXISTS
+            "contacts": one("SELECT COUNT(*) FROM dm_contacts WHERE COALESCE(account_deleted,0)=0"),
+            "pending": one("""SELECT COUNT(*) FROM dm_contacts c WHERE COALESCE(c.account_deleted,0)=0 AND EXISTS
                 (SELECT 1 FROM messages m WHERE m.contact_id=c.id AND m.direction='inbound' AND m.status='new')"""),
-            "high_intent": one("SELECT COUNT(*) FROM dm_contacts WHERE intent='high'"),
-            "interested": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='interested'"),
-            "qualified": one("""SELECT COUNT(*) FROM dm_contacts WHERE stage IN ('qualified','contacted','converted')
-                OR (intent='high' AND (contact_info!='' OR traveler_count>0 OR origin!=''
-                    OR travel_date!='' OR company_name!='' OR budget!=''))"""),
+            "high_intent": one("SELECT COUNT(*) FROM dm_contacts WHERE intent='high' AND COALESCE(account_deleted,0)=0"),
+            "interested": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='interested' AND COALESCE(account_deleted,0)=0"),
+            "qualified": one("""SELECT COUNT(*) FROM dm_contacts WHERE COALESCE(account_deleted,0)=0
+                AND (stage IN ('qualified','contacted','converted')
+                    OR (intent='high' AND (contact_info!='' OR traveler_count>0 OR origin!=''
+                        OR travel_date!='' OR company_name!='' OR budget!='')))"""),
             "today_inbound": one("""SELECT COUNT(*) FROM messages WHERE direction='inbound'
                 AND substr(created_at,1,10)=?""", (today,)),
             "today_auto": one("""SELECT COUNT(*) FROM dm_reply_logs WHERE substr(created_at,1,10)=?
@@ -1713,15 +1717,15 @@ def analytics():
             FROM dm_reply_logs l JOIN dm_rules r ON r.id=l.rule_id
             WHERE l.status IN ('sent','ready') GROUP BY l.rule_id ORDER BY count DESC LIMIT 5""").fetchall()]
         data["stage_counts"] = [dict(r) for r in c.execute(
-            "SELECT stage, COUNT(*) count FROM dm_contacts GROUP BY stage").fetchall()]
+            "SELECT stage, COUNT(*) count FROM dm_contacts WHERE COALESCE(account_deleted,0)=0 GROUP BY stage").fetchall()]
         data["segment_counts"] = [dict(r) for r in c.execute(
-            "SELECT segment, COUNT(*) count FROM dm_contacts GROUP BY segment").fetchall()]
+            "SELECT segment, COUNT(*) count FROM dm_contacts WHERE COALESCE(account_deleted,0)=0 GROUP BY segment").fetchall()]
     return jsonify({"code": 200, "data": data, "msg": None})
 
 
 def export_contacts():
     segment = request.args.get("segment")
-    sql = "SELECT * FROM dm_contacts WHERE 1=1"
+    sql = "SELECT * FROM dm_contacts WHERE COALESCE(account_deleted,0)=0"
     args = []
     if segment:
         sql += " AND segment=?"

@@ -108,10 +108,10 @@
             />
           </el-select>
         </el-form-item>
-        <el-form-item label="名称" prop="name">
+        <el-form-item label="账号名称备注" prop="name">
           <el-input 
             v-model="accountForm.name" 
-            placeholder="请输入账号名称" 
+            placeholder="选填，不填将自动生成名称"
             :disabled="sseConnecting"
           />
         </el-form-item>
@@ -336,7 +336,7 @@ const accountForm = reactive({
 // 表单验证规则
 const rules = {
   platform: [{ required: true, message: '请选择平台', trigger: 'change' }],
-  name: [{ required: true, message: '请输入账号名称', trigger: 'blur' }]
+  name: []
 }
 
 // SSE连接状态
@@ -609,6 +609,14 @@ const submitAccountForm = () => {
   accountFormRef.value.validate(async (valid) => {
     if (valid) {
       if (dialogType.value === 'add') {
+        // 名称选填：留空时自动生成默认名称（如“抖音账号1”）
+        const name = accountForm.name.trim()
+        if (!name) {
+          const samePlatformCount = accountStore.accounts.filter(
+            acc => acc.platform === accountForm.platform
+          ).length
+          accountForm.name = `${accountForm.platform}账号${samePlatformCount + 1}`
+        }
         // 建立SSE连接
         connectSSE(accountForm.platform, accountForm.name)
       } else {

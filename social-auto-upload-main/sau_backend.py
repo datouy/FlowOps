@@ -440,10 +440,10 @@ def delete_account():
 
             if not record:
                 return jsonify({
-                    "code": 404,
-                    "msg": "account not found",
+                    "code": 200,
+                    "msg": "账号不存在或已删除",
                     "data": None
-                }), 404
+                }), 200
 
             record = dict(record)
 
@@ -460,6 +460,33 @@ def delete_account():
             # 删除数据库记录
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
             conn.commit()
+
+        # 隐藏该账号在私信中心的会话（聊天记录保留在本地，不再展示）
+        try:
+            _platform_name = {
+                1: "小红书", 2: "视频号", 3: "抖音",
+                4: "快手", 5: "微博", 6: "百家号",
+            }.get(record.get("type") if isinstance(record, dict) else None, "")
+            _account_name = record.get("userName") if isinstance(record, dict) else None
+            if _account_name:
+                with dm_ops.get_conn() as dm_conn:
+                    cols = {row["name"] for row in dm_conn.execute(
+                        "PRAGMA table_info(dm_contacts)").fetchall()}
+                    if "account_deleted" not in cols:
+                        dm_conn.execute(
+                            "ALTER TABLE dm_contacts ADD COLUMN account_deleted INTEGER DEFAULT 0")
+                    if _platform_name:
+                        dm_conn.execute(
+                            """UPDATE dm_contacts SET account_deleted=1
+                                WHERE platform=? AND account=?""",
+                            (_platform_name, _account_name))
+                    else:
+                        dm_conn.execute(
+                            "UPDATE dm_contacts SET account_deleted=1 WHERE account=?",
+                            (_account_name,))
+                    dm_conn.commit()
+        except Exception as dm_err:
+            logger.warning("清理账号私信数据失败（不影响账号删除）: {}", dm_err)
 
         return jsonify({
             "code": 200,
@@ -690,7 +717,8 @@ def login():
     response.headers['Cache-Control'] = 'no-cache'
     response.headers['X-Accel-Buffering'] = 'no'  # 关键：禁用 Nginx 缓冲
     response.headers['Content-Type'] = 'text/event-stream'
-    response.headers['Connection'] = 'keep-alive'
+    # 注意：不能设置 Connection 头，WSGI/waitress 禁止逐跳头（PEP 3333），
+    # 否则 /login 会直接 500，导致前端“连接服务器失败”。
     return response
 
 @app.route('/postVideo', methods=['POST'])

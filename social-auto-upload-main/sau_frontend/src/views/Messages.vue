@@ -1,5 +1,14 @@
 <template>
   <div class="dm-page">
+    <el-alert
+      v-if="hasNoAccounts"
+      title="当前没有登录账号，无法查看私信"
+      description="请先到「账号管理」添加并登录账号，登录后私信会自动同步显示。"
+      type="info"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
     <div class="page-head">
       <div>
         <h2>私信自动回复</h2>
@@ -642,6 +651,7 @@ import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { dmApi } from '@/api/dm'
+import { useAccountStore } from '@/stores/account'
 import { API_BASE, withToken } from '@/config'
 import {
   avatarText, deliveryTagType, deliveryText, intentTagType, intentText,
@@ -651,6 +661,8 @@ import { useLivePolling } from '@/composables/useLivePolling'
 
 const route = useRoute()
 const apiBase = API_BASE
+const accountStore = useAccountStore()
+const hasNoAccounts = computed(() => !accountStore.accounts.length)
 const platforms = ['抖音', '快手', '视频号', '小红书', '微博', '百家号']
 const weekdays = [
   { value: '1', label: '一' }, { value: '2', label: '二' }, { value: '3', label: '三' },
@@ -936,6 +948,7 @@ function setSyncStatus(platform, data) {
 }
 
 async function loadSyncStatus() {
+  if (hasNoAccounts.value) return []
   const targets = [
     ['抖音', '/dm/sync/status', syncForm, 0],
     ['小红书', '/dm/xhs/status', xhsSyncForm, 0],
@@ -1051,6 +1064,7 @@ function handlePlatformFilterChange() {
 }
 
 async function refreshLive() {
+  if (hasNoAccounts.value) return
   const contactId = currentContact.value?.id
   liveTick.value += 1
   try {
@@ -1092,6 +1106,7 @@ async function loadStorageHealth() {
 }
 
 async function loadConversations(silent = false) {
+  if (hasNoAccounts.value) return
   if (!silent) loadingConversations.value = true
   try {
     const params = {}
@@ -1114,6 +1129,7 @@ async function loadConversations(silent = false) {
 }
 
 async function loadLeads() {
+  if (hasNoAccounts.value) return
   loadingLeads.value = true
   try {
     const params = {}
@@ -1373,6 +1389,12 @@ function exportLeads() {
 useLivePolling(refreshLive, { interval: 1000, isActive: () => activeTab.value === 'inbox' })
 
 onMounted(async () => {
+  try {
+    await accountStore.loadAccounts()
+  } catch (error) {
+    console.error('加载账号列表失败:', error)
+  }
+  if (hasNoAccounts.value) return
   await Promise.all([
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(), loadStorageHealth(),

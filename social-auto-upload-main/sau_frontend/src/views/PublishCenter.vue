@@ -266,16 +266,33 @@
             class="account-dialog"
           >
             <div class="account-dialog-content">
+              <div class="account-dialog-toolbar">
+                <el-radio-group v-model="dialogPlatformFilter" size="small">
+                  <el-radio-button label="全部">全部平台</el-radio-button>
+                  <el-radio-button
+                    v-for="platform in dialogPlatformOptions"
+                    :key="platform"
+                    :label="platform"
+                  >
+                    {{ platform }}
+                  </el-radio-button>
+                </el-radio-group>
+                <div class="account-dialog-actions">
+                  <el-button size="small" @click="selectAllFiltered">全选当前</el-button>
+                  <el-button size="small" @click="clearFiltered">取消全选</el-button>
+                </div>
+              </div>
               <el-checkbox-group v-model="tempSelectedAccounts">
                 <div class="account-list">
                   <el-checkbox
-                    v-for="account in availableAccounts"
+                    v-for="account in filteredDialogAccounts"
                     :key="account.id"
                     :label="account.id"
                     class="account-item"
                   >
                     <div class="account-info">
                       <span class="account-name">{{ account.name }}</span>                      
+                      <span class="account-platform-tag">{{ account.platform }}</span>
                     </div>
                   </el-checkbox>
                 </div>
@@ -710,17 +727,29 @@ const accountStore = useAccountStore()
 
 // 根据选择的平台获取可用账号列表
 const availableAccounts = computed(() => {
-  const platformMap = {
-    3: '抖音',
-    2: '视频号',
-    1: '小红书',
-    4: '快手',
-    5: '微博',
-    6: '百家号'
-  }
-  const currentPlatform = currentTab.value ? platformMap[currentTab.value.selectedPlatform] : null
-  return currentPlatform ? accountStore.accounts.filter(acc => acc.platform === currentPlatform) : []
+  return accountStore.accounts
 })
+
+// 账号选择弹窗：平台筛选与批量选择
+const dialogPlatformFilter = ref('全部')
+const dialogPlatformOptions = computed(() => {
+  const order = ['抖音', '快手', '视频号', '小红书', '微博', '百家号']
+  const present = [...new Set(accountStore.accounts.map(acc => acc.platform))]
+  return order.filter(p => present.includes(p)).concat(present.filter(p => !order.includes(p)))
+})
+const filteredDialogAccounts = computed(() => {
+  if (dialogPlatformFilter.value === '全部') return availableAccounts.value
+  return availableAccounts.value.filter(acc => acc.platform === dialogPlatformFilter.value)
+})
+const selectAllFiltered = () => {
+  const ids = filteredDialogAccounts.value.map(acc => acc.id)
+  const merged = new Set([...tempSelectedAccounts.value, ...ids])
+  tempSelectedAccounts.value = [...merged]
+}
+const clearFiltered = () => {
+  const ids = new Set(filteredDialogAccounts.value.map(acc => acc.id))
+  tempSelectedAccounts.value = tempSelectedAccounts.value.filter(id => !ids.has(id))
+}
 
 // 话题相关状态
 const topicDialogVisible = ref(false)
@@ -858,6 +887,7 @@ const confirmTopicSelection = () => {
 const openAccountDialog = (tab) => {
   currentTab.value = tab
   tempSelectedAccounts.value = [...tab.selectedAccounts]
+  dialogPlatformFilter.value = '全部'
   accountDialogVisible.value = true
 }
 
@@ -1720,6 +1750,48 @@ onUnmounted(() => {
     margin: 10px 0 0;
     color: #909399;
     font-size: 12px;
+  }
+}
+
+// 账号选择弹窗
+.account-dialog-content {
+  .account-dialog-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 12px;
+
+    .account-dialog-actions {
+      display: flex;
+      gap: 8px;
+    }
+  }
+
+  .account-list {
+    max-height: 320px;
+    overflow-y: auto;
+
+    .account-item {
+      display: flex;
+      width: 100%;
+      padding: 4px 0;
+
+      .account-info {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+
+        .account-platform-tag {
+          font-size: 12px;
+          color: #909399;
+          background: #f4f4f5;
+          border-radius: 3px;
+          padding: 1px 6px;
+        }
+      }
+    }
   }
 }
 </style>

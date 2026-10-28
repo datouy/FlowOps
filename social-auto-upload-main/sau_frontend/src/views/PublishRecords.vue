@@ -1,5 +1,14 @@
 <template>
   <div class="publish-records">
+    <el-alert
+      v-if="hasNoAccounts"
+      title="当前没有登录账号，无法查看发布数据"
+      description="请先到「账号管理」添加并登录账号，发布数据同步后即可在这里查看。"
+      type="info"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
     <el-alert v-if="expiredAccounts.length" type="warning" :closable="false" class="account-alert">
       <template #title>
         <span>以下账号登录已过期，请到「账号管理」重新扫码：{{ expiredAccounts.join('、') }}</span>
@@ -255,8 +264,11 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
+import { useAccountStore } from '@/stores/account'
 
 const view = ref('overview')
+const accountStore = useAccountStore()
+const hasNoAccounts = computed(() => !accountStore.accounts.length)
 const jobs = ref([])
 const unmatched = ref([])
 const linkDialog = ref(false)
@@ -316,6 +328,7 @@ function jobStatusText(row) {
 }
 
 async function loadAll() {
+  if (hasNoAccounts.value) return
   try {
     const [stats, jobResult, accountResult, unmatchedResult, notifyResult] = await Promise.all([
       http.get('/stats/summary'),
@@ -393,7 +406,12 @@ async function triggerSync() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  try {
+    await accountStore.loadAccounts()
+  } catch (error) {
+    console.error('加载账号列表失败:', error)
+  }
   loadAll()
   timer = setInterval(loadAll, 10000)
 })

@@ -1,9 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { accountApi } from '@/api/account'
 
 export const useAccountStore = defineStore('account', () => {
   // 存储所有账号信息
   const accounts = ref([])
+  const accountsLoaded = ref(false)
+  let accountsPromise = null
   
   // 平台类型映射
   const platformTypes = {
@@ -28,6 +31,25 @@ export const useAccountStore = defineStore('account', () => {
         platform: platformTypes[item[1]] || '未知'
       }
     })
+    accountsLoaded.value = true
+  }
+
+  // 首次访问需要账号数据的页面时加载一次，避免直接刷新页面误判为没有账号
+  const loadAccounts = async () => {
+    if (accountsLoaded.value) return accounts.value
+    if (accountsPromise) return accountsPromise
+    accountsPromise = accountApi.getAccounts()
+      .then((response) => {
+        if (response.code !== 200) {
+          throw new Error(response.msg || '获取账号列表失败')
+        }
+        setAccounts(response.data || [])
+        return accounts.value
+      })
+      .finally(() => {
+        accountsPromise = null
+      })
+    return accountsPromise
   }
   
   // 添加账号
@@ -55,7 +77,9 @@ export const useAccountStore = defineStore('account', () => {
   
   return {
     accounts,
+    accountsLoaded,
     setAccounts,
+    loadAccounts,
     addAccount,
     updateAccount,
     deleteAccount,
