@@ -323,12 +323,16 @@ async def _wait_for_douyin_login(
                         phone = (phone_data or {}).get("phone", "")
                         if phone:
                             await phone_input.fill(phone)
-                            send_button = page.get_by_role(
-                                "button", name=re.compile(r"获取验证码|发送验证码|获取短信|发送短信")
-                            ).first
+                            send_button = page.get_by_text("获取验证码").first
                             if await send_button.count() and await send_button.is_visible():
-                                await send_button.click()
+                                if await send_button.is_enabled():
+                                    await send_button.click()
+                                    douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
+                                else:
+                                    douyin_logger.warning(_msg("⚠️", "「获取验证码」按钮不可点击，尝试按Enter"))
+                                    await phone_input.press("Enter")
                             else:
+                                douyin_logger.warning(_msg("⚠️", "未找到「获取验证码」按钮，尝试按Enter"))
                                 await phone_input.press("Enter")
                         code_data = await second_verify_callback("code")
                         if not code_data:
@@ -336,13 +340,17 @@ async def _wait_for_douyin_login(
                         code = (code_data or {}).get("code", "")
                         if code:
                             await code_input.fill(code)
-                            submit_button = page.get_by_role(
-                                "button", name=re.compile(r"确认|确定|提交|验证|登录")
-                            ).first
-                            if await submit_button.count() and await submit_button.is_visible():
-                                await submit_button.click()
+                            verify_btn = page.locator('div.uc-ui-verify_sms-verify_button:has-text("验证")').first
+                            if await verify_btn.count() and await verify_btn.is_visible():
+                                await verify_btn.click(force=True)
+                                douyin_logger.success(_msg("✅", "已点击「验证」按钮"))
                             else:
-                                await code_input.press("Enter")
+                                verify_by_text = page.get_by_text("验证", exact=True).first
+                                if await verify_by_text.count() and await verify_by_text.is_visible():
+                                    await verify_by_text.click(force=True)
+                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮(text)"))
+                                else:
+                                    await code_input.press("Enter")
                 except Exception as exc:
                     douyin_logger.warning(_msg("⚠️", f"短信二次验证处理失败: {exc}"))
                 finally:
