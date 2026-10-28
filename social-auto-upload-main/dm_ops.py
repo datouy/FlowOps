@@ -22,8 +22,12 @@ from db_utils import (
 
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
+ACCOUNT_DB = Path(BASE_DIR / "db" / "database.db")
 BACKUP_DIR = Path(BASE_DIR / "db" / "backups")
 BACKUP_KEEP = 7
+ACCOUNT_PLATFORM_NAMES = {
+    1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "微博", 6: "百家号",
+}
 
 SEGMENTS = {"general": "通用", "new": "新客户", "interested": "意向客户", "existing": "老客户", "unknown": "未分类"}
 STAGES = {
@@ -63,6 +67,41 @@ DEFAULT_SETTINGS = {
 
 def get_conn():
     return connect(DB, timeout=30)
+
+
+def active_account_pairs() -> list[tuple[str, str]]:
+    """Return platform/account pairs that are currently logged in."""
+    if not ACCOUNT_DB.is_file():
+        return []
+    try:
+        with connect(ACCOUNT_DB, timeout=10) as c:
+            rows = c.execute(
+                "SELECT type, userName FROM user_info WHERE status=1"
+            ).fetchall()
+    except Exception:
+        return []
+    pairs = {
+        (ACCOUNT_PLATFORM_NAMES.get(int(row["type"]), ""), str(row["userName"] or "").strip())
+        for row in rows
+    }
+    return sorted((platform, account) for platform, account in pairs if platform and account)
+
+
+def account_scope_sql(platform_col: str = "platform",
+                      account_col: str = "account") -> tuple[str, list]:
+    """Build a parameterized SQL fragment for currently logged-in accounts."""
+    pairs = active_account_pairs()
+    if not pairs:
+        return " AND 0=1", []
+    clauses = [f"({platform_col}=? AND {account_col}=?)" for _ in pairs]
+    args = [value for pair in pairs for value in pair]
+    return " AND (" + " OR ".join(clauses) + ")", args
+
+
+def is_active_account_contact(contact: dict) -> bool:
+    platform = str(contact.get("platform") or "").strip()
+    account = str(contact.get("account") or "").strip()
+    return bool(platform and account and (platform, account) in active_account_pairs())
 
 
 def _now() -> str:
@@ -1386,6 +1425,7 @@ def _score_priority_lead(row: dict, now: datetime | None = None) -> dict:
 def priority_leads(limit: int = 8) -> list[dict]:
     """返回当前最值得跟进的线索，排除已成交和已流失客户。"""
     limit = max(1, min(int(limit or 8), 20))
+    scope_sql, scope_args = account_scope_sql("c.platform", "c.account")
     sql = """SELECT c.*, m.content AS last_content, m.direction AS last_direction,
         m.created_at AS last_message_time,
         CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply,
@@ -1395,10 +1435,10 @@ def priority_leads(limit: int = 8) -> list[dict]:
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='outbound'
             AND x.delivery_status='ready') AS pending_delivery
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
-        WHERE c.stage NOT IN ('converted','lost') AND COALESCE(c.account_deleted,0)=0
-        ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"""
+        WHERE c.stage NOT IN ('converted','lost') AND COALESCE(c.account_deleted,0)=0"""
+    sql += scope_sql + " ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"
     with get_conn() as c:
-        rows = [_decorate_contact(dict(r)) for r in c.execute(sql).fetchall()]
+        rows = [_decorate_contact(dict(r)) for r in c.execute(sql, scope_args).fetchall()]
     ranked = [_score_priority_lead(row) for row in rows]
     ranked.sort(key=lambda row: (row["lead_score"], row.get("last_message_time") or ""), reverse=True)
     return ranked[:limit]
@@ -1411,12 +1451,12 @@ def list_conversations():
     stage = request.args.get("stage")
     status = request.args.get("status")
     q = _clean(request.args.get("q"), 120)
+    scope_sql, args = account_scope_sql("c.platform", "c.account")
     sql = """SELECT c.*, m.id AS last_message_id, m.content AS last_content, m.direction AS last_direction,
         m.created_at AS last_message_time, m.delivery_status AS last_delivery_status,
         CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply
         FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
-        WHERE COALESCE(c.account_deleted,0)=0"""
-    args = []
+        WHERE COALESCE(c.account_deleted,0)=0""" + scope_sql
     for field, value in (
         ("c.platform", platform), ("c.account", account),
         ("c.segment", segment), ("c.stage", stage),
@@ -1447,7 +1487,7 @@ def conversation_detail(cid: int):
         after = 0
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
-        if not row:
+        if not row or row["account_deleted"] or not is_active_account_contact(dict(row)):
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = _decorate_contact(dict(row))
         messages = [dict(r) for r in c.execute("""SELECT * FROM (
@@ -1691,42 +1731,71 @@ def ai_draft(cid: int):
 
 def analytics():
     today = datetime.now().strftime("%Y-%m-%d")
+    contact_scope, contact_args = account_scope_sql("c.platform", "c.account")
+    message_scope, message_args = account_scope_sql("m.platform", "m.account")
     with get_conn() as c:
         def one(sql, args=()):
             return c.execute(sql, args).fetchone()[0]
         data = {
-            "contacts": one("SELECT COUNT(*) FROM dm_contacts WHERE COALESCE(account_deleted,0)=0"),
-            "pending": one("""SELECT COUNT(*) FROM dm_contacts c WHERE COALESCE(c.account_deleted,0)=0 AND EXISTS
-                (SELECT 1 FROM messages m WHERE m.contact_id=c.id AND m.direction='inbound' AND m.status='new')"""),
-            "high_intent": one("SELECT COUNT(*) FROM dm_contacts WHERE intent='high' AND COALESCE(account_deleted,0)=0"),
-            "interested": one("SELECT COUNT(*) FROM dm_contacts WHERE segment='interested' AND COALESCE(account_deleted,0)=0"),
-            "qualified": one("""SELECT COUNT(*) FROM dm_contacts WHERE COALESCE(account_deleted,0)=0
-                AND (stage IN ('qualified','contacted','converted')
-                    OR (intent='high' AND (contact_info!='' OR traveler_count>0 OR origin!=''
-                        OR travel_date!='' OR company_name!='' OR budget!='')))"""),
-            "today_inbound": one("""SELECT COUNT(*) FROM messages WHERE direction='inbound'
-                AND substr(created_at,1,10)=?""", (today,)),
-            "today_auto": one("""SELECT COUNT(*) FROM dm_reply_logs WHERE substr(created_at,1,10)=?
-                AND status IN ('sent','ready')""", (today,)),
-            "sent": one("SELECT COUNT(*) FROM dm_reply_logs WHERE status='sent'"),
-            "ready": one("SELECT COUNT(*) FROM dm_reply_logs WHERE status='ready'"),
-            "failed": one("SELECT COUNT(*) FROM dm_reply_logs WHERE status='failed'"),
-            "skipped": one("SELECT COUNT(*) FROM dm_reply_logs WHERE status='skipped'"),
+            "contacts": one("""SELECT COUNT(*) FROM dm_contacts c
+                WHERE COALESCE(c.account_deleted,0)=0""" + contact_scope, contact_args),
+            "pending": one("""SELECT COUNT(*) FROM dm_contacts c WHERE COALESCE(c.account_deleted,0)=0
+                AND EXISTS
+                (SELECT 1 FROM messages m WHERE m.contact_id=c.id AND m.direction='inbound'
+                    AND m.status='new')""" + contact_scope, contact_args),
+            "high_intent": one("""SELECT COUNT(*) FROM dm_contacts c
+                WHERE c.intent='high' AND COALESCE(c.account_deleted,0)=0""" + contact_scope, contact_args),
+            "interested": one("""SELECT COUNT(*) FROM dm_contacts c
+                WHERE c.segment='interested' AND COALESCE(c.account_deleted,0)=0""" + contact_scope, contact_args),
+            "qualified": one("""SELECT COUNT(*) FROM dm_contacts c WHERE COALESCE(c.account_deleted,0)=0
+                AND (c.stage IN ('qualified','contacted','converted')
+                    OR (c.intent='high' AND (c.contact_info!='' OR c.traveler_count>0 OR c.origin!=''
+                        OR c.travel_date!='' OR c.company_name!='' OR c.budget!='')))""" + contact_scope,
+                contact_args),
+            "today_inbound": one("""SELECT COUNT(*) FROM messages m WHERE m.direction='inbound'
+                AND substr(m.created_at,1,10)=?""" + message_scope, (today, *message_args)),
+            "today_auto": one("""SELECT COUNT(*) FROM dm_reply_logs l
+                JOIN dm_contacts c ON c.id=l.contact_id
+                WHERE substr(l.created_at,1,10)=? AND l.status IN ('sent','ready')
+                AND COALESCE(c.account_deleted,0)=0""" + contact_scope,
+                (today, *contact_args)),
+            "sent": one("""SELECT COUNT(*) FROM dm_reply_logs l
+                JOIN dm_contacts c ON c.id=l.contact_id
+                WHERE l.status='sent' AND COALESCE(c.account_deleted,0)=0""" + contact_scope,
+                contact_args),
+            "ready": one("""SELECT COUNT(*) FROM dm_reply_logs l
+                JOIN dm_contacts c ON c.id=l.contact_id
+                WHERE l.status='ready' AND COALESCE(c.account_deleted,0)=0""" + contact_scope,
+                contact_args),
+            "failed": one("""SELECT COUNT(*) FROM dm_reply_logs l
+                JOIN dm_contacts c ON c.id=l.contact_id
+                WHERE l.status='failed' AND COALESCE(c.account_deleted,0)=0""" + contact_scope,
+                contact_args),
+            "skipped": one("""SELECT COUNT(*) FROM dm_reply_logs l
+                JOIN dm_contacts c ON c.id=l.contact_id
+                WHERE l.status='skipped' AND COALESCE(c.account_deleted,0)=0""" + contact_scope,
+                contact_args),
         }
         data["top_rules"] = [dict(r) for r in c.execute("""SELECT r.name, COUNT(*) count
             FROM dm_reply_logs l JOIN dm_rules r ON r.id=l.rule_id
-            WHERE l.status IN ('sent','ready') GROUP BY l.rule_id ORDER BY count DESC LIMIT 5""").fetchall()]
+            JOIN dm_contacts c ON c.id=l.contact_id
+            WHERE l.status IN ('sent','ready') AND COALESCE(c.account_deleted,0)=0""" + contact_scope + """
+            GROUP BY l.rule_id ORDER BY count DESC LIMIT 5""", contact_args).fetchall()]
         data["stage_counts"] = [dict(r) for r in c.execute(
-            "SELECT stage, COUNT(*) count FROM dm_contacts WHERE COALESCE(account_deleted,0)=0 GROUP BY stage").fetchall()]
+            """SELECT c.stage, COUNT(*) count FROM dm_contacts c
+            WHERE COALESCE(c.account_deleted,0)=0""" + contact_scope +
+            " GROUP BY c.stage", contact_args).fetchall()]
         data["segment_counts"] = [dict(r) for r in c.execute(
-            "SELECT segment, COUNT(*) count FROM dm_contacts WHERE COALESCE(account_deleted,0)=0 GROUP BY segment").fetchall()]
+            """SELECT c.segment, COUNT(*) count FROM dm_contacts c
+            WHERE COALESCE(c.account_deleted,0)=0""" + contact_scope +
+            " GROUP BY c.segment", contact_args).fetchall()]
     return jsonify({"code": 200, "data": data, "msg": None})
 
 
 def export_contacts():
     segment = request.args.get("segment")
-    sql = "SELECT * FROM dm_contacts WHERE COALESCE(account_deleted,0)=0"
-    args = []
+    scope_sql, args = account_scope_sql()
+    sql = "SELECT * FROM dm_contacts WHERE COALESCE(account_deleted,0)=0" + scope_sql
     if segment:
         sql += " AND segment=?"
         args.append(segment)

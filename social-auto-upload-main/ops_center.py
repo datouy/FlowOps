@@ -74,13 +74,17 @@ def list_messages():
     status = request.args.get("status")
     platform = request.args.get("platform")
     intent = request.args.get("intent")
-    sql = "SELECT * FROM messages WHERE 1=1"
-    args = []
+    try:
+        import dm_ops
+        scope_sql, args = dm_ops.account_scope_sql("m.platform", "m.account")
+    except Exception:
+        scope_sql, args = " AND 0=1", []
+    sql = "SELECT * FROM messages m WHERE 1=1" + scope_sql
     for field, value in (("status", status), ("platform", platform), ("intent", intent)):
         if value:
-            sql += f" AND {field}=?"
+            sql += f" AND m.{field}=?"
             args.append(value)
-    sql += " ORDER BY CASE intent WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id DESC LIMIT 500"
+    sql += " ORDER BY CASE m.intent WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, m.id DESC LIMIT 500"
     with get_conn() as c:
         rows = [dict(r) for r in c.execute(sql, args).fetchall()]
     return jsonify({"code": 200, "data": rows, "msg": None})
@@ -153,12 +157,23 @@ def todo_summary():
         return jsonify({"code": 200, "data": _TODO_CACHE["payload"], "msg": None})
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
+    try:
+        import dm_ops
+        message_scope, message_args = dm_ops.account_scope_sql("m.platform", "m.account")
+    except Exception:
+        dm_ops = None
+        message_scope, message_args = " AND 0=1", []
     with get_conn() as c:
-        pending_messages = c.execute("SELECT COUNT(*) FROM messages WHERE status='new'").fetchone()[0]
-        high_intent = c.execute("SELECT COUNT(*) FROM messages WHERE status='new' AND intent='high'").fetchone()[0]
+        pending_messages = c.execute(
+            "SELECT COUNT(*) FROM messages m WHERE m.status='new'" + message_scope,
+            message_args).fetchone()[0]
+        high_intent = c.execute(
+            "SELECT COUNT(*) FROM messages m WHERE m.status='new' AND m.intent='high'" + message_scope,
+            message_args).fetchone()[0]
         try:
-            auto_ready = c.execute("""SELECT COUNT(*) FROM messages
-                WHERE direction='outbound' AND delivery_status='ready'""").fetchone()[0]
+            auto_ready = c.execute("""SELECT COUNT(*) FROM messages m
+                WHERE m.direction='outbound' AND m.delivery_status='ready'""" + message_scope,
+                message_args).fetchone()[0]
         except Exception:
             auto_ready = 0
     with publish_jobs.get_conn() as c:
@@ -185,8 +200,8 @@ def todo_summary():
         unused_assets = 0
     priority_items = []
     try:
-        import dm_ops
-        priority_items = dm_ops.priority_leads(6)
+        if dm_ops is not None:
+            priority_items = dm_ops.priority_leads(6)
     except Exception:
         priority_items = []
     items = []

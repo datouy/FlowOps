@@ -662,7 +662,7 @@ import { useLivePolling } from '@/composables/useLivePolling'
 const route = useRoute()
 const apiBase = API_BASE
 const accountStore = useAccountStore()
-const hasNoAccounts = computed(() => !accountStore.accounts.length)
+const hasNoAccounts = computed(() => !accountStore.accounts.some(account => account.status === '正常'))
 const platforms = ['抖音', '快手', '视频号', '小红书', '微博', '百家号']
 const weekdays = [
   { value: '1', label: '一' }, { value: '2', label: '二' }, { value: '3', label: '三' },

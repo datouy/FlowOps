@@ -8,6 +8,16 @@
       <el-button @click="load" :loading="loading">刷新</el-button>
     </div>
 
+    <el-alert
+      v-if="hasNoAccounts"
+      title="当前没有登录账号，私信和留言待办已隐藏"
+      description="请先到「账号管理」添加并登录账号，登录后相关消息会自动显示。"
+      type="info"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
+
     <div class="metric-grid">
       <div class="metric" @click="go('/messages')">
         <span>待回复私信/留言</span><strong>{{ todo.counts.messages || 0 }}</strong>
@@ -103,12 +113,15 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Bell } from '@element-plus/icons-vue'
 import { http } from '@/utils/request'
+import { useAccountStore } from '@/stores/account'
 
 const router = useRouter()
+const accountStore = useAccountStore()
+const hasNoAccounts = computed(() => !accountStore.accounts.some(account => account.status === '正常'))
 const loading = ref(false)
 const todo = ref({ date: '', counts: {}, items: [] })
 
@@ -137,7 +150,14 @@ function leadInfo(lead) {
 function openLead(lead) {
   router.push({ path: '/messages', query: { contact: lead.id, platform: lead.platform || '' } })
 }
-onMounted(load)
+onMounted(async () => {
+  try {
+    await accountStore.loadAccounts()
+  } catch (error) {
+    console.error('加载账号列表失败:', error)
+  }
+  load()
+})
 </script>
 
 <style scoped>
