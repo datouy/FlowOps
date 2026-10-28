@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,6 +92,13 @@ def _load_env() -> dict:
                 continue
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
+    # Docker Compose and the process manager inject these settings through
+    # the environment. Keep that explicit configuration authoritative while
+    # retaining .env support for local runs.
+    for key in ("WB_API_KEY", "WB_BASE_URL", "WB_MODEL", "WB_REALM"):
+        value = str(os.environ.get(key, "") or "").strip()
+        if value:
+            env[key] = value
     return env
 
 
