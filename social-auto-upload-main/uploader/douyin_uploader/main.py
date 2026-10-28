@@ -322,7 +322,24 @@ async def _wait_for_douyin_login(
                             raise RuntimeError("等待抖音短信验证输入超时")
                         phone = (phone_data or {}).get("phone", "")
                         if phone:
+                            def _mask_phone(p):
+                                p = (p or "").strip()
+                                if len(p) >= 7:
+                                    return p[:3] + "****" + p[-4:]
+                                return p
+                            try:
+                                pre_value = await phone_input.input_value()
+                            except Exception:
+                                pre_value = ""
+                            douyin_logger.info(_msg("📱", f"填写前手机号框内容={_mask_phone(pre_value)!r}"))
+                            await phone_input.click()
+                            await phone_input.fill("")
                             await phone_input.fill(phone)
+                            try:
+                                after_value = await phone_input.input_value()
+                            except Exception:
+                                after_value = ""
+                            douyin_logger.info(_msg("📱", f"已填手机号 {_mask_phone(phone)}，输入框当前长度={len(after_value)}"))
                             send_button = page.get_by_text("获取验证码").first
                             if await send_button.count() and await send_button.is_visible():
                                 try:
@@ -330,11 +347,22 @@ async def _wait_for_douyin_login(
                                     douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
                                 except Exception as click_exc:
                                     douyin_logger.warning(_msg("⚠️", f"JS点击「获取验证码」失败，改用force点击: {click_exc}"))
-                                    await send_button.click(force=True, timeout=5000)
-                                    douyin_logger.info(_msg("📤", "已点击「获取验证码」(force)，请查看手机短信"))
+                                    try:
+                                        await send_button.click(force=True, timeout=5000)
+                                        douyin_logger.info(_msg("📤", "已点击「获取验证码」(force)，请查看手机短信"))
+                                    except Exception as force_exc:
+                                        douyin_logger.warning(_msg("⚠️", f"force点击也失败: {force_exc}"))
                             else:
                                 douyin_logger.warning(_msg("⚠️", "未找到「获取验证码」按钮，尝试按Enter"))
                                 await phone_input.press("Enter")
+                            await asyncio.sleep(2)
+                            try:
+                                btn_text = (await send_button.inner_text()).strip() if await send_button.count() else ""
+                                modal_text = (await page.locator("#uc-second-verify").inner_text())[:800] if await page.locator("#uc-second-verify").count() else ""
+                                markers = [m for m in ("重新获取", "重新发送", "再次获取", "秒后", "s后", "已发送", "失败", "错误", "不一致", "绑定") if m in modal_text]
+                                douyin_logger.info(_msg("⏱️", f"发送后按钮文本={btn_text!r} 弹窗片段={modal_text!r} 关键标记={markers}"))
+                            except Exception:
+                                pass
                         code_data = await second_verify_callback("code")
                         if not code_data:
                             raise RuntimeError("等待抖音短信验证码输入超时")
