@@ -306,7 +306,7 @@ async def _wait_for_douyin_login(
         # 必须先看到抖音接口返回 scanned，避免登录页自带的短信表单误触发。
         phone_input = page.locator('input[placeholder*="手机号"]').first
         code_input = page.locator('input[placeholder*="验证码"]').first
-        scanned = bool(qr_connect_state and qr_connect_state.get("scanned"))
+        scanned = bool(qr_connect_state and (qr_connect_state.get("scanned") or qr_connect_state.get("second_verify")))
         phone_visible = (await phone_input.count() > 0) and (await phone_input.is_visible())
         code_visible = (await code_input.count() > 0) and (await code_input.is_visible())
         has_second_verify = scanned and phone_visible and code_visible
@@ -417,6 +417,8 @@ async def douyin_cookie_gen(
                         if isinstance(data, dict):
                             if data.get("status") == "scanned":
                                 qr_connect_state["scanned"] = True
+                            if payload.get("message") == "error" and data.get("verify_ways"):
+                                qr_connect_state["second_verify"] = True
                             douyin_logger.debug(
                                 "check_qrconnect: keys={} data_keys={} status={} redirect={} message={}",
                                 sorted(payload.keys()),
