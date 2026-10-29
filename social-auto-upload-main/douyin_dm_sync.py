@@ -435,28 +435,67 @@ def _display_time_to_text(value: str) -> str:
 
 async def _click_conversation(
     page, cid: str, max_scrolls: int = 20, settle_ms: int = 1600,
-    click_timeout_ms: int = 5000,
+    click_timeout_ms: int = 5000, is_group: bool = False,
+    is_stranger: bool = False,
 ) -> bool:
+    tab_label = "群消息" if is_group else (
+        "陌生人私信" if is_stranger else "朋友私信"
+    )
+    tab_changed = await page.evaluate("""(label) => {
+        document.querySelectorAll('[data-flowops-dm-tab]').forEach(el => {
+            el.removeAttribute('data-flowops-dm-tab');
+        });
+        const tabs = Array.from(document.querySelectorAll('[class*="sub-tab-item"]'))
+            .filter(el => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 1 && rect.height > 1 &&
+                    String(el.innerText || '').trim() === label;
+            });
+        const current = tabs.find(el => String(el.className || '').includes('active'));
+        if (current || !tabs.length) return false;
+        tabs[0].setAttribute('data-flowops-dm-tab', '1');
+        return true;
+    }""", tab_label)
+    if tab_changed:
+        await page.locator('[data-flowops-dm-tab="1"]').click(
+            timeout=max(500, click_timeout_ms)
+        )
+        await page.wait_for_timeout(500)
     await page.evaluate("""() => {
         const grid = document.querySelector('.ReactVirtualized__Grid');
         if (grid) grid.scrollTop = 0;
     }""")
     await page.wait_for_timeout(350)
     for _ in range(max(1, max_scrolls)):
-        index = await page.evaluate("""(cid) => {
-            const items = Array.from(document.querySelectorAll('.semi-list-item'));
+        found = await page.evaluate("""(cid) => {
+            document.querySelectorAll('[data-flowops-dm-target]').forEach(el => {
+                el.removeAttribute('data-flowops-dm-target');
+            });
+            const items = Array.from(document.querySelectorAll('.semi-list-item'))
+                .filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 1 && rect.height > 1 &&
+                        style.display !== 'none' && style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0;
+                });
             for (let index = 0; index < items.length; index++) {
                 const header = items[index].querySelector('.semi-list-item-body-header');
                 if (!header) continue;
                 const key = Object.keys(header).find(name => name.startsWith('__reactProps$'));
                 let conversation = null;
                 try { conversation = header[key]?.children?.props?.conversation; } catch (error) {}
-                if (conversation && String(conversation.id || conversation.shortId || '') === cid) return index;
+                if (conversation && String(conversation.id || conversation.shortId || '') === cid) {
+                    items[index].setAttribute('data-flowops-dm-target', '1');
+                    return true;
+                }
             }
-            return -1;
+            return false;
         }""", cid)
-        if index >= 0:
-            await page.locator('.semi-list-item').nth(index).click(
+        if found:
+            # 页面会保留一组零尺寸的旧列表行；索引必须取自可见行，否则
+            # 后续会话会被定位到隐藏副本并因不可见而点击失败。
+            await page.locator('.semi-list-item[data-flowops-dm-target="1"]').click(
                 timeout=max(500, click_timeout_ms)
             )
             await page.wait_for_timeout(settle_ms)
@@ -818,7 +857,7 @@ async def _scan_douyin_in_browser(
                 should_scan_history = (not quick) or effective_unread > 0
                 if should_scan_history and user_id in seen_history_users:
                     continue
-                if should_scan_history and _history_marker_fresh(
+                if should_scan_history and not quick and _history_marker_fresh(
                     account_name, cid, signature
                 ):
                     row["history_synced"] = True
@@ -830,6 +869,8 @@ async def _scan_douyin_in_browser(
                     max_scrolls=2 if quick else 20,
                     settle_ms=400 if quick else 1600,
                     click_timeout_ms=900 if quick else 5000,
+                    is_group=bool(row.get("is_group")),
+                    is_stranger=bool(row.get("is_stranger")),
                 ):
                     history = await _collect_history(
                         page, quick=quick, hours=history_hours,
@@ -837,7 +878,9 @@ async def _scan_douyin_in_browser(
                     if isinstance(history, list) and history:
                         row["history"] = history
                         seen_history_users.add(user_id)
-                        _save_history_marker(account_name, cid, signature)
+                        # 增量同步只回看少量轮次，不能代表完整历史已经补齐。
+                        if not quick:
+                            _save_history_marker(account_name, cid, signature)
             except Exception:
                 pass
         timings["history_ms"] = int((time.monotonic() - started_mono) * 1000)
