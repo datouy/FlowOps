@@ -38,6 +38,21 @@ DOUYIN_AUTH_COOKIE_NAMES = {
 }
 
 
+def _desktop_browser_context_options(browser) -> dict:
+    """Build a normal desktop browser profile instead of Playwright's headless UA."""
+    version = str(getattr(browser, "version", "") or "")
+    major = version.split(".", 1)[0] if version else "131"
+    return {
+        "user_agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        ),
+        "locale": "zh-CN",
+        "timezone_id": "Asia/Shanghai",
+        "viewport": {"width": 1440, "height": 1000},
+    }
+
+
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
@@ -273,6 +288,7 @@ async def _wait_for_douyin_login(
     original_url = page.url
     saw_2fa = False
     second_verify_waiting = False
+    second_verify_attempted = False
     deadline = time.monotonic() + timeout_seconds
     poll_count = 0
     while time.monotonic() < deadline:
@@ -304,13 +320,15 @@ async def _wait_for_douyin_login(
         # 抖音账号安全策略：扫码确认后可能要求短信二次验证。
         # 页面 URL 不变，因此要主动识别手机号/验证码输入框；
         # 必须先看到抖音接口返回 scanned，避免登录页自带的短信表单误触发。
-        phone_input = page.locator('input[placeholder*="手机号"]').first
-        code_input = page.locator('input[placeholder*="验证码"]').first
+        verify_modal = await _douyin_second_verify_modal(page, timeout_ms=1000)
+        verify_root = verify_modal or page
+        phone_input = verify_root.locator('input[placeholder*="手机号"]').first
+        code_input = verify_root.locator('input[placeholder*="验证码"]').first
         scanned = bool(qr_connect_state and (qr_connect_state.get("scanned") or qr_connect_state.get("second_verify")))
         phone_visible = (await phone_input.count() > 0) and (await phone_input.is_visible())
         code_visible = (await code_input.count() > 0) and (await code_input.is_visible())
         has_second_verify = scanned and phone_visible and code_visible
-        if has_second_verify:
+        if has_second_verify and not second_verify_attempted:
             # 二次验证是交互式的，进来就把整体等待窗口放宽。
             deadline = max(deadline, time.monotonic() + 240)
             if not second_verify_waiting:
@@ -339,11 +357,9 @@ async def _wait_for_douyin_login(
                                 after_value = ""
                             douyin_logger.info(_msg("📱", f"已填手机号 {_mask_phone(phone)}，输入框当前长度={len(after_value)}"))
                             send_ok, send_label = await _click_douyin_sms_send_button(page)
-                            if send_ok:
-                                douyin_logger.info(_msg("📤", f"短信验证发送已触发（{send_label}），请查看手机短信"))
-                            else:
-                                douyin_logger.warning(_msg("⚠️", f"{send_label}，尝试按Enter"))
-                                await phone_input.press("Enter")
+                            if not send_ok:
+                                raise RuntimeError(f"短信验证发送失败：{send_label}")
+                            douyin_logger.info(_msg("📤", f"短信验证发送已触发（{send_label}），请查看手机短信"))
                             await asyncio.sleep(2)
                             try:
                                 modal_text = (await page.locator("#uc-second-verify").inner_text())[:800] if await page.locator("#uc-second-verify").count() else ""
@@ -357,26 +373,21 @@ async def _wait_for_douyin_login(
                         code = (code_data or {}).get("code", "")
                         if code:
                             await code_input.fill(code)
-                            verify_btn = page.locator('div.uc-ui-verify_sms-verify_button:has-text("验证")').first
-                            if await verify_btn.count() and await verify_btn.is_visible():
-                                try:
-                                    await verify_btn.click(force=True)
-                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮"))
-                                except Exception as verify_exc:
-                                    douyin_logger.warning(_msg("⚠️", f"force点击「验证」失败，改JS点击: {verify_exc}"))
-                                    await verify_btn.evaluate("el => el.click()")
-                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮(JS)"))
-                            else:
-                                verify_by_text = page.get_by_text("验证", exact=True).first
-                                if await verify_by_text.count() and await verify_by_text.is_visible():
-                                    await verify_by_text.click(force=True)
-                                    douyin_logger.success(_msg("✅", "已点击「验证」按钮(text)"))
-                                else:
-                                    await code_input.press("Enter")
+                            if not await _click_douyin_verify_button(page):
+                                await code_input.press("Enter")
+                            douyin_logger.success(_msg("✅", "已提交抖音短信验证码"))
+                            second_verify_attempted = True
                 except Exception as exc:
-                    douyin_logger.warning(_msg("⚠️", f"短信二次验证处理失败: {exc}"))
+                    raise RuntimeError(f"短信二次验证处理失败: {exc}") from exc
                 finally:
                     second_verify_waiting = False
+            await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+            continue
+
+        if has_second_verify and second_verify_attempted:
+            form_error = await _read_douyin_form_error(page)
+            if form_error:
+                raise RuntimeError(form_error)
             await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
             continue
 
@@ -402,15 +413,79 @@ async def _wait_for_douyin_login(
 
     return _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
 
+async def _douyin_second_verify_modal(page: Page, timeout_ms: int = 15000):
+    """Wait for the platform verification panel across known DOM variants.
+
+    Douyin replaces this panel while the phone field is being filled, so a
+    one-shot visibility check can race against React rendering.
+    """
+    deadline = time.monotonic() + max(timeout_ms, 1000) / 1000
+    selectors = (
+        "#uc-second-verify",
+        '[id*="second-verify"]',
+        '[class*="second_verify"]',
+        '[class*="second-verify"]',
+    )
+    while time.monotonic() < deadline:
+        for selector in selectors:
+            modal = page.locator(selector).filter(has_text="验证").first
+            try:
+                if await modal.count() and await modal.is_visible():
+                    return modal
+            except Exception:
+                continue
+        # The component is portalled in some releases and no longer has the
+        # old id. Locate a compact visible ancestor containing both the title
+        # and the phone/code fields as a final fallback.
+        candidate = page.locator(
+            'div:has-text("身份验证"), div:has-text("接收短信验证码")'
+        ).filter(has=page.locator('input[placeholder*="手机号"]')).last
+        try:
+            if await candidate.count() and await candidate.is_visible():
+                return candidate
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return None
+
+
+async def _click_visible_text(page: Page, root, label: str, timeout_ms: int = 8000) -> bool:
+    """Click a visible control without relying on a framework-specific tag."""
+    deadline = time.monotonic() + max(timeout_ms, 500) / 1000
+    locator = root.get_by_text(label, exact=True)
+    while time.monotonic() < deadline:
+        for index in range(min(await locator.count(), 8)):
+            item = locator.nth(index)
+            try:
+                if not await item.is_visible():
+                    continue
+                if await _native_click(page, item):
+                    return True
+            except Exception:
+                continue
+        await asyncio.sleep(0.25)
+    return False
+
+
 async def _click_douyin_sms_send_button(page: Page) -> tuple[bool, str]:
     """点击身份验证弹窗中的短信发送按钮。
 
     登录页其他区域可能也存在“获取验证码”元素；必须把查找范围限制在
     #uc-second-verify 内，否则会点到不可交互的占位节点，短信不会发出。
     """
-    modal = page.locator("#uc-second-verify").first
-    if not await modal.count() or not await modal.is_visible():
+    modal = await _douyin_second_verify_modal(page, timeout_ms=15000)
+    if modal is None:
         return False, "未找到身份验证弹窗"
+
+    # Some releases first ask the user to choose the verification method.
+    sms_option = modal.get_by_text("接收短信验证码", exact=True).first
+    try:
+        if await sms_option.count() and await sms_option.is_visible():
+            await _native_click(page, sms_option)
+            await asyncio.sleep(0.6)
+            modal = await _douyin_second_verify_modal(page, timeout_ms=5000) or modal
+    except Exception:
+        pass
 
     candidates = [
         ("发送短信验证", modal.get_by_role("button", name=re.compile("发送短信验证"))),
@@ -419,23 +494,45 @@ async def _click_douyin_sms_send_button(page: Page) -> tuple[bool, str]:
         ("获取验证码", modal.get_by_role("button", name=re.compile("获取验证码|重新获取|重新发送"))),
         ("获取验证码", modal.get_by_text(re.compile("获取验证码|重新获取|重新发送"), exact=False)),
     ]
-    for label, locator in candidates:
-        button = locator.first
-        if not await button.count() or not await button.is_visible():
-            continue
-        try:
-            await button.click(force=True, timeout=5000)
-        except Exception as click_exc:
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        modal = await _douyin_second_verify_modal(page, timeout_ms=2000) or modal
+        for label, locator in candidates:
+            button = locator.first
             try:
-                await button.evaluate("el => el.click()")
-            except Exception as js_exc:
-                douyin_logger.warning(
-                    _msg("⚠️", f"点击「{label}」失败: click={click_exc}; js={js_exc}")
-                )
-                continue
-        douyin_logger.info(_msg("📤", f"已点击身份验证弹窗中的「{label}」"))
-        return True, label
+                if not await button.count() or not await button.is_visible():
+                    continue
+                if await _native_click(page, button):
+                    douyin_logger.info(_msg("📤", f"已点击身份验证弹窗中的「{label}」"))
+                    await asyncio.sleep(1.2)
+                    return True, label
+            except Exception as click_exc:
+                douyin_logger.warning(_msg("⚠️", f"点击「{label}」失败，继续重试: {click_exc}"))
+        if await _click_visible_text(page, modal, "发送短信验证", timeout_ms=800):
+            douyin_logger.info(_msg("📤", "已点击身份验证弹窗中的「发送短信验证」"))
+            await asyncio.sleep(1.2)
+            return True, "发送短信验证"
+        await asyncio.sleep(0.35)
     return False, "未找到可点击的短信发送按钮"
+
+
+async def _click_douyin_verify_button(page: Page) -> bool:
+    modal = await _douyin_second_verify_modal(page, timeout_ms=5000)
+    root = modal or page
+    candidates = [
+        root.locator('div.uc-ui-verify_sms-verify_button:has-text("验证")'),
+        root.get_by_role("button", name=re.compile(r"^验证$")),
+        root.locator('button:has-text("验证")'),
+    ]
+    for locator in candidates:
+        button = locator.first
+        try:
+            if await button.count() and await button.is_visible():
+                if await _native_click(page, button):
+                    return True
+        except Exception:
+            continue
+    return await _click_visible_text(page, root, "验证", timeout_ms=8000)
 
 
 async def _read_douyin_form_error(page: Page) -> str:
@@ -489,7 +586,7 @@ async def douyin_form_cookie_gen(
     result = _build_login_result(False, "failed", f"{method_label}失败", account_file)
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context()
+        context = await browser.new_context(**_desktop_browser_context_options(browser))
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -587,7 +684,7 @@ async def douyin_cookie_gen(
             should_close_context = False
         else:
             browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-            context = await browser.new_context()
+            context = await browser.new_context(**_desktop_browser_context_options(browser))
             should_close_context = True
         context = await set_init_script(context)
         qrcode_path = None
@@ -662,6 +759,12 @@ async def douyin_cookie_gen(
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
         finally:
+            # QR images are refreshed during the wait.  Use the path returned
+            # by the last wait result so an expired first QR cannot leave the
+            # most recent temporary image behind after a timeout or failure.
+            latest_qrcode = (result.get("qrcode") or {}).get("image_path")
+            if latest_qrcode:
+                qrcode_path = Path(latest_qrcode)
             if remove_qrcode_file(qrcode_path):
                 douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
             if not result["success"]:

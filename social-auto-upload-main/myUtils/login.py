@@ -69,6 +69,9 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
                 return None
             if not isinstance(item, dict):
                 continue
+            stage = str(item.get("stage") or "").strip().lower()
+            if stage and stage != field:
+                continue
             value = str(item.get(field) or "").strip()
             if value:
                 return item
@@ -92,7 +95,7 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
                 phone=phone,
                 password=password,
                 sms_code_callback=initial_sms_callback if auth_method == "sms" else None,
-                timeout_seconds=180,
+                timeout_seconds=240,
             )
         else:
             result = await wait_for_douyin_login(
@@ -100,7 +103,7 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
                 qrcode_callback=qrcode_callback,
                 second_verify_callback=second_verify_callback,
                 poll_interval=2,
-                timeout_seconds=90,
+                timeout_seconds=120,
             )
         if not result.get("success"):
             raise RuntimeError(result.get("message") or "抖音登录失败")

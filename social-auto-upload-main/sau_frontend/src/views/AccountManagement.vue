@@ -154,7 +154,7 @@
         </template>
         
         <!-- 二维码显示区域 -->
-        <div v-if="sseConnecting" class="qrcode-container">
+        <div v-if="sseConnecting || loginStatus" class="qrcode-container">
           <div v-if="needSecondVerify && !loginStatus" class="verify-wrapper">
             <p class="qrcode-tip">
               {{ directSmsFlow ? '短信验证码已请求发送，请输入验证码完成登录' : '抖音要求短信二次验证，请按提示完成' }}
@@ -195,7 +195,7 @@
             </p>
           </div>
           <div v-else-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
-            <p class="qrcode-tip">二维码已生成，请在 90 秒内使用对应平台 APP 扫码</p>
+            <p class="qrcode-tip">二维码已生成，请在 120 秒内使用对应平台 APP 扫码</p>
             <img :src="qrCodeData" alt="登录二维码" class="qrcode-image" />
             <el-button
               class="refresh-qrcode-button"
@@ -822,17 +822,13 @@ const connectSSE = async (platform, name, accountId = null, options = {}) => {
           }, 1000)
         }, 1000)
       } else {
-        // 保留失败原因，短暂展示后允许用户重新扫码
+        // 保留失败原因，直到用户重新发起登录，避免错误提示一闪而过。
         if (loginErrorMessage.value) {
           ElMessage.error(loginErrorMessage.value)
         }
-        setTimeout(() => {
-          sseConnecting.value = false
-          qrCodeData.value = ''
-          loginStatus.value = ''
-          loginPassword.value = ''
-          directSmsFlow.value = false
-        }, 2000)
+        sseConnecting.value = false
+        verifySubmitting.value = false
+        loginPassword.value = ''
       }
     }
   }
