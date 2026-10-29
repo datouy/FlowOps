@@ -1,5 +1,7 @@
 import asyncio
+import re
 import time
+from queue import Empty
 
 from playwright.async_api import async_playwright
 from loguru import logger
@@ -30,8 +32,12 @@ def get_browser_options():
 
 # 抖音登录：复用发布模块中已验证的登录实现。
 # 旧实现只监听页面跳转，扫码后页面不跳转时会一直等到 200 秒。
-async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None):
-    from uploader.douyin_uploader.main import douyin_cookie_gen as wait_for_douyin_login
+async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None,
+                            auth_method='qr', phone='', password=''):
+    from uploader.douyin_uploader.main import (
+        douyin_cookie_gen as wait_for_douyin_login,
+        douyin_form_cookie_gen,
+    )
 
     cookie_name = f"{uuid.uuid4().hex}.json"
     cookies_dir = Path(BASE_DIR / "cookiesFile")
@@ -43,8 +49,7 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         if image_data_url:
             status_queue.put(image_data_url)
 
-    async def second_verify_callback(phase):
-        status_queue.put("SECOND_VERIFY_PHONE" if phase == "phone" else "SECOND_VERIFY_CODE")
+    async def wait_for_verify_value(field):
         if verify_queue is None:
             return None
         deadline = time.monotonic() + 180
@@ -54,26 +59,51 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
                     asyncio.to_thread(verify_queue.get, timeout=10),
                     timeout=12,
                 )
+            except Empty:
+                # 短信到达时间不可控，单次等待超时只表示暂时没有新输入，
+                # 不能因此终止整个登录会话。
+                continue
+            except asyncio.TimeoutError:
+                continue
             except Exception:
                 return None
             if not isinstance(item, dict):
                 continue
-            value = str(item.get("phone") if phase == "phone" else item.get("code") or "").strip()
+            value = str(item.get(field) or "").strip()
             if value:
                 return item
             # 前端重复点击会把不完整的旧数据塞进队列，丢弃后继续等正确阶段的数据
         return None
 
+    async def second_verify_callback(phase):
+        status_queue.put("SECOND_VERIFY_PHONE" if phase == "phone" else "SECOND_VERIFY_CODE")
+        return await wait_for_verify_value("phone" if phase == "phone" else "code")
+
+    async def initial_sms_callback():
+        status_queue.put("AUTH_SMS_CODE")
+        code_data = await wait_for_verify_value("code")
+        return (code_data or {}).get("code", "")
+
     try:
-        result = await wait_for_douyin_login(
-            str(cookie_path),
-            qrcode_callback=qrcode_callback,
-            second_verify_callback=second_verify_callback,
-            poll_interval=2,
-            timeout_seconds=90,
-        )
+        if auth_method in ("password", "sms"):
+            result = await douyin_form_cookie_gen(
+                str(cookie_path),
+                auth_method=auth_method,
+                phone=phone,
+                password=password,
+                sms_code_callback=initial_sms_callback if auth_method == "sms" else None,
+                timeout_seconds=180,
+            )
+        else:
+            result = await wait_for_douyin_login(
+                str(cookie_path),
+                qrcode_callback=qrcode_callback,
+                second_verify_callback=second_verify_callback,
+                poll_interval=2,
+                timeout_seconds=90,
+            )
         if not result.get("success"):
-            raise RuntimeError(result.get("message") or "抖音扫码登录失败")
+            raise RuntimeError(result.get("message") or "抖音登录失败")
 
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
@@ -92,7 +122,10 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         status_queue.put("200")
         return True
     except Exception as exc:
-        logger.warning("抖音扫码登录失败: {}", exc)
+        error_message = re.sub(r"(?<!\d)1\d{10}(?!\d)", "1**********", str(exc)).strip()
+        error_message = re.sub(r"\s+", " ", error_message)[:240] or "抖音登录失败"
+        logger.warning("抖音登录失败({}): {}", auth_method, error_message)
+        status_queue.put(f"LOGIN_ERROR:{error_message}")
         try:
             cookie_path.unlink(missing_ok=True)
         except Exception:

@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import os
 os.environ.setdefault("FLOWOPS_BACKEND", "1")
+import re
 import signal
 import sys
 import threading
@@ -28,6 +29,10 @@ runtime_config.validate_server_config()
 
 active_queues = {}
 active_verify_queues = {}
+active_verify_submissions = {}
+active_verify_lock = threading.Lock()
+pending_login_requests = {}
+pending_login_lock = threading.Lock()
 app = Flask(__name__)
 setup_request_logging(app)
 import schedule_ops
@@ -710,6 +715,14 @@ def login():
     if not queue_id:
         queue_id = f"{id}-{uuid.uuid4().hex[:12]}"
 
+    with pending_login_lock:
+        login_request = pending_login_requests.pop(queue_id, None)
+    if login_request and time.monotonic() - login_request["created_at"] > 120:
+        login_request = None
+    auth_method = (login_request or {}).get("auth_method", "qr")
+    auth_phone = (login_request or {}).get("phone", "")
+    auth_password = (login_request or {}).get("password", "")
+
     # 模拟一个用于异步通信的队列
     status_queue = Queue()
     verify_queue = Queue()
@@ -718,7 +731,9 @@ def login():
 
     # 启动异步任务线程
     thread = threading.Thread(
-        target=run_async_function, args=(type, id, status_queue, account_id, verify_queue), daemon=True,
+        target=run_async_function,
+        args=(type, id, status_queue, account_id, verify_queue, auth_method, auth_phone, auth_password),
+        daemon=True,
     )
     thread.start()
     response = Response(sse_stream(status_queue, queue_id), mimetype='text/event-stream')
@@ -729,6 +744,51 @@ def login():
     # 否则 /login 会直接 500，导致前端“连接服务器失败”。
     return response
 
+
+@app.route('/loginPrepare', methods=['POST'])
+def login_prepare():
+    """暂存密码/短信登录参数，随后由 SSE 连接取走，避免密码进入 URL 和日志。"""
+    data = request.get_json(silent=True) or {}
+    queue_id = str(data.get('session') or '').strip()[:64]
+    platform_type = str(data.get('type') or '').strip()
+    account_name = str(data.get('id') or '').strip()[:64]
+    auth_method = str(data.get('auth_method') or '').strip().lower()
+    if not queue_id or not account_name:
+        return jsonify({"code": 400, "msg": "缺少登录会话或账号名称", "data": None}), 400
+    if platform_type != '3' or auth_method not in ('password', 'sms'):
+        return jsonify({"code": 400, "msg": "当前平台不支持该登录方式", "data": None}), 400
+
+    phone = re.sub(r"[\s-]", "", str(data.get('phone') or ''))[:32]
+    if phone.startswith("+86"):
+        phone = phone[3:]
+    elif phone.startswith("86") and len(phone) == 13:
+        phone = phone[2:]
+    if not re.fullmatch(r"1\d{10}", phone):
+        return jsonify({"code": 400, "msg": "请输入正确的 11 位手机号", "data": None}), 400
+
+    password = str(data.get('password') or '')[:128]
+    if auth_method == 'password' and not password:
+        return jsonify({"code": 400, "msg": "请输入登录密码", "data": None}), 400
+
+    now = time.monotonic()
+    with pending_login_lock:
+        stale = [key for key, item in pending_login_requests.items() if now - item["created_at"] > 120]
+        for key in stale:
+            pending_login_requests.pop(key, None)
+        pending_login_requests[queue_id] = {
+            "auth_method": auth_method,
+            "phone": phone,
+            "password": password if auth_method == 'password' else "",
+            "created_at": now,
+        }
+    def _expire_prepared_login():
+        with pending_login_lock:
+            pending_login_requests.pop(queue_id, None)
+    expire_timer = threading.Timer(120, _expire_prepared_login)
+    expire_timer.daemon = True
+    expire_timer.start()
+    return jsonify({"code": 200, "msg": "登录参数已接收", "data": {"auth_method": auth_method}}), 200
+
 @app.route('/loginVerify', methods=['POST'])
 def login_verify():
     """接收抖音二次验证（手机号 + 短信验证码）并转发给正在等待的登录线程。"""
@@ -738,13 +798,32 @@ def login_verify():
     if verify_queue is None:
         return jsonify({"code": 404, "msg": "登录验证会话不存在或已结束", "data": None}), 404
 
-    phone = str(data.get('phone') or '').strip()[:32]
+    phone = re.sub(r"[\s-]", "", str(data.get('phone') or ''))[:32]
+    if phone.startswith("+86"):
+        phone = phone[3:]
+    elif phone.startswith("86") and len(phone) == 13:
+        phone = phone[2:]
     code = str(data.get('code') or '').strip()[:32]
+    stage = str(data.get('stage') or '').strip().lower()
     if not phone and not code:
         return jsonify({"code": 400, "msg": "验证信息不能为空", "data": None}), 400
+    if stage == 'phone' and not re.fullmatch(r"1\d{10}", phone):
+        return jsonify({"code": 400, "msg": "请输入正确的 11 位手机号", "data": None}), 400
+    if stage == 'code' and not (4 <= len(code) <= 8 and code.isdigit()):
+        return jsonify({"code": 400, "msg": "请输入 4-8 位数字验证码", "data": None}), 400
+
+    # 页面按钮连续触发时，前端请求可能并发到达。短时间内相同内容只入队一次，
+    # 避免登录线程消费一串重复数据，也避免让用户误以为短信被重复发送。
+    signature = (stage, phone, code)
+    now = time.monotonic()
+    with active_verify_lock:
+        previous = active_verify_submissions.get(key)
+        if previous and previous['signature'] == signature and now - previous['sent_at'] < 3:
+            return jsonify({"code": 200, "msg": "验证信息已提交，请勿重复点击", "data": {"duplicate": True}}), 200
+        active_verify_submissions[key] = {'signature': signature, 'sent_at': now}
 
     verify_queue.put({"phone": phone, "code": code})
-    return jsonify({"code": 200, "msg": "已提交验证信息", "data": None}), 200
+    return jsonify({"code": 200, "msg": "已提交验证信息", "data": {"duplicate": False}}), 200
 
 @app.route('/postVideo', methods=['POST'])
 def postVideo():
@@ -1015,7 +1094,8 @@ def download_cookie():
 
 
 # 包装函数：在线程中运行异步函数
-def run_async_function(type, id, status_queue, account_id=None, verify_queue=None):
+def run_async_function(type, id, status_queue, account_id=None, verify_queue=None,
+                       auth_method='qr', auth_phone='', auth_password=''):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -1025,7 +1105,15 @@ def run_async_function(type, id, status_queue, account_id=None, verify_queue=Non
             case '2':
                 coroutine = get_tencent_cookie(id, status_queue, account_id=account_id)
             case '3':
-                coroutine = douyin_cookie_gen(id, status_queue, account_id=account_id, verify_queue=verify_queue)
+                coroutine = douyin_cookie_gen(
+                    id,
+                    status_queue,
+                    account_id=account_id,
+                    verify_queue=verify_queue,
+                    auth_method=auth_method,
+                    phone=auth_phone,
+                    password=auth_password,
+                )
             case '4':
                 coroutine = get_ks_cookie(id, status_queue)
             case '5':
@@ -1076,6 +1164,7 @@ def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
         if queue_id is not None:
             active_queues.pop(queue_id, None)
             active_verify_queues.pop(queue_id, None)
+            active_verify_submissions.pop(queue_id, None)
             logger.debug("清理队列: {}", queue_id)
 
 import publish_jobs

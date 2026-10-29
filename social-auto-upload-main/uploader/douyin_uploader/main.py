@@ -338,27 +338,17 @@ async def _wait_for_douyin_login(
                             except Exception:
                                 after_value = ""
                             douyin_logger.info(_msg("📱", f"已填手机号 {_mask_phone(phone)}，输入框当前长度={len(after_value)}"))
-                            send_button = page.get_by_text("获取验证码").first
-                            if await send_button.count() and await send_button.is_visible():
-                                try:
-                                    await send_button.evaluate("el => el.click()")
-                                    douyin_logger.info(_msg("📤", "已点击「获取验证码」，请查看手机短信"))
-                                except Exception as click_exc:
-                                    douyin_logger.warning(_msg("⚠️", f"JS点击「获取验证码」失败，改用force点击: {click_exc}"))
-                                    try:
-                                        await send_button.click(force=True, timeout=5000)
-                                        douyin_logger.info(_msg("📤", "已点击「获取验证码」(force)，请查看手机短信"))
-                                    except Exception as force_exc:
-                                        douyin_logger.warning(_msg("⚠️", f"force点击也失败: {force_exc}"))
+                            send_ok, send_label = await _click_douyin_sms_send_button(page)
+                            if send_ok:
+                                douyin_logger.info(_msg("📤", f"短信验证发送已触发（{send_label}），请查看手机短信"))
                             else:
-                                douyin_logger.warning(_msg("⚠️", "未找到「获取验证码」按钮，尝试按Enter"))
+                                douyin_logger.warning(_msg("⚠️", f"{send_label}，尝试按Enter"))
                                 await phone_input.press("Enter")
                             await asyncio.sleep(2)
                             try:
-                                btn_text = (await send_button.inner_text()).strip() if await send_button.count() else ""
                                 modal_text = (await page.locator("#uc-second-verify").inner_text())[:800] if await page.locator("#uc-second-verify").count() else ""
                                 markers = [m for m in ("重新获取", "重新发送", "再次获取", "秒后", "s后", "已发送", "失败", "错误", "不一致", "绑定") if m in modal_text]
-                                douyin_logger.info(_msg("⏱️", f"发送后按钮文本={btn_text!r} 弹窗片段={modal_text!r} 关键标记={markers}"))
+                                douyin_logger.info(_msg("⏱️", f"发送后弹窗片段={modal_text!r} 关键标记={markers}"))
                             except Exception:
                                 pass
                         code_data = await second_verify_callback("code")
@@ -411,6 +401,169 @@ async def _wait_for_douyin_login(
         await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
     return _build_login_result(False, "timeout", "等待抖音扫码登录超时", account_file, qrcode_info, page.url)
+
+async def _click_douyin_sms_send_button(page: Page) -> tuple[bool, str]:
+    """点击身份验证弹窗中的短信发送按钮。
+
+    登录页其他区域可能也存在“获取验证码”元素；必须把查找范围限制在
+    #uc-second-verify 内，否则会点到不可交互的占位节点，短信不会发出。
+    """
+    modal = page.locator("#uc-second-verify").first
+    if not await modal.count() or not await modal.is_visible():
+        return False, "未找到身份验证弹窗"
+
+    candidates = [
+        ("发送短信验证", modal.get_by_role("button", name=re.compile("发送短信验证"))),
+        ("发送短信验证", modal.locator('[role="button"]:has-text("发送短信验证")')),
+        ("发送短信验证", modal.get_by_text("发送短信验证", exact=True)),
+        ("获取验证码", modal.get_by_role("button", name=re.compile("获取验证码|重新获取|重新发送"))),
+        ("获取验证码", modal.get_by_text(re.compile("获取验证码|重新获取|重新发送"), exact=False)),
+    ]
+    for label, locator in candidates:
+        button = locator.first
+        if not await button.count() or not await button.is_visible():
+            continue
+        try:
+            await button.click(force=True, timeout=5000)
+        except Exception as click_exc:
+            try:
+                await button.evaluate("el => el.click()")
+            except Exception as js_exc:
+                douyin_logger.warning(
+                    _msg("⚠️", f"点击「{label}」失败: click={click_exc}; js={js_exc}")
+                )
+                continue
+        douyin_logger.info(_msg("📤", f"已点击身份验证弹窗中的「{label}」"))
+        return True, label
+    return False, "未找到可点击的短信发送按钮"
+
+
+async def _read_douyin_form_error(page: Page) -> str:
+    """读取验证码/密码表单提交后的明确失败提示。"""
+    try:
+        body_text = await page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return ""
+
+    error_markers = (
+        "访问太频繁",
+        "请求过于频繁",
+        "操作过于频繁",
+        "验证码错误",
+        "验证码不正确",
+        "验证码已失效",
+        "验证码已过期",
+        "密码错误",
+        "账号或密码错误",
+        "账号已封禁",
+        "账号被冻结",
+    )
+    for line in body_text.splitlines():
+        text = line.strip()
+        if not text or len(text) > 160:
+            continue
+        if any(marker in text for marker in error_markers):
+            return text
+    return ""
+
+
+async def douyin_form_cookie_gen(
+    account_file,
+    auth_method,
+    phone,
+    password="",
+    sms_code_callback=None,
+    timeout_seconds: float = 180,
+    headless: bool | None = None,
+):
+    """通过创作者中心的验证码或密码方式登录并保存 Cookie。"""
+    if headless is None:
+        headless = os.environ.get("DOUYIN_FORM_LOGIN_HEADLESS", "false").lower() in ("1", "true", "yes")
+    method_label = "验证码登录" if auth_method == "sms" else "密码登录"
+    result = _build_login_result(False, "failed", f"{method_label}失败", account_file)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
+        context = await browser.new_context()
+        context = await set_init_script(context)
+        page = await context.new_page()
+        try:
+            await page.goto("https://creator.douyin.com/", wait_until="domcontentloaded", timeout=60000)
+            mode_tab = page.get_by_text(method_label, exact=True).first
+            await mode_tab.wait_for(state="visible", timeout=30000)
+            await mode_tab.click()
+
+            phone_input = page.locator('input[placeholder="请输入手机号"]').first
+            await phone_input.wait_for(state="visible", timeout=15000)
+            await phone_input.fill(phone)
+
+            if auth_method == "password":
+                password_input = page.locator('input[placeholder="请输入密码"]').first
+                await password_input.wait_for(state="visible", timeout=15000)
+                await password_input.fill(password)
+                douyin_logger.info(_msg("🔐", "已填写抖音密码登录表单"))
+            else:
+                send_button = page.locator(
+                    '#douyin_login_comp_button_input_id span:has-text("获取验证码")'
+                ).first
+                if not await send_button.count() or not await send_button.is_visible():
+                    send_button = page.get_by_text("获取验证码", exact=True).first
+                if not await send_button.count() or not await send_button.is_visible():
+                    raise RuntimeError("未找到登录页「获取验证码」按钮")
+                await send_button.click(force=True, timeout=10000)
+                douyin_logger.info(_msg("📤", "已触发抖音验证码登录短信"))
+                if not sms_code_callback:
+                    raise RuntimeError("缺少短信验证码输入通道")
+                code = str(await sms_code_callback() or "").strip()
+                if not code:
+                    raise RuntimeError("等待抖音登录验证码输入超时")
+                code_input = page.locator('input[placeholder="请输入验证码"]').first
+                await code_input.fill(code)
+
+            login_button = page.locator("#douyin_login_comp_btn_id").first
+            if not await login_button.count() or not await login_button.is_visible():
+                login_button = page.get_by_text("登录", exact=True).first
+            await login_button.click(force=True, timeout=10000)
+            douyin_logger.info(_msg("📝", f"已提交抖音{method_label}表单"))
+
+            deadline = time.monotonic() + timeout_seconds
+            last_url = page.url
+            while time.monotonic() < deadline:
+                if await _is_douyin_login_completed(page):
+                    await asyncio.sleep(2)
+                    await context.storage_state(path=account_file)
+                    result = _build_login_result(
+                        True,
+                        "success",
+                        f"抖音{method_label}成功",
+                        account_file,
+                        current_url=page.url,
+                    )
+                    break
+                form_error = await _read_douyin_form_error(page)
+                if form_error:
+                    raise RuntimeError(form_error)
+                if page.url != last_url:
+                    douyin_logger.info(_msg("🔎", f"抖音{method_label}页面已跳转: {page.url}"))
+                    last_url = page.url
+                await asyncio.sleep(0.8)
+            else:
+                raise RuntimeError(
+                    f"抖音{method_label}等待超时，请在登录浏览器完成安全验证后重试"
+                    f"（当前页面: {page.url}）"
+                )
+        except Exception as exc:
+            result = _build_login_result(
+                False,
+                "failed",
+                str(exc),
+                account_file,
+                current_url=page.url,
+            )
+        finally:
+            await context.close()
+            await browser.close()
+    return result
+
 
 async def douyin_cookie_gen(
     account_file,

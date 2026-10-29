@@ -86,7 +86,7 @@
     <!-- 添加/编辑账号对话框 -->
     <el-dialog
       v-model="dialogVisible"
-      :title="dialogType === 'add' ? '添加账号' : '编辑账号'"
+      :title="reLoginMode ? '重新登录账号' : (dialogType === 'add' ? '添加账号' : '编辑账号')"
       width="500px"
       :close-on-click-modal="false"
       :close-on-press-escape="!sseConnecting"
@@ -99,6 +99,7 @@
             placeholder="请选择平台" 
             style="width: 100%"
             :disabled="dialogType === 'edit' || sseConnecting"
+            @change="handleLoginPlatformChange"
           >
             <el-option
               v-for="platform in platformOptions"
@@ -115,12 +116,51 @@
             :disabled="sseConnecting"
           />
         </el-form-item>
+        <el-form-item
+          v-if="accountForm.platform === '抖音' && (dialogType === 'add' || reLoginMode)"
+          label="登录方式"
+        >
+          <el-radio-group v-model="loginMethod" :disabled="sseConnecting">
+            <el-radio-button label="qr">扫码登录</el-radio-button>
+            <el-radio-button label="sms">验证码登录</el-radio-button>
+            <el-radio-button label="password">密码登录</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <template
+          v-if="accountForm.platform === '抖音' && (dialogType === 'add' || reLoginMode) && loginMethod !== 'qr'"
+        >
+          <el-form-item label="手机号">
+            <el-input
+              v-model="loginPhone"
+              maxlength="11"
+              placeholder="请输入抖音绑定手机号"
+              :disabled="sseConnecting"
+            />
+          </el-form-item>
+          <el-form-item v-if="loginMethod === 'password'" label="登录密码">
+            <el-input
+              v-model="loginPassword"
+              type="password"
+              show-password
+              autocomplete="current-password"
+              placeholder="密码仅用于本次登录，不会保存"
+              :disabled="sseConnecting"
+              @keyup.enter="submitAccountForm"
+            />
+          </el-form-item>
+          <p v-if="loginMethod === 'sms' && !sseConnecting" class="direct-login-hint">
+            点击下方“确认”后，将通过抖音发送短信验证码，并打开登录浏览器；如出现安全验证，请在该浏览器中完成。
+          </p>
+        </template>
         
         <!-- 二维码显示区域 -->
         <div v-if="sseConnecting" class="qrcode-container">
           <div v-if="needSecondVerify && !loginStatus" class="verify-wrapper">
-            <p class="qrcode-tip">抖音要求短信二次验证，请按提示完成</p>
+            <p class="qrcode-tip">
+              {{ directSmsFlow ? '短信验证码已请求发送，请输入验证码完成登录' : '抖音要求短信二次验证，请按提示完成' }}
+            </p>
             <el-input
+              v-if="!directSmsFlow"
               v-model="verifyPhone"
               placeholder="请输入手机号"
               :disabled="verifyStage !== 'phone' || verifySubmitting"
@@ -134,18 +174,25 @@
               v-if="verifyStage === 'phone'"
               type="primary"
               :loading="verifySubmitting"
+              :disabled="verifySubmitting || verifyCooldown > 0"
               @click="submitSecondVerify('phone')"
             >
-              发送验证码
+              {{ verifyCooldown > 0 ? `${verifyCooldown} 秒后可重新发送` : '发送验证码' }}
             </el-button>
             <el-button
               v-else
               type="primary"
               :loading="verifySubmitting"
+              :disabled="verifySubmitting"
               @click="submitSecondVerify('code')"
             >
-              提交验证
+              {{ directSmsFlow ? '登录' : '提交验证' }}
             </el-button>
+            <p class="verify-hint">
+              {{ directSmsFlow && loginStatus !== '500'
+                ? '若登录浏览器出现安全验证，请先在该浏览器中完成，完成后这里会自动确认登录。'
+                : '若长时间收不到短信，请确认该手机号已绑定当前抖音账号。' }}
+            </p>
           </div>
           <div v-else-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
             <p class="qrcode-tip">二维码已生成，请在 90 秒内使用对应平台 APP 扫码</p>
@@ -163,7 +210,7 @@
           </div>
           <div v-else-if="!qrCodeData && !loginStatus" class="loading-wrapper">
             <el-icon class="is-loading"><Refresh /></el-icon>
-            <span>请求中...</span>
+            <span>{{ loginMethod === 'qr' ? '请求中...' : '正在登录抖音...' }}</span>
           </div>
           <div v-else-if="loginStatus === '200'" class="success-wrapper">
             <el-icon><CircleCheckFilled /></el-icon>
@@ -171,7 +218,7 @@
           </div>
           <div v-else-if="loginStatus === '500'" class="error-wrapper">
             <el-icon><CircleCloseFilled /></el-icon>
-            <span>登录失败或扫码超时，请重新发起登录</span>
+            <span>{{ loginErrorMessage || (loginMethod === 'qr' ? '登录失败或扫码超时，请重新发起登录' : '登录失败，请检查手机号、密码或验证码') }}</span>
           </div>
         </div>
       </el-form>
@@ -184,7 +231,17 @@
             :loading="sseConnecting && !qrCodeData"
             :disabled="sseConnecting"
           >
-            {{ sseConnecting ? (qrCodeData ? '等待扫码' : '获取二维码') : '确认' }}
+            {{
+              sseConnecting
+                ? (loginMethod === 'qr' ? (qrCodeData ? '等待扫码' : '获取二维码') : '登录中')
+                : (dialogType === 'edit' && !reLoginMode
+                  ? '保存'
+                  : loginMethod === 'sms'
+                    ? '发送验证码并登录'
+                    : loginMethod === 'password'
+                      ? '登录'
+                      : '确认')
+            }}
           </el-button>
         </span>
       </template>
@@ -362,6 +419,7 @@ const handleSearch = () => {
 // 对话框相关
 const dialogVisible = ref(false)
 const dialogType = ref('add') // 'add' 或 'edit'
+const reLoginMode = ref(false)
 const accountFormRef = ref(null)
 
 // 账号表单
@@ -387,16 +445,51 @@ const verifyStage = ref('phone')
 const verifyPhone = ref('')
 const verifyCode = ref('')
 const verifySubmitting = ref(false)
+const verifyCooldown = ref(0)
+const loginMethod = ref('qr')
+const loginPhone = ref('')
+const loginPassword = ref('')
+const loginErrorMessage = ref('')
+const directSmsFlow = ref(false)
 const currentLoginId = ref('')
 const currentPlatform = ref('')
 const currentAccountName = ref('')
 const currentAccountId = ref(null)
+let verifyCooldownTimer = null
+
+const clearVerifyCooldown = () => {
+  if (verifyCooldownTimer) {
+    clearInterval(verifyCooldownTimer)
+    verifyCooldownTimer = null
+  }
+  verifyCooldown.value = 0
+}
+
+const startVerifyCooldown = (seconds = 60) => {
+  clearVerifyCooldown()
+  verifyCooldown.value = seconds
+  verifyCooldownTimer = setInterval(() => {
+    verifyCooldown.value = Math.max(0, verifyCooldown.value - 1)
+    if (verifyCooldown.value === 0) {
+      clearVerifyCooldown()
+    }
+  }, 1000)
+}
+
+const handleLoginPlatformChange = (platform) => {
+  if (platform !== '抖音') {
+    loginMethod.value = 'qr'
+    loginPhone.value = ''
+    loginPassword.value = ''
+  }
+}
 
 // 添加账号
 const handleAddAccount = () => {
   const currentTab = accountTabs.find(item => item.name === activeTab.value)
   const defaultPlatform = currentTab && currentTab.name !== 'all' ? currentTab.label : ''
   dialogType.value = 'add'
+  reLoginMode.value = false
   Object.assign(accountForm, {
     id: null,
     name: '',
@@ -412,6 +505,12 @@ const handleAddAccount = () => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  clearVerifyCooldown()
+  loginMethod.value = 'qr'
+  loginPhone.value = ''
+  loginPassword.value = ''
+  loginErrorMessage.value = ''
+  directSmsFlow.value = false
   currentLoginId.value = ''
   dialogVisible.value = true
 }
@@ -419,6 +518,7 @@ const handleAddAccount = () => {
 // 编辑账号
 const handleEdit = (row) => {
   dialogType.value = 'edit'
+  reLoginMode.value = false
   Object.assign(accountForm, {
     id: row.id,
     name: row.name,
@@ -528,6 +628,7 @@ const handleUploadCookie = (row) => {
 const handleReLogin = (row) => {
   // 设置表单信息
   dialogType.value = 'edit'
+  reLoginMode.value = true
   Object.assign(accountForm, {
     id: row.id,
     name: row.name,
@@ -544,15 +645,16 @@ const handleReLogin = (row) => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  clearVerifyCooldown()
+  loginMethod.value = 'qr'
+  loginPhone.value = ''
+  loginPassword.value = ''
+  loginErrorMessage.value = ''
+  directSmsFlow.value = false
   currentLoginId.value = ''
 
-  // 显示对话框
+  // 显示对话框，由用户选择扫码、验证码或密码登录
   dialogVisible.value = true
-
-  // 立即开始登录流程
-  setTimeout(() => {
-    connectSSE(row.platform, row.name, row.id)
-  }, 300)
 }
 
 // 获取默认头像
@@ -582,24 +684,37 @@ const cancelLogin = () => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  clearVerifyCooldown()
+  loginMethod.value = 'qr'
+  loginPhone.value = ''
+  loginPassword.value = ''
+  loginErrorMessage.value = ''
+  directSmsFlow.value = false
   currentLoginId.value = ''
+  reLoginMode.value = false
   dialogVisible.value = false
 }
 
 // 建立SSE连接
-const connectSSE = (platform, name, accountId = null) => {
+const connectSSE = async (platform, name, accountId = null, options = {}) => {
   // 关闭可能存在的连接
   closeSSEConnection()
+
+  const authMethod = platform === '抖音' ? (options.authMethod || 'qr') : 'qr'
+  loginMethod.value = authMethod
 
   // 设置连接状态
   sseConnecting.value = true
   qrCodeData.value = ''
   loginStatus.value = ''
+  loginErrorMessage.value = ''
   needSecondVerify.value = false
   verifyStage.value = 'phone'
-  verifyPhone.value = ''
+  verifyPhone.value = authMethod === 'sms' ? loginPhone.value.trim() : ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  directSmsFlow.value = authMethod === 'sms'
+  clearVerifyCooldown()
   currentPlatform.value = platform
   currentAccountName.value = name
   currentAccountId.value = accountId
@@ -607,6 +722,25 @@ const connectSSE = (platform, name, accountId = null) => {
 
   // 获取平台类型编号
   const type = platformMeta[platform]?.type || 1
+
+  if (authMethod !== 'qr') {
+    try {
+      await http.post('/loginPrepare', {
+        session: currentLoginId.value,
+        type,
+        id: name,
+        account_id: accountId,
+        auth_method: authMethod,
+        phone: loginPhone.value.trim(),
+        password: loginPassword.value
+      })
+      loginPassword.value = ''
+    } catch (error) {
+      sseConnecting.value = false
+      directSmsFlow.value = false
+      return
+    }
+  }
 
   // 创建SSE连接
   const baseUrl = API_BASE
@@ -619,6 +753,19 @@ const connectSSE = (platform, name, accountId = null) => {
   // 监听消息
   eventSource.onmessage = (event) => {
     const data = event.data
+
+    if (data.startsWith('LOGIN_ERROR:')) {
+      loginErrorMessage.value = data.slice('LOGIN_ERROR:'.length).trim() || '抖音登录失败'
+      return
+    }
+
+    if (data === 'AUTH_SMS_CODE') {
+      directSmsFlow.value = true
+      needSecondVerify.value = true
+      verifyStage.value = 'code'
+      verifySubmitting.value = false
+      return
+    }
 
     // 抖音二次验证：先收集手机号，再收集短信验证码
     if (data === 'SECOND_VERIFY_PHONE' || data === 'SECOND_VERIFY_CODE') {
@@ -652,6 +799,9 @@ const connectSSE = (platform, name, accountId = null) => {
           setTimeout(() => {
             dialogVisible.value = false
             sseConnecting.value = false
+            loginPassword.value = ''
+            directSmsFlow.value = false
+            reLoginMode.value = false
 
             // 根据是否是重新登录显示不同提示
             ElMessage.success(dialogType.value === 'edit' ? '重新登录成功' : '账号添加成功')
@@ -673,10 +823,15 @@ const connectSSE = (platform, name, accountId = null) => {
         }, 1000)
       } else {
         // 保留失败原因，短暂展示后允许用户重新扫码
+        if (loginErrorMessage.value) {
+          ElMessage.error(loginErrorMessage.value)
+        }
         setTimeout(() => {
           sseConnecting.value = false
           qrCodeData.value = ''
           loginStatus.value = ''
+          loginPassword.value = ''
+          directSmsFlow.value = false
         }, 2000)
       }
     }
@@ -700,11 +855,13 @@ const refreshLogin = () => {
     return
   }
   ElMessage.info('正在刷新二维码')
-  connectSSE(currentPlatform.value, currentAccountName.value, currentAccountId.value)
+  connectSSE(currentPlatform.value, currentAccountName.value, currentAccountId.value, { authMethod: 'qr' })
 }
 
 // 提交抖音短信二次验证
 const submitSecondVerify = async (stage) => {
+  if (verifySubmitting.value) return
+  if (needSecondVerify.value && stage !== verifyStage.value) return
   if (!currentLoginId.value) {
     ElMessage.error('登录会话已失效，请重新发起登录')
     return
@@ -723,10 +880,12 @@ const submitSecondVerify = async (stage) => {
     await http.post('/loginVerify', {
       id: currentLoginId.value,
       phone: verifyPhone.value.trim(),
-      code: verifyCode.value.trim()
+      code: verifyCode.value.trim(),
+      stage
     })
     if (stage === 'phone') {
-      ElMessage.success('验证码已发送，请查看短信')
+      ElMessage.info('手机号已提交，正在请求抖音发送验证码')
+      startVerifyCooldown(60)
     }
   } catch (error) {
     // 请求工具已经统一弹出错误提示
@@ -739,7 +898,7 @@ const submitSecondVerify = async (stage) => {
 const submitAccountForm = () => {
   accountFormRef.value.validate(async (valid) => {
     if (valid) {
-      if (dialogType.value === 'add') {
+      if (dialogType.value === 'add' || reLoginMode.value) {
         // 名称选填：留空时自动生成默认名称（如“抖音账号1”）
         const name = accountForm.name.trim()
         if (!name) {
@@ -748,8 +907,26 @@ const submitAccountForm = () => {
           ).length
           accountForm.name = `${accountForm.platform}账号${samePlatformCount + 1}`
         }
-        // 建立SSE连接
-        connectSSE(accountForm.platform, accountForm.name)
+        const authMethod = accountForm.platform === '抖音' ? loginMethod.value : 'qr'
+        const normalizedPhone = loginPhone.value.replace(/[\s-]/g, '').replace(/^\+?86/, '')
+        if (authMethod === 'sms' || authMethod === 'password') {
+          if (!/^1\d{10}$/.test(normalizedPhone)) {
+            ElMessage.warning('请输入正确的 11 位手机号')
+            return
+          }
+          if (authMethod === 'password' && !loginPassword.value) {
+            ElMessage.warning('请输入登录密码')
+            return
+          }
+          loginPhone.value = normalizedPhone
+        }
+        // 建立SSE连接；重新登录时沿用已有账号 id
+        await connectSSE(
+          accountForm.platform,
+          accountForm.name,
+          reLoginMode.value ? accountForm.id : null,
+          { authMethod }
+        )
       } else {
         // 编辑账号逻辑
         try {
@@ -790,6 +967,7 @@ const submitAccountForm = () => {
 
 // 组件卸载前关闭SSE连接
 onBeforeUnmount(() => {
+  clearVerifyCooldown()
   closeSSEConnection()
 })
 </script>
@@ -807,6 +985,13 @@ onBeforeUnmount(() => {
 }
 
 .account-management {
+  .direct-login-hint {
+    margin: -8px 0 14px 80px;
+    color: #909399;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
   .page-header {
     margin-bottom: 20px;
     
@@ -906,6 +1091,14 @@ onBeforeUnmount(() => {
       .qrcode-tip {
         text-align: center;
         color: #606266;
+      }
+
+      .verify-hint {
+        margin: 0;
+        color: #909399;
+        font-size: 12px;
+        line-height: 1.6;
+        text-align: center;
       }
     }
     
