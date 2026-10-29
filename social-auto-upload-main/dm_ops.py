@@ -301,6 +301,19 @@ def _migrate_group_metadata(c):
     c.execute("DELETE FROM dm_meta WHERE key LIKE 'douyin_history%'")
 
 
+def _migrate_message_times(c):
+    """重扫一次抖音历史，并把会话摘要时间重新按已落库消息计算。"""
+    c.execute("DELETE FROM dm_meta WHERE key LIKE 'douyin_history%'")
+    c.execute("""UPDATE dm_contacts SET
+        first_seen_at=COALESCE((SELECT MIN(x.created_at) FROM messages x
+            WHERE x.contact_id=dm_contacts.id), first_seen_at),
+        last_message_at=COALESCE((SELECT MAX(x.created_at) FROM messages x
+            WHERE x.contact_id=dm_contacts.id), last_message_at),
+        last_inbound_at=COALESCE((SELECT MAX(x.created_at) FROM messages x
+            WHERE x.contact_id=dm_contacts.id AND x.direction='inbound'), last_inbound_at)
+        WHERE EXISTS (SELECT 1 FROM messages x WHERE x.contact_id=dm_contacts.id)""")
+
+
 def init_db():
     with get_conn() as c:
         apply_migrations(c, "dm_ops", {
@@ -311,6 +324,7 @@ def init_db():
             5: _merge_douyin_contacts,
             6: _migrate_douyin_cleanup,
             7: _migrate_group_metadata,
+            8: _migrate_message_times,
         })
         # account_deleted 独立于迁移版本补齐，保证旧库升级后删除账号可用
         _ensure_column(c, "dm_contacts", "account_deleted", "INTEGER DEFAULT 0")
@@ -1166,6 +1180,46 @@ def _duplicate(c, platform: str, account: str, external_message_id: str):
     return dict(row) if row else None
 
 
+def repair_message_timestamp(
+    message_id: int, created_at: str, external_message_id: str | None = None,
+    source_content: str | None = None,
+) -> bool:
+    """用平台返回的消息身份和时间修正已入库记录，并同步会话时间摘要。"""
+    stamp = _clean(created_at, 40)
+    try:
+        datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return False
+    with get_conn() as c:
+        row = c.execute("""SELECT id,contact_id,created_at,external_message_id,source_content
+            FROM messages WHERE id=?""", (message_id,)).fetchone()
+        if not row:
+            return False
+        next_external_id = _clean(external_message_id, 160) if external_message_id else row["external_message_id"]
+        next_source = _clean(source_content, 500) if source_content else row["source_content"]
+        unchanged = (
+            str(row["created_at"] or "") == stamp
+            and str(row["external_message_id"] or "") == str(next_external_id or "")
+            and str(row["source_content"] or "") == str(next_source or "")
+        )
+        if unchanged:
+            return False
+        c.execute("""UPDATE messages SET created_at=?,external_message_id=?,source_content=?
+            WHERE id=?""", (stamp, next_external_id, next_source, message_id))
+        contact_id = row["contact_id"]
+        if contact_id:
+            aggregate = c.execute("""SELECT MIN(created_at) AS first_at,
+                MAX(created_at) AS last_at,
+                MAX(CASE WHEN direction='inbound' THEN created_at END) AS last_inbound_at
+                FROM messages WHERE contact_id=?""", (contact_id,)).fetchone()
+            c.execute("""UPDATE dm_contacts SET first_seen_at=?,last_message_at=?,last_inbound_at=?
+                WHERE id=?""", (
+                aggregate["first_at"], aggregate["last_at"],
+                aggregate["last_inbound_at"], contact_id,
+            ))
+    return True
+
+
 def ingest_message(item: dict, allow_auto_reply: bool = True,
                    force_draft: bool = False) -> dict:
     content = _clean(item.get("content"), 4000)
@@ -1434,7 +1488,8 @@ def priority_leads(limit: int = 8) -> list[dict]:
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id) AS message_count,
         (SELECT COUNT(*) FROM messages x WHERE x.contact_id=c.id AND x.direction='outbound'
             AND x.delivery_status='ready') AS pending_delivery
-        FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
+        FROM dm_contacts c JOIN messages m ON m.id=(SELECT x.id FROM messages x
+            WHERE x.contact_id=c.id ORDER BY datetime(x.created_at) DESC, x.id DESC LIMIT 1)
         WHERE c.stage NOT IN ('converted','lost') AND COALESCE(c.account_deleted,0)=0"""
     sql += scope_sql + " ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"
     with get_conn() as c:
@@ -1455,7 +1510,8 @@ def list_conversations():
     sql = """SELECT c.*, m.id AS last_message_id, m.content AS last_content, m.direction AS last_direction,
         m.created_at AS last_message_time, m.delivery_status AS last_delivery_status,
         CASE WHEN m.direction='inbound' AND m.status IN ('new','read') THEN 1 ELSE 0 END AS needs_reply
-        FROM dm_contacts c JOIN messages m ON m.id=(SELECT MAX(id) FROM messages WHERE contact_id=c.id)
+        FROM dm_contacts c JOIN messages m ON m.id=(SELECT x.id FROM messages x
+            WHERE x.contact_id=c.id ORDER BY datetime(x.created_at) DESC, x.id DESC LIMIT 1)
         WHERE COALESCE(c.account_deleted,0)=0""" + scope_sql
     for field, value in (
         ("c.platform", platform), ("c.account", account),

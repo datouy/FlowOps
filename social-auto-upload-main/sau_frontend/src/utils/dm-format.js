@@ -31,7 +31,12 @@ export function avatarText(name) {
 export function shortTime(value) {
   if (!value) return ''
   const text = String(value)
-  const today = new Date().toISOString().slice(0, 10)
+  const now = new Date()
+  const today = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  ].join('-')
   if (text.slice(0, 10) === today) return text.slice(11, 16)
   return text.slice(5, 10)
 }

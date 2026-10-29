@@ -1066,6 +1066,7 @@ function handlePlatformFilterChange() {
 async function refreshLive() {
   if (hasNoAccounts.value) return
   const contactId = currentContact.value?.id
+  const previousLastMessageTime = currentContact.value?.last_message_time || ''
   liveTick.value += 1
   try {
     await Promise.all([loadSyncStatus(), loadConversations(true)])
@@ -1074,8 +1075,12 @@ async function refreshLive() {
     if (contactId) {
       const latest = conversations.value.find(item => item.id === contactId)
       const latestId = Number(latest?.last_message_id || 0)
-      if (latestId > lastMessageId.value) {
-        await loadConversation(contactId, true, true)
+      const latestTime = latest?.last_message_time || ''
+      const timeChanged = Boolean(
+        previousLastMessageTime && latestTime && latestTime !== previousLastMessageTime
+      )
+      if (latestId > lastMessageId.value || timeChanged) {
+        await loadConversation(contactId, true, !timeChanged)
       }
       if (Number(currentContact.value?.unread_count || 0) > 0) {
         await markConversationRead(contactId)

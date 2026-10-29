@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,14 @@ def _parse_iso(value: Any) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+def _platform_time_text(value: Any) -> str:
+    """把平台时间转换为本地展示时间；无效值返回空串，避免冒充当前时间。"""
+    parsed = _parse_iso(value)
+    if not parsed:
+        return ""
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -885,6 +894,9 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
 
     created_at = _parse_iso(row.get("created_at"))
     display_time = _clean_text(row.get("display_time"), 40)
+    created_at_text = _platform_time_text(row.get("created_at"))
+    if not created_at_text and display_time:
+        created_at_text = _display_time_to_text(display_time)
     if history_hours and created_at and not unread:
         age = datetime.now(timezone.utc) - created_at
         if age > timedelta(hours=history_hours):
@@ -905,7 +917,7 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
     if unread:
         source += f" · 未读 {unread}"
     nickname = _display_name(row)
-    return {
+    result = {
         "platform": "抖音",
         "account": _account_name(account),
         "external_user_id": _clean_text(_stable_user_id(row.get("cid")), 120),
@@ -921,7 +933,60 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
             if text == UNPARSEABLE_CONTENT else "new"
         ),
         "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
-    }, ""
+    }
+    if created_at_text:
+        result["created_at"] = created_at_text
+    return result, ""
+
+
+def _reconcile_preview_times(items: list[dict], account: dict) -> int:
+    """用已展开的历史记录替换旧版会话预览被误记成同步时刻的时间。"""
+    history_source = "抖音创作者中心聊天记录"
+    by_message: dict[tuple[str, str, str], list[dict]] = {}
+    for item in items:
+        if not str(item.get("source_content") or "").startswith(history_source):
+            continue
+        key = (
+            str(item.get("external_user_id") or ""),
+            str(item.get("direction") or ""),
+            str(item.get("content") or ""),
+        )
+        by_message.setdefault(key, []).append(item)
+    if not by_message:
+        return 0
+
+    repaired = []
+    account_name = _account_name(account)
+    with dm_ops.get_conn() as conn:
+        for (user_id, direction, content), history_items in by_message.items():
+            history_items.sort(key=lambda value: value.get("created_at") or "")
+            stamps = [item.get("created_at") or "" for item in history_items]
+            previews = conn.execute("""SELECT id,created_at FROM messages
+                WHERE platform='抖音' AND account=? AND external_user_id=?
+                  AND direction=? AND content=?
+                  AND source_content LIKE '抖音创作者中心私信同步%'
+                  AND external_message_id LIKE 'dy-sync-%'""", (
+                account_name, user_id, direction, content,
+            )).fetchall()
+            for preview in previews:
+                index = bisect_right(stamps, str(preview["created_at"] or "")) - 1
+                if index < 0:
+                    continue
+                authoritative = history_items[index]
+                if str(preview["created_at"] or "") == authoritative.get("created_at"):
+                    continue
+                repaired.append((
+                    preview["id"], authoritative.get("created_at"),
+                    authoritative.get("external_message_id"),
+                    authoritative.get("source_content"),
+                ))
+    for message_id, created_at, external_message_id, source_content in repaired:
+        dm_ops.repair_message_timestamp(
+            message_id, created_at,
+            external_message_id=external_message_id,
+            source_content=source_content,
+        )
+    return len(repaired)
 
 
 def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
@@ -956,13 +1021,18 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
             history_items = _history_items(
                 row, row.get("history") or [], account, history_hours,
             )
+            history_items.sort(key=lambda value: value.get("created_at") or "")
             items.extend(history_items or [item])
         else:
             skipped += 1
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
+    _reconcile_preview_times(items, account)
     # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
     ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
+    for item, result in zip(items, ingest.get("items", [])):
+        if result.get("duplicate") and result.get("message_id") and item.get("created_at"):
+            dm_ops.repair_message_timestamp(result["message_id"], item["created_at"])
     for contact_id in {
         int(result.get("contact_id")) for result in ingest.get("items", [])
         if result.get("contact_id")
