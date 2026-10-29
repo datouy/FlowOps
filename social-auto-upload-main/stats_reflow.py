@@ -602,7 +602,10 @@ def run_stats_reflow_once() -> dict:
             result['matched'] += saved
             if not saved:
                 result['unmatched'] += 1
-            platform_result = result['platforms'][str(platform)]
+            platform_result = result['platforms'].setdefault(str(platform), {
+                'name': PLATFORM_NAMES.get(platform, str(platform)),
+                'fetched': 0, 'saved': 0, 'matched': 0, 'history': 0,
+            })
             platform_result['saved'] += saved
             platform_result['matched'] += saved
 
@@ -617,7 +620,10 @@ def run_stats_reflow_once() -> dict:
             saved = _save_stats(platform, sources.get(source_key), remaining)
             result['saved'] += saved
             result['history'] += saved
-            platform_result = result['platforms'][str(platform)]
+            platform_result = result['platforms'].setdefault(str(platform), {
+                'name': PLATFORM_NAMES.get(platform, str(platform)),
+                'fetched': 0, 'saved': 0, 'matched': 0, 'history': 0,
+            })
             platform_result['saved'] += saved
             platform_result['history'] += saved
 
