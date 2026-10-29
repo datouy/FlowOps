@@ -96,13 +96,53 @@ def _account_cookie(account: dict | None, platform: int) -> Path | None:
     return None
 
 
-def _record_accounts(record: dict) -> list[dict | None]:
+def _account_identifiers(account: dict) -> set[str]:
+    """Return every persisted name that can identify an account."""
+    file_path = str(account.get('filePath') or '')
+    return {
+        str(value).strip()
+        for value in (
+            account.get('id'),
+            account.get('userName'),
+            file_path,
+            Path(file_path).name,
+        )
+        if str(value or '').strip()
+    }
+
+
+def _current_account_keys(account_rows: list[dict] | None = None) -> set[tuple[int, str]]:
+    rows = _account_rows() if account_rows is None else account_rows
+    return {
+        (int(row.get('type') or 0), identifier)
+        for row in rows
+        for identifier in _account_identifiers(row)
+    }
+
+
+def filter_current_account_rows(
+    rows: list[dict], account_rows: list[dict] | None = None
+) -> list[dict]:
+    """Keep statistics owned by accounts that still exist in account management."""
+    keys = _current_account_keys(account_rows)
+    return [
+        row for row in rows
+        if (int(row.get('platform') or 0), str(row.get('account') or '').strip()) in keys
+    ]
+
+
+def _record_accounts(
+    record: dict, account_rows: list[dict] | None = None
+) -> list[dict]:
     entries = []
     for raw in str(record.get('accounts') or '').split(','):
         raw = raw.strip()
         if raw:
             entries.append(raw)
-    rows = _account_rows()
+    rows = _account_rows() if account_rows is None else account_rows
+    record_platform = int(record.get('type') or 0)
+    if record_platform:
+        rows = [row for row in rows if int(row.get('type') or 0) == record_platform]
     by_id = {int(r['id']): r for r in rows}
     by_path = {str(r.get('filePath') or ''): r for r in rows}
     by_name = {Path(str(r.get('filePath') or '')).name: r for r in rows}
@@ -113,9 +153,60 @@ def _record_accounts(record: dict) -> list[dict | None]:
             account = by_path.get(entry) or by_name.get(Path(entry).name)
         if account and account not in result:
             result.append(account)
-    if not result:
-        result = [r for r in rows if int(r.get('type') or 0) == int(record.get('type') or 0)]
-    return result or [None]
+    # An explicit cookie that no longer matches an account is an orphaned
+    # record. It must never fall back to whichever account now occupies the
+    # same platform slot.
+    if not entries:
+        result = list(rows)
+    return result
+
+
+def filter_current_account_records(
+    records: list[dict], account_rows: list[dict] | None = None
+) -> list[dict]:
+    """Hide publish audit rows whose recorded accounts no longer exist."""
+    rows = _account_rows() if account_rows is None else account_rows
+    return [record for record in records if _record_accounts(record, rows)]
+
+
+def filter_current_account_jobs(
+    jobs: list[dict], account_rows: list[dict] | None = None
+) -> list[dict]:
+    """Hide queued jobs and schedule entries owned by deleted accounts."""
+    normalized = []
+    for job in jobs:
+        item = dict(job)
+        raw_accounts = item.get("accounts")
+        if not raw_accounts and item.get("account_list"):
+            raw_accounts = item.get("account_list")
+        if not raw_accounts and item.get("account"):
+            raw_accounts = item.get("account")
+        if isinstance(raw_accounts, (list, tuple, set)):
+            raw_accounts = ",".join(str(value) for value in raw_accounts)
+        elif isinstance(raw_accounts, str) and raw_accounts.startswith("["):
+            try:
+                parsed = json.loads(raw_accounts)
+                if isinstance(parsed, list):
+                    raw_accounts = ",".join(str(value) for value in parsed)
+            except (TypeError, ValueError):
+                pass
+        item["accounts"] = str(raw_accounts or "")
+        normalized.append(item)
+    return filter_current_account_records(normalized, account_rows)
+
+
+def clear_account_stats(platform: int, account_name: str) -> int:
+    """Remove derived statistics when an account is deleted."""
+    account_name = str(account_name or '').strip()
+    if not platform or not account_name:
+        return 0
+    _db_prepare()
+    with get_conn() as c:
+        cursor = c.execute(
+            'DELETE FROM content_stats WHERE platform=? AND account=?',
+            (int(platform), account_name),
+        )
+        return max(0, int(cursor.rowcount or 0))
 
 
 def _to_int(value: Any) -> int:
@@ -677,6 +768,7 @@ def stats_status() -> dict:
 def stats_summary() -> dict:
     """返回发布记录、每条记录的最新内容数据、平台/账号汇总。"""
     _db_prepare()
+    accounts = _account_rows()
     with get_conn() as c:
         records = [dict(r) for r in c.execute(
             'SELECT * FROM publish_records ORDER BY id DESC LIMIT 100'
@@ -692,6 +784,9 @@ def stats_summary() -> dict:
             ) latest ON latest.max_id = s.id
             ORDER BY s.id DESC
         ''').fetchall()]
+
+    records = filter_current_account_records(records, accounts)
+    rows = filter_current_account_rows(rows, accounts)
 
     by_record: dict[int, list[dict]] = {}
     platform_totals: dict[str, dict] = {}
@@ -745,7 +840,7 @@ def stats_summary() -> dict:
         stats = by_record.get(int(record['id']), [])
         record['account_names'] = [
             str((account or {}).get('userName') or '')
-            for account in _record_accounts(record)
+            for account in _record_accounts(record, accounts)
             if (account or {}).get('userName')
         ]
         record['stats'] = stats

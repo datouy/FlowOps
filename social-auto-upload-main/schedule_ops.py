@@ -1,4 +1,5 @@
 import publish_jobs
+import stats_reflow
 import json
 from flask import jsonify, request
 from datetime import datetime, timedelta
@@ -29,7 +30,7 @@ def _week_schedule():
                 'scheduled_at': r['scheduled_at'],
                 'date': r['scheduled_at'][:10],
             })
-        return items
+        return stats_reflow.filter_current_account_jobs(items)
     # Fallback: derive from job extra (legacy jobs before expansion existed).
     with publish_jobs.get_conn() as c:
         rows = c.execute('SELECT * FROM jobs ORDER BY id DESC').fetchall()
@@ -62,7 +63,7 @@ def _week_schedule():
                 'scheduled_at': dt.strftime('%Y-%m-%d %H:%M'),
                 'date': dt.strftime('%Y-%m-%d'),
             })
-    return items
+    return stats_reflow.filter_current_account_jobs(items)
 
 def register(app):
     @app.route('/material-status', methods=['GET'])
@@ -98,7 +99,8 @@ def register(app):
                 WHERE s.record_id IS NULL OR s.record_id = 0
                 ORDER BY s.id DESC
             ''').fetchall()
-        return jsonify({'code': 200, 'data': [dict(r) for r in rows], 'msg': None}), 200
+        rows = stats_reflow.filter_current_account_rows([dict(r) for r in rows])
+        return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
     @app.route('/stats/link', methods=['POST'])
     def stats_link():

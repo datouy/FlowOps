@@ -571,6 +571,13 @@ def delete_account():
         except Exception as dm_err:
             logger.warning("清理账号私信数据失败（不影响账号删除）: {}", dm_err)
 
+        # Derived statistics belong to the deleted account and should not
+        # resurface when another account signs into the same platform.
+        try:
+            stats_reflow.clear_account_stats(record.get("type"), record.get("userName"))
+        except Exception as stats_err:
+            logger.warning("清理账号统计快照失败（不影响账号删除）: {}", stats_err)
+
         return jsonify({
             "code": 200,
             "msg": "account deleted successfully",
@@ -591,6 +598,7 @@ def list_jobs():
     limit = request.args.get('limit', 50)
     with publish_jobs.get_conn() as c:
         rows = [dict(r) for r in c.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
+    rows = stats_reflow.filter_current_account_jobs(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 @app.route('/jobs/<int:job_id>', methods=['GET'])
@@ -681,6 +689,7 @@ def list_publish_records():
     limit = request.args.get('limit', 100)
     with publish_jobs.get_conn() as c:
         rows = [dict(r) for r in c.execute('SELECT * FROM publish_records ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
+    rows = stats_reflow.filter_current_account_records(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 @app.route('/account-status', methods=['GET'])

@@ -12,6 +12,7 @@ from flask import Blueprint, jsonify, request
 from conf import BASE_DIR
 import ai_content
 import publish_jobs
+import stats_reflow
 from db_utils import connect, record_schema_version
 
 bp = Blueprint("ops_center", __name__)
@@ -299,11 +300,19 @@ def weekly_report(days: int = 7) -> dict:
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with publish_jobs.get_conn() as c:
         jobs = c.execute("SELECT * FROM jobs WHERE created_at>=? ORDER BY id DESC", (since,)).fetchall()
-        records = c.execute("SELECT * FROM publish_records WHERE created_at>=? ORDER BY id DESC", (since,)).fetchall()
-        rows = c.execute("""SELECT s.* FROM content_stats s
+        records = [dict(row) for row in c.execute(
+            "SELECT * FROM publish_records WHERE created_at>=? ORDER BY id DESC", (since,)
+        ).fetchall()]
+        rows = [dict(row) for row in c.execute("""SELECT s.* FROM content_stats s
             INNER JOIN (SELECT content_key, MAX(id) mid FROM content_stats
                         WHERE content_key IS NOT NULL AND content_key!='' GROUP BY content_key) m
-            ON m.mid=s.id ORDER BY s.plays DESC""").fetchall()
+            ON m.mid=s.id ORDER BY s.plays DESC""").fetchall()]
+    accounts = stats_reflow._account_rows()
+    records = stats_reflow.filter_current_account_records(records, accounts)
+    jobs = stats_reflow.filter_current_account_jobs(
+        [dict(row) for row in jobs], accounts
+    )
+    rows = stats_reflow.filter_current_account_rows(rows, accounts)
     success = sum(1 for r in records if r["status"] == "success")
     failed = sum(1 for r in records if r["status"] == "failed")
     platform = {}
