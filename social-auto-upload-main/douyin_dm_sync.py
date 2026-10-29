@@ -447,19 +447,18 @@ def _display_time_to_text(value: str) -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def _click_conversation(
-    page, cid: str, max_scrolls: int = 20, settle_ms: int = 1600,
-    click_timeout_ms: int = 5000, is_group: bool = False,
-    is_stranger: bool = False,
-) -> bool:
-    tab_label = "群消息" if is_group else (
-        "陌生人私信" if is_stranger else "朋友私信"
-    )
+async def _select_dm_tab(page, label: str) -> tuple[str, bool]:
+    """切换私信子页签；返回 (状态, 是否本就处于该页签)。
+
+    状态: "switched" 已点击切换 / "active" 本就在该页签 / "missing" 页面无此页签。
+    """
     tab_changed = await page.evaluate("""(label) => {
         document.querySelectorAll('[data-flowops-dm-tab]').forEach(el => {
             el.removeAttribute('data-flowops-dm-tab');
         });
-        const tabs = Array.from(document.querySelectorAll('[class*="sub-tab-item"]'))
+        const tabs = Array.from(document.querySelectorAll(
+            '[class*="sub-tab-item"], [class*="semi-tabs-tab"]'
+        ))
             .filter(el => {
                 const rect = el.getBoundingClientRect();
                 return rect.width > 1 && rect.height > 1 &&
@@ -469,12 +468,33 @@ async def _click_conversation(
         if (current || !tabs.length) return false;
         tabs[0].setAttribute('data-flowops-dm-tab', '1');
         return true;
-    }""", tab_label)
-    if tab_changed:
-        await page.locator('[data-flowops-dm-tab="1"]').click(
-            timeout=max(500, click_timeout_ms)
-        )
-        await page.wait_for_timeout(500)
+    }""", label)
+    if not tab_changed:
+        exists = await page.evaluate("""(label) => Array.from(document.querySelectorAll(
+            '[class*="sub-tab-item"], [class*="semi-tabs-tab"]'
+        )).some(el => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 1 && rect.height > 1 &&
+                String(el.innerText || '').trim() === label;
+        })""", label)
+        return ("active" if exists else "missing"), exists
+    await page.locator('[data-flowops-dm-tab="1"]').click(
+        timeout=5000
+    )
+    await page.wait_for_timeout(500)
+    return "switched", False
+
+
+async def _click_conversation(
+    page, cid: str, max_scrolls: int = 20, settle_ms: int = 1600,
+    click_timeout_ms: int = 5000, is_group: bool = False,
+    is_stranger: bool = False,
+) -> bool:
+    tab_label = "群消息" if is_group else (
+        "陌生人私信" if is_stranger else "朋友私信"
+    )
+    status, _current = await _select_dm_tab(page, tab_label)
+    # 页面无子页签时，目标会话就在唯一列表里，继续按原逻辑查找。
     await page.evaluate("""() => {
         const grid = document.querySelector('.ReactVirtualized__Grid');
         if (grid) grid.scrollTop = 0;
@@ -826,27 +846,43 @@ async def _scan_douyin_in_browser(
         if quick:
             limit = min(limit, 20)
         collected = {}
-        for _ in range(1 if quick else 20):
-            rows = await page.evaluate(SCAN_SCRIPT, limit)
-            batch = rows if isinstance(rows, list) else []
-            added = 0
-            for row in batch:
-                cid = str(row.get("cid") or "")
-                if cid and cid not in collected:
-                    collected[cid] = row
-                    added += 1
-            if len(collected) >= limit:
-                break
-            moved = await page.evaluate("""() => {
-                const grid = document.querySelector('.ReactVirtualized__Grid');
-                if (!grid) return false;
-                const before = grid.scrollTop;
-                grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
-                return grid.scrollTop !== before;
-            }""")
-            if not moved and added == 0:
-                break
-            await page.wait_for_timeout(350)
+
+        async def _collect_current_tab() -> None:
+            for _ in range(1 if quick else 20):
+                rows = await page.evaluate(SCAN_SCRIPT, limit)
+                batch = rows if isinstance(rows, list) else []
+                added = 0
+                for row in batch:
+                    cid = str(row.get("cid") or "")
+                    if cid and cid not in collected:
+                        collected[cid] = row
+                        added += 1
+                if len(collected) >= limit:
+                    break
+                moved = await page.evaluate("""() => {
+                    const grid = document.querySelector('.ReactVirtualized__Grid');
+                    if (!grid) return false;
+                    const before = grid.scrollTop;
+                    grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+                    return grid.scrollTop !== before;
+                }""")
+                if not moved and added == 0:
+                    break
+                await page.wait_for_timeout(350)
+
+        # 先采集当前页签，再遍历其余子页签；未关注/陌生人会话在
+        # "陌生人私信"页签下，不切换就永远扫不到。
+        await _collect_current_tab()
+        current_tab_collected = True
+        for tab_label in ("陌生人私信", "朋友私信", "群消息"):
+            status, already_active = await _select_dm_tab(page, tab_label)
+            if status == "missing":
+                continue
+            if already_active and current_tab_collected:
+                current_tab_collected = False
+                continue
+            await _collect_current_tab()
+            current_tab_collected = True
         timings["list_ms"] = int((time.monotonic() - started_mono) * 1000)
 
         data = list(collected.values())
@@ -870,11 +906,6 @@ async def _scan_douyin_in_browser(
                 # 手动“同步全部私信”扫描所有会话；定时增量只看有未读的会话。
                 should_scan_history = (not quick) or effective_unread > 0
                 if should_scan_history and user_id in seen_history_users:
-                    continue
-                if should_scan_history and not quick and _history_marker_fresh(
-                    account_name, cid, signature
-                ):
-                    row["history_synced"] = True
                     continue
                 if not should_scan_history:
                     continue
