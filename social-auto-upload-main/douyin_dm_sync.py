@@ -228,13 +228,15 @@ HISTORY_SCRIPT = r"""
     const text = String(textNode?.innerText || '').trim();
     const direction = cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound';
     if (!text) {
-      const hasMedia = Boolean(el.querySelector('video')) ||
-        Array.from(el.querySelectorAll('img')).some(
+      const hasVideo = Boolean(el.querySelector('video'));
+      const hasImage = Array.from(el.querySelectorAll('img')).some(
           img => (img.naturalWidth || img.width || 0) >= 80
         );
-      if (!hasMedia) continue;
+      if (!hasVideo && !hasImage) continue;
       rows.push({
-        text: '', media: true, direction, display_time: currentTime,
+        text: '', media: true,
+        media_type: hasVideo ? 'video' : 'image',
+        direction, display_time: currentTime,
       });
       continue;
     }
@@ -612,7 +614,13 @@ def _history_items(row: dict, history: list[dict], account: dict,
         if text and _is_unread_placeholder(text):
             continue
         if not text:
-            text = UNPARSEABLE_CONTENT
+            media_type = item.get("media_type")
+            if item.get("media"):
+                text = "[视频]" if media_type == "video" else (
+                    "[图片]" if media_type == "image" else "[媒体消息]"
+                )
+            else:
+                text = UNPARSEABLE_CONTENT
         if _is_placeholder(text):
             text = UNPARSEABLE_CONTENT
         direction = "outbound" if item.get("direction") == "outbound" else "inbound"
@@ -640,6 +648,7 @@ def _history_items(row: dict, history: list[dict], account: dict,
             "is_group": bool(row.get("is_group")),
             "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
             "author": nickname if direction == "inbound" else "我",
+            "nickname": nickname,
             "content": text,
             "source_content": source,
             "msg_type": "dm",
@@ -953,8 +962,7 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
         unread = max(0, int(row.get("unread") or 0))
     except (TypeError, ValueError):
         unread = 0
-    if row.get("is_from_me") and not unread:
-        return None, "自己发送的消息"
+    from_me = bool(row.get("is_from_me"))
     try:
         message_type = int(row.get("message_type") or 0)
     except (TypeError, ValueError):
@@ -965,7 +973,7 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
         text = preview
     allow_auto_reply = (
         message_type == 7 and bool(text) and not _is_placeholder(text)
-        and not row.get("is_group")
+        and not row.get("is_group") and not from_me
     )
     if _is_placeholder(text):
         # 平台只给了“收到一条新类型消息”这类占位文案时，展示中性提示，
@@ -1005,21 +1013,24 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
     if unread:
         source += f" · 未读 {unread}"
     nickname = _display_name(row)
+    author = "我" if from_me else nickname
     result = {
         "platform": "抖音",
         "account": _account_name(account),
         "external_user_id": _clean_text(_stable_user_id(row.get("cid")), 120),
         "is_group": bool(row.get("is_group")),
         "external_message_id": external_message_id,
-        "author": nickname,
+        "author": author,
+        "nickname": nickname,
         "content": text,
         "source_content": source,
         "msg_type": "dm",
+        "direction": "outbound" if from_me else "inbound",
         "auto_reply": allow_auto_reply,
         "status": (
             ("read" if not unread else "new")
             if text == UNPARSEABLE_CONTENT else "new"
-        ),
+        ) if not from_me else "read",
         "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
     }
     if created_at_text:

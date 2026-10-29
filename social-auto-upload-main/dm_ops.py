@@ -754,6 +754,9 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
     account = _clean(item.get("account"), 120)
     external = _external_id(item, content)
     nickname = _clean(item.get("nickname") or item.get("author"), 80)
+    # 我方发出的消息 author 是“我”，不能拿去覆盖联系人昵称。
+    if direction != "inbound" and not item.get("nickname"):
+        nickname = ""
     is_group = 1 if item.get("is_group") else 0
     fields = extract_lead_fields(content)
     row = c.execute(
