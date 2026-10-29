@@ -84,9 +84,13 @@ def _msg(emoji: str, text: str) -> str:
 
 
 async def _native_click(page, locator) -> bool:
-    """对元素做"真人级"点击：真实鼠标点中心 + 派发完整 pointer/mouse 事件序列。
-    抖音身份验证组件（uc_verification_component）只认这整套事件，不认单纯 click。
-    返回是否点击成功。"""
+    """Click an element exactly once with trusted browser input.
+
+    The browser emits the complete pointer/mouse sequence for a real mouse
+    click.  Synthesising those events after the mouse click caused one-time SMS
+    codes to be submitted twice and is deliberately avoided here.  JS click is
+    only a last-resort fallback when both browser input paths fail.
+    """
     try:
         await locator.scroll_into_view_if_needed(timeout=5000)
     except Exception:
@@ -97,10 +101,14 @@ async def _native_click(page, locator) -> bool:
         box = None
     if not box:
         try:
-            await locator.click(timeout=8000)
+            await locator.click(force=True, timeout=8000)
             return True
         except Exception:
-            return False
+            try:
+                await locator.evaluate("el => el.click()")
+                return True
+            except Exception:
+                return False
     x = box["x"] + box["width"] / 2
     y = box["y"] + box["height"] / 2
     try:
@@ -108,21 +116,78 @@ async def _native_click(page, locator) -> bool:
         await asyncio.sleep(0.15)
         await page.mouse.click(x, y)
         await asyncio.sleep(0.2)
-        await page.evaluate(
-            """({x, y}) => {
-                const el = document.elementFromPoint(x, y);
-                if (!el) return;
-                const opts = {bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,view:window,pointerId:1,pointerType:'mouse',isPrimary:true,button:0,buttons:1};
-                for (const t of ['pointerover','pointerenter','pointerdown','mousedown','pointerup','mouseup','click']) {
-                    const C = t.startsWith('pointer') ? PointerEvent : MouseEvent;
-                    try { el.dispatchEvent(new C(t, opts)); } catch(e){ try{ el.dispatchEvent(new MouseEvent(t,opts)); }catch(_){} }
-                }
-            }""",
-            {"x": x, "y": y},
-        )
         return True
     except Exception:
+        try:
+            await locator.click(force=True, timeout=8000)
+            return True
+        except Exception:
+            try:
+                await locator.evaluate("el => el.click()")
+                return True
+            except Exception:
+                return False
+
+
+async def _first_visible_locator(locator, timeout_ms: int = 15000, require_enabled: bool = True):
+    """Return the first currently visible item from a locator collection.
+
+    Douyin keeps hidden form controls mounted next to the active verification
+    dialog.  ``locator.first`` therefore frequently targets an invisible input
+    or button.  Resolve visibility for every candidate on each poll so React
+    rerenders during phone/code submission remain safe.
+    """
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    while True:
+        try:
+            count = min(await locator.count(), 32)
+            for index in range(count):
+                item = locator.nth(index)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    if require_enabled and not await item.is_enabled():
+                        continue
+                    return item
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.2)
+
+
+async def _fill_visible_input(page, locator, value: str, label: str, timeout_ms: int = 20000):
+    """Fill the visible control and prove the browser's value changed."""
+    item = await _first_visible_locator(locator, timeout_ms=timeout_ms)
+    if item is None:
+        raise RuntimeError(f"未找到可输入的{label}")
+    await item.scroll_into_view_if_needed(timeout=5000)
+    await item.click(timeout=5000)
+    await item.fill(str(value))
+    await asyncio.sleep(0.15)
+    actual = await item.input_value(timeout=3000)
+    if str(actual).strip() != str(value).strip():
+        # Custom inputs occasionally ignore fill's synthetic input event.
+        await item.click(timeout=3000)
+        await item.press("Control+A")
+        await item.press("Backspace")
+        await item.press_sequentially(str(value), delay=45)
+        await asyncio.sleep(0.2)
+        actual = await item.input_value(timeout=3000)
+    if str(actual).strip() != str(value).strip():
+        raise RuntimeError(
+            f"{label}未写入页面可见输入框（期望{len(str(value))}位，实际{len(str(actual))}位）"
+        )
+    return len(str(actual).strip())
+
+
+async def _click_first_visible(page, locator, timeout_ms: int = 10000) -> bool:
+    item = await _first_visible_locator(locator, timeout_ms=timeout_ms)
+    if item is None:
         return False
+    return await _native_click(page, item)
 
 
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
@@ -322,11 +387,11 @@ async def _wait_for_douyin_login(
         # 必须先看到抖音接口返回 scanned，避免登录页自带的短信表单误触发。
         verify_modal = await _douyin_second_verify_modal(page, timeout_ms=1000)
         verify_root = verify_modal or page
-        phone_input = verify_root.locator('input[placeholder*="手机号"]').first
-        code_input = verify_root.locator('input[placeholder*="验证码"]').first
+        phone_inputs = verify_root.locator('input[placeholder*="手机号"]')
+        code_inputs = verify_root.locator('input[placeholder*="验证码"]')
         scanned = bool(qr_connect_state and (qr_connect_state.get("scanned") or qr_connect_state.get("second_verify")))
-        phone_visible = (await phone_input.count() > 0) and (await phone_input.is_visible())
-        code_visible = (await code_input.count() > 0) and (await code_input.is_visible())
+        phone_visible = await _first_visible_locator(phone_inputs, timeout_ms=0) is not None
+        code_visible = await _first_visible_locator(code_inputs, timeout_ms=0) is not None
         has_second_verify = scanned and phone_visible and code_visible
         if has_second_verify and not second_verify_attempted:
             # 二次验证是交互式的，进来就把整体等待窗口放宽。
@@ -346,16 +411,15 @@ async def _wait_for_douyin_login(
                                     return p[:3] + "****" + p[-4:]
                                 return p
                             try:
-                                pre_value = await phone_input.input_value()
+                                visible_phone = await _first_visible_locator(phone_inputs, timeout_ms=3000)
+                                pre_value = await visible_phone.input_value() if visible_phone else ""
                             except Exception:
                                 pre_value = ""
                             douyin_logger.info(_msg("📱", f"填写前手机号框内容={_mask_phone(pre_value)!r}"))
-                            await phone_input.fill(phone)
-                            try:
-                                after_value = await phone_input.input_value()
-                            except Exception:
-                                after_value = ""
-                            douyin_logger.info(_msg("📱", f"已填手机号 {_mask_phone(phone)}，输入框当前长度={len(after_value)}"))
+                            phone_length = await _fill_visible_input(
+                                page, phone_inputs, phone, "手机号输入框"
+                            )
+                            douyin_logger.info(_msg("📱", f"已填手机号 {_mask_phone(phone)}，输入框当前长度={phone_length}"))
                             send_ok, send_label = await _click_douyin_sms_send_button(page)
                             if not send_ok:
                                 raise RuntimeError(f"短信验证发送失败：{send_label}")
@@ -372,9 +436,15 @@ async def _wait_for_douyin_login(
                             raise RuntimeError("等待抖音短信验证码输入超时")
                         code = (code_data or {}).get("code", "")
                         if code:
-                            await code_input.fill(code)
+                            code_length = await _fill_visible_input(
+                                page, code_inputs, code, "短信验证码输入框"
+                            )
+                            douyin_logger.info(_msg("📝", f"验证码已写入可见输入框，长度={code_length}"))
                             if not await _click_douyin_verify_button(page):
-                                await code_input.press("Enter")
+                                visible_code = await _first_visible_locator(code_inputs, timeout_ms=3000)
+                                if visible_code is None:
+                                    raise RuntimeError("验证码已填写，但未找到可见的「验证」按钮")
+                                await visible_code.press("Enter")
                             douyin_logger.success(_msg("✅", "已提交抖音短信验证码"))
                             second_verify_attempted = True
                 except Exception as exc:
@@ -428,10 +498,13 @@ async def _douyin_second_verify_modal(page: Page, timeout_ms: int = 15000):
     )
     while time.monotonic() < deadline:
         for selector in selectors:
-            modal = page.locator(selector).filter(has_text="验证").first
+            modal = page.locator(selector).filter(has_text="验证")
             try:
-                if await modal.count() and await modal.is_visible():
-                    return modal
+                visible = await _first_visible_locator(
+                    modal, timeout_ms=0, require_enabled=False
+                )
+                if visible is not None:
+                    return visible
             except Exception:
                 continue
         # The component is portalled in some releases and no longer has the
@@ -439,10 +512,13 @@ async def _douyin_second_verify_modal(page: Page, timeout_ms: int = 15000):
         # and the phone/code fields as a final fallback.
         candidate = page.locator(
             'div:has-text("身份验证"), div:has-text("接收短信验证码")'
-        ).filter(has=page.locator('input[placeholder*="手机号"]')).last
+        ).filter(has=page.locator('input[placeholder*="手机号"]'))
         try:
-            if await candidate.count() and await candidate.is_visible():
-                return candidate
+            visible = await _first_visible_locator(
+                candidate, timeout_ms=0, require_enabled=False
+            )
+            if visible is not None:
+                return visible
         except Exception:
             pass
         await asyncio.sleep(0.25)
@@ -454,15 +530,9 @@ async def _click_visible_text(page: Page, root, label: str, timeout_ms: int = 80
     deadline = time.monotonic() + max(timeout_ms, 500) / 1000
     locator = root.get_by_text(label, exact=True)
     while time.monotonic() < deadline:
-        for index in range(min(await locator.count(), 8)):
-            item = locator.nth(index)
-            try:
-                if not await item.is_visible():
-                    continue
-                if await _native_click(page, item):
-                    return True
-            except Exception:
-                continue
+        item = await _first_visible_locator(locator, timeout_ms=0)
+        if item is not None and await _native_click(page, item):
+            return True
         await asyncio.sleep(0.25)
     return False
 
@@ -498,11 +568,8 @@ async def _click_douyin_sms_send_button(page: Page) -> tuple[bool, str]:
     while time.monotonic() < deadline:
         modal = await _douyin_second_verify_modal(page, timeout_ms=2000) or modal
         for label, locator in candidates:
-            button = locator.first
             try:
-                if not await button.count() or not await button.is_visible():
-                    continue
-                if await _native_click(page, button):
+                if await _click_first_visible(page, locator, timeout_ms=0):
                     douyin_logger.info(_msg("📤", f"已点击身份验证弹窗中的「{label}」"))
                     await asyncio.sleep(1.2)
                     return True, label
@@ -525,13 +592,8 @@ async def _click_douyin_verify_button(page: Page) -> bool:
         root.locator('button:has-text("验证")'),
     ]
     for locator in candidates:
-        button = locator.first
-        try:
-            if await button.count() and await button.is_visible():
-                if await _native_click(page, button):
-                    return True
-        except Exception:
-            continue
+        if await _click_first_visible(page, locator, timeout_ms=0):
+            return True
     return await _click_visible_text(page, root, "验证", timeout_ms=8000)
 
 
@@ -591,46 +653,56 @@ async def douyin_form_cookie_gen(
         page = await context.new_page()
         try:
             await page.goto("https://creator.douyin.com/", wait_until="domcontentloaded", timeout=60000)
-            mode_tab = page.get_by_text(method_label, exact=True).first
-            await mode_tab.wait_for(state="visible", timeout=30000)
-            await mode_tab.click()
+            mode_tab = page.get_by_text(method_label, exact=True)
+            if not await _click_first_visible(page, mode_tab, timeout_ms=30000):
+                raise RuntimeError(f"未找到登录页「{method_label}」入口")
 
-            phone_input = page.locator('input[placeholder="请输入手机号"]').first
-            await phone_input.wait_for(state="visible", timeout=15000)
-            await phone_input.fill(phone)
+            phone_inputs = page.locator('input[placeholder="请输入手机号"]')
+            phone_length = await _fill_visible_input(
+                page, phone_inputs, phone, "手机号输入框"
+            )
+            douyin_logger.info(_msg("📱", f"登录页手机号已写入可见输入框，长度={phone_length}"))
 
             if auth_method == "password":
-                password_input = page.locator('input[placeholder="请输入密码"]').first
-                await password_input.wait_for(state="visible", timeout=15000)
-                await password_input.fill(password)
+                password_inputs = page.locator('input[placeholder="请输入密码"]')
+                await _fill_visible_input(
+                    page, password_inputs, password, "密码输入框"
+                )
                 douyin_logger.info(_msg("🔐", "已填写抖音密码登录表单"))
             else:
-                send_button = page.locator(
+                send_buttons = page.locator(
                     '#douyin_login_comp_button_input_id span:has-text("获取验证码")'
-                ).first
-                if not await send_button.count() or not await send_button.is_visible():
-                    send_button = page.get_by_text("获取验证码", exact=True).first
-                if not await send_button.count() or not await send_button.is_visible():
+                )
+                if await _first_visible_locator(send_buttons, timeout_ms=0) is None:
+                    send_buttons = page.get_by_text("获取验证码", exact=True)
+                if not await _click_first_visible(page, send_buttons, timeout_ms=10000):
                     raise RuntimeError("未找到登录页「获取验证码」按钮")
-                await send_button.click(force=True, timeout=10000)
                 douyin_logger.info(_msg("📤", "已触发抖音验证码登录短信"))
                 if not sms_code_callback:
                     raise RuntimeError("缺少短信验证码输入通道")
                 code = str(await sms_code_callback() or "").strip()
                 if not code:
                     raise RuntimeError("等待抖音登录验证码输入超时")
-                code_input = page.locator('input[placeholder="请输入验证码"]').first
-                await code_input.fill(code)
+                code_inputs = page.locator('input[placeholder="请输入验证码"]')
+                code_length = await _fill_visible_input(
+                    page, code_inputs, code, "验证码输入框"
+                )
+                douyin_logger.info(_msg("📝", f"验证码已写入可见输入框，长度={code_length}"))
 
-            login_button = page.locator("#douyin_login_comp_btn_id").first
-            if not await login_button.count() or not await login_button.is_visible():
-                login_button = page.get_by_text("登录", exact=True).first
-            await login_button.click(force=True, timeout=10000)
+            login_buttons = page.locator("#douyin_login_comp_btn_id")
+            if await _first_visible_locator(login_buttons, timeout_ms=0) is None:
+                login_buttons = page.get_by_role("button", name=re.compile(r"^登录$"))
+            if await _first_visible_locator(login_buttons, timeout_ms=0) is None:
+                login_buttons = page.get_by_text("登录", exact=True)
+            if not await _click_first_visible(page, login_buttons, timeout_ms=10000):
+                raise RuntimeError("未找到登录页「登录」按钮")
             douyin_logger.info(_msg("📝", f"已提交抖音{method_label}表单"))
 
             deadline = time.monotonic() + timeout_seconds
             last_url = page.url
+            poll_count = 0
             while time.monotonic() < deadline:
+                poll_count += 1
                 if await _is_douyin_login_completed(page):
                     await asyncio.sleep(2)
                     await context.storage_state(path=account_file)
@@ -648,6 +720,18 @@ async def douyin_form_cookie_gen(
                 if page.url != last_url:
                     douyin_logger.info(_msg("🔎", f"抖音{method_label}页面已跳转: {page.url}"))
                     last_url = page.url
+                if poll_count % 10 == 0:
+                    try:
+                        cookie_names = sorted({c.get("name") for c in await context.cookies()})
+                        douyin_logger.debug(
+                            "{}等待中: url={} auth_cookie_present={} cookie_count={}",
+                            method_label,
+                            page.url,
+                            bool(DOUYIN_AUTH_COOKIE_NAMES.intersection(cookie_names)),
+                            len(cookie_names),
+                        )
+                    except Exception:
+                        pass
                 await asyncio.sleep(0.8)
             else:
                 raise RuntimeError(

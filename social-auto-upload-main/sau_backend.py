@@ -21,6 +21,7 @@ from conf import BASE_DIR
 from db_utils import connect as db_connect
 import runtime_config
 from app_logging import logger, setup_request_logging
+from interactive_login import interactive_login_manager
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
 # 平台发布统一走 myUtils.platform_registry，避免这里重复维护平台清单。
@@ -90,6 +91,82 @@ def _guard_access_token():
 def health():
     """启动探针：不返回任何业务数据，便于 start.bat 判断服务是否就绪。"""
     return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
+
+
+@app.route('/interactiveLogin/start', methods=['POST'])
+def interactive_login_start():
+    """Open an isolated official Douyin window for interactive login."""
+    data = request.get_json(silent=True) or {}
+    account_name = str(data.get('id') or '').strip()[:64] or '抖音账号'
+    try:
+        account_id = int(data.get('account_id')) if data.get('account_id') else None
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "账号 ID 格式错误", "data": None}), 400
+    try:
+        session_id, session = interactive_login_manager.start(account_name, account_id)
+    except RuntimeError as exc:
+        return jsonify({"code": 429, "msg": str(exc), "data": None}), 429
+    return jsonify({
+        "code": 200,
+        "msg": "官方登录窗口已启动",
+        "data": {"session": session_id, **session.snapshot()},
+    }), 200
+
+
+@app.route('/interactiveLogin/status', methods=['GET'])
+def interactive_login_status():
+    session_id = str(request.args.get('id') or '').strip()[:64]
+    session = interactive_login_manager.get(session_id)
+    if session is None:
+        return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
+    return jsonify({"code": 200, "msg": None, "data": session.snapshot()}), 200
+
+
+@app.route('/interactiveLogin/frame', methods=['GET'])
+def interactive_login_frame():
+    session_id = str(request.args.get('id') or '').strip()[:64]
+    session = interactive_login_manager.get(session_id)
+    if session is None:
+        return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
+    frame = b''
+    for _ in range(20):
+        frame, _version = session.current_frame()
+        if frame:
+            break
+        time.sleep(0.1)
+    if not frame:
+        return Response(status=204)
+    response = Response(frame, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.route('/interactiveLogin/input', methods=['POST'])
+def interactive_login_input():
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('id') or '').strip()[:64]
+    session = interactive_login_manager.get(session_id)
+    if session is None:
+        return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
+    kind = str(data.get('kind') or '').strip().lower()
+    if kind not in {'click', 'mouse_down', 'mouse_move', 'mouse_up', 'text', 'key', 'scroll', 'reload'}:
+        return jsonify({"code": 400, "msg": "不支持的登录窗口操作", "data": None}), 400
+    try:
+        session.submit(kind, data.get('payload') if isinstance(data.get('payload'), dict) else {})
+    except RuntimeError as exc:
+        return jsonify({"code": 429, "msg": str(exc), "data": None}), 429
+    return jsonify({"code": 200, "msg": "已发送", "data": None}), 200
+
+
+@app.route('/interactiveLogin/stop', methods=['POST'])
+def interactive_login_stop():
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('id') or '').strip()[:64]
+    stopped = interactive_login_manager.stop(session_id)
+    if not stopped:
+        return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
+    return jsonify({"code": 200, "msg": "登录窗口已关闭", "data": None}), 200
 
 # 获取当前目录（假设 index.html 和 assets 在这里）
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -822,7 +899,7 @@ def login_verify():
             return jsonify({"code": 200, "msg": "验证信息已提交，请勿重复点击", "data": {"duplicate": True}}), 200
         active_verify_submissions[key] = {'signature': signature, 'sent_at': now}
 
-    verify_queue.put({"phone": phone, "code": code})
+    verify_queue.put({"phone": phone, "code": code, "stage": stage})
     return jsonify({"code": 200, "msg": "已提交验证信息", "data": {"duplicate": False}}), 200
 
 @app.route('/postVideo', methods=['POST'])
@@ -1163,6 +1240,9 @@ def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
     finally:
         if queue_id is not None:
             active_queues.pop(queue_id, None)
+            active_verify_queues.pop(queue_id, None)
+            with active_verify_lock:
+                active_verify_submissions.pop(queue_id, None)
             active_verify_queues.pop(queue_id, None)
             active_verify_submissions.pop(queue_id, None)
             logger.debug("清理队列: {}", queue_id)

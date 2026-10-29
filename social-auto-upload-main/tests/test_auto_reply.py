@@ -425,7 +425,11 @@ def test_ai_reply_with_sensitive_content_is_held_for_human(db, monkeypatch):
     assert message["delivery_status"] == "ready"
 
 
-def test_conversation_detail_after_returns_only_new_messages(db):
+def test_conversation_detail_after_returns_only_new_messages(db, monkeypatch):
+    # The route deliberately rejects contacts whose account is no longer
+    # connected.  This fixture owns only the operations DB, so declare the
+    # account it inserts as active rather than depending on the developer's DB.
+    monkeypatch.setattr(dm_ops, "active_account_pairs", lambda: [("小红书", "测试号")])
     app = Flask(__name__)
     app.register_blueprint(dm_ops.bp)
     client = app.test_client()

@@ -87,10 +87,10 @@
     <el-dialog
       v-model="dialogVisible"
       :title="reLoginMode ? '重新登录账号' : (dialogType === 'add' ? '添加账号' : '编辑账号')"
-      width="500px"
+      :width="interactiveLoginActive ? 'min(1080px, 94vw)' : '500px'"
       :close-on-click-modal="false"
-      :close-on-press-escape="!sseConnecting"
-      :show-close="!sseConnecting"
+      :close-on-press-escape="!sseConnecting && !interactiveLoginActive"
+      :show-close="!sseConnecting && !interactiveLoginActive"
     >
       <el-form :model="accountForm" label-width="80px" :rules="rules" ref="accountFormRef">
         <el-form-item label="平台" prop="platform">
@@ -120,41 +120,70 @@
           v-if="accountForm.platform === '抖音' && (dialogType === 'add' || reLoginMode)"
           label="登录方式"
         >
-          <el-radio-group v-model="loginMethod" :disabled="sseConnecting">
-            <el-radio-button label="qr">扫码登录</el-radio-button>
-            <el-radio-button label="sms">验证码登录</el-radio-button>
-            <el-radio-button label="password">密码登录</el-radio-button>
-          </el-radio-group>
+          <div class="official-login-note">
+            <strong>抖音官方安全登录窗口</strong>
+            <span>扫码、短信验证码、密码和滑块验证都在该窗口内完成，与直接打开抖音创作者中心一致。</span>
+          </div>
         </el-form-item>
-        <template
-          v-if="accountForm.platform === '抖音' && (dialogType === 'add' || reLoginMode) && loginMethod !== 'qr'"
-        >
-          <el-form-item label="手机号">
-            <el-input
-              v-model="loginPhone"
-              maxlength="11"
-              placeholder="请输入抖音绑定手机号"
-              :disabled="sseConnecting"
+
+        <div v-if="interactiveLoginActive || interactiveLoginStatus" class="interactive-login-panel">
+          <div class="interactive-login-status" :class="interactiveLoginStatus">
+            <span>{{ interactiveLoginMessage }}</span>
+            <el-button
+              v-if="interactiveLoginStatus === 'failed' || interactiveLoginStatus === 'expired'"
+              type="primary"
+              size="small"
+              @click="retryInteractiveLogin"
+            >重新打开</el-button>
+          </div>
+          <div
+            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            class="remote-browser-stage"
+            :class="{ dragging: remotePointerDown }"
+          >
+            <img
+              ref="interactiveImageRef"
+              v-if="interactiveFrameUrl"
+              :src="interactiveFrameUrl"
+              alt="抖音官方登录窗口"
+              draggable="false"
+              @pointerdown.prevent="startRemotePointer"
+              @pointermove.prevent="moveRemotePointer"
+              @pointerup.prevent="endRemotePointer"
+              @pointercancel="endRemotePointer"
+              @wheel.prevent="scrollRemoteBrowser"
             />
-          </el-form-item>
-          <el-form-item v-if="loginMethod === 'password'" label="登录密码">
+            <div v-else class="remote-browser-loading">
+              <el-icon class="is-loading"><Refresh /></el-icon>
+              <span>正在载入抖音官方登录页...</span>
+            </div>
+          </div>
+          <div
+            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            class="remote-browser-controls"
+          >
             <el-input
-              v-model="loginPassword"
-              type="password"
-              show-password
-              autocomplete="current-password"
-              placeholder="密码仅用于本次登录，不会保存"
-              :disabled="sseConnecting"
-              @keyup.enter="submitAccountForm"
-            />
-          </el-form-item>
-          <p v-if="loginMethod === 'sms' && !sseConnecting" class="direct-login-hint">
-            点击下方“确认”后，将通过抖音发送短信验证码，并打开登录浏览器；如出现安全验证，请在该浏览器中完成。
-          </p>
-        </template>
+              v-model="remoteInputText"
+              maxlength="128"
+              placeholder="先点击上方手机号或密码框，再在这里输入内容"
+              @keyup.enter="sendRemoteText"
+            >
+              <template #append>
+                <el-button @click="sendRemoteText">输入到登录框</el-button>
+              </template>
+            </el-input>
+            <div class="remote-key-row">
+              <el-button size="small" @click="sendRemoteKey('Tab')">Tab</el-button>
+              <el-button size="small" @click="sendRemoteKey('Backspace')">退格</el-button>
+              <el-button size="small" @click="sendRemoteKey('Enter')">Enter</el-button>
+              <el-button size="small" @click="reloadRemoteBrowser">刷新页面</el-button>
+              <span>滑块验证可直接在上方画面中拖动。</span>
+            </div>
+          </div>
+        </div>
         
         <!-- 二维码显示区域 -->
-        <div v-if="sseConnecting || loginStatus" class="qrcode-container">
+        <div v-if="!interactiveLoginActive && (sseConnecting || loginStatus)" class="qrcode-container">
           <div v-if="needSecondVerify && !loginStatus" class="verify-wrapper">
             <p class="qrcode-tip">
               {{ directSmsFlow ? '短信验证码已请求发送，请输入验证码完成登录' : '抖音要求短信二次验证，请按提示完成' }}
@@ -189,9 +218,11 @@
               {{ directSmsFlow ? '登录' : '提交验证' }}
             </el-button>
             <p class="verify-hint">
-              {{ directSmsFlow && loginStatus !== '500'
-                ? '若登录浏览器出现安全验证，请先在该浏览器中完成，完成后这里会自动确认登录。'
-                : '若长时间收不到短信，请确认该手机号已绑定当前抖音账号。' }}
+              {{ verifySubmitted
+                ? '验证码已提交，正在等待抖音确认登录。正常需要几秒钟；若平台弹出安全验证，请完成后再等待结果。'
+                : directSmsFlow && loginStatus !== '500'
+                  ? '若登录浏览器出现安全验证，请先在该浏览器中完成，完成后这里会自动确认登录。'
+                  : '若长时间收不到短信，请确认该手机号已绑定当前抖音账号。' }}
             </p>
           </div>
           <div v-else-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
@@ -228,19 +259,21 @@
           <el-button 
             type="primary" 
             @click="submitAccountForm" 
-            :loading="sseConnecting && !qrCodeData"
-            :disabled="sseConnecting"
+            :loading="interactiveLoginStarting || (sseConnecting && !qrCodeData)"
+            :disabled="sseConnecting || interactiveLoginActive"
           >
             {{
-              sseConnecting
+              interactiveLoginActive
+                ? '请在官方窗口完成登录'
+                : interactiveLoginStarting
+                  ? '正在打开官方窗口'
+                  : sseConnecting
                 ? (loginMethod === 'qr' ? (qrCodeData ? '等待扫码' : '获取二维码') : '登录中')
                 : (dialogType === 'edit' && !reLoginMode
                   ? '保存'
-                  : loginMethod === 'sms'
-                    ? '发送验证码并登录'
-                    : loginMethod === 'password'
-                      ? '登录'
-                      : '确认')
+                  : accountForm.platform === '抖音'
+                    ? '打开抖音官方登录窗口'
+                    : '确认')
             }}
           </el-button>
         </span>
@@ -257,7 +290,7 @@ import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'
-import { API_BASE, withToken } from '@/config'
+import { API_BASE, withToken, authHeaders } from '@/config'
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -445,6 +478,7 @@ const verifyStage = ref('phone')
 const verifyPhone = ref('')
 const verifyCode = ref('')
 const verifySubmitting = ref(false)
+const verifySubmitted = ref(false)
 const verifyCooldown = ref(0)
 const loginMethod = ref('qr')
 const loginPhone = ref('')
@@ -456,6 +490,20 @@ const currentPlatform = ref('')
 const currentAccountName = ref('')
 const currentAccountId = ref(null)
 let verifyCooldownTimer = null
+const interactiveLoginActive = ref(false)
+const interactiveLoginStarting = ref(false)
+const interactiveLoginStatus = ref('')
+const interactiveLoginMessage = ref('')
+const interactiveLoginId = ref('')
+const interactiveFrameUrl = ref('')
+const interactiveImageRef = ref(null)
+const remoteInputText = ref('')
+const remotePointerDown = ref(false)
+let interactiveFrameTimer = null
+let interactiveStatusTimer = null
+let interactiveFrameLoading = false
+let interactiveFrameObjectUrl = ''
+let remoteLastMoveAt = 0
 
 const clearVerifyCooldown = () => {
   if (verifyCooldownTimer) {
@@ -486,6 +534,7 @@ const handleLoginPlatformChange = (platform) => {
 
 // 添加账号
 const handleAddAccount = () => {
+  resetInteractiveLogin()
   const currentTab = accountTabs.find(item => item.name === activeTab.value)
   const defaultPlatform = currentTab && currentTab.name !== 'all' ? currentTab.label : ''
   dialogType.value = 'add'
@@ -505,6 +554,7 @@ const handleAddAccount = () => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  verifySubmitted.value = false
   clearVerifyCooldown()
   loginMethod.value = 'qr'
   loginPhone.value = ''
@@ -626,6 +676,7 @@ const handleUploadCookie = (row) => {
 
 // 重新登录账号
 const handleReLogin = (row) => {
+  resetInteractiveLogin()
   // 设置表单信息
   dialogType.value = 'edit'
   reLoginMode.value = true
@@ -645,6 +696,7 @@ const handleReLogin = (row) => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  verifySubmitted.value = false
   clearVerifyCooldown()
   loginMethod.value = 'qr'
   loginPhone.value = ''
@@ -675,6 +727,7 @@ const closeSSEConnection = () => {
 }
 
 const cancelLogin = () => {
+  closeInteractiveLogin()
   closeSSEConnection()
   sseConnecting.value = false
   qrCodeData.value = ''
@@ -684,6 +737,7 @@ const cancelLogin = () => {
   verifyPhone.value = ''
   verifyCode.value = ''
   verifySubmitting.value = false
+  verifySubmitted.value = false
   clearVerifyCooldown()
   loginMethod.value = 'qr'
   loginPhone.value = ''
@@ -693,6 +747,216 @@ const cancelLogin = () => {
   currentLoginId.value = ''
   reLoginMode.value = false
   dialogVisible.value = false
+}
+
+const clearInteractiveTimers = () => {
+  if (interactiveFrameTimer) {
+    clearInterval(interactiveFrameTimer)
+    interactiveFrameTimer = null
+  }
+  if (interactiveStatusTimer) {
+    clearInterval(interactiveStatusTimer)
+    interactiveStatusTimer = null
+  }
+}
+
+const releaseInteractiveFrame = () => {
+  if (interactiveFrameObjectUrl) {
+    URL.revokeObjectURL(interactiveFrameObjectUrl)
+    interactiveFrameObjectUrl = ''
+  }
+  interactiveFrameUrl.value = ''
+}
+
+const resetInteractiveLogin = () => {
+  clearInteractiveTimers()
+  releaseInteractiveFrame()
+  interactiveLoginActive.value = false
+  interactiveLoginStarting.value = false
+  interactiveLoginStatus.value = ''
+  interactiveLoginMessage.value = ''
+  interactiveLoginId.value = ''
+  remoteInputText.value = ''
+  remotePointerDown.value = false
+  interactiveFrameLoading = false
+}
+
+const closeInteractiveLogin = (notifyServer = true) => {
+  const sessionId = interactiveLoginId.value
+  clearInteractiveTimers()
+  releaseInteractiveFrame()
+  if (notifyServer && sessionId && interactiveLoginStatus.value !== 'success') {
+    http.post('/interactiveLogin/stop', { id: sessionId }, { silent: true }).catch(() => {})
+  }
+  resetInteractiveLogin()
+}
+
+const refreshInteractiveFrame = async () => {
+  if (!interactiveLoginId.value || interactiveFrameLoading) return
+  const status = interactiveLoginStatus.value
+  if (status !== 'running' && status !== 'starting') return
+  interactiveFrameLoading = true
+  try {
+    const response = await fetch(
+      `${API_BASE}/interactiveLogin/frame?id=${encodeURIComponent(interactiveLoginId.value)}&t=${Date.now()}`,
+      { headers: authHeaders(), cache: 'no-store' }
+    )
+    if (response.ok && response.status === 200) {
+      const blob = await response.blob()
+      if (blob.size > 0) {
+        const nextUrl = URL.createObjectURL(blob)
+        if (interactiveFrameObjectUrl) URL.revokeObjectURL(interactiveFrameObjectUrl)
+        interactiveFrameObjectUrl = nextUrl
+        interactiveFrameUrl.value = nextUrl
+      }
+    }
+  } catch (error) {
+    // A later poll will recover from a transient frame timeout.
+  } finally {
+    interactiveFrameLoading = false
+  }
+}
+
+const completeInteractiveLogin = () => {
+  if (interactiveLoginStatus.value === 'success') return
+  interactiveLoginStatus.value = 'success'
+  interactiveLoginMessage.value = '登录成功，账号和 Cookie 已保存'
+  clearInteractiveTimers()
+  setTimeout(async () => {
+    dialogVisible.value = false
+    interactiveLoginActive.value = false
+    reLoginMode.value = false
+    await fetchAccounts()
+    ElMessage.success(dialogType.value === 'edit' ? '重新登录成功' : '账号添加成功')
+  }, 900)
+}
+
+const pollInteractiveLogin = async () => {
+  if (!interactiveLoginId.value) return
+  try {
+    const response = await http.get(
+      '/interactiveLogin/status',
+      { id: interactiveLoginId.value },
+      { silent: true }
+    )
+    const data = response.data || {}
+    interactiveLoginMessage.value = data.message || interactiveLoginMessage.value
+    interactiveLoginStatus.value = data.status || interactiveLoginStatus.value
+    if (data.status === 'success') {
+      completeInteractiveLogin()
+    } else if (data.status === 'failed' || data.status === 'expired') {
+      clearInteractiveTimers()
+      interactiveLoginMessage.value = data.message || '官方登录窗口异常退出'
+      ElMessage.error(interactiveLoginMessage.value)
+    }
+  } catch (error) {
+    if (error?.response?.status === 404) {
+      clearInteractiveTimers()
+      interactiveLoginStatus.value = 'failed'
+      interactiveLoginMessage.value = '登录窗口已关闭，请重新打开'
+    }
+  }
+}
+
+const startInteractiveLogin = async (name, accountId = null) => {
+  closeInteractiveLogin()
+  interactiveLoginActive.value = true
+  interactiveLoginStarting.value = true
+  interactiveLoginStatus.value = 'starting'
+  interactiveLoginMessage.value = '正在打开抖音官方登录窗口'
+  currentAccountName.value = name
+  currentAccountId.value = accountId
+  try {
+    const response = await http.post('/interactiveLogin/start', {
+      id: name,
+      account_id: accountId
+    })
+    const data = response.data || {}
+    interactiveLoginId.value = data.session || ''
+    interactiveLoginStatus.value = data.status || 'running'
+    interactiveLoginMessage.value = data.message || '请在官方窗口完成登录'
+    interactiveFrameTimer = setInterval(refreshInteractiveFrame, 650)
+    interactiveStatusTimer = setInterval(pollInteractiveLogin, 900)
+    refreshInteractiveFrame()
+  } catch (error) {
+    interactiveLoginStatus.value = 'failed'
+    interactiveLoginMessage.value = error?.message || '打开抖音官方登录窗口失败'
+  } finally {
+    interactiveLoginStarting.value = false
+  }
+}
+
+const retryInteractiveLogin = () => {
+  startInteractiveLogin(
+    currentAccountName.value || accountForm.name,
+    currentAccountId.value || (reLoginMode.value ? accountForm.id : null)
+  )
+}
+
+const sendRemoteInput = (kind, payload = {}) => {
+  if (!interactiveLoginId.value || interactiveLoginStatus.value !== 'running') return
+  http.post(
+    '/interactiveLogin/input',
+    { id: interactiveLoginId.value, kind, payload },
+    { silent: true }
+  ).catch(() => {})
+}
+
+const remotePoint = (event) => {
+  const image = interactiveImageRef.value
+  if (!image) return { x: 0, y: 0 }
+  const rect = image.getBoundingClientRect()
+  const naturalWidth = image.naturalWidth || 1280
+  const naturalHeight = image.naturalHeight || 900
+  const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight)
+  const contentWidth = naturalWidth * scale
+  const contentHeight = naturalHeight * scale
+  const offsetX = (rect.width - contentWidth) / 2
+  const offsetY = (rect.height - contentHeight) / 2
+  return {
+    x: Math.max(0, Math.min(1279, ((event.clientX - rect.left - offsetX) / contentWidth) * 1280)),
+    y: Math.max(0, Math.min(899, ((event.clientY - rect.top - offsetY) / contentHeight) * 900))
+  }
+}
+
+const startRemotePointer = (event) => {
+  remotePointerDown.value = true
+  event.currentTarget?.setPointerCapture?.(event.pointerId)
+  sendRemoteInput('mouse_down', remotePoint(event))
+}
+
+const moveRemotePointer = (event) => {
+  if (!remotePointerDown.value) return
+  const now = Date.now()
+  if (now - remoteLastMoveAt < 45) return
+  remoteLastMoveAt = now
+  sendRemoteInput('mouse_move', remotePoint(event))
+}
+
+const endRemotePointer = (event) => {
+  if (!remotePointerDown.value) return
+  remotePointerDown.value = false
+  sendRemoteInput('mouse_move', remotePoint(event))
+  sendRemoteInput('mouse_up', remotePoint(event))
+}
+
+const scrollRemoteBrowser = (event) => {
+  sendRemoteInput('scroll', { deltaY: event.deltaY })
+}
+
+const sendRemoteText = () => {
+  const text = remoteInputText.value
+  if (!text) return
+  sendRemoteInput('text', { text })
+  remoteInputText.value = ''
+}
+
+const sendRemoteKey = (key) => {
+  sendRemoteInput('key', { key })
+}
+
+const reloadRemoteBrowser = () => {
+  sendRemoteInput('reload')
 }
 
 // 建立SSE连接
@@ -882,6 +1146,9 @@ const submitSecondVerify = async (stage) => {
     if (stage === 'phone') {
       ElMessage.info('手机号已提交，正在请求抖音发送验证码')
       startVerifyCooldown(60)
+    } else {
+      verifySubmitted.value = true
+      ElMessage.success('验证码已提交，正在等待抖音确认')
     }
   } catch (error) {
     // 请求工具已经统一弹出错误提示
@@ -903,26 +1170,13 @@ const submitAccountForm = () => {
           ).length
           accountForm.name = `${accountForm.platform}账号${samePlatformCount + 1}`
         }
-        const authMethod = accountForm.platform === '抖音' ? loginMethod.value : 'qr'
-        const normalizedPhone = loginPhone.value.replace(/[\s-]/g, '').replace(/^\+?86/, '')
-        if (authMethod === 'sms' || authMethod === 'password') {
-          if (!/^1\d{10}$/.test(normalizedPhone)) {
-            ElMessage.warning('请输入正确的 11 位手机号')
-            return
-          }
-          if (authMethod === 'password' && !loginPassword.value) {
-            ElMessage.warning('请输入登录密码')
-            return
-          }
-          loginPhone.value = normalizedPhone
+        const accountId = reLoginMode.value ? accountForm.id : null
+        if (accountForm.platform === '抖音') {
+          await startInteractiveLogin(accountForm.name, accountId)
+        } else {
+          // 其他平台继续使用现有二维码 SSE 登录流程。
+          await connectSSE(accountForm.platform, accountForm.name, accountId, { authMethod: 'qr' })
         }
-        // 建立SSE连接；重新登录时沿用已有账号 id
-        await connectSSE(
-          accountForm.platform,
-          accountForm.name,
-          reLoginMode.value ? accountForm.id : null,
-          { authMethod }
-        )
       } else {
         // 编辑账号逻辑
         try {
@@ -963,6 +1217,7 @@ const submitAccountForm = () => {
 
 // 组件卸载前关闭SSE连接
 onBeforeUnmount(() => {
+  closeInteractiveLogin()
   clearVerifyCooldown()
   closeSSEConnection()
 })
@@ -1045,6 +1300,95 @@ onBeforeUnmount(() => {
     &:hover {
       transform: scale(1.05);
       box-shadow: 0 0 8px rgba(0, 0, 0, 0.15);
+    }
+  }
+
+  .official-login-note {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    line-height: 1.55;
+    color: #606266;
+    font-size: 12px;
+
+    strong {
+      color: #303133;
+      font-size: 13px;
+    }
+  }
+
+  .interactive-login-panel {
+    margin: 8px 0 18px;
+    border: 1px solid #dcdfe6;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #f5f7fa;
+
+    .interactive-login-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 38px;
+      padding: 7px 12px;
+      color: #606266;
+      font-size: 13px;
+      background: #fff;
+      border-bottom: 1px solid #ebeef5;
+
+      &.success { color: #529b2e; }
+      &.failed, &.expired { color: #c45656; }
+    }
+
+    .remote-browser-stage {
+      position: relative;
+      width: 100%;
+      min-height: 360px;
+      background: #111827;
+      user-select: none;
+      touch-action: none;
+      cursor: default;
+
+      &.dragging { cursor: grabbing; }
+
+      img {
+        display: block;
+        width: 100%;
+        height: auto;
+        max-height: 66vh;
+        margin: 0 auto;
+        object-fit: contain;
+        pointer-events: auto;
+      }
+    }
+
+    .remote-browser-loading {
+      height: 420px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: #dcdfe6;
+
+      .el-icon { animation: rotate 1s linear infinite; }
+    }
+
+    .remote-browser-controls {
+      padding: 10px 12px 12px;
+      background: #fff;
+      border-top: 1px solid #ebeef5;
+
+      .remote-key-row {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+        color: #909399;
+        font-size: 12px;
+
+        .el-button + .el-button { margin-left: 0; }
+      }
     }
   }
 
