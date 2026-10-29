@@ -54,10 +54,12 @@ def friendly_error(exc: Exception) -> str:
     """把底层异常转换成适合展示给用户的中文提示。"""
     text = str(exc).strip() or exc.__class__.__name__
     lower = text.lower()
+    if "target page, context or browser has been closed" in lower:
+        if "xserver" in lower or "x server" in lower or "$display" in lower:
+            return "服务器没有图形界面，请在无头模式或 Xvfb 环境中启动浏览器"
+        return "平台页面意外关闭，请稍后重试"
     if "executable doesn't exist" in lower or "browsertype.launch" in lower:
         return "Playwright 浏览器未安装，请执行 playwright install chromium"
-    if "target page, context or browser has been closed" in lower:
-        return "平台页面意外关闭，请稍后重试"
     return text[:500]
 
 

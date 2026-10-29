@@ -478,7 +478,13 @@ async def douyin_form_cookie_gen(
 ):
     """通过创作者中心的验证码或密码方式登录并保存 Cookie。"""
     if headless is None:
-        headless = os.environ.get("DOUYIN_FORM_LOGIN_HEADLESS", "false").lower() in ("1", "true", "yes")
+        configured = os.environ.get("DOUYIN_FORM_LOGIN_HEADLESS")
+        if configured is None:
+            # 服务器容器通常没有 X Server；短信/密码登录由网页内表单完成，
+            # 不依赖本机桌面，因此在无 DISPLAY 的 Unix 环境默认无头启动。
+            headless = os.name != "nt" and not os.environ.get("DISPLAY")
+        else:
+            headless = configured.lower() in ("1", "true", "yes")
     method_label = "验证码登录" if auth_method == "sms" else "密码登录"
     result = _build_login_result(False, "failed", f"{method_label}失败", account_file)
     async with async_playwright() as playwright:

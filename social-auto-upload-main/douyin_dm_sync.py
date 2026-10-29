@@ -134,7 +134,15 @@ SCAN_SCRIPT = r"""
 (limit) => {
   const rows = [];
   const timePattern = /^(刚刚|\d{1,2}:\d{2}|昨天|前天|星期[一二三四五六日天]|\d{1,2}月\d{1,2}日|\d{2}-\d{2}|20\d{2}-\d{2}-\d{2})$/;
-  const elements = Array.from(document.querySelectorAll('.semi-list-item'));
+  // 选中会话后 React 会保留一组隐藏旧行。它们可能与新行复用同一个
+  // conversation，但 DOM 文本已经错位，因此必须让可见行先被采集。
+  const elements = Array.from(document.querySelectorAll('.semi-list-item'))
+    .map((el, index) => {
+      const rect = el.getBoundingClientRect();
+      return {el, index, visible: rect.width > 1 && rect.height > 1};
+    })
+    .sort((a, b) => Number(b.visible) - Number(a.visible) || a.index - b.index)
+    .map(entry => entry.el);
   for (const el of elements.slice(0, Math.max(1, Number(limit) || 20))) {
     const header = el.querySelector('.semi-list-item-body-header');
     if (!header) continue;
@@ -152,9 +160,14 @@ SCAN_SCRIPT = r"""
     const badgeText = String(el.querySelector('.semi-badge-count')?.innerText || '').trim();
     const unread = Number.parseInt(badgeText, 10) || 0;
     const lines = String(el.innerText || '').split('\n').map(line => line.trim()).filter(Boolean);
+    const rect = el.getBoundingClientRect();
+    const visible = rect.width > 1 && rect.height > 1;
     const timeIndex = lines.findIndex(line => timePattern.test(line));
     const nameLines = lines.slice(0, timeIndex >= 0 ? timeIndex : lines.length)
       .filter(line => !/^\d{1,3}$/.test(line));
+    if (badgeText && nameLines.length && nameLines[0].startsWith(badgeText)) {
+      nameLines[0] = nameLines[0].slice(badgeText.length).trim();
+    }
     const rawName = String(
       conversation.coreInfo?.name || conversation.coreInfo?.nickname ||
       conversation.groupName || conversation.name || ''
@@ -180,7 +193,8 @@ SCAN_SCRIPT = r"""
       cid: String(conversation.id || conversation.shortId || ''),
       short_id: String(conversation.shortId || ''),
       sec_uid: String(conversation.secUid || ''),
-      name: rawName || nameLines[0] || '',
+      name: visible ? (nameLines[0] || rawName) : (rawName || nameLines[0]),
+      name_visible: visible,
       display_time: timeIndex >= 0 ? lines[timeIndex] : '',
       preview: preview.slice(0, 300),
       created_at: createdAt,
@@ -1057,6 +1071,10 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
                 continue
         collapsed_rows.append(row)
     for row in collapsed_rows:
+        if row.get("name_visible") and _clean_text(row.get("name"), 120):
+            dm_ops.repair_contact_nickname(
+                "抖音", name, _stable_user_id(row.get("cid")), _display_name(row),
+            )
         if row.get("history_synced"):
             continue
         item, reason = _row_to_item(row, account, history_hours=history_hours)

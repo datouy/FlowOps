@@ -1220,6 +1220,31 @@ def repair_message_timestamp(
     return True
 
 
+def repair_contact_nickname(
+    platform: str, account: str, external_user_id: str, nickname: str,
+) -> int:
+    """用平台可见会话名称修正重复消息无法触发的旧联系人名称。"""
+    external = _clean(external_user_id, 120)
+    name = _clean(nickname, 80)
+    if not external or not name:
+        return 0
+    updated = 0
+    with get_conn() as c:
+        contacts = c.execute("""SELECT id FROM dm_contacts
+            WHERE platform=? AND account=? AND external_user_id=?""",
+            (_clean(platform, 40), _clean(account, 120), external)).fetchall()
+        for contact in contacts:
+            contact_id = contact["id"]
+            c.execute(
+                "UPDATE dm_contacts SET nickname=?,updated_at=? WHERE id=?",
+                (name, _now(), contact_id),
+            )
+            c.execute("""UPDATE messages SET author=?
+                WHERE contact_id=? AND direction='inbound'""", (name, contact_id))
+            updated += 1
+    return updated
+
+
 def ingest_message(item: dict, allow_auto_reply: bool = True,
                    force_draft: bool = False) -> dict:
     content = _clean(item.get("content"), 4000)
