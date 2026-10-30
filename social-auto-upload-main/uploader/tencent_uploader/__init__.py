@@ -1,9 +1,9 @@
-from pathlib import Path
+"""视频号上传器入口。
 
-from conf import BASE_DIR
-
-Path(BASE_DIR / "cookies" / "tencent_uploader").mkdir(exist_ok=True)
-
+Cookie 目录的创建已经下沉到 ``uploader.tencent_uploader.main``（在模块顶部
+执行），这样这里就能保持"import 位于文件顶部"的规范，
+不需要用 noqa 压制 E402。
+"""
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_IMMEDIATE
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_SCHEDULED
 from uploader.tencent_uploader.main import TencentBaseUploader

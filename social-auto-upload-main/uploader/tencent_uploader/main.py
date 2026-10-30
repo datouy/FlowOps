@@ -26,6 +26,12 @@ TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
+# 视频号的 Cookie 目录必须在任何写文件动作之前建好。
+# 原先这段在 uploader/tencent_uploader/__init__.py 里（import 子模块之前执行），
+# 挪到这里后 __init__.py 就能保持"import 在文件顶部"的规范。
+# 用 parents=True + exist_ok=True，重复调用安全。
+Path(BASE_DIR / "cookies" / "tencent_uploader").mkdir(parents=True, exist_ok=True)
+
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"

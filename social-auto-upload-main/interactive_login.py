@@ -4,6 +4,10 @@ The server renders a real Chromium window and streams compressed screenshots
 to the account-management dialog.  Mouse and keyboard commands are replayed in
 that browser, so the user works with the platform's official login panel and
 the server can still persist the resulting cookie.
+
+抖音和小红书共用这套机制：抖音走创作者中心官方表单，小红书走创作服务平台
+官方登录页。视频号的扫码页结构与两者都不同（微信跨域 iframe + long-poll），
+见 myUtils/login.py 里专门的实现。
 """
 
 from __future__ import annotations
@@ -35,8 +39,61 @@ DOUYIN_AUTH_COOKIE_NAMES = {
     "uid_tt_ss",
 }
 
+# 小红书登录成功后一定会带上 web_session。
+#
+# 注意：a1 / gid / webId / webBuild 在**未登录**时也会被下发（实测匿名访问
+# creator 登录页就有），把它们当成功标志会 100% 假阳性——窗口刚打开就
+# 直接报"登录成功"。只有 web_session 才代表真正登录。
+XHS_AUTH_COOKIE_NAMES = {
+    "web_session",
+}
 
-class InteractiveDouyinLogin:
+# 视频号登录成功后一定会带这些会话 cookie。
+# 微信开放平台的授权 cookie，登录成功后由 oauth-callback 写入。
+TENCENT_AUTH_COOKIE_NAMES = {
+    "sessionid",
+    "sessionid_ss",
+    "wxuin",
+    "wxpluginkey",
+    "wxruskey",
+    "wxsid",
+    "devicetype",
+    "mon_wechat",
+}
+
+# 前端停止轮询多久后，认为这个登录窗口已被用户遗弃并主动回收。
+# 前端正常情况下每 1 秒就会拉一次帧，所以 90 秒完全没动静必然是被遗弃了。
+ABANDONED_SESSION_SECONDS = 90.0
+
+# 平台 -> (账号类型编号, 登录地址, 官方表单定位器)
+#
+# login_form 为空表示该平台靠扫码登录，没有可填写的表单。
+# video_account_urls 用来判定"已登录"：登录成功后页面会跳到平台首页。
+PLATFORM_LOGIN_TARGETS = {
+    "douyin": {
+        "type": 3,
+        "url": "https://creator.douyin.com/",
+        "login_form": 'input[placeholder="请输入手机号"]',
+    },
+    "xiaohongshu": {
+        "type": 1,
+        "url": "https://creator.xiaohongshu.com/login?source=&redirectReason=401",
+        "login_form": 'input[placeholder*="手机号"]',
+    },
+    "tencent": {
+        "type": 2,
+        # 用真实的登录页地址，直达微信扫码登录界面。
+        "url": "https://channels.weixin.qq.com/login.html",
+        "login_form": "",
+        # 登录成功后微信会跳到 oauth-callback，再由平台跳回首页
+        "login_success_urls": (
+            "https://channels.weixin.qq.com/platform",
+        ),
+    },
+}
+
+
+class InteractivePlatformLogin:
     """One isolated Chromium login session with a small command queue."""
 
     def __init__(
@@ -44,19 +101,25 @@ class InteractiveDouyinLogin:
         session_id: str,
         account_name: str,
         account_id: int | None,
+        platform: str = "douyin",
         timeout_seconds: float = 300,
     ):
         self.session_id = session_id
         self.account_name = account_name[:64]
         self.account_id = account_id
+        self.platform = platform if platform in PLATFORM_LOGIN_TARGETS else "douyin"
         self.timeout_seconds = timeout_seconds
         self.created_at = time.monotonic()
         self.finished_at: float | None = None
+        # 最后一次被前端访问（拉帧/查状态）的时间，用于识别被遗弃的会话。
+        self.last_seen_at = time.monotonic()
         self.status = "starting"
-        self.message = "正在打开抖音官方登录窗口"
+        self.message = f"正在打开{self._platform_label}官方登录窗口"
         self.frame = b""
         self.frame_version = 0
         self.cookie_name = ""
+        # 小红书官方 user 接口返回的登录用户信息（登录成功后缓存）
+        self._xhs_user: dict | None = None
         self.commands: queue.Queue = queue.Queue(maxsize=256)
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
@@ -64,6 +127,26 @@ class InteractiveDouyinLogin:
         self.pointer_last: tuple[float, float] | None = None
         self.pointer_moved = False
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def _platform_label(self) -> str:
+        return {
+            "douyin": "抖音",
+            "xiaohongshu": "小红书",
+            "tencent": "视频号",
+        }.get(self.platform, "抖音")
+
+    @property
+    def _auth_cookie_names(self) -> set[str]:
+        if self.platform == "xiaohongshu":
+            return XHS_AUTH_COOKIE_NAMES
+        if self.platform == "tencent":
+            return TENCENT_AUTH_COOKIE_NAMES
+        return DOUYIN_AUTH_COOKIE_NAMES
+
+    @property
+    def _platform_type(self) -> int:
+        return PLATFORM_LOGIN_TARGETS[self.platform]["type"]
 
     def start(self) -> None:
         self.thread.start()
@@ -91,6 +174,7 @@ class InteractiveDouyinLogin:
 
     def snapshot(self) -> dict:
         with self.lock:
+            self.last_seen_at = time.monotonic()
             return {
                 "status": self.status,
                 "message": self.message,
@@ -104,6 +188,7 @@ class InteractiveDouyinLogin:
 
     def current_frame(self) -> tuple[bytes, int]:
         with self.lock:
+            self.last_seen_at = time.monotonic()
             return self.frame, self.frame_version
 
     def _record_account(self, context) -> None:
@@ -112,21 +197,71 @@ class InteractiveDouyinLogin:
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
         context.storage_state(path=str(cookie_path))
 
+        platform_type = self._platform_type
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
             if self.account_id:
                 cursor.execute(
                     "UPDATE user_info SET type=?, filePath=?, userName=?, status=1 WHERE id=?",
-                    (3, cookie_name, self.account_name, self.account_id),
+                    (platform_type, cookie_name, self.account_name, self.account_id),
                 )
             if not self.account_id or cursor.rowcount == 0:
                 cursor.execute(
                     "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
-                    (3, cookie_name, self.account_name, 1),
+                    (platform_type, cookie_name, self.account_name, 1),
                 )
             conn.commit()
         with self.lock:
             self.cookie_name = cookie_name
+
+    def _recheck_tencent_accounts(self) -> list[str]:
+        """视频号登录成功后复检全部视频号账号并回写状态。
+
+        同一个管理员微信再次扫码登录后，旧网页会话可能被平台挤下线；
+        如果只更新当前账号，其它账号会等到下次巡检才变成"异常"，
+        用户看到的就是"登录完莫名其妙状态异常"。这里立即复检，
+        把刚失效的账号名单直接反馈给用户。
+        """
+        import asyncio
+
+        from myUtils.auth import check_cookies_concurrently
+
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        try:
+            with db_connect(db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, filePath, userName FROM user_info WHERE type=2"
+                ).fetchall()
+        except Exception as exc:
+            logger.warning("视频号登录后读取账号列表失败: {}", exc)
+            return []
+        if not rows:
+            return []
+        try:
+            flags = asyncio.run(
+                check_cookies_concurrently(
+                    [(2, row[1]) for row in rows], max_concurrent=2
+                )
+            )
+        except Exception as exc:
+            logger.warning("视频号登录后复检失败: {}", exc)
+            return []
+        updates = []
+        dead_names = []
+        for index, row in enumerate(rows):
+            alive = bool(flags.get(index, False))
+            updates.append((1 if alive else 0, row[0]))
+            if not alive:
+                dead_names.append(row[2] or f"账号{row[0]}")
+        try:
+            with db_connect(db_path) as conn:
+                conn.executemany(
+                    "UPDATE user_info SET status=? WHERE id=?", updates
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.warning("视频号登录后状态回写失败: {}", exc)
+        return dead_names
 
     def _launch_browser(self, playwright):
         configured = os.environ.get("INTERACTIVE_LOGIN_HEADLESS")
@@ -298,6 +433,103 @@ class InteractiveDouyinLogin:
             return
         raise ValueError(f"unsupported interactive login command: {kind}")
 
+    def _is_logged_in(self, context, page=None) -> bool:
+        """判断是否已真正登录。
+
+        cookie 判定是主路径；小红书额外用官方 user 接口做交叉验证，
+        因为匿名访客也会拿到 a1/gid/webId 这类 cookie，只看 cookie 容易误判。
+        视频号反过来：URL 跳转是主判据，因为微信授权 cookie 名字会随版本变动，
+        等 cookie 反而可能漏判成功。
+        """
+        cookies = context.cookies()
+        names = {
+            cookie.get("name")
+            for cookie in cookies
+            if cookie.get("value")
+        }
+
+        if self.platform == "tencent":
+            # 微信扫码成功后，主框架会经 oauth-callback 跳回平台首页。
+            # 只要离开 login.html 就认为流程走完了。
+            if page is None:
+                return False
+            current = page.url or ""
+            if "/login" in current or "oauth-callback" in current:
+                return False
+            success_urls = PLATFORM_LOGIN_TARGETS["tencent"].get("login_success_urls", ())
+            if any(current.startswith(prefix) for prefix in success_urls):
+                return True
+            return "/platform" in current
+
+        if not (names & self._auth_cookie_names):
+            return False
+
+        if self.platform == "xiaohongshu":
+            # 匿名访客不会有 web_session，但保险起见再验一次官方接口。
+            if self._xhs_user is not None:
+                return True
+            return self._probe_xhs_user(context)
+        return True
+
+    def _center_tencent_qrcode(self, page) -> None:
+        """把视频号登录卡片移到视口中央，让二维码清晰可见。
+
+        实测 1280 宽的视口下，二维码 iframe 落在 x=934（宽度只有 208），
+        挤在右边缘；推流给用户后几乎看不清。把整个 .login-qrcode-wrap
+        平移到水平居中，扫码体验立刻正常。
+        """
+        try:
+            moved = page.evaluate(
+                """() => {
+                    const wrap = document.querySelector('div.login-qrcode-wrap');
+                    if (!wrap) return null;
+                    const before = wrap.getBoundingClientRect();
+                    // 把卡片整体左移，使二维码落在视口水平中心
+                    const targetCenter = window.innerWidth / 2;
+                    const shift = (before.left + before.width / 2) - targetCenter;
+                    if (Math.abs(shift) < 8) return { moved: false, shift: 0 };
+                    wrap.style.position = 'fixed';
+                    wrap.style.left = '50%';
+                    wrap.style.top = '50%';
+                    wrap.style.transform =
+                        'translate(-50%, -50%) translateX(' + (-shift) + 'px)';
+                    wrap.style.zIndex = '99999';
+                    const after = wrap.getBoundingClientRect();
+                    return {
+                        moved: true,
+                        shift: shift,
+                        left: after.left,
+                        top: after.top,
+                        width: after.width,
+                        height: after.height,
+                    };
+                }"""
+            )
+            logger.debug("视频号二维码居中: {}", moved)
+        except Exception as exc:
+            logger.warning("视频号二维码居中失败: {}", exc)
+
+    def _probe_xhs_user(self, context) -> bool:
+        """调用小红书官方 user 接口确认登录态，返回是否已登录。"""
+        try:
+            response = context.request.get(
+                "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
+                headers={"Cookie": "; ".join(
+                    f"{c['name']}={c['value']}" for c in context.cookies()
+                )},
+                timeout=15000,
+            )
+            if not response.ok:
+                return False
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict) and not data.get("guest") and data.get("user_id"):
+                self._xhs_user = data
+                return True
+        except Exception:
+            return False
+        return False
+
     def _run(self) -> None:
         browser = None
         context = None
@@ -320,27 +552,52 @@ class InteractiveDouyinLogin:
                     context.add_init_script(path=str(stealth_path))
                 page = context.new_page()
                 page.on("dialog", lambda dialog: dialog.dismiss())
+
+                target = PLATFORM_LOGIN_TARGETS[self.platform]
                 page.goto(
-                    "https://creator.douyin.com/",
+                    target["url"],
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
                 # The landing animation can finish before the login card is
                 # painted.  Wait for the real official form before exposing the
                 # first frame so users never see an empty background.
-                login_form = page.locator('input[placeholder="请输入手机号"]').first
-                login_form.wait_for(state="visible", timeout=60000)
-                # Douyin's decorative canvas can widen the document to 4000px
-                # while the responsive card stays around the existing viewport
-                # width.  Center the official card before streaming frames.
-                login_form.scroll_into_view_if_needed(timeout=10000)
-                logger.debug(
-                    "交互登录页已定位: scrollX={} box={}",
-                    page.evaluate("() => scrollX"),
-                    login_form.bounding_box(),
-                )
+                login_form = page.locator(target["login_form"]).first if target["login_form"] else None
+                try:
+                    if login_form is not None:
+                        login_form.wait_for(state="visible", timeout=45000)
+                except Exception:
+                    # 官方页可能改版或直接落到扫码页；只要页面渲染出来就继续，
+                    # 后续靠 cookie 判定登录成功，不因为定位不到表单就失败。
+                    logger.warning(
+                        "未定位到{}官方登录表单，继续等待登录",
+                        self._platform_label,
+                    )
+                    time.sleep(1.5)
+                else:
+                    # 装饰性 canvas 会把文档撑到 4000px 宽，而响应式卡片
+                    # 仍停留在原视口宽度。先把官方卡片滚到可见区域再推流。
+                    if login_form is not None:
+                        try:
+                            login_form.scroll_into_view_if_needed(timeout=10000)
+                        except Exception:
+                            pass
+                        logger.debug(
+                            "交互登录页已定位: scrollX={} box={}",
+                            page.evaluate("() => scrollX"),
+                            login_form.bounding_box(),
+                        )
+
+                if self.platform == "tencent":
+                    # 视频号登录页的二维码 iframe 位于 x≈934，宽度 1280 视口下
+                    # 几乎贴着右边缘，用户在对话框里根本看不清。
+                    # 把整个登录卡片挪到画面中央再推流。
+                    self._center_tencent_qrcode(page)
+
                 time.sleep(0.8)
-                self._set_state("running", "请在上方抖音官方窗口完成登录")
+                self._set_state(
+                    "running", f"请在上方{self._platform_label}官方窗口完成登录"
+                )
                 last_frame_at = 0.0
 
                 while not self.stop_event.is_set():
@@ -356,16 +613,31 @@ class InteractiveDouyinLogin:
                         self._apply_command(page, kind, payload)
                         last_frame_at = 0.0
 
-                    cookies = context.cookies()
-                    if any(
-                        cookie.get("name") in DOUYIN_AUTH_COOKIE_NAMES
-                        and cookie.get("value")
-                        for cookie in cookies
-                    ):
+                    if self._is_logged_in(context, page):
                         time.sleep(0.8)
                         self._record_account(context)
-                        self._set_state("success", "抖音登录成功，账号与 Cookie 已保存")
-                        logger.info("交互式抖音登录成功，账号已记录: {}", self.account_name)
+                        success_message = (
+                            f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                        )
+                        if self.platform == "tencent":
+                            dead_names = self._recheck_tencent_accounts()
+                            others = [
+                                name for name in dead_names
+                                if name != self.account_name
+                            ]
+                            if self.account_name in dead_names:
+                                success_message += "；注意：刚保存的登录校验未通过，请重新扫码"
+                            elif others:
+                                success_message += (
+                                    "；检测到以下视频号账号登录已失效，需要重新扫码："
+                                    + "、".join(others[:5])
+                                )
+                        self._set_state("success", success_message)
+                        logger.info(
+                            "交互式{}登录成功，账号已记录: {}",
+                            self._platform_label,
+                            self.account_name,
+                        )
                         try:
                             self._publish_frame(
                                 page.screenshot(type="jpeg", quality=68, timeout=8000)
@@ -385,7 +657,7 @@ class InteractiveDouyinLogin:
                             pass
                     time.sleep(0.08)
         except Exception as exc:
-            logger.warning("交互式抖音登录失败: {}", exc)
+            logger.warning("交互式{}登录失败: {}", self._platform_label, exc)
             # Keep the error useful without exposing long Playwright traces.
             self._set_state("failed", str(exc).strip()[:240] or "官方登录窗口异常退出")
         finally:
@@ -403,46 +675,131 @@ class InteractiveDouyinLogin:
 
 
 class InteractiveLoginManager:
-    def __init__(self, max_sessions: int = 2):
+    def __init__(self, max_sessions: int = 4, reaper_interval: float = 15.0):
         self.max_sessions = max_sessions
-        self.sessions: dict[str, InteractiveDouyinLogin] = {}
+        self.sessions: dict[str, InteractivePlatformLogin] = {}
         self.lock = threading.Lock()
+        # 回收线程的轮询间隔。
+        self.reaper_interval = max(1.0, float(reaper_interval))
+        self._reaper_stop = threading.Event()
+        self._reaper: threading.Thread | None = None
 
     def _prune_locked(self) -> None:
+        """清理已结束和被遗弃的会话，避免浏览器进程堆积。
+
+        两类会话要回收：
+        1. 已结束的（登录成功/失败/超时）——留 30 秒宽限，让前端还能
+           拿到登录成功的最后一帧画面。
+        2. 被遗弃的——前端关闭了页面或直接关掉浏览器标签，没机会调用
+           /interactiveLogin/stop。这类会话会一直占着 max_sessions 名额，
+           让用户重试时撞上 429，所以超过空闲阈值就主动结束。
+        """
         now = time.monotonic()
         stale = [
             key
             for key, session in self.sessions.items()
-            if session.finished_at and now - session.finished_at > 180
+            if session.finished_at and now - session.finished_at > 30
         ]
-        for key in stale:
-            self.sessions.pop(key, None)
+        # 空闲超过 ABANDONED_SESSION_SECONDS 仍在前端轮询窗口内的会话才保留；
+        # 完全没被访问过的说明前端已经走了，直接结束以释放浏览器进程。
+        abandoned = [
+            key
+            for key, session in self.sessions.items()
+            if session.finished_at is None
+            and now - session.last_seen_at > ABANDONED_SESSION_SECONDS
+        ]
+        for key in stale + abandoned:
+            session = self.sessions.pop(key, None)
+            if session is not None:
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+
+    def _reap_loop(self) -> None:
+        """后台回收线程。
+
+        没有这个线程的话，回收只会在下次 ``start()`` / ``get()`` 时顺带
+        发生。用户扫码失败后直接关掉浏览器标签走人、再也没打开过登录窗口，
+        那条会话就没人管了——Chromium 进程会一直挂到 300 秒超时才退出，
+        白占一个浏览器进程和一份内存。
+
+        这里独立起一个轻量线程按固定间隔回收，不用依赖外部调用。
+        """
+        while not self._reaper_stop.wait(self.reaper_interval):
+            try:
+                with self.lock:
+                    self._prune_locked()
+            except Exception:
+                # 回收线程绝不能因为一次异常就死掉
+                pass
+
+    def start_reaper(self) -> None:
+        """启动后台回收线程（幂等）。"""
+        with self.lock:
+            if self._reaper is not None and self._reaper.is_alive():
+                return
+            self._reaper_stop.clear()
+            self._reaper = threading.Thread(
+                target=self._reap_loop,
+                name="interactive-login-reaper",
+                daemon=True,
+            )
+            self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        self._reaper_stop.set()
+        reaper = self._reaper
+        if reaper is not None and reaper.is_alive():
+            reaper.join(timeout=2.0)
+        self._reaper = None
 
     def start(
-        self, account_name: str, account_id: int | None = None
-    ) -> tuple[str, InteractiveDouyinLogin]:
+        self,
+        account_name: str,
+        account_id: int | None = None,
+        platform: str = "douyin",
+    ) -> tuple[str, InteractivePlatformLogin]:
         with self.lock:
             self._prune_locked()
             running = [s for s in self.sessions.values() if s.finished_at is None]
             if len(running) >= self.max_sessions:
                 raise RuntimeError("正在运行的官方登录窗口过多，请先关闭旧窗口")
             session_id = uuid.uuid4().hex
-            session = InteractiveDouyinLogin(session_id, account_name, account_id)
+            session = InteractivePlatformLogin(
+                session_id, account_name, account_id, platform=platform
+            )
             self.sessions[session_id] = session
             session.start()
             return session_id, session
 
-    def get(self, session_id: str) -> InteractiveDouyinLogin | None:
+    def get(self, session_id: str) -> InteractivePlatformLogin | None:
         with self.lock:
             self._prune_locked()
             return self.sessions.get(session_id)
 
     def stop(self, session_id: str) -> bool:
-        session = self.get(session_id)
+        """关闭一个登录窗口。
+
+        注意：不能直接用 ``get()``——它会先做一次回收，而被判定为
+        "已遗弃"的会话此时已经被移出字典，``get()`` 返回 None，
+        于是这里会返回 False。但那个会话的 Chromium 进程其实还开着，
+        必须照样停掉它，否则用户点了"关闭窗口"却什么都没发生。
+        """
+        with self.lock:
+            session = self.sessions.pop(session_id, None)
         if session is None:
-            return False
-        session.stop()
+            # 可能已经被回收线程清掉了——那时它已经被 stop() 过了，
+            # 返回 True 表示"这个窗口确实已经不在了"，语义上更准确。
+            return True
+        try:
+            session.stop()
+        except Exception:
+            pass
         return True
 
 
 interactive_login_manager = InteractiveLoginManager()
+# 后台回收线程常驻：用户扫码失败后直接走人、也没再打开过登录窗口时，
+# 那条会话没人会去 stop，Chromium 会一直挂到 300 秒超时才退出。
+interactive_login_manager.start_reaper()

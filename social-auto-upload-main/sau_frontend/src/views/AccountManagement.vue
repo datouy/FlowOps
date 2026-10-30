@@ -91,6 +91,7 @@
       :close-on-click-modal="false"
       :close-on-press-escape="!sseConnecting && !interactiveLoginActive"
       :show-close="!sseConnecting && !interactiveLoginActive"
+      @closed="closeInteractiveLogin"
     >
       <el-form :model="accountForm" label-width="80px" :rules="rules" ref="accountFormRef">
         <el-form-item label="平台" prop="platform">
@@ -117,12 +118,12 @@
           />
         </el-form-item>
         <el-form-item
-          v-if="accountForm.platform === '抖音' && (dialogType === 'add' || reLoginMode)"
+          v-if="interactiveLoginPlatform && (dialogType === 'add' || reLoginMode)"
           label="登录方式"
         >
           <div class="official-login-note">
-            <strong>抖音官方安全登录窗口</strong>
-            <span>扫码、短信验证码、密码和滑块验证都在该窗口内完成，与直接打开抖音创作者中心一致。</span>
+            <strong>{{ interactiveLoginPlatform }}官方登录窗口</strong>
+            <span>扫码、短信验证码、密码和滑块验证都在该窗口内完成，与直接打开{{ interactiveLoginPlatform }}官方页面一致。</span>
           </div>
         </el-form-item>
 
@@ -140,22 +141,24 @@
             v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
             class="remote-browser-stage"
             :class="{ dragging: remotePointerDown }"
+            :style="remoteStageStyle"
           >
             <img
               ref="interactiveImageRef"
               v-if="interactiveFrameUrl"
               :src="interactiveFrameUrl"
-              alt="抖音官方登录窗口"
+              :alt="`${interactiveLoginPlatform || '官方'}登录窗口`"
               draggable="false"
               @pointerdown.prevent="startRemotePointer"
               @pointermove.prevent="moveRemotePointer"
               @pointerup.prevent="endRemotePointer"
               @pointercancel="endRemotePointer"
               @wheel.prevent="scrollRemoteBrowser"
+              :style="remoteImageStyle"
             />
             <div v-else class="remote-browser-loading">
               <el-icon class="is-loading"><Refresh /></el-icon>
-              <span>正在载入抖音官方登录页...</span>
+              <span>正在载入{{ interactiveLoginPlatform || '官方' }}登录页...</span>
             </div>
           </div>
           <div
@@ -179,6 +182,17 @@
               <el-button size="small" @click="reloadRemoteBrowser">刷新页面</el-button>
               <span>滑块验证可直接在上方画面中拖动。</span>
             </div>
+          </div>
+          <div
+            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            class="remote-zoom-row"
+          >
+            <span class="remote-zoom-label">画面缩放</span>
+            <el-button size="small" @click="zoomRemoteOut">缩小</el-button>
+            <span class="remote-zoom-value">{{ Math.round(remoteZoom * 100) }}%</span>
+            <el-button size="small" @click="zoomRemoteIn">放大</el-button>
+            <el-button size="small" text @click="resetRemoteZoom">重置</el-button>
+            <span class="remote-zoom-hint">放大后拖动画面下方的滚动条查看，二维码更清晰</span>
           </div>
         </div>
         
@@ -227,7 +241,13 @@
           </div>
           <div v-else-if="qrCodeData && !loginStatus" class="qrcode-wrapper">
             <p class="qrcode-tip">二维码已生成，请在 120 秒内使用对应平台 APP 扫码</p>
-            <img :src="qrCodeData" alt="登录二维码" class="qrcode-image" />
+            <img :src="qrCodeData" alt="登录二维码" class="qrcode-image" :style="qrImageStyle" />
+            <div class="qr-zoom-row">
+              <el-button size="small" @click="zoomQrOut">缩小</el-button>
+              <span class="qr-zoom-value">{{ Math.round(qrZoom * 100) }}%</span>
+              <el-button size="small" @click="zoomQrIn">放大</el-button>
+              <el-button size="small" text @click="resetQrZoom">重置</el-button>
+            </div>
             <el-button
               class="refresh-qrcode-button"
               type="info"
@@ -238,10 +258,14 @@
               <el-icon><Refresh /></el-icon>
               二维码过期？刷新二维码
             </el-button>
+            <p v-if="loginProgressText" class="qrcode-progress">
+              <el-icon class="is-loading"><Refresh /></el-icon>
+              <span>{{ loginProgressText }}</span>
+            </p>
           </div>
           <div v-else-if="!qrCodeData && !loginStatus" class="loading-wrapper">
-            <el-icon class="is-loading"><Refresh /></el-icon>
-            <span>{{ loginMethod === 'qr' ? '请求中...' : '正在登录抖音...' }}</span>
+            <el-icon v-if="!loginProgressText" class="is-loading"><Refresh /></el-icon>
+            <span>{{ loginProgressText || (loginMethod === 'qr' ? '请求中...' : '正在登录抖音...') }}</span>
           </div>
           <div v-else-if="loginStatus === '200'" class="success-wrapper">
             <el-icon><CircleCheckFilled /></el-icon>
@@ -271,8 +295,8 @@
                 ? (loginMethod === 'qr' ? (qrCodeData ? '等待扫码' : '获取二维码') : '登录中')
                 : (dialogType === 'edit' && !reLoginMode
                   ? '保存'
-                  : accountForm.platform === '抖音'
-                    ? '打开抖音官方登录窗口'
+                  : INTERACTIVE_PLATFORMS[accountForm.platform]
+                    ? `打开${accountForm.platform}官方登录窗口`
                     : '确认')
             }}
           </el-button>
@@ -285,7 +309,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { Refresh, CircleCheckFilled, CircleCloseFilled, Download, Upload, Loading } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -307,6 +330,20 @@ const platformMeta = {
   '百家号': { key: 'baijiahao', type: 6 }
 }
 const platformOptions = Object.keys(platformMeta)
+// 走"官方登录窗口"的平台：把平台真实登录页拉到对话框里完成登录。
+// 视频号也走这里——它的登录页是微信扫码界面，直接把真实页面搬到对话框，
+// 用户看到的就是官方页面，二维码清晰可扫、扫码状态一目了然。
+const INTERACTIVE_PLATFORMS = {
+  '抖音': 'douyin',
+  '小红书': 'xiaohongshu',
+  '视频号': 'tencent'
+}
+// 平台键 -> 中文名，用于官方登录窗口的提示文案。
+const INTERACTIVE_PLATFORM_LABELS = {
+  douyin: '抖音',
+  xiaohongshu: '小红书',
+  tencent: '视频号'
+}
 const accountTabs = [
   { name: 'all', label: '全部' },
   ...platformOptions.map(label => ({ name: platformMeta[label].key, label }))
@@ -484,17 +521,21 @@ const loginMethod = ref('qr')
 const loginPhone = ref('')
 const loginPassword = ref('')
 const loginErrorMessage = ref('')
+const loginProgressText = ref('')
 const directSmsFlow = ref(false)
 const currentLoginId = ref('')
 const currentPlatform = ref('')
 const currentAccountName = ref('')
 const currentAccountId = ref(null)
+// 当前走"官方登录窗口"的平台 key（douyin / xiaohongshu）
+const currentInteractivePlatform = ref('douyin')
 let verifyCooldownTimer = null
 const interactiveLoginActive = ref(false)
 const interactiveLoginStarting = ref(false)
 const interactiveLoginStatus = ref('')
 const interactiveLoginMessage = ref('')
 const interactiveLoginId = ref('')
+const interactiveLoginPlatform = ref('')
 const interactiveFrameUrl = ref('')
 const interactiveImageRef = ref(null)
 const remoteInputText = ref('')
@@ -504,6 +545,39 @@ let interactiveStatusTimer = null
 let interactiveFrameLoading = false
 let interactiveFrameObjectUrl = ''
 let remoteLastMoveAt = 0
+const remoteZoom = ref(1)
+const qrZoom = ref(1)
+const REMOTE_ZOOM_MIN = 0.5
+const REMOTE_ZOOM_MAX = 3
+const QR_ZOOM_MIN = 1
+const QR_ZOOM_MAX = 4
+
+const clampZoom = (value, min, max) => Math.min(max, Math.max(min, Math.round(value * 100) / 100))
+
+const remoteStageStyle = computed(() =>
+  remoteZoom.value > 1 ? { overflow: 'auto' } : {}
+)
+
+const remoteImageStyle = computed(() => {
+  if (remoteZoom.value <= 1) return {}
+  return {
+    width: `${remoteZoom.value * 100}%`,
+    maxHeight: 'none',
+  }
+})
+
+const qrImageStyle = computed(() => ({
+  width: `${200 * qrZoom.value}px`,
+  maxWidth: 'none',
+  maxHeight: 'none',
+}))
+
+const zoomRemoteIn = () => { remoteZoom.value = clampZoom(remoteZoom.value + 0.25, REMOTE_ZOOM_MIN, REMOTE_ZOOM_MAX) }
+const zoomRemoteOut = () => { remoteZoom.value = clampZoom(remoteZoom.value - 0.25, REMOTE_ZOOM_MIN, REMOTE_ZOOM_MAX) }
+const resetRemoteZoom = () => { remoteZoom.value = 1 }
+const zoomQrIn = () => { qrZoom.value = clampZoom(qrZoom.value + 0.5, QR_ZOOM_MIN, QR_ZOOM_MAX) }
+const zoomQrOut = () => { qrZoom.value = clampZoom(qrZoom.value - 0.5, QR_ZOOM_MIN, QR_ZOOM_MAX) }
+const resetQrZoom = () => { qrZoom.value = 1 }
 
 const clearVerifyCooldown = () => {
   if (verifyCooldownTimer) {
@@ -776,6 +850,7 @@ const resetInteractiveLogin = () => {
   interactiveLoginStatus.value = ''
   interactiveLoginMessage.value = ''
   interactiveLoginId.value = ''
+  interactiveLoginPlatform.value = ''
   remoteInputText.value = ''
   remotePointerDown.value = false
   interactiveFrameLoading = false
@@ -858,29 +933,33 @@ const pollInteractiveLogin = async () => {
   }
 }
 
-const startInteractiveLogin = async (name, accountId = null) => {
+const startInteractiveLogin = async (name, accountId = null, platform = 'douyin') => {
   closeInteractiveLogin()
+  remoteZoom.value = 1
+  const platformLabel = INTERACTIVE_PLATFORM_LABELS[platform] || '抖音'
   interactiveLoginActive.value = true
   interactiveLoginStarting.value = true
   interactiveLoginStatus.value = 'starting'
-  interactiveLoginMessage.value = '正在打开抖音官方登录窗口'
+  interactiveLoginMessage.value = `正在打开${platformLabel}官方登录窗口`
+  interactiveLoginPlatform.value = platformLabel
   currentAccountName.value = name
   currentAccountId.value = accountId
   try {
     const response = await http.post('/interactiveLogin/start', {
       id: name,
-      account_id: accountId
+      account_id: accountId,
+      platform
     })
     const data = response.data || {}
     interactiveLoginId.value = data.session || ''
     interactiveLoginStatus.value = data.status || 'running'
-    interactiveLoginMessage.value = data.message || '请在官方窗口完成登录'
+    interactiveLoginMessage.value = data.message || `请在${platformLabel}官方窗口完成登录`
     interactiveFrameTimer = setInterval(refreshInteractiveFrame, 650)
     interactiveStatusTimer = setInterval(pollInteractiveLogin, 900)
     refreshInteractiveFrame()
   } catch (error) {
     interactiveLoginStatus.value = 'failed'
-    interactiveLoginMessage.value = error?.message || '打开抖音官方登录窗口失败'
+    interactiveLoginMessage.value = error?.message || `打开${platformLabel}官方登录窗口失败`
   } finally {
     interactiveLoginStarting.value = false
   }
@@ -889,7 +968,8 @@ const startInteractiveLogin = async (name, accountId = null) => {
 const retryInteractiveLogin = () => {
   startInteractiveLogin(
     currentAccountName.value || accountForm.name,
-    currentAccountId.value || (reLoginMode.value ? accountForm.id : null)
+    currentAccountId.value || (reLoginMode.value ? accountForm.id : null),
+    currentInteractivePlatform.value
   )
 }
 
@@ -941,6 +1021,11 @@ const endRemotePointer = (event) => {
 }
 
 const scrollRemoteBrowser = (event) => {
+  if (event.ctrlKey) {
+    if (event.deltaY < 0) zoomRemoteIn()
+    else zoomRemoteOut()
+    return
+  }
   sendRemoteInput('scroll', { deltaY: event.deltaY })
 }
 
@@ -959,10 +1044,27 @@ const reloadRemoteBrowser = () => {
   sendRemoteInput('reload')
 }
 
+// 把后端推送的登录中间态转成用户看得懂的提示。
+// 关键点：手机端提示"登录成功"后，界面必须立刻给出反馈，
+// 否则用户完全无法判断自己是不是还在等。
+const applyLoginStatusEvent = (eventName) => {
+  const map = {
+    scanned: '已扫码！请在手机上确认登录',
+    confirmed: '手机端已确认，正在保存登录状态...',
+    qrcode_expired: '二维码已过期，正在自动刷新...',
+    no_qrcode: '未能自动读取二维码，请直接扫描浏览器窗口中的二维码'
+  }
+  const text = map[eventName]
+  if (text) {
+    loginProgressText.value = text
+  }
+}
+
 // 建立SSE连接
 const connectSSE = async (platform, name, accountId = null, options = {}) => {
   // 关闭可能存在的连接
   closeSSEConnection()
+  qrZoom.value = 1
 
   const authMethod = platform === '抖音' ? (options.authMethod || 'qr') : 'qr'
   loginMethod.value = authMethod
@@ -972,6 +1074,7 @@ const connectSSE = async (platform, name, accountId = null, options = {}) => {
   qrCodeData.value = ''
   loginStatus.value = ''
   loginErrorMessage.value = ''
+  loginProgressText.value = ''
   needSecondVerify.value = false
   verifyStage.value = 'phone'
   verifyPhone.value = authMethod === 'sms' ? loginPhone.value.trim() : ''
@@ -1020,6 +1123,14 @@ const connectSSE = async (platform, name, accountId = null, options = {}) => {
 
     if (data.startsWith('LOGIN_ERROR:')) {
       loginErrorMessage.value = data.slice('LOGIN_ERROR:'.length).trim() || '抖音登录失败'
+      return
+    }
+
+    // 登录进度中间态：让用户明确知道"扫码了没有 / 到哪一步了"，
+    // 而不是只能对着二维码干等。
+    if (data.startsWith('LOGIN_STATUS:')) {
+      const event_name = data.slice('LOGIN_STATUS:'.length).trim()
+      applyLoginStatusEvent(event_name)
       return
     }
 
@@ -1171,8 +1282,12 @@ const submitAccountForm = () => {
           accountForm.name = `${accountForm.platform}账号${samePlatformCount + 1}`
         }
         const accountId = reLoginMode.value ? accountForm.id : null
-        if (accountForm.platform === '抖音') {
-          await startInteractiveLogin(accountForm.name, accountId)
+        // 抖音和小红书都走"官方登录窗口"：把平台真实登录页拉到对话框里，
+        // 用户直接在上面扫码/输验证码，和官方页面完全一致。
+        const interactiveKey = INTERACTIVE_PLATFORMS[accountForm.platform]
+        if (interactiveKey) {
+          currentInteractivePlatform.value = interactiveKey
+          await startInteractiveLogin(accountForm.name, accountId, interactiveKey)
         } else {
           // 其他平台继续使用现有二维码 SSE 登录流程。
           await connectSSE(accountForm.platform, accountForm.name, accountId, { authMethod: 'qr' })
@@ -1344,6 +1459,7 @@ onBeforeUnmount(() => {
       position: relative;
       width: 100%;
       min-height: 360px;
+      max-height: 66vh;
       background: #111827;
       user-select: none;
       touch-action: none;
@@ -1359,6 +1475,26 @@ onBeforeUnmount(() => {
         margin: 0 auto;
         object-fit: contain;
         pointer-events: auto;
+      }
+    }
+
+    .remote-zoom-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #fff;
+      border-top: 1px solid #ebeef5;
+      color: #606266;
+      font-size: 12px;
+
+      .remote-zoom-value {
+        min-width: 44px;
+        text-align: center;
+      }
+
+      .remote-zoom-hint {
+        color: #909399;
       }
     }
 
@@ -1409,14 +1545,47 @@ onBeforeUnmount(() => {
       }
       
       .qrcode-image {
-        max-width: 200px;
-        max-height: 200px;
+        width: 200px;
+        height: auto;
         border: 1px solid #ebeef5;
         background-color: black;
       }
 
+      .qr-zoom-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        margin-top: 8px;
+        color: #606266;
+        font-size: 12px;
+
+        .qr-zoom-value {
+          min-width: 44px;
+          text-align: center;
+        }
+      }
+
       .refresh-qrcode-button {
         margin-top: 10px;
+      }
+
+      // 登录进度提示：扫码/确认/刷新等中间态，让用户知道系统在等什么
+      .qrcode-progress {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 12px 0 0;
+        padding: 6px 14px;
+        border-radius: 16px;
+        font-size: 13px;
+        color: #67c23a;
+        background-color: #f0f9eb;
+        border: 1px solid #e1f3d8;
+
+        .el-icon {
+          font-size: 14px;
+        }
       }
     }
 
