@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from queue import Empty, Queue
 from flask_cors import CORS
-from myUtils.auth import check_cookie
+from myUtils.auth import check_cookies_concurrently
 from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.exceptions import NotFound
 from werkzeug.utils import secure_filename
@@ -21,7 +21,7 @@ from conf import BASE_DIR
 from db_utils import connect as db_connect
 import runtime_config
 from app_logging import logger, setup_request_logging
-from interactive_login import interactive_login_manager
+from interactive_login import PLATFORM_LOGIN_TARGETS, interactive_login_manager
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
 # 平台发布统一走 myUtils.platform_registry，避免这里重复维护平台清单。
@@ -34,6 +34,9 @@ active_verify_submissions = {}
 active_verify_lock = threading.Lock()
 pending_login_requests = {}
 pending_login_lock = threading.Lock()
+# 账号 cookie 校验并发度：每个校验都要开一个 Chromium，等 5~8 秒。
+# 串行做的话 N 个账号要 N×8 秒；并发后总耗时约等于单个账号的耗时。
+ACCOUNT_CHECK_CONCURRENCY = 4
 app = Flask(__name__)
 setup_request_logging(app)
 import schedule_ops
@@ -95,15 +98,24 @@ def health():
 
 @app.route('/interactiveLogin/start', methods=['POST'])
 def interactive_login_start():
-    """Open an isolated official Douyin window for interactive login."""
+    """Open an isolated official login window for the requested platform."""
     data = request.get_json(silent=True) or {}
-    account_name = str(data.get('id') or '').strip()[:64] or '抖音账号'
+    account_name = str(data.get('id') or '').strip()[:64] or '账号'
+    platform = str(data.get('platform') or 'douyin').strip().lower()
+    if platform not in PLATFORM_LOGIN_TARGETS:
+        return jsonify({
+            "code": 400,
+            "msg": "该平台暂不支持官方登录窗口",
+            "data": None,
+        }), 400
     try:
         account_id = int(data.get('account_id')) if data.get('account_id') else None
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "账号 ID 格式错误", "data": None}), 400
     try:
-        session_id, session = interactive_login_manager.start(account_name, account_id)
+        session_id, session = interactive_login_manager.start(
+            account_name, account_id, platform=platform
+        )
     except RuntimeError as exc:
         return jsonify({"code": 429, "msg": str(exc), "data": None}), 429
     return jsonify({
@@ -174,21 +186,40 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 # 处理所有静态资源请求（未来打包用）
 @app.route('/assets/<filename>')
 def custom_static(filename):
-    return send_from_directory(os.path.join(current_dir, 'assets'), filename)
+    """返回前端打包产物。
+
+    Vite 产出的文件名带内容哈希（``index-CV6JzdQ9.js``），内容变了文件名
+    就会变，所以可以放心用一年的强缓存。之前的响应没有任何 Cache-Control，
+    浏览器每次都要重新问服务器、重新下载 1MB 的 JS。
+
+    ``index.html`` 则相反：它引用的是带哈希的资源，必须每次都回源校验，
+    否则发新版后用户会一直拿到旧的 html 指向已经不存在的旧资源。
+    """
+    response = send_from_directory(os.path.join(current_dir, 'assets'), filename)
+    response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+    return response
+
 
 # 处理 favicon.ico 静态资源（未来打包用）
 @app.route('/favicon.ico')
 def favicon():
-    return send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+    response = send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+    response.headers['Cache-Control'] = 'public, max-age=604800'
+    return response
 
 @app.route('/vite.svg')
 def vite_svg():
-    return send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+    response = send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+    response.headers['Cache-Control'] = 'public, max-age=604800'
+    return response
 
 # （未来打包用）
 @app.route('/')
 def index():  # put application's code here
-    return send_from_directory(current_dir, 'index.html')
+    response = send_from_directory(current_dir, 'index.html')
+    # index.html 不带哈希，必须每次回源校验，否则会一直用旧版本
+    response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return response
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -409,34 +440,55 @@ def getAccounts():
 
 @app.route("/getValidAccounts",methods=['GET'])
 async def getValidAccounts():
+    """校验所有账号的登录状态并回写 status。
+
+    历史实现有三个问题：
+    1. 逐个账号串行校验，每个都要开一次 Chromium、等 5~8 秒，
+       N 个账号就是 N×8 秒（日志里实测 10~15 秒）。
+    2. SQLite 连接在整个浏览器操作期间一直持有（``with`` 块跨越了
+       所有 await），既占连接也拖慢其它请求。
+    3. 视图是 ``async def``，Flask 会用 asgiref 把它包成同步调用，
+       于是整个 waitress 工作线程在 15 秒里什么都干不了。
+
+    现在改成：先读数据 -> 关连接 -> 并发校验 -> 重新开连接一次性回写。
+    """
+    # 1) 先把账号列表读出来，随即释放数据库连接
     with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-        SELECT * FROM user_info''')
-        rows = cursor.fetchall()
+        rows = conn.execute("SELECT * FROM user_info").fetchall()
         rows_list = [list(row) for row in rows]
-        logger.debug("当前数据表内容：")
-        for row in rows:
-            logger.debug("{}", row)
-        for row in rows_list:
-            flag = await check_cookie(row[1],row[2])
-            if not flag:
-                row[4] = 0
-                cursor.execute('''
-                UPDATE user_info 
-                SET status = ? 
-                WHERE id = ?
-                ''', (0,row[0]))
-                conn.commit()
-                logger.info("用户状态已更新")
-        for row in rows:
-            logger.debug("{}", row)
-        return jsonify(
-                        {
-                            "code": 200,
-                            "msg": None,
-                            "data": rows_list
-                        }),200
+
+    if not rows_list:
+        return jsonify({"code": 200, "msg": None, "data": []}), 200
+
+    # 2) 并发校验各账号登录状态（每个账号独立开浏览器）
+    alive_flags = await check_cookies_concurrently(
+        [(row[1], row[2]) for row in rows_list],
+        max_concurrent=ACCOUNT_CHECK_CONCURRENCY,
+    )
+
+    # 3) 回写状态：一次事务写完，不在 await 期间持有连接
+    dead_ids = []
+    for index, row in enumerate(rows_list):
+        flag = alive_flags.get(index, False)
+        if not flag:
+            row[4] = 0
+            dead_ids.append(row[0])
+        else:
+            row[4] = 1
+    if dead_ids:
+        try:
+            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+                conn.executemany(
+                    "UPDATE user_info SET status=? WHERE id=?",
+                    [(0, account_id) for account_id in dead_ids],
+                )
+        except Exception as exc:
+            logger.exception("回写账号状态失败: {}", exc)
+    logger.info(
+        "账号校验完成：共 {} 个，失效 {} 个",
+        len(rows_list), len(dead_ids),
+    )
+    return jsonify({"code": 200, "msg": None, "data": rows_list}), 200
 
 @app.route('/deleteFile', methods=['GET'])
 def delete_file():
