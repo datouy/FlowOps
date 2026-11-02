@@ -224,8 +224,6 @@ class InteractivePlatformLogin:
         用户看到的就是"登录完莫名其妙状态异常"。这里立即复检，
         把刚失效的账号名单直接反馈给用户。
         """
-        import asyncio
-
         from myUtils.auth import check_cookies_concurrently
 
         db_path = Path(BASE_DIR / "db" / "database.db")
@@ -240,8 +238,8 @@ class InteractivePlatformLogin:
         if not rows:
             return []
         try:
-            flags = asyncio.run(
-                check_cookies_concurrently(
+            flags = self._run_coro_in_new_thread(
+                lambda: check_cookies_concurrently(
                     [(2, row[1]) for row in rows], max_concurrent=2
                 )
             )
@@ -275,13 +273,37 @@ class InteractivePlatformLogin:
             return False
         for attempt in range(2):
             try:
-                if asyncio.run(check_cookie(2, self.cookie_name)):
+                # 本线程由 sync_playwright 驱动，内部已有一个 event loop，
+                # 直接 asyncio.run 会报 "cannot be called from a running
+                # event loop"。放到独立线程里跑 async 校验。
+                if self._run_coro_in_new_thread(
+                    lambda: check_cookie(2, self.cookie_name)
+                ):
                     return True
             except Exception as exc:
                 logger.warning("视频号 cookie 校验异常: {}", exc)
             if attempt == 0:
                 time.sleep(2)
         return False
+
+    @staticmethod
+    def _run_coro_in_new_thread(coro_factory):
+        """在全新线程里运行 async 函数，绕开本线程已存在的 event loop。"""
+        import asyncio
+
+        result = {}
+
+        def _runner():
+            try:
+                result["value"] = asyncio.run(coro_factory())
+            except Exception as exc:  # pragma: no cover - 记录后按失败处理
+                logger.warning("async 校验线程异常: {}", exc)
+                result["value"] = False
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+        return result.get("value", False)
 
     def _rollback_account(self) -> None:
         # 登录校验失败时回滚：删除 cookie 文件并把账号状态改回失效。
