@@ -916,13 +916,15 @@ const pollInteractiveLogin = async () => {
     )
     const data = response.data || {}
     interactiveLoginMessage.value = data.message || interactiveLoginMessage.value
-    interactiveLoginStatus.value = data.status || interactiveLoginStatus.value
     if (data.status === 'success') {
       completeInteractiveLogin()
     } else if (data.status === 'failed' || data.status === 'expired') {
       clearInteractiveTimers()
       interactiveLoginMessage.value = data.message || '官方登录窗口异常退出'
       ElMessage.error(interactiveLoginMessage.value)
+      interactiveLoginStatus.value = data.status
+    } else {
+      interactiveLoginStatus.value = data.status || interactiveLoginStatus.value
     }
   } catch (error) {
     if (error?.response?.status === 404) {
