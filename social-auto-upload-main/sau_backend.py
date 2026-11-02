@@ -180,29 +180,6 @@ def interactive_login_stop():
         return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
     return jsonify({"code": 200, "msg": "登录窗口已关闭", "data": None}), 200
 
-
-@app.route('/interactiveLogin/vnc-info', methods=['GET'])
-def interactive_login_vnc_info():
-    """Return the noVNC real-browser endpoint and credentials for the login window.
-
-    截图流依赖轮询 + 坐标回放，账号选择页这类页面容易点不中；noVNC 直接把
-    服务器 Xvfb 里的真实 Chromium 桌面通过网页 VNC 呈现，鼠标键盘原样透传。
-    """
-    enabled = os.environ.get("YUNCE_VNC_ENABLED", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
-    return jsonify({
-        "code": 200,
-        "msg": None,
-        "data": {
-            "enabled": enabled,
-            "path": "/novnc/vnc.html?autoconnect=1&resize=scale&reconnect=1&reconnect_delay=1000",
-            "user": os.environ.get("YUNCE_VNC_USER", "yunce"),
-            "password": os.environ.get("YUNCE_VNC_PASSWORD", ""),
-        },
-    }), 200
-
-
 # 获取当前目录（假设 index.html 和 assets 在这里）
 current_dir = os.path.dirname(os.path.abspath(__file__))
 

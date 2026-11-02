@@ -32,8 +32,6 @@ services:
       # 只绑本机回环，外网入口交给 Nginx（TLS + 大文件 + SSE）
       # 没有 Nginx 又想直接访问时改成 "5409:5409"
       - "127.0.0.1:5409:5409"
-      # noVNC：网页内嵌真实浏览器桌面（登录窗口用），同样只绑本机回环，交给 Nginx 反代
-      - "127.0.0.1:6080:6080"
     volumes:
       - ./data/db:/app/db
       - ./data/cookies:/app/cookies

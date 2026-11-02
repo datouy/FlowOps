@@ -143,18 +143,9 @@
             :class="{ dragging: remotePointerDown }"
             :style="remoteStageStyle"
           >
-            <iframe
-              v-if="vncIframeUrl"
-              :src="vncIframeUrl"
-              class="remote-vnc-iframe"
-              frameborder="0"
-              scrolling="no"
-              allow="autoplay; fullscreen; clipboard-write; clipboard-read; pointer-lock"
-              title="真实浏览器登录窗口"
-            ></iframe>
             <img
               ref="interactiveImageRef"
-              v-else-if="interactiveFrameUrl"
+              v-if="interactiveFrameUrl"
               :src="interactiveFrameUrl"
               :alt="`${interactiveLoginPlatform || '官方'}登录窗口`"
               draggable="false"
@@ -425,7 +416,6 @@ const validateAllAccountsInBackground = async () => {
 
 // 页面加载时获取账号数据
 onMounted(() => {
-  prefetchVncInfo()
   // 快速获取账号列表（不验证），立即显示
   fetchAccountsQuick()
 
@@ -985,25 +975,6 @@ const retryInteractiveLogin = () => {
   )
 }
 
-const vncInfoCache = ref(null)
-
-const prefetchVncInfo = async () => {
-  try {
-    const response = await http.get('/interactiveLogin/vnc-info', {}, { silent: true })
-    vncInfoCache.value = response.data || null
-  } catch (error) {
-    vncInfoCache.value = null
-  }
-}
-
-// 内部弹窗内嵌 noVNC 真实浏览器画面；VNC 密码走 RFB 协议层，避免 Basic Auth 阻断 websocket
-const vncIframeUrl = computed(() => {
-  const info = vncInfoCache.value
-  if (!info || !info.enabled || !info.password) return ''
-  const sep = (info.path || '').includes('?') ? '&' : '?'
-  return `${window.location.origin}${info.path}${sep}password=${encodeURIComponent(info.password)}&show_dot=1&view_only=0`
-})
-
 const sendRemoteInput = (kind, payload = {}) => {
   if (!interactiveLoginId.value || interactiveLoginStatus.value !== 'running') return
   http.post(
@@ -1529,15 +1500,6 @@ onBeforeUnmount(() => {
       .remote-zoom-hint {
         color: #909399;
       }
-    }
-
-    .remote-vnc-iframe {
-      display: block;
-      width: 100%;
-      height: 68vh;
-      min-height: 420px;
-      border: none;
-      background: #111827;
     }
 
     .remote-browser-loading {
