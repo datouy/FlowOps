@@ -118,6 +118,8 @@ class InteractivePlatformLogin:
         self.frame = b""
         self.frame_version = 0
         self.cookie_name = ""
+        # 视频号会话探测的节流时间戳：避免登录窗口轮询时频繁开新页面。
+        self._last_tencent_probe = 0.0
         # 小红书官方 user 接口返回的登录用户信息（登录成功后缓存）
         self._xhs_user: dict | None = None
         self.commands: queue.Queue = queue.Queue(maxsize=256)
@@ -262,6 +264,50 @@ class InteractivePlatformLogin:
         except Exception as exc:
             logger.warning("视频号登录后状态回写失败: {}", exc)
         return dead_names
+
+    def _verify_tencent_cookie(self) -> bool:
+        # 视频号登录保存 cookie 后立即校验，避免把无效 cookie 当成功。
+        import asyncio
+
+        from myUtils.auth import check_cookie
+
+        if not self.cookie_name:
+            return False
+        for attempt in range(2):
+            try:
+                if asyncio.run(check_cookie(2, self.cookie_name)):
+                    return True
+            except Exception as exc:
+                logger.warning("视频号 cookie 校验异常: {}", exc)
+            if attempt == 0:
+                time.sleep(2)
+        return False
+
+    def _rollback_account(self) -> None:
+        # 登录校验失败时回滚：删除 cookie 文件并把账号状态改回失效。
+        try:
+            if self.cookie_name:
+                (Path(BASE_DIR / "cookiesFile") / self.cookie_name).unlink(
+                    missing_ok=True
+                )
+        except Exception as exc:
+            logger.warning("回滚删除 cookie 文件失败: {}", exc)
+        db_path = Path(BASE_DIR / "db" / "database.db")
+        try:
+            with db_connect(db_path) as conn:
+                if self.account_id:
+                    conn.execute(
+                        "UPDATE user_info SET status=0 WHERE id=?",
+                        (self.account_id,),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM user_info WHERE filePath=?",
+                        (self.cookie_name,),
+                    )
+                conn.commit()
+        except Exception as exc:
+            logger.warning("回滚账号状态失败: {}", exc)
 
     def _launch_browser(self, playwright):
         configured = os.environ.get("INTERACTIVE_LOGIN_HEADLESS")
@@ -438,28 +484,30 @@ class InteractivePlatformLogin:
 
         cookie 判定是主路径；小红书额外用官方 user 接口做交叉验证，
         因为匿名访客也会拿到 a1/gid/webId 这类 cookie，只看 cookie 容易误判。
-        视频号反过来：URL 跳转是主判据，因为微信授权 cookie 名字会随版本变动，
-        等 cookie 反而可能漏判成功。
+        视频号只用正面证据 + 会话探测，不再用 URL 兜底：未登录时首页 URL
+        也包含 /platform，用 "URL 在平台页" 当判据会把一个刚打开的空白页
+        瞬间误判成登录成功，保存一个无效 cookie，导致账号之后全部校验失败。
         """
+        if self.platform == "tencent":
+            if page is None:
+                return False
+            # 正面证据：登录后才会出现的功能按钮，每轮都查。
+            if self._tencent_dom_logged_in(page):
+                return True
+            # 确定性：访问平台页会不会被踢回登录页。开新页面较重，做节流。
+            now = time.monotonic()
+            if now - self._last_tencent_probe >= 5.0:
+                self._last_tencent_probe = now
+                if self._tencent_session_valid_sync(context):
+                    return True
+            return False
+
         cookies = context.cookies()
         names = {
             cookie.get("name")
             for cookie in cookies
             if cookie.get("value")
         }
-
-        if self.platform == "tencent":
-            # 微信扫码成功后，主框架会经 oauth-callback 跳回平台首页。
-            # 只要离开 login.html 就认为流程走完了。
-            if page is None:
-                return False
-            current = page.url or ""
-            if "/login" in current or "oauth-callback" in current:
-                return False
-            success_urls = PLATFORM_LOGIN_TARGETS["tencent"].get("login_success_urls", ())
-            if any(current.startswith(prefix) for prefix in success_urls):
-                return True
-            return "/platform" in current
 
         if not (names & self._auth_cookie_names):
             return False
@@ -470,6 +518,48 @@ class InteractivePlatformLogin:
                 return True
             return self._probe_xhs_user(context)
         return True
+
+    def _tencent_dom_logged_in(self, page) -> bool:
+        """视频号登录成功的正面证据：登录后才会出现的功能按钮。"""
+        for selector in (
+            'div:has-text("发表视频")',
+            'button:has-text("发表")',
+            'button:has-text("保存草稿")',
+        ):
+            try:
+                marker = page.locator(selector).first
+                if marker.count() and marker.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _tencent_session_valid_sync(self, context) -> bool:
+        """确定性判断视频号是否已登录：访问平台页会不会被踢回登录页。"""
+        probe = None
+        try:
+            probe = context.new_page()
+            probe.goto(
+                "https://channels.weixin.qq.com/platform/post/create",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            for _ in range(8):
+                time.sleep(0.5)
+                if "/login" in (probe.url or ""):
+                    return False
+            for frame in probe.frames:
+                if "open.weixin.qq.com/connect/qrconnect" in (frame.url or ""):
+                    return False
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                if probe is not None:
+                    probe.close()
+            except Exception:
+                pass
 
     def _center_tencent_qrcode(self, page) -> None:
         """把视频号登录卡片移到视口中央，让二维码清晰可见。
@@ -616,22 +706,34 @@ class InteractivePlatformLogin:
                     if self._is_logged_in(context, page):
                         time.sleep(0.8)
                         self._record_account(context)
-                        success_message = (
-                            f"{self._platform_label}登录成功，账号与 Cookie 已保存"
-                        )
                         if self.platform == "tencent":
+                            if not self._verify_tencent_cookie():
+                                self._rollback_account()
+                                self._set_state(
+                                    "failed", "视频号登录校验未通过，请重新扫码登录"
+                                )
+                                logger.warning(
+                                    "视频号登录后 cookie 校验失败，已回滚: {}",
+                                    self.account_name,
+                                )
+                                break
+                            success_message = (
+                                f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                            )
                             dead_names = self._recheck_tencent_accounts()
                             others = [
                                 name for name in dead_names
                                 if name != self.account_name
                             ]
-                            if self.account_name in dead_names:
-                                success_message += "；注意：刚保存的登录校验未通过，请重新扫码"
-                            elif others:
+                            if others:
                                 success_message += (
                                     "；检测到以下视频号账号登录已失效，需要重新扫码："
                                     + "、".join(others[:5])
                                 )
+                        else:
+                            success_message = (
+                                f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                            )
                         self._set_state("success", success_message)
                         logger.info(
                             "交互式{}登录成功，账号已记录: {}",
