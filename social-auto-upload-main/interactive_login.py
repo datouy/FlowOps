@@ -356,19 +356,44 @@ class InteractivePlatformLogin:
 
     @staticmethod
     def _dom_click(page, x: float, y: float) -> None:
-        """Fallback for the official page, which ignores CDP mouse clicks."""
+        """Fallback for the official page, which ignores CDP mouse clicks.
+
+        派发完整的 pointer/mouse 事件序列（很多前端框架的合成事件只监听
+        pointerdown/click 而非 click），并把命中 iframe 的坐标换算进 iframe
+        内部操作，保证「选择账号」这类列表项能正常点中。
+        """
         page.evaluate(
             """([x, y]) => {
-                const element = document.elementFromPoint(x, y);
-                if (!element) return false;
-                const target = element.closest(
-                    'button,a,[role="button"],[role="tab"],label,input,textarea,select,[tabindex]'
-                ) || element;
-                if (target instanceof HTMLElement) {
-                    target.focus({preventScroll: true});
-                    target.click();
+                const fire = (el, X, Y) => {
+                    if (!(el instanceof Element)) return false;
+                    const t = el.closest(
+                        'button,a,[role="button"],[role="tab"],label,input,textarea,select,[tabindex],[contenteditable="true"]'
+                    ) || el;
+                    const opts = {bubbles: true, cancelable: true, composed: true,
+                                  view: window, clientX: X, clientY: Y, button: 0};
+                    try {
+                        t.focus({preventScroll: true});
+                        t.dispatchEvent(new PointerEvent('pointerdown', opts));
+                        t.dispatchEvent(new MouseEvent('mousedown', opts));
+                        t.dispatchEvent(new PointerEvent('pointerup', opts));
+                        t.dispatchEvent(new MouseEvent('mouseup', opts));
+                        t.dispatchEvent(new MouseEvent('click', opts));
+                    } catch (e) {
+                        try { t.click(); } catch (e2) {}
+                    }
+                    return true;
+                };
+                const el = document.elementFromPoint(x, y);
+                if (!el) return false;
+                if (el.tagName === 'IFRAME') {
+                    const rect = el.getBoundingClientRect();
+                    const ix = x - rect.left, iy = y - rect.top;
+                    try {
+                        const doc = el.contentDocument;
+                        if (doc) return fire(doc.elementFromPoint(ix, iy), ix, iy);
+                    } catch (e) { /* cross-origin iframe，回到主文档 */ }
                 }
-                return true;
+                return fire(el, x, y);
             }""",
             [x, y],
         )
@@ -771,15 +796,15 @@ class InteractivePlatformLogin:
                         break
 
                     now = time.monotonic()
-                    if now - last_frame_at >= 0.45:
+                    if now - last_frame_at >= 0.15:
                         try:
                             self._publish_frame(
-                                page.screenshot(type="jpeg", quality=68, timeout=8000)
+                                page.screenshot(type="jpeg", quality=55, timeout=8000)
                             )
                             last_frame_at = now
                         except PlaywrightError:
                             pass
-                    time.sleep(0.08)
+                    time.sleep(0.05)
         except Exception as exc:
             logger.warning("交互式{}登录失败: {}", self._platform_label, exc)
             # Keep the error useful without exposing long Playwright traces.

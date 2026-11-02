@@ -956,8 +956,8 @@ const startInteractiveLogin = async (name, accountId = null, platform = 'douyin'
     interactiveLoginId.value = data.session || ''
     interactiveLoginStatus.value = data.status || 'running'
     interactiveLoginMessage.value = data.message || `请在${platformLabel}官方窗口完成登录`
-    interactiveFrameTimer = setInterval(refreshInteractiveFrame, 650)
-    interactiveStatusTimer = setInterval(pollInteractiveLogin, 900)
+    interactiveFrameTimer = setInterval(refreshInteractiveFrame, 220)
+    interactiveStatusTimer = setInterval(pollInteractiveLogin, 450)
     refreshInteractiveFrame()
   } catch (error) {
     interactiveLoginStatus.value = 'failed'
@@ -982,6 +982,8 @@ const sendRemoteInput = (kind, payload = {}) => {
     { id: interactiveLoginId.value, kind, payload },
     { silent: true }
   ).catch(() => {})
+  // 点击后立即拉一帧，让画面尽快反映操作结果
+  setTimeout(() => refreshInteractiveFrame(), 40)
 }
 
 const remotePoint = (event) => {
