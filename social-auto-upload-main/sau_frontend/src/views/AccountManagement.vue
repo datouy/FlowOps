@@ -1006,7 +1006,9 @@ const openVncNow = () => {
   const info = vncInfoCache.value
   if (!info || !info.enabled) return false
   vncCredential.value = { user: info.user || 'yunce', password: info.password || '' }
-  window.open(window.location.origin + info.path, '_blank', 'noopener,noreferrer')
+  // URL 内嵌 Basic Auth 凭据，浏览器自动登录，不再弹手输框
+  const auth = encodeURIComponent(vncCredential.value.user) + ':' + encodeURIComponent(vncCredential.value.password)
+  window.open(window.location.protocol + '//' + auth + '@' + window.location.host + info.path, '_blank', 'noopener,noreferrer')
   return true
 }
 
@@ -1019,7 +1021,8 @@ const openVncWindow = async () => {
       return
     }
     vncCredential.value = { user: data.user || 'yunce', password: data.password || '' }
-    const url = window.location.origin + data.path
+    const auth = encodeURIComponent(vncCredential.value.user) + ':' + encodeURIComponent(vncCredential.value.password)
+    const url = window.location.protocol + '//' + auth + '@' + window.location.host + data.path
     window.open(url, '_blank', 'noopener,noreferrer')
   } catch (error) {
     ElMessage.error('打开真实浏览器窗口失败，请稍后重试')
