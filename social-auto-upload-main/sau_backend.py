@@ -96,22 +96,134 @@ def health():
     return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
 
 
+# ---------------------------------------------------------------- 登录账号槽位
+#
+# "登录账号选择"：先用平台定位到 type，再列出该平台已有账号，让前端在
+# 「新建账号 / 覆盖已有账号」之间选。key 只认 PLATFORM_LOGIN_TARGETS 里的三个，
+# 中文名与 type 都归一化到这里，避免前端出现 channels / tencent 两套 key。
+PLATFORM_LABELS = {"douyin": "抖音", "xiaohongshu": "小红书", "tencent": "视频号"}
+ACCOUNT_STATUS_TEXT = {1: "正常", 0: "异常", -1: "验证中"}
+
+
+def _resolve_login_platform(value) -> str | None:
+    """把 platform key / 中文名 / type 编号归一化成登录平台 key。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text in PLATFORM_LOGIN_TARGETS:
+        return text
+    for key, meta in PLATFORM_LOGIN_TARGETS.items():
+        if str(meta.get("type")) == text:
+            return key
+    for key, label in PLATFORM_LABELS.items():
+        if text == label:
+            return key
+    return None
+
+
+def _platform_accounts(platform_key: str) -> list:
+    """读取该登录平台已有的账号行（即可覆盖的登录槽位）。"""
+    platform_type = PLATFORM_LOGIN_TARGETS[platform_key]["type"]
+    db_path = Path(BASE_DIR / "db" / "database.db")
+    if not db_path.is_file():
+        return []
+    with db_connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, userName, status, filePath FROM user_info WHERE type=? ORDER BY id",
+            (platform_type,),
+        ).fetchall()
+    accounts = []
+    for row in rows:
+        status = int(row[2]) if row[2] is not None else 0
+        accounts.append({
+            "id": int(row[0]),
+            "name": row[1] or f"账号{row[0]}",
+            "status": status,
+            "statusText": ACCOUNT_STATUS_TEXT.get(status, "未知"),
+            "cookieName": row[3] or "",
+        })
+    return accounts
+
+
+def _account_row(account_id: int):
+    """按 id 取账号行，用于覆盖登录前的归属校验。"""
+    db_path = Path(BASE_DIR / "db" / "database.db")
+    if not db_path.is_file():
+        return None
+    with db_connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT id, type, userName FROM user_info WHERE id=?", (account_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return {"id": int(row[0]), "type": int(row[1]), "name": row[2] or ""}
+
+
+@app.route('/accounts/slots', methods=['GET'])
+def account_slots():
+    """登录账号选择：返回平台元数据 + 可覆盖的账号列表 + 建议新名称。"""
+    platform_key = _resolve_login_platform(
+        request.args.get('platform') or request.args.get('type')
+    )
+    if platform_key is None:
+        return jsonify({
+            "code": 400,
+            "msg": "platform 仅支持 douyin / xiaohongshu / tencent（或中文名、type 编号）",
+            "data": None,
+        }), 400
+    accounts = _platform_accounts(platform_key)
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {
+            "platform": {
+                "key": platform_key,
+                "type": PLATFORM_LOGIN_TARGETS[platform_key]["type"],
+                "label": PLATFORM_LABELS[platform_key],
+            },
+            "accounts": accounts,
+            "nextName": f"{PLATFORM_LABELS[platform_key]}账号{len(accounts) + 1}",
+        },
+    }), 200
+
+
 @app.route('/interactiveLogin/start', methods=['POST'])
 def interactive_login_start():
     """Open an isolated official login window for the requested platform."""
     data = request.get_json(silent=True) or {}
     account_name = str(data.get('id') or '').strip()[:64] or '账号'
-    platform = str(data.get('platform') or 'douyin').strip().lower()
+    platform = _resolve_login_platform(data.get('platform')) or str(
+        data.get('platform') or 'douyin'
+    ).strip().lower()
     if platform not in PLATFORM_LOGIN_TARGETS:
         return jsonify({
             "code": 400,
-            "msg": "该平台暂不支持官方登录窗口",
+            "msg": "该平台暂不支持官方登录窗口（目前支持 抖音 / 小红书 / 视频号）",
             "data": None,
         }), 400
     try:
         account_id = int(data.get('account_id')) if data.get('account_id') else None
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "账号 ID 格式错误", "data": None}), 400
+    # 覆盖登录前先确认这个账号确实属于当前平台，否则会把抖音账号行写进小红书。
+    if account_id is not None:
+        row = _account_row(account_id)
+        platform_type = PLATFORM_LOGIN_TARGETS[platform]["type"]
+        if row is None:
+            return jsonify({
+                "code": 404,
+                "msg": "要覆盖的账号不存在，可能已被删除，请刷新后重试",
+                "data": None,
+            }), 404
+        if row["type"] != platform_type:
+            return jsonify({
+                "code": 400,
+                "msg": (
+                    f"账号「{row['name'] or row['id']}」不属于"
+                    f"{PLATFORM_LABELS[platform]}，请选择本平台的账号或新建"
+                ),
+                "data": None,
+            }), 400
     try:
         session_id, session = interactive_login_manager.start(
             account_name, account_id, platform=platform
@@ -121,7 +233,14 @@ def interactive_login_start():
     return jsonify({
         "code": 200,
         "msg": "官方登录窗口已启动",
-        "data": {"session": session_id, **session.snapshot()},
+        "data": {
+            "session": session_id,
+            "mode": "replace" if account_id else "create",
+            "accountId": account_id,
+            "platform": platform,
+            "platformLabel": PLATFORM_LABELS.get(platform, platform),
+            **session.snapshot(),
+        },
     }), 200
 
 

@@ -118,6 +118,46 @@
           />
         </el-form-item>
         <el-form-item
+          v-if="dialogType === 'add' && !reLoginMode && INTERACTIVE_PLATFORMS[accountForm.platform]"
+          label="登录到"
+        >
+          <div class="login-target">
+            <el-radio-group
+              v-model="loginTarget"
+              :disabled="sseConnecting || interactiveLoginActive"
+              @change="handleLoginTargetChange"
+            >
+              <el-radio value="new">新建账号</el-radio>
+              <el-radio value="existing" :disabled="!slotAccounts.length">
+                覆盖已有账号
+                <template v-if="slotAccounts.length">（{{ slotAccounts.length }}）</template>
+              </el-radio>
+            </el-radio-group>
+            <el-select
+              v-if="loginTarget === 'existing'"
+              v-model="selectedSlotId"
+              class="login-target-select"
+              placeholder="请选择要覆盖的账号"
+              :loading="slotLoading"
+              :disabled="sseConnecting || interactiveLoginActive"
+              @change="handleSlotChange"
+            >
+              <el-option
+                v-for="slot in slotAccounts"
+                :key="slot.id"
+                :value="slot.id"
+                :label="`${slot.name}（${slot.statusText}）`"
+              />
+            </el-select>
+            <div v-if="loginTarget === 'existing'" class="login-target-hint">
+              覆盖登录只刷新该账号的 Cookie，账号 ID 与历史发布记录保持不变。
+            </div>
+            <div v-else-if="slotAccounts.length" class="login-target-hint">
+              该平台已有 {{ slotAccounts.length }} 个账号，要更新其中一个请选「覆盖已有账号」。
+            </div>
+          </div>
+        </el-form-item>
+        <el-form-item
           v-if="interactiveLoginPlatform && (dialogType === 'add' || reLoginMode)"
           label="登录方式"
         >
@@ -323,27 +363,26 @@ const appStore = useAppStore()
 // 平台元数据：标签页、添加账号下拉框和扫码登录共用同一份配置
 const platformMeta = {
   '快手': { key: 'kuaishou', type: 4 },
-  '抖音': { key: 'douyin', type: 3 },
-  '视频号': { key: 'channels', type: 2 },
-  '小红书': { key: 'xiaohongshu', type: 1 },
+  '抖音': { key: 'douyin', type: 3, loginKey: 'douyin' },
+  // 视频号的标签页 key 用 channels，但官方登录窗口只认 tencent：
+  // 两个 key 分开维护，避免把 channels 传给 /interactiveLogin/start 被 400。
+  '视频号': { key: 'channels', type: 2, loginKey: 'tencent' },
+  '小红书': { key: 'xiaohongshu', type: 1, loginKey: 'xiaohongshu' },
   '微博': { key: 'weibo', type: 5 },
   '百家号': { key: 'baijiahao', type: 6 }
 }
 const platformOptions = Object.keys(platformMeta)
 // 走"官方登录窗口"的平台：把平台真实登录页拉到对话框里完成登录。
-// 视频号也走这里——它的登录页是微信扫码界面，直接把真实页面搬到对话框，
-// 用户看到的就是官方页面，二维码清晰可扫、扫码状态一目了然。
-const INTERACTIVE_PLATFORMS = {
-  '抖音': 'douyin',
-  '小红书': 'xiaohongshu',
-  '视频号': 'tencent'
-}
+// 直接由 platformMeta.loginKey 派生，只留一份平台清单。
+const INTERACTIVE_PLATFORMS = Object.fromEntries(
+  Object.entries(platformMeta)
+    .filter(([, meta]) => meta.loginKey)
+    .map(([label, meta]) => [label, meta.loginKey])
+)
 // 平台键 -> 中文名，用于官方登录窗口的提示文案。
-const INTERACTIVE_PLATFORM_LABELS = {
-  douyin: '抖音',
-  xiaohongshu: '小红书',
-  tencent: '视频号'
-}
+const INTERACTIVE_PLATFORM_LABELS = Object.fromEntries(
+  Object.entries(INTERACTIVE_PLATFORMS).map(([label, key]) => [key, label])
+)
 const accountTabs = [
   { name: 'all', label: '全部' },
   ...platformOptions.map(label => ({ name: platformMeta[label].key, label }))
@@ -527,7 +566,12 @@ const currentLoginId = ref('')
 const currentPlatform = ref('')
 const currentAccountName = ref('')
 const currentAccountId = ref(null)
-// 当前走"官方登录窗口"的平台 key（douyin / xiaohongshu）
+// 「登录到」：新建账号 or 覆盖已有账号（覆盖时复用该账号 id，只换 Cookie）
+const loginTarget = ref('new')
+const slotAccounts = ref([])
+const slotLoading = ref(false)
+const selectedSlotId = ref(null)
+// 当前走"官方登录窗口"的平台 key（douyin / xiaohongshu / tencent）
 const currentInteractivePlatform = ref('douyin')
 let verifyCooldownTimer = null
 const interactiveLoginActive = ref(false)
@@ -598,12 +642,62 @@ const startVerifyCooldown = (seconds = 60) => {
   }, 1000)
 }
 
+const loginPlatformKey = (platform) => INTERACTIVE_PLATFORMS[platform] || ''
+
+// 登录账号选择：拉取该平台已有账号，供「覆盖已有账号」下拉使用。
+const loadAccountSlots = async (platform) => {
+  const key = loginPlatformKey(platform)
+  slotAccounts.value = []
+  selectedSlotId.value = null
+  loginTarget.value = 'new'
+  if (!key) return
+  slotLoading.value = true
+  try {
+    const res = await http.get('/accounts/slots', { platform: key }, { silent: true })
+    const data = res?.data || {}
+    slotAccounts.value = Array.isArray(data.accounts) ? data.accounts : []
+  } catch (error) {
+    console.warn('读取账号槽位失败:', error)
+    slotAccounts.value = []
+  } finally {
+    slotLoading.value = false
+  }
+}
+
+const handleLoginTargetChange = (value) => {
+  if (value !== 'existing') {
+    // 切回新建：清掉覆盖时带出的账号 id；若名称是覆盖时自动带出的，也一并清掉
+    currentAccountId.value = null
+    if (slotAccounts.value.some(slot => slot.name === accountForm.name)) {
+      accountForm.name = ''
+    }
+    selectedSlotId.value = null
+    return
+  }
+  if (!slotAccounts.value.length) {
+    loginTarget.value = 'new'
+    ElMessage.info('该平台还没有可覆盖的账号，请先新建')
+    return
+  }
+  if (!selectedSlotId.value) selectedSlotId.value = slotAccounts.value[0].id
+  handleSlotChange(selectedSlotId.value)
+}
+
+const handleSlotChange = (slotId) => {
+  const slot = slotAccounts.value.find(item => item.id === slotId)
+  if (!slot) return
+  currentAccountId.value = slot.id
+  accountForm.name = slot.name
+}
+
 const handleLoginPlatformChange = (platform) => {
   if (platform !== '抖音') {
     loginMethod.value = 'qr'
     loginPhone.value = ''
     loginPassword.value = ''
   }
+  // 换平台必须重拉槽位，否则会把上一个平台的账号覆盖掉
+  loadAccountSlots(platform)
 }
 
 // 添加账号
@@ -636,7 +730,13 @@ const handleAddAccount = () => {
   loginErrorMessage.value = ''
   directSmsFlow.value = false
   currentLoginId.value = ''
+  // 登录账号选择：重置为「新建账号」，并按当前平台预载可覆盖的账号
+  loginTarget.value = 'new'
+  slotAccounts.value = []
+  selectedSlotId.value = null
+  slotLoading.value = false
   dialogVisible.value = true
+  if (accountForm.platform) loadAccountSlots(accountForm.platform)
 }
 
 // 编辑账号
@@ -1277,16 +1377,32 @@ const submitAccountForm = () => {
   accountFormRef.value.validate(async (valid) => {
     if (valid) {
       if (dialogType.value === 'add' || reLoginMode.value) {
-        // 名称选填：留空时自动生成默认名称（如“抖音账号1”）
-        const name = accountForm.name.trim()
-        if (!name) {
-          const samePlatformCount = accountStore.accounts.filter(
-            acc => acc.platform === accountForm.platform
-          ).length
-          accountForm.name = `${accountForm.platform}账号${samePlatformCount + 1}`
+        // 覆盖已有账号时复用该账号 id（只刷新 Cookie）；新建则传 null 让后端 INSERT
+        const replacing = !reLoginMode.value && loginTarget.value === 'existing'
+        if (replacing && !selectedSlotId.value) {
+          ElMessage.warning('请选择要覆盖的账号')
+          return
         }
-        const accountId = reLoginMode.value ? accountForm.id : null
-        // 抖音和小红书都走"官方登录窗口"：把平台真实登录页拉到对话框里，
+        // 名称选填：覆盖模式沿用原账号名；新建留空时自动生成（如"抖音账号2"）
+        let name = accountForm.name.trim()
+        if (!name) {
+          const slot = replacing
+            ? slotAccounts.value.find(item => item.id === selectedSlotId.value)
+            : null
+          if (slot) {
+            name = slot.name
+          } else {
+            const samePlatformCount = accountStore.accounts.filter(
+              acc => acc.platform === accountForm.platform
+            ).length
+            name = `${accountForm.platform}账号${samePlatformCount + 1}`
+          }
+          accountForm.name = name
+        }
+        const accountId = reLoginMode.value
+          ? accountForm.id
+          : (replacing ? selectedSlotId.value : null)
+        // 抖音、小红书、视频号都走"官方登录窗口"：把平台真实登录页拉到对话框里，
         // 用户直接在上面扫码/输验证码，和官方页面完全一致。
         const interactiveKey = INTERACTIVE_PLATFORMS[accountForm.platform]
         if (interactiveKey) {
@@ -1433,6 +1549,23 @@ onBeforeUnmount(() => {
     strong {
       color: #303133;
       font-size: 13px;
+    }
+  }
+
+  .login-target {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+
+    .login-target-select {
+      width: 100%;
+    }
+
+    .login-target-hint {
+      color: #909399;
+      font-size: 12px;
+      line-height: 1.5;
     }
   }
 
