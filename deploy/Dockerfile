@@ -82,4 +82,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
 # db/database.db 的 user_info / file_records 只有 createTable.py 会建，
 # 其余库都是模块导入时自建表；所以启动前必须先跑一次这个幂等脚本。
 # 脚本按 CWD 找 ./database.db，因此要 cd 到 /app/db 再执行。
-CMD ["sh", "-c", "cd /app/db && python /app/_init_db.py; test $? -eq 0 || exit $?; cd /app; Xvfb :99 -screen 0 1440x1000x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & export DISPLAY=:99; sleep 1; x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 -xkb >/tmp/x11vnc.log 2>&1 & websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/websockify.log 2>&1 & exec python sau_backend.py"]
+CMD ["sh", "/app/docker-entrypoint.sh"]
