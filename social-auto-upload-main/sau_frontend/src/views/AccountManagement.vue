@@ -349,6 +349,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { Refresh, CircleCheckFilled, CircleCloseFilled, Download, Upload, Loading } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -753,39 +754,41 @@ const handleEdit = (row) => {
 }
 
 // 删除账号
-const handleDelete = (row) => {
-  ElMessageBox.confirm(
-    `确定要删除账号 ${row.name} 吗？`,
-    '警告',
-    {
-      confirmButtonText: '确定',
-      cancelButtonText: '取消',
-      type: 'warning',
-    }
-  )
-    .then(async () => {
-      try {
-        // 调用API删除账号
-        const response = await accountApi.deleteAccount(row.id)
+const deletePendingId = ref(null)
 
-        if (response.code === 200) {
-          // 从状态管理中删除账号
-          accountStore.deleteAccount(row.id)
-          ElMessage({
-            type: 'success',
-            message: '删除成功',
-          })
-        } else {
-          ElMessage.error(response.msg || '删除失败')
-        }
-      } catch (error) {
-        console.error('删除账号失败:', error)
-        ElMessage.error('删除账号失败')
+const handleDelete = async (row) => {
+  if (deletePendingId.value !== null) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除账号 ${row.name} 吗？`,
+      '警告',
+      {
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+        type: 'warning',
       }
-    })
-    .catch(() => {
-      // 取消删除
-    })
+    )
+  } catch (e) {
+    return // 用户取消
+  }
+
+  deletePendingId.value = row.id
+  try {
+    // 调用API删除账号
+    const response = await accountApi.deleteAccount(row.id)
+    if (response?.code === 200) {
+      // 从状态管理中删除账号
+      accountStore.deleteAccount(row.id)
+      ElMessage({ type: 'success', message: '删除成功' })
+    } else {
+      ElMessage.error(response?.msg || '删除失败')
+    }
+  } catch (error) {
+    // request 拦截器已统一提示后端/网络错误，这里只留日志，避免重复弹窗
+    console.error('删除账号失败:', error)
+  } finally {
+    deletePendingId.value = null
+  }
 }
 
 // 下载Cookie文件
