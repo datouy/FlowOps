@@ -9,8 +9,16 @@ from utils.log import tencent_logger, kuaishou_logger, douyin_logger, xiaohongsh
 from pathlib import Path
 
 
+def _linux_chrome_ua(version: str) -> str:
+    major = version.split(".", 1)[0] if version else "131"
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
 @asynccontextmanager
-async def browser_session(account_file):
+async def browser_session(account_file, interactive_ua=False, locale=None, timezone_id=None):
     """Open one Chromium session and always tear it down.
 
     Why this exists: ``async with async_playwright()`` only guarantees the
@@ -29,7 +37,16 @@ async def browser_session(account_file):
         browser = await playwright.chromium.launch(headless=LOCAL_CHROME_HEADLESS)
         context = None
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context_kwargs = {"storage_state": account_file}
+            if interactive_ua:
+                context_kwargs["user_agent"] = _linux_chrome_ua(
+                    str(getattr(browser, "version", "") or "")
+                )
+            if locale:
+                context_kwargs["locale"] = locale
+            if timezone_id:
+                context_kwargs["timezone_id"] = timezone_id
+            context = await browser.new_context(**context_kwargs)
             context = await set_init_script(context)
             page = await context.new_page()
             yield browser, context, page
@@ -67,7 +84,12 @@ async def cookie_auth_douyin(account_file):
 
 
 async def cookie_auth_tencent(account_file):
-    async with browser_session(account_file) as (_browser, _context, page):
+    # 视频号会话绑定设备指纹（UA）。登录窗口用的是 Linux Chrome UA，
+    # 校验如果用 Playwright 默认的 HeadlessChrome UA，会被微信当成新设备
+    # 踢回登录页，导致刚扫好的 cookie 被误判失效。这里必须用同一套 UA。
+    async with browser_session(
+        account_file, interactive_ua=True, locale="zh-CN", timezone_id="Asia/Shanghai"
+    ) as (_browser, _context, page):
         try:
             # 访问指定的 URL
             await page.goto(

@@ -430,7 +430,18 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**options)
-            context = await browser.new_context()
+            # 与 interactive_login / 校验端保持同一套 Linux Chrome UA，
+            # 视频号会话绑定设备指纹，UA 不一致会被微信当成新设备踢下线。
+            version = str(getattr(browser, "version", "") or "")
+            major = version.split(".", 1)[0] if version else "131"
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+                ),
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto("https://channels.weixin.qq.com", wait_until="domcontentloaded")
