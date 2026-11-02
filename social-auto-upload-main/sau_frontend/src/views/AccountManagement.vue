@@ -139,6 +139,18 @@
           </div>
           <div
             v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            class="remote-vnc-row"
+          >
+            <el-button type="primary" @click="openVncWindow">
+              <el-icon><FullScreen /></el-icon>
+              在真实浏览器窗口中操作
+            </el-button>
+            <span v-if="vncCredential" class="remote-vnc-hint">
+              浏览器若提示登录：账号 <code>{{ vncCredential.user }}</code>，密码 <code>{{ vncCredential.password }}</code>
+            </span>
+          </div>
+          <div
+            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
             class="remote-browser-stage"
             :class="{ dragging: remotePointerDown }"
             :style="remoteStageStyle"
@@ -308,7 +320,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
-import { Refresh, CircleCheckFilled, CircleCloseFilled, Download, Upload, Loading } from '@element-plus/icons-vue'
+import { Refresh, CircleCheckFilled, CircleCloseFilled, Download, Upload, Loading, FullScreen } from '@element-plus/icons-vue'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -536,6 +548,7 @@ const interactiveLoginStatus = ref('')
 const interactiveLoginMessage = ref('')
 const interactiveLoginId = ref('')
 const interactiveLoginPlatform = ref('')
+const vncCredential = ref(null)
 const interactiveFrameUrl = ref('')
 const interactiveImageRef = ref(null)
 const remoteInputText = ref('')
@@ -973,6 +986,22 @@ const retryInteractiveLogin = () => {
     currentAccountId.value || (reLoginMode.value ? accountForm.id : null),
     currentInteractivePlatform.value
   )
+}
+
+const openVncWindow = async () => {
+  try {
+    const response = await http.get('/interactiveLogin/vnc-info', {}, { silent: true })
+    const data = response.data || {}
+    if (!data.enabled) {
+      ElMessage.warning('真实浏览器窗口未启用，请联系管理员开启 VNC')
+      return
+    }
+    vncCredential.value = { user: data.user || 'yunce', password: data.password || '' }
+    const url = window.location.origin + data.path
+    window.open(url, '_blank', 'noopener,noreferrer')
+  } catch (error) {
+    ElMessage.error('打开真实浏览器窗口失败，请稍后重试')
+  }
 }
 
 const sendRemoteInput = (kind, payload = {}) => {
@@ -1499,6 +1528,29 @@ onBeforeUnmount(() => {
 
       .remote-zoom-hint {
         color: #909399;
+      }
+    }
+
+    .remote-vnc-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      background: #fff;
+      border-bottom: 1px solid #ebeef5;
+
+      .remote-vnc-hint {
+        color: #606266;
+        font-size: 12px;
+
+        code {
+          padding: 1px 5px;
+          background: #f5f7fa;
+          border: 1px solid #dcdfe6;
+          border-radius: 3px;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
       }
     }
 
