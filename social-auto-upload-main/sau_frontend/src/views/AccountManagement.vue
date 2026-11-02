@@ -428,6 +428,7 @@ const validateAllAccountsInBackground = async () => {
 
 // 页面加载时获取账号数据
 onMounted(() => {
+  prefetchVncInfo()
   // 快速获取账号列表（不验证），立即显示
   fetchAccountsQuick()
 
@@ -949,6 +950,7 @@ const pollInteractiveLogin = async () => {
 }
 
 const startInteractiveLogin = async (name, accountId = null, platform = 'douyin') => {
+  openVncNow()
   closeInteractiveLogin()
   remoteZoom.value = 1
   const platformLabel = INTERACTIVE_PLATFORM_LABELS[platform] || '抖音'
@@ -986,6 +988,26 @@ const retryInteractiveLogin = () => {
     currentAccountId.value || (reLoginMode.value ? accountForm.id : null),
     currentInteractivePlatform.value
   )
+}
+
+const vncInfoCache = ref(null)
+
+const prefetchVncInfo = async () => {
+  try {
+    const response = await http.get('/interactiveLogin/vnc-info', {}, { silent: true })
+    vncInfoCache.value = response.data || null
+  } catch (error) {
+    vncInfoCache.value = null
+  }
+}
+
+// 用户手势内同步打开 VNC，避免浏览器拦截弹窗；失败再退回手动按钮
+const openVncNow = () => {
+  const info = vncInfoCache.value
+  if (!info || !info.enabled) return false
+  vncCredential.value = { user: info.user || 'yunce', password: info.password || '' }
+  window.open(window.location.origin + info.path, '_blank', 'noopener,noreferrer')
+  return true
 }
 
 const openVncWindow = async () => {
