@@ -303,10 +303,9 @@ def weekly_report(days: int = 7) -> dict:
         records = [dict(row) for row in c.execute(
             "SELECT * FROM publish_records WHERE created_at>=? ORDER BY id DESC", (since,)
         ).fetchall()]
-        rows = [dict(row) for row in c.execute("""SELECT s.* FROM content_stats s
-            INNER JOIN (SELECT content_key, MAX(id) mid FROM content_stats
-                        WHERE content_key IS NOT NULL AND content_key!='' GROUP BY content_key) m
-            ON m.mid=s.id ORDER BY s.plays DESC""").fetchall()]
+        rows = [dict(row) for row in c.execute("""SELECT * FROM content_stats
+            WHERE content_key IS NOT NULL AND content_key!=''
+            ORDER BY plays DESC""").fetchall()]
     accounts = stats_reflow._account_rows()
     records = stats_reflow.filter_current_account_records(records, accounts)
     jobs = stats_reflow.filter_current_account_jobs(

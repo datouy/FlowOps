@@ -13,6 +13,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
 from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
@@ -68,7 +69,37 @@ def _db_prepare():
                 c.execute(f'ALTER TABLE content_stats ADD COLUMN {name} {definition}')
         c.execute('CREATE INDEX IF NOT EXISTS idx_content_stats_record ON content_stats(record_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_content_stats_key ON content_stats(content_key)')
+        # content_key 唯一化：同一内容每次回流只保留一行最新快照。
+        # 先清理历史重复行（保留 id 最大的一行），再建唯一索引。
+        _dedupe_content_stats(c)
+        c.execute(
+            'CREATE UNIQUE INDEX IF NOT EXISTS idx_content_stats_key_unique '
+            f'ON content_stats(content_key) WHERE {CONTENT_KEY_PRESENT}'
+        )
         record_schema_version(c, "stats_reflow", 1)
+
+
+# content_key 有效的条件。它同时用在唯一索引、部分索引的 UPSERT
+# 冲突目标和去重 SQL 里，必须三处完全一致，SQLite 才能匹配上索引。
+CONTENT_KEY_PRESENT = "content_key IS NOT NULL AND content_key != ''"
+
+
+def _dedupe_content_stats(c):
+    """删除 content_key 相同的历史重复行，只保留最新的一条。
+
+    旧版 ``_save_stats`` 是无条件 INSERT，每次回流都会给同一内容加一行。
+    这里在建立唯一索引之前先把重复行清掉，否则唯一索引建不上。
+    """
+    try:
+        c.execute(f'''DELETE FROM content_stats WHERE id NOT IN (
+            SELECT MAX(id) FROM content_stats
+            WHERE {CONTENT_KEY_PRESENT}
+            GROUP BY content_key
+        ) AND {CONTENT_KEY_PRESENT}''')
+    except Exception as exc:
+        # 去重失败不应该阻塞启动，索引会在下次迁移时补上；
+        # 但必须留日志——建不上唯一索引会让 UPSERT 静默退化成"每次插新行"
+        logger.warning('content_stats 去重失败，唯一索引可能未建立: {}', exc)
 
 
 def _account_rows():
@@ -615,23 +646,51 @@ def _save_stats(
     items: list[dict],
     record_id: int | None = None,
 ):
+    """把抓取到的内容数据写入 content_stats。
+
+    历史实现是无条件 INSERT。每回流一次，同一条内容就多一行快照——
+    表会无限膨胀，而所有查询（schedule_ops / ops_center / stats_reflow）
+    都要靠 ``MAX(id) GROUP BY content_key`` 子查询去重，既慢又容易漏。
+
+    现在改成 UPSERT：``content_key`` 相同就更新那一行，不再插入新行。
+    这样 content_stats 里每条内容只有一行"最新快照"，
+    查询可以直接按 content_key 取，不用再套子查询去重。
+
+    为了兼容已有的历史数据，``_db_prepare`` 会先把重复行清理掉
+    （保留 id 最大的一行），再建立唯一索引。
+    """
     if not items:
         return 0
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     account_name = str((account or {}).get('userName') or (account or {}).get('id') or '')
+    saved = 0
     with get_conn() as c:
         for item in items:
             content_key = f"{platform}:{account_name}:{item.get('id') or item.get('title')}"
             c.execute('''INSERT INTO content_stats
                 (record_id, platform, account, content_key, title, plays, likes, comments,
                  collects, shares, followers, published_at, raw, fetched_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(content_key) WHERE content_key IS NOT NULL AND content_key != ''
+                DO UPDATE SET
+                    record_id=COALESCE(excluded.record_id, content_stats.record_id),
+                    title=excluded.title,
+                    plays=excluded.plays,
+                    likes=excluded.likes,
+                    comments=excluded.comments,
+                    collects=excluded.collects,
+                    shares=excluded.shares,
+                    followers=excluded.followers,
+                    published_at=excluded.published_at,
+                    raw=excluded.raw,
+                    fetched_at=excluded.fetched_at''', (
                 record_id, platform, account_name, content_key, item.get('title', ''),
                 item.get('plays', 0), item.get('likes', 0), item.get('comments', 0),
                 item.get('collects', 0), item.get('shares', 0), item.get('followers', 0),
                 item.get('published_at', ''), item.get('raw', ''), now,
             ))
-    return len(items)
+            saved += 1
+    return saved
 
 
 def _set_state(**kwargs):
@@ -773,16 +832,12 @@ def stats_summary() -> dict:
         records = [dict(r) for r in c.execute(
             'SELECT * FROM publish_records ORDER BY id DESC LIMIT 100'
         ).fetchall()]
-        # 按内容唯一键只取最新快照，历史快照仍保留在表中用于趋势分析。
+        # content_key 现在有唯一索引，每条内容只有一行最新快照，
+        # 不需要再套 MAX(id) GROUP BY 子查询去重。
         rows = [dict(r) for r in c.execute('''
-            SELECT s.* FROM content_stats s
-            INNER JOIN (
-                SELECT content_key, MAX(id) AS max_id
-                FROM content_stats
-                WHERE content_key IS NOT NULL AND content_key != ''
-                GROUP BY content_key
-            ) latest ON latest.max_id = s.id
-            ORDER BY s.id DESC
+            SELECT * FROM content_stats
+            WHERE content_key IS NOT NULL AND content_key != ''
+            ORDER BY id DESC
         ''').fetchall()]
 
     records = filter_current_account_records(records, accounts)

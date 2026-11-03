@@ -88,16 +88,12 @@ def register(app):
     def stats_unmatched():
         """Return latest collected contents that were not linked to a publish record."""
         with publish_jobs.get_conn() as c:
+            # content_key 有唯一索引，每条内容只有一行最新快照
             rows = c.execute('''
-                SELECT s.* FROM content_stats s
-                INNER JOIN (
-                    SELECT content_key, MAX(id) AS max_id
-                    FROM content_stats
-                    WHERE content_key IS NOT NULL AND content_key != ''
-                    GROUP BY content_key
-                ) latest ON latest.max_id = s.id
-                WHERE s.record_id IS NULL OR s.record_id = 0
-                ORDER BY s.id DESC
+                SELECT * FROM content_stats
+                WHERE (record_id IS NULL OR record_id = 0)
+                    AND content_key IS NOT NULL AND content_key != ''
+                ORDER BY id DESC
             ''').fetchall()
         rows = stats_reflow.filter_current_account_rows([dict(r) for r in rows])
         return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
