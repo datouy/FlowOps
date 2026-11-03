@@ -38,6 +38,23 @@ PLACEHOLDER_TEXTS = (
     "请打开抖音查看详情",
 )
 UNPARSEABLE_CONTENT = "当前内容无法在平台上展示"
+MEDIA_UNAVAILABLE_TEXTS = {
+    "video": "该内容为视频，该平台上无法正常展示",
+    "image": "该内容为图片，该平台上无法正常展示",
+    "sticker": "该内容为表情，该平台上无法正常展示",
+    "share": "该内容为分享内容，该平台上无法正常展示",
+    "other": "该内容无法在当前平台正常展示",
+}
+LEGACY_MEDIA_PLACEHOLDERS = {
+    "[图片]", "[视频]", "[表情]", "[分享内容]", "[分享视频]",
+    "分享视频无法查看", "分享视频无法查看\n视频无法查看，请浏览其他内容",
+    "视频无法查看，请浏览其他内容", UNPARSEABLE_CONTENT,
+}
+VIDEO_UNAVAILABLE_MARKERS = (
+    "分享视频无法查看", "视频无法查看，请浏览其他内容",
+)
+VIDEO_MESSAGE_TYPES = {8}
+IMAGE_MESSAGE_TYPES = {3, 77}
 
 # 常驻浏览器：单独一条 asyncio 事件循环线程承载 Playwright，
 # 每个账号一个 context/page 会话，按 Cookie 修改时间失效重建。
@@ -88,7 +105,42 @@ def _is_placeholder(text: str) -> bool:
         return True
     if any(marker in value for marker in PLACEHOLDER_TEXTS):
         return True
+    if _media_type_from_text(value) or value in LEGACY_MEDIA_PLACEHOLDERS:
+        return True
     return bool(UNREAD_PLACEHOLDER_RE.fullmatch(value))
+
+
+def _media_type_from_text(text: str, message_type: int = 0) -> str:
+    """识别平台只暴露封面、占位文案或消息类型时的媒体种类。"""
+    value = str(text or "").strip()
+    if any(marker in value for marker in VIDEO_UNAVAILABLE_MARKERS):
+        return "video"
+    compact = re.sub(r"\s+", "", value)
+    if compact in ("[视频]", "[分享视频]"):
+        return "video"
+    if compact in ("[图片]", "分享[图文]"):
+        return "image"
+    if compact == "[表情]":
+        return "sticker"
+    if compact == "[分享内容]":
+        return "share"
+    try:
+        kind = int(message_type or 0)
+    except (TypeError, ValueError):
+        kind = 0
+    if kind in VIDEO_MESSAGE_TYPES:
+        return "video"
+    if kind in IMAGE_MESSAGE_TYPES:
+        return "image"
+    return ""
+
+
+def _unavailable_media_text(media_type: str) -> str:
+    return MEDIA_UNAVAILABLE_TEXTS.get(media_type, MEDIA_UNAVAILABLE_TEXTS["other"])
+
+
+def _is_legacy_media_placeholder(text: str) -> bool:
+    return str(text or "").strip() in LEGACY_MEDIA_PLACEHOLDERS
 
 
 BAD_NAME_MARKERS = (
@@ -227,15 +279,30 @@ HISTORY_SCRIPT = r"""
     const textNode = el.querySelector('.text-prz9K6, .text-item-message-zUNhSB');
     const text = String(textNode?.innerText || '').trim();
     const direction = cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound';
-    if (!text) {
-      const hasVideo = Boolean(el.querySelector('video'));
-      const hasImage = Array.from(el.querySelectorAll('img')).some(
-          img => (img.naturalWidth || img.width || 0) >= 80
-        );
-      if (!hasVideo && !hasImage) continue;
+    // 抖音的视频消息通常只渲染封面 img，播放图标才是可靠的视频特征。
+    // 直接消息里的视频不会创建 video 标签；旧逻辑因此把封面误判成图片。
+    const videoUnavailable = /分享视频无法查看|视频无法查看/.test(text);
+    const hasVideo = Boolean(el.querySelector('video')) || videoUnavailable ||
+      Boolean(el.querySelector('svg[class*="play"], [class*="play-icon"], [class*="playIcon"]'));
+    if (hasVideo) {
       rows.push({
         text: '', media: true,
-        media_type: hasVideo ? 'video' : 'image',
+        media_type: 'video',
+        direction, display_time: currentTime,
+      });
+      continue;
+    }
+    if (!text) {
+      const hasImage = Array.from(el.querySelectorAll('img')).some(img => {
+        if (img.closest('[class*="avatar"]')) return false;
+        const width = img.naturalWidth || img.width || 0;
+        return width >= 80 && Boolean(img.closest(
+          '[class*="aweme-cover"], [class*="image"], [class*="img"], [class*="pic"]'
+        ));
+      });
+      if (!hasImage) continue;
+      rows.push({
+        text: '', media: true, media_type: 'image',
         direction, display_time: currentTime,
       });
       continue;
@@ -609,19 +676,18 @@ def _history_items(row: dict, history: list[dict], account: dict,
     result = []
     for item in history:
         text = _clean_text(item.get("text"), 4000)
+        media_type = _clean_text(item.get("media_type"), 20)
         if not text and not item.get("media"):
             continue
         if text and _is_unread_placeholder(text):
             continue
-        if not text:
-            media_type = item.get("media_type")
-            if item.get("media"):
-                text = "[视频]" if media_type == "video" else (
-                    "[图片]" if media_type == "image" else "[媒体消息]"
-                )
-            else:
-                text = UNPARSEABLE_CONTENT
-        if _is_placeholder(text):
+        if item.get("media"):
+            text = _unavailable_media_text(media_type)
+        else:
+            detected = _media_type_from_text(text)
+            if detected:
+                text = _unavailable_media_text(detected)
+        if not item.get("media") and not _media_type_from_text(text) and _is_placeholder(text):
             text = UNPARSEABLE_CONTENT
         direction = "outbound" if item.get("direction") == "outbound" else "inbound"
         display_time = _clean_text(item.get("display_time"), 40)
@@ -971,11 +1037,14 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
     preview = _clean_text(row.get("preview"), 300)
     if not text and preview:
         text = preview
+    media_type = _media_type_from_text(text, message_type)
     allow_auto_reply = (
-        message_type == 7 and bool(text) and not _is_placeholder(text)
+        message_type == 7 and bool(text) and not media_type and not _is_placeholder(text)
         and not row.get("is_group") and not from_me
     )
-    if _is_placeholder(text):
+    if media_type:
+        text = _unavailable_media_text(media_type)
+    elif _is_placeholder(text):
         # 平台只给了“收到一条新类型消息”这类占位文案时，展示中性提示，
         # 不伪造未读数量，也不把它当成客户发来的正文。
         text = UNPARSEABLE_CONTENT
@@ -985,8 +1054,10 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
         elif not unread:
             return None, "非文本消息"
         else:
-            labels = {3: "[图片]", 5: "[表情]", 8: "[视频]", 77: "[图片]", 110: "[分享内容]"}
-            text = labels.get(message_type, UNPARSEABLE_CONTENT)
+            labels = {
+                3: "image", 5: "sticker", 8: "video", 77: "image", 110: "share",
+            }
+            text = _unavailable_media_text(labels.get(message_type, "other"))
 
     created_at = _parse_iso(row.get("created_at"))
     display_time = _clean_text(row.get("display_time"), 40)
@@ -1088,6 +1159,51 @@ def _reconcile_preview_times(items: list[dict], account: dict) -> int:
     return len(repaired)
 
 
+def _reconcile_media_placeholders(items: list[dict], account: dict) -> int:
+    """把旧版“[图片]”等占位校正为本次历史解析出的准确媒体类型。"""
+    media_texts = set(MEDIA_UNAVAILABLE_TEXTS.values())
+    authoritative = [
+        item for item in items
+        if str(item.get("content") or "") in media_texts
+        and str(item.get("source_content") or "").startswith("抖音创作者中心聊天记录")
+    ]
+    if not authoritative:
+        return 0
+
+    account_name = _account_name(account)
+    repaired = 0
+    with dm_ops.get_conn() as conn:
+        for item in authoritative:
+            user_id = str(item.get("external_user_id") or "")
+            direction = str(item.get("direction") or "inbound")
+            created_at = str(item.get("created_at") or "")
+            if not user_id or not created_at:
+                continue
+            rows = conn.execute("""SELECT id,content,created_at FROM messages
+                WHERE platform='抖音' AND account=? AND external_user_id=?
+                  AND direction=? ORDER BY id DESC""", (
+                account_name, user_id, direction,
+            )).fetchall()
+            minute = created_at[:16]
+            candidates = [
+                row for row in rows
+                if str(row["created_at"] or "")[:16] == minute
+                and _is_legacy_media_placeholder(str(row["content"] or ""))
+                and str(row["content"] or "") != str(item.get("content") or "")
+            ]
+            # 同一分钟出现多条旧占位时无法可靠对应，保留原记录，避免误改图片。
+            if len(candidates) != 1:
+                continue
+            row = candidates[0]
+            conn.execute("""UPDATE messages SET content=?,external_message_id=?,source_content=?
+                WHERE id=?""", (
+                item.get("content"), item.get("external_message_id"),
+                item.get("source_content"), row["id"],
+            ))
+            repaired += 1
+    return repaired
+
+
 def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
     name = _account_name(account)
     if not account.get("cookie_path"):
@@ -1130,6 +1246,7 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
             skipped += 1
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
+    _reconcile_media_placeholders(items, account)
     _reconcile_preview_times(items, account)
     # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
     ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)

@@ -71,3 +71,66 @@ def test_row_to_item_keeps_group_history_without_auto_reply():
     assert reason == ""
     assert item["platform"] == "抖音"
     assert item["external_user_id"] == "c1"
+
+
+def test_media_type_detection_handles_video_cover_and_placeholders():
+    assert dy._media_type_from_text("[图片]") == "image"
+    assert dy._media_type_from_text("[视频]") == "video"
+    assert dy._media_type_from_text("分享视频无法查看\n视频无法查看，请浏览其他内容") == "video"
+    assert dy._media_type_from_text("普通消息", 8) == "video"
+
+
+def test_history_items_keep_media_kind_even_when_cover_has_text():
+    row = {"cid": "c1", "name": "258", "unread": 0}
+    account = {"id": 1, "userName": "测试账号"}
+    items = dy._history_items(row, [{
+        "text": "封面上的说明文字", "media": True, "media_type": "video",
+        "direction": "inbound", "display_time": "17:24",
+    }], account, hours=0)
+
+    assert len(items) == 1
+    assert items[0]["content"] == "该内容为视频，该平台上无法正常展示"
+    assert items[0]["auto_reply"] is False
+
+
+def test_row_to_item_maps_platform_video_placeholder_to_explicit_notice():
+    item, reason = dy._row_to_item({
+        "cid": "c1", "name": "258", "unread": 1,
+        "text": "[图片]", "message_type": 0,
+    }, {"id": 1, "userName": "测试账号"})
+
+    assert reason == ""
+    assert item["content"] == "该内容为图片，该平台上无法正常展示"
+    assert item["auto_reply"] is False
+
+
+def test_history_script_recognizes_play_icon_and_image_cover():
+    assert 'svg[class*="play"]' in dy.HISTORY_SCRIPT
+    assert '[class*="aweme-cover"]' in dy.HISTORY_SCRIPT
+    assert 'img.closest(\'[class*="avatar"]\')' in dy.HISTORY_SCRIPT
+
+
+def test_reconcile_rewrites_legacy_image_placeholder_without_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(dm_ops, "DB", tmp_path / "ops_center.db")
+    dm_ops.init_db()
+    dm_ops.ingest_message({
+        "platform": "抖音", "account": "测试账号", "external_user_id": "c1",
+        "external_message_id": "legacy-image", "author": "258", "nickname": "258",
+        "content": "[图片]", "source_content": "抖音创作者中心聊天记录",
+        "direction": "inbound", "created_at": "2026-11-03 17:24:03",
+    }, allow_auto_reply=False)
+    account = {"id": 1, "userName": "测试账号"}
+    repaired = dy._reconcile_media_placeholders([{
+        "external_user_id": "c1", "direction": "inbound",
+        "content": "该内容为视频，该平台上无法正常展示",
+        "source_content": "抖音创作者中心聊天记录",
+        "external_message_id": "video-history",
+        "created_at": "2026-11-03 17:24:00",
+    }], account)
+
+    assert repaired == 1
+    with dm_ops.get_conn() as conn:
+        rows = conn.execute("SELECT content,external_message_id FROM messages").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["content"] == "该内容为视频，该平台上无法正常展示"
+    assert rows[0]["external_message_id"] == "video-history"
