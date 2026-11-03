@@ -6,11 +6,53 @@ import time
 import uuid
 
 MAX_REQUEST_AGE_SECONDS = 30 * 60
+# 终态记录（resolved/cancelled）的保留时长：足够前端读到最终状态，
+# 又不会让 _requests/_events 无限增长。
+TERMINAL_RETENTION_SECONDS = 15 * 60
+# 硬上限，防止极端情况下（大量并发任务）字典无限膨胀。
+MAX_TRACKED_REQUESTS = 200
 
 _lock = threading.Lock()
 _requests = {}
 _events = {}
 _context = threading.local()
+
+
+def _prune_locked(now: float) -> int:
+    """清理已终结或过期的验证码请求，返回清理条数。
+
+    必须在持有 _lock 时调用。历史版本只往 _requests/_events 里写、从不删，
+    每次发布任务要验证码就新增一条记录 + 一个 threading.Event，长跑服务
+    会无限增长内存；create_request 的去重扫描也随之退化成 O(n)。
+    """
+    removed = 0
+    # 1) 超过保留期的终态记录直接丢弃
+    for request_id in [
+        rid for rid, item in _requests.items()
+        if item.get("status") in ("resolved", "cancelled")
+        and now - float(item.get("updated_at") or 0) > TERMINAL_RETENTION_SECONDS
+    ]:
+        _requests.pop(request_id, None)
+        _events.pop(request_id, None)
+        removed += 1
+    # 2) 超过最大请求年龄的记录（连 pending 也没人管了）一并丢弃
+    for request_id in [
+        rid for rid, item in _requests.items()
+        if now - float(item.get("updated_at") or 0) > MAX_REQUEST_AGE_SECONDS
+    ]:
+        _requests.pop(request_id, None)
+        _events.pop(request_id, None)
+        removed += 1
+    # 3) 仍然超量时，从最旧的一条开始丢，避免内存无上限增长
+    if len(_requests) > MAX_TRACKED_REQUESTS:
+        oldest = sorted(
+            _requests.items(), key=lambda kv: float(kv[1].get("created_at") or 0)
+        )
+        for request_id, _item in oldest[:len(_requests) - MAX_TRACKED_REQUESTS]:
+            _requests.pop(request_id, None)
+            _events.pop(request_id, None)
+            removed += 1
+    return removed
 
 
 def set_job_context(job_id=None, title="", platform="", file_name=""):
@@ -51,6 +93,7 @@ def create_request(platform="", account_file="", account_name=""):
     context = _job_context()
     account_file = str(account_file or "")
     with _lock:
+        _prune_locked(now)
         for request in _requests.values():
             if (
                 request["status"] in ("pending", "verifying")
@@ -84,11 +127,18 @@ def create_request(platform="", account_file="", account_name=""):
 def latest_pending():
     """Return the oldest unresolved request, if any."""
     with _lock:
+        _prune_locked(time.time())
         pending = [request for request in _requests.values() if request["status"] == "pending"]
         if not pending:
             return None
         pending.sort(key=lambda item: item["created_at"])
         return _snapshot(pending[0])
+
+
+def prune_expired() -> int:
+    """对外暴露的清理入口（供后台定时任务调用）。"""
+    with _lock:
+        return _prune_locked(time.time())
 
 
 def submit_code(request_id, code):
