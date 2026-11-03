@@ -90,7 +90,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
 import { API_BASE, withToken } from '@/config'
 

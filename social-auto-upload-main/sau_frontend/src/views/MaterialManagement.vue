@@ -192,7 +192,6 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { Refresh, Upload } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
 import { materialApi } from '@/api/material'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'

@@ -1,5 +1,4 @@
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
 import { API_BASE, authHeaders } from '@/config'
 
 // 创建axios实例

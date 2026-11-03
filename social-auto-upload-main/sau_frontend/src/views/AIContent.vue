@@ -95,7 +95,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import { http } from '@/utils/request'
 
 const router = useRouter()
