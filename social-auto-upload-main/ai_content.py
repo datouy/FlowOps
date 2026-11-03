@@ -412,15 +412,19 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
         + '{"小红书":{"title":"","body":"","tags":[]},"抖音":{"title":"","body":"","tags":[]},"视频号":{"title":"","body":"","tags":[]},"快手":{"title":"","body":"","tags":[]},"微博":{"title":"","body":"","tags":[]},"百家号":{"title":"","body":"","tags":[]}}'
     )
     if progress_cb:
-        try: progress_cb(5)
-        except Exception: pass
+        try:
+            progress_cb(5)
+        except Exception:
+            pass
     try:
         text = _call_with_retry(prompt, 3000)
     except RuntimeError:
         return _fallback_pack(data, platforms, industry, progress_cb)
     if progress_cb:
-        try: progress_cb(70)
-        except Exception: pass
+        try:
+            progress_cb(70)
+        except Exception:
+            pass
     cleaned = _clean_json(text)
     try:
         parsed = json.loads(cleaned)
@@ -436,8 +440,10 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
             "tags": _parse_tags(item.get("tags")),
         })
     if progress_cb:
-        try: progress_cb(100)
-        except Exception: pass
+        try:
+            progress_cb(100)
+        except Exception:
+            pass
     return {"items": result, "model": _load_env().get("WB_MODEL"), "industry": industry}
 
 

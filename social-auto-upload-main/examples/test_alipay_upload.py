@@ -2,7 +2,6 @@
 """测试支付宝生活号上传：使用已保存的 cookie 上传并发布一个视频。"""
 import asyncio
 import sys
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

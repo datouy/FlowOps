@@ -5,7 +5,6 @@ import asyncio
 import inspect
 import json as _json
 import os
-import re
 import time
 from pathlib import Path
 
@@ -13,7 +12,6 @@ from playwright.async_api import Page, Playwright, TimeoutError as PWTimeoutErro
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
-from utils.base_social_media import set_init_script
 from utils.log import alipay_logger
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path

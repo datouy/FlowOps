@@ -46,7 +46,6 @@ def upload_note_to_douyin():
     image_paths = [Path(BASE_DIR) / "videos/demo.png", Path(BASE_DIR) / "videos/demo.png", Path(BASE_DIR) / "videos/demo.png"]
     note = "图文内容示例"
     tags = ["图文", "示例", "抖音图文"]
-    video_meta_publish_time = datetime.strptime("2026-3-25 12:13", "%Y-%m-%d %H:%M")
 
     app = DouYinNote(
         image_paths=image_paths,

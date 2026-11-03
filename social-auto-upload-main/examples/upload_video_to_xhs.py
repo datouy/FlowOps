@@ -26,7 +26,7 @@ if __name__ == '__main__':
     # 注意：该校验cookie方式可能并没那么准确
     try:
         xhs_client.get_video_first_frame_image_id("3214")
-    except:
+    except Exception:
         print("cookie 失效")
         exit()
 

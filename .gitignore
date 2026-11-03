@@ -13,6 +13,7 @@ social-auto-upload-main/cookies/
 social-auto-upload-main/cookiesFile/
 social-auto-upload-main/videoFile/
 social-auto-upload-main/logs/
+/logs/
 
 # ---- runtime output ----
 *.log
@@ -35,6 +36,12 @@ social-auto-upload-main/verify_code.txt
 .ruff_cache/
 .coverage
 htmlcov/
+
+# ---- 本地分析 / 诊断产物（脚本、截图、数据库快照，不进仓库）----
+/_re/
+/tmp_diag/
+/tmp_diag_*.py
+social-auto-upload-main/db/*.bak-*
 
 # ---- Python ----
 venv/

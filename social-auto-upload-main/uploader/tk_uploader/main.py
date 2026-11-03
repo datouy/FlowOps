@@ -33,7 +33,7 @@ async def cookie_auth(account_file):
                     return False
             tiktok_logger.success("[+] cookie valid")
             return True
-        except:
+        except Exception:
             tiktok_logger.success("[+] cookie valid")
             return True
 
@@ -155,7 +155,7 @@ class TiktokVideo(object):
         try:
             await page.wait_for_selector('iframe[data-tt="Upload_index_iframe"], div.upload-container', timeout=10000)
             tiktok_logger.info("Either iframe or div appeared.")
-        except Exception as e:
+        except Exception:
             tiktok_logger.error("Neither iframe nor div appeared within the timeout.")
 
         await self.choose_base_locator(page)
@@ -250,7 +250,7 @@ class TiktokVideo(object):
                     if await self.locator_base.locator('button[aria-label="Select file"]').count():
                         tiktok_logger.info("  [-] found some error while uploading now retry...")
                         await self.handle_upload_error(page)
-            except:
+            except Exception:
                 tiktok_logger.info("  [-] video uploading...")
                 await asyncio.sleep(2)
 

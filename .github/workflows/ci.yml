@@ -27,17 +27,10 @@ jobs:
           python -m pip install -r requirements-dev.txt
       - name: Run tests
         run: python -m pytest
+      # 全仓库 lint：之前只检查了一份白名单文件，uploader/、examples/ 等
+      # 目录的代码完全没被检查过，导致 30+ 个问题长期存在。
       - name: Run Ruff
-        run: >-
-          python -m ruff check
-          app_logging.py db_utils.py runtime_config.py dm_platform_common.py
-          douyin_dm_sync.py xiaohongshu_dm_sync.py channels_dm_sync.py
-          dm_ops.py compliance.py schedule_suggest.py publish_jobs.py
-          ai_pack_jobs.py material_ops.py ops_center.py platform_reply.py
-          stats_reflow.py sau_backend.py myUtils/login.py
-          myUtils/auth.py myUtils/postVideo.py myUtils/platform_registry.py
-          utils/network.py
-          uploader/ks_uploader/main.py uploader/weibo_uploader/main.py tests
+        run: python -m ruff check .
 
   frontend:
     name: Frontend build
