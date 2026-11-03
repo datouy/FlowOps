@@ -31,6 +31,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_pack_cache ON pack_jobs(cache_key, status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pack_created ON pack_jobs(created_at)")
         record_schema_version(c, "ai_pack_jobs", 1)
 
 
@@ -89,7 +90,14 @@ def status(job_id: int) -> dict | None:
 
 
 def clear_cache() -> int:
+    """删除 7 天前的缓存任务。
+
+    注意不要写成 ``datetime(created_at) < datetime('now','-7 days')``——
+    那样 SQLite 无法使用 created_at 上的索引，每次都是全表扫描。
+    这里先算出截止时间戳，再用普通比较走索引。
+    """
     with get_conn() as c:
-        cur = c.execute("DELETE FROM pack_jobs WHERE datetime(created_at) < datetime('now', '-7 days')")
+        cutoff = c.execute("SELECT datetime('now', '-7 days')").fetchone()[0]
+        cur = c.execute("DELETE FROM pack_jobs WHERE created_at < ?", (cutoff,))
         return cur.rowcount
 
