@@ -15,10 +15,12 @@ from flask import Blueprint, Response, jsonify, request
 
 from conf import BASE_DIR
 import ai_content
+import ops_schema
 from db_utils import (
     apply_migrations, backup as db_backup, checkpoint as db_checkpoint,
     connect, integrity_ok, stats as db_stats,
 )
+from utils.log import logger
 
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
@@ -118,21 +120,9 @@ def _ensure_column(c, table: str, name: str, ddl: str):
 
 
 def _initialize_schema(c):
-    c.execute("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        platform TEXT DEFAULT '', account TEXT DEFAULT '',
-        msg_type TEXT DEFAULT 'comment', author TEXT DEFAULT '',
-        content TEXT NOT NULL, source_content TEXT DEFAULT '',
-        intent TEXT DEFAULT 'low', status TEXT DEFAULT 'new',
-        reply_text TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        handled_at DATETIME, contact_id INTEGER,
-        external_user_id TEXT DEFAULT '', external_message_id TEXT DEFAULT '',
-        direction TEXT DEFAULT 'inbound', delivery_status TEXT DEFAULT 'received',
-        auto_reply_status TEXT DEFAULT '', matched_rule_id INTEGER)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS message_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, content TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+    # messages / message_templates 的 DDL 统一放在 ops_schema，
+    # 避免 ops_center 和 dm_ops 各写一份、导入顺序决定表结构。
+    ops_schema.ensure_core_schema(c)
     c.execute("""CREATE TABLE IF NOT EXISTS dm_contacts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         platform TEXT NOT NULL DEFAULT '', account TEXT NOT NULL DEFAULT '',

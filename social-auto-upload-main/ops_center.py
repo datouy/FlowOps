@@ -11,6 +11,7 @@ from flask import Blueprint, jsonify, request
 
 from conf import BASE_DIR
 import ai_content
+import ops_schema
 import publish_jobs
 import stats_reflow
 from db_utils import connect, record_schema_version
@@ -41,22 +42,18 @@ def get_conn():
 
 
 def init_db():
+    """初始化运营中心用到的表。
+
+    DDL 现在统一放在 ``ops_schema`` 里——``ops_center`` 和 ``dm_ops``
+    共用同一个数据库文件，过去两边各写了一份 ``CREATE TABLE IF NOT
+    EXISTS messages``，而 ``IF NOT EXISTS`` 只在表不存在时生效，
+    于是"谁先 import 谁决定表结构"。这里改成调用同一份公共 schema，
+    导入顺序不再影响库结构。
+    """
     with get_conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT DEFAULT '', account TEXT DEFAULT '',
-            msg_type TEXT DEFAULT 'comment', author TEXT DEFAULT '',
-            content TEXT NOT NULL, source_content TEXT DEFAULT '',
-            intent TEXT DEFAULT 'low', status TEXT DEFAULT 'new',
-            reply_text TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            handled_at DATETIME)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS message_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, content TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_intent ON messages(intent)")
-        record_schema_version(c, "ops_center", 1)
+        ops_schema.ensure_core_schema(c)
+        ops_schema.ensure_ops_center_indexes(c)
+        record_schema_version(c, ops_schema.SCHEMA_SCOPE, 1)
 
 
 init_db()
@@ -181,7 +178,12 @@ def todo_summary():
         failed_jobs = c.execute("SELECT COUNT(*) FROM jobs WHERE status='failed'").fetchone()[0]
         pending_review = c.execute("SELECT COUNT(*) FROM jobs WHERE status='pending_review'").fetchone()[0]
         try:
-            scheduled_today = c.execute("SELECT COUNT(*) FROM scheduled_items WHERE substr(scheduled_at,1,10)=?", (today,)).fetchone()[0]
+            # 用范围比较而不是 substr(scheduled_at,1,10)=?——
+            # scheduled_at 是 'YYYY-MM-DD HH:MM:SS' 格式，范围条件能走上索引。
+            scheduled_today = c.execute(
+                "SELECT COUNT(*) FROM scheduled_items WHERE scheduled_at>=? AND scheduled_at<=?",
+                (f"{today} 00:00:00", f"{today} 23:59:59"),
+            ).fetchone()[0]
         except Exception:
             scheduled_today = 0
         try:
