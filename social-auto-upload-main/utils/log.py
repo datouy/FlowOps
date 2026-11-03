@@ -29,6 +29,25 @@ def log_formatter(record: dict) -> str:
     return f"<fg #70acde>{{time:YYYY-MM-DD HH:mm:ss}}</fg #70acde> | <fg {color}>{{level}}</fg {color}>: <light-white>{{message}}</light-white>\n"
 
 
+# 业务日志的 sink 配置表：(变量名, business_name, 日志文件路径)
+#
+# 只列真正有人在用的。之前的版本把 xhs 和 bilibili 也建了 sink，
+# 但没有任何模块 import 过它们——纯粹是两个空文件 + 每次写日志都要
+# 多过一遍 filter，白白占用句柄和磁盘。
+BUSINESS_LOGGERS = (
+    ("douyin_logger", "douyin", "logs/douyin.log"),
+    ("tencent_logger", "tencent", "logs/tencent.log"),
+    ("tiktok_logger", "tiktok", "logs/tiktok.log"),
+    ("kuaishou_logger", "kuaishou", "logs/kuaishou.log"),
+    ("baijiahao_logger", "baijiahao", "logs/baijiahao.log"),
+    ("xiaohongshu_logger", "xiaohongshu", "logs/xiaohongshu.log"),
+    ("youtube_logger", "youtube", "logs/youtube.log"),
+    ("alipay_logger", "alipay", "logs/alipay.log"),
+    ("weibo_logger", "weibo", "logs/weibo.log"),
+    ("hupu_logger", "hupu", "logs/hupu.log"),
+)
+
+
 def create_logger(log_name: str, file_path: str):
     """
     Create custom logger for different business modules.
@@ -49,15 +68,14 @@ logger.remove()
 # Add a standard console handler
 logger.add(sys.stdout, colorize=True, format=log_formatter)
 
-douyin_logger = create_logger('douyin', 'logs/douyin.log')
-tencent_logger = create_logger('tencent', 'logs/tencent.log')
-xhs_logger = create_logger('xhs', 'logs/xhs.log')
-tiktok_logger = create_logger('tiktok', 'logs/tiktok.log')
-bilibili_logger = create_logger('bilibili', 'logs/bilibili.log')
-kuaishou_logger = create_logger('kuaishou', 'logs/kuaishou.log')
-baijiahao_logger = create_logger('baijiahao', 'logs/baijiahao.log')
-xiaohongshu_logger = create_logger('xiaohongshu', 'logs/xiaohongshu.log')
-youtube_logger = create_logger('youtube', 'logs/youtube.log')
-alipay_logger = create_logger('alipay', 'logs/alipay.log')
-weibo_logger = create_logger('weibo', 'logs/weibo.log')
-hupu_logger = create_logger('hupu', 'logs/hupu.log')
+# 业务日志 sink 统一在这里建。模块用
+#   from utils.log import douyin_logger
+# 取用即可，不要在业务代码里自己 logger.add()。
+for _var, _name, _path in BUSINESS_LOGGERS:
+    globals()[_var] = create_logger(_name, _path)
+
+# 没有业务 sink 的平台日志统一收到这里，避免"日志写到哪里都不知道"：
+# 例如 stats_reflow 里的 xhs 分支曾经 import xhs_logger（已删除），
+# 现在明确落到 xiaohongshu.log。
+if BUSINESS_LOGGERS:  # 配置表为空时没有循环变量可删，避免 NameError
+    del _var, _name, _path

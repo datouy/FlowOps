@@ -20,6 +20,20 @@ def _inject_context(record: dict) -> None:
     record["extra"].setdefault("request_id", _REQUEST_ID.get())
 
 
+def _is_app_level(record: dict) -> bool:
+    """只让"应用级"日志进 app.log。
+
+    业务日志（``logger.bind(business_name=...)``）已经有自己的文件了，
+    以前它们同时也会写一份到 app.log——douyin.log 里有 277 条消息，
+    其中 133 条在 app.log 里又出现了一遍。日志量翻倍、排查时还要
+    在两个文件之间去重，非常浪费时间。
+
+    这里按 business_name 过滤掉业务日志，app.log 只留请求日志、
+    调度事件、异常这类应用级内容。
+    """
+    return not record["extra"].get("business_name")
+
+
 def configure_app_logging() -> None:
     global _configured
     if _configured:
@@ -37,6 +51,7 @@ def configure_app_logging() -> None:
         encoding="utf-8",
         enqueue=True,
         backtrace=False,
+        filter=_is_app_level,
         diagnose=False,
         format=(
             "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
