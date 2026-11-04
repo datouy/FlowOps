@@ -49,6 +49,40 @@
                     </el-tag>
                   </template>
                 </el-table-column>
+                <el-table-column label="健康度" width="290">
+                  <template #default="scope">
+                    <div class="health-cell">
+                      <span>{{ scope.row.lastCheckAt || '未校验' }}</span>
+                      <el-tooltip
+                        v-if="scope.row.failReason && scope.row.status === '异常'"
+                        :content="scope.row.failReason"
+                        placement="top"
+                      >
+                        <el-tag type="danger" size="small" effect="plain">失效原因</el-tag>
+                      </el-tooltip>
+                      <el-tooltip
+                        v-else-if="scope.row.failReason"
+                        :content="scope.row.failReason"
+                        placement="top"
+                      >
+                        <el-tag type="info" size="small" effect="plain">待确认</el-tag>
+                      </el-tooltip>
+                      <el-tooltip
+                        v-if="isSharedSession(scope.row)"
+                        content="与其它账号来自同一次扫码，共享同一个登录会话；它们会一起失效，也会一起修好"
+                        placement="top"
+                      >
+                        <el-tag type="success" size="small" effect="plain">共用登录</el-tag>
+                      </el-tooltip>
+                      <el-button
+                        link
+                        size="small"
+                        :loading="checkingAccountId === scope.row.id"
+                        @click="handleCheckAccount(scope.row)"
+                      >复检</el-button>
+                    </div>
+                  </template>
+                </el-table-column>
                 <el-table-column prop="status" label="状态">
                   <template #default="scope">
                     <el-tag
@@ -69,6 +103,13 @@
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
+                    <el-button size="small" @click="openAccountEnvironment(scope.row)">环境</el-button>
+                    <el-button
+                      v-if="scope.row.platform === '视频号'"
+                      size="small"
+                      type="success"
+                      @click="handleSeedChannels(scope.row)"
+                    >补登频道</el-button>
                     <el-button size="small" type="danger" @click="handleDelete(scope.row)">删除</el-button>
                   </template>
                 </el-table-column>
@@ -164,6 +205,11 @@
           <div class="official-login-note">
             <strong>{{ interactiveLoginPlatform }}官方登录窗口</strong>
             <span>扫码、短信验证码、密码和滑块验证都在该窗口内完成，与直接打开{{ interactiveLoginPlatform }}官方页面一致。</span>
+            <span v-if="interactiveLoginPlatform === '视频号'">
+              一次扫码就够了：登录后如果这个微信还管理着其它视频号，请在上方窗口左上角切换到下一个频道，
+              系统会用<strong>同一个会话</strong>逐个保存；全部完成后点「完成并关闭」。
+              不要为每个视频号单独扫一次码——微信只保留最近一次登录的会话，会把先前登录的号挤下线。
+            </span>
           </div>
         </el-form-item>
 
@@ -176,9 +222,20 @@
               size="small"
               @click="retryInteractiveLogin"
             >重新打开</el-button>
+            <el-button
+              v-if="interactiveLoginStatus === 'collecting' && interactiveLoginPlatform === '视频号'"
+              size="small"
+              @click="switchTencentChannel"
+            >切换频道</el-button>
+            <el-button
+              v-if="interactiveLoginStatus === 'collecting'"
+              type="success"
+              size="small"
+              @click="finishInteractiveLogin"
+            >完成并关闭</el-button>
           </div>
           <div
-            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            v-if="interactiveBrowserLive"
             class="remote-browser-stage"
             :class="{ dragging: remotePointerDown }"
             :style="remoteStageStyle"
@@ -202,7 +259,7 @@
             </div>
           </div>
           <div
-            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            v-if="interactiveBrowserLive"
             class="remote-browser-controls"
           >
             <el-input
@@ -224,7 +281,7 @@
             </div>
           </div>
           <div
-            v-if="interactiveLoginStatus === 'running' || interactiveLoginStatus === 'starting'"
+            v-if="interactiveBrowserLive"
             class="remote-zoom-row"
           >
             <span class="remote-zoom-label">画面缩放</span>
@@ -343,6 +400,37 @@
         </span>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="environmentVisible" title="账号独立运行环境" width="560px">
+      <div v-if="environmentAccount" class="environment-summary">
+        <strong>{{ environmentAccount.name }}</strong>
+        <span>每个账号使用独立 Chromium 用户目录，Cookie、localStorage、IndexedDB 和缓存不会串号。</span>
+        <el-tag :type="environmentForm.profileExists ? 'success' : 'info'" effect="plain">
+          {{ environmentForm.profileExists ? '持久目录已建立' : '首次运行自动建立' }}
+        </el-tag>
+      </div>
+      <el-form :model="environmentForm" label-width="94px" v-loading="environmentLoading">
+        <el-form-item label="代理地址">
+          <el-input v-model="environmentForm.proxyServer" placeholder="http://127.0.0.1:7890 或 socks5://host:port" />
+        </el-form-item>
+        <el-form-item label="代理用户名">
+          <el-input v-model="environmentForm.proxyUsername" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="代理密码">
+          <el-input v-model="environmentForm.proxyPassword" type="password" show-password autocomplete="new-password" placeholder="留空表示保持原密码" />
+        </el-form-item>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="代理只作用于该账号的登录、巡检和发布会话；留空代理地址表示直连。"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="environmentVisible = false">取消</el-button>
+        <el-button :loading="environmentSaving" type="primary" @click="saveAccountEnvironment">保存环境</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -398,16 +486,8 @@ const searchKeyword = ref('')
 // 获取账号数据（快速，不验证）
 const fetchAccountsQuick = async () => {
   try {
-    const res = await accountApi.getAccounts()
-    if (res.code === 200 && res.data) {
-      // 将所有账号的状态暂时设为"验证中"
-      const accountsWithPendingStatus = res.data.map(account => {
-        const updatedAccount = [...account];
-        updatedAccount[4] = -1; // -1 表示验证中的临时状态
-        return updatedAccount;
-      });
-      accountStore.setAccounts(accountsWithPendingStatus);
-    }
+    // 页面首次加载只读数据库健康快照，不把全部账号伪装成“验证中”。
+    await accountStore.loadAccounts(true)
   } catch (error) {
     console.error('快速获取账号数据失败:', error)
   }
@@ -422,7 +502,8 @@ const fetchAccounts = async () => {
   try {
     const res = await accountApi.getValidAccounts()
     if (res.code === 200 && res.data) {
-      accountStore.setAccounts(res.data)
+      // 校验接口负责回写状态；列表统一再从 v2 账号服务读取一次。
+      await accountStore.loadAccounts(true)
       ElMessage.success('账号数据获取成功')
       // 标记为已访问
       if (appStore.isFirstTimeAccountManagement) {
@@ -439,31 +520,60 @@ const fetchAccounts = async () => {
   }
 }
 
-// 后台验证所有账号（优化版本，使用setTimeout避免阻塞UI）
-const validateAllAccountsInBackground = async () => {
-  // 使用setTimeout将验证过程放在下一个事件循环，避免阻塞UI
-  setTimeout(async () => {
-    try {
-      const res = await accountApi.getValidAccounts()
-      if (res.code === 200 && res.data) {
-        accountStore.setAccounts(res.data)
-      }
-    } catch (error) {
-      console.error('后台验证账号失败:', error)
-    }
-  }, 0)
-}
+// 整表校验统一走 fetchAccounts（右上角刷新按钮）：
+// 后端单飞 + 30 秒缓存 + 视频号串行 + 连续两次失败才判异常。
+// 页面挂载时**不再**自动触发——每打开一次页面就并发开浏览器访问视频号后台，
+// 会被平台判成异常访问，把网页会话直接作废（列表一片红）。
+
 
 // 页面加载时获取账号数据
 onMounted(() => {
-  // 快速获取账号列表（不验证），立即显示
+  // 只拉列表 + 健康度（纯数据库/JSON 读取，不碰平台）。
+  //
+  // 以前这里会顺手触发一次"整表校验"：每打开一次账号管理页，就并发开好几个
+  // Chromium 去访问视频号后台。视频号对同一台机器的高频访问很敏感，会直接把
+  // 网页会话判失效（表现为列表里一片红、重扫后又好了）。校验改成显式动作：
+  // 点右上角刷新、或点某一行的"复检"。
   fetchAccountsQuick()
-
-  // 在后台验证所有账号
-  setTimeout(() => {
-    validateAllAccountsInBackground()
-  }, 100) // 稍微延迟一下，让用户看到快速加载的效果
 })
+
+// 单账号复检：走 /api/v2/accounts/<id>/check，回写状态/最后校验时间/失效原因
+const checkingAccountId = ref(null)
+
+// 同一次扫码保存出来的多个频道共享会话：计数 >1 才提示"共用登录"
+const sharedSessionGroups = computed(() => {
+  const counts = {}
+  for (const account of accountStore.accounts) {
+    const group = account.sessionGroup
+    if (!group) continue
+    counts[group] = (counts[group] || 0) + 1
+  }
+  return Object.fromEntries(Object.entries(counts).filter(([, n]) => n > 1))
+})
+
+const isSharedSession = (row) =>
+  Boolean(row?.sessionGroup && sharedSessionGroups.value[row.sessionGroup])
+
+const handleCheckAccount = async (row) => {
+  checkingAccountId.value = row.id
+  try {
+    const res = await accountApi.checkAccount(row.id)
+    const data = res?.data || {}
+    // 后端按"连续 2 次失败才判异常"收敛，这里显示的是落库后的有效状态
+    if (data.alive) {
+      ElMessage.success('账号状态正常')
+    } else if (data.statusText === '正常') {
+      ElMessage.warning(data.reason || '本次校验未通过，暂不改变账号状态，请稍后再试')
+    } else {
+      ElMessage.warning(data.reason || '账号已失效，请重新登录')
+    }
+    await accountStore.loadHealth()
+  } catch (error) {
+    console.error('账号复检失败:', error)
+  } finally {
+    checkingAccountId.value = null
+  }
+}
 
 // 获取平台标签类型
 const getPlatformTagType = (platform) => {
@@ -540,6 +650,17 @@ const accountForm = reactive({
   status: '正常'
 })
 
+const environmentVisible = ref(false)
+const environmentAccount = ref(null)
+const environmentLoading = ref(false)
+const environmentSaving = ref(false)
+const environmentForm = reactive({
+  profileExists: false,
+  proxyServer: '',
+  proxyUsername: '',
+  proxyPassword: '',
+})
+
 // 表单验证规则
 const rules = {
   platform: [{ required: true, message: '请选择平台', trigger: 'change' }],
@@ -578,9 +699,16 @@ let verifyCooldownTimer = null
 const interactiveLoginActive = ref(false)
 const interactiveLoginStarting = ref(false)
 const interactiveLoginStatus = ref('')
+// 远程窗口需要保持画面/输入透传的三种状态：
+//   starting / running —— 正常登录中
+//   collecting         —— 视频号"一次扫码、多频道保存"阶段：窗口必须继续可操作
+const interactiveBrowserLive = computed(() =>
+  ['starting', 'running', 'collecting'].includes(interactiveLoginStatus.value)
+)
 const interactiveLoginMessage = ref('')
 const interactiveLoginId = ref('')
 const interactiveLoginPlatform = ref('')
+const interactiveSavedCount = ref(0)
 const interactiveFrameUrl = ref('')
 const interactiveImageRef = ref(null)
 const remoteInputText = ref('')
@@ -751,6 +879,54 @@ const handleEdit = (row) => {
     status: row.status
   })
   dialogVisible.value = true
+}
+
+const openAccountEnvironment = async (row) => {
+  environmentAccount.value = row
+  environmentVisible.value = true
+  environmentLoading.value = true
+  Object.assign(environmentForm, {
+    profileExists: Boolean(row.environment?.profileExists),
+    proxyServer: row.environment?.proxyServer || '',
+    proxyUsername: row.environment?.proxyUsername || '',
+    proxyPassword: '',
+  })
+  try {
+    const res = await accountApi.getAccountEnvironment(row.id)
+    const data = res?.data || {}
+    Object.assign(environmentForm, {
+      profileExists: Boolean(data.profileExists),
+      proxyServer: data.proxyServer || '',
+      proxyUsername: data.proxyUsername || '',
+      proxyPassword: '',
+    })
+  } catch (error) {
+    console.error('读取账号环境失败:', error)
+  } finally {
+    environmentLoading.value = false
+  }
+}
+
+const saveAccountEnvironment = async () => {
+  if (!environmentAccount.value || environmentSaving.value) return
+  environmentSaving.value = true
+  try {
+    const proxy = {
+      server: environmentForm.proxyServer.trim(),
+      username: environmentForm.proxyUsername.trim(),
+    }
+    if (environmentForm.proxyPassword) proxy.password = environmentForm.proxyPassword
+    const res = await accountApi.updateAccountEnvironment(environmentAccount.value.id, proxy)
+    Object.assign(environmentForm, res?.data || {})
+    environmentForm.proxyPassword = ''
+    environmentVisible.value = false
+    ElMessage.success('账号运行环境已保存，下次登录或发布时生效')
+    await fetchAccountsQuick()
+  } catch (error) {
+    ElMessage.error(error?.message || '保存账号环境失败')
+  } finally {
+    environmentSaving.value = false
+  }
 }
 
 // 删除账号
@@ -954,6 +1130,7 @@ const resetInteractiveLogin = () => {
   interactiveLoginMessage.value = ''
   interactiveLoginId.value = ''
   interactiveLoginPlatform.value = ''
+  interactiveSavedCount.value = 0
   remoteInputText.value = ''
   remotePointerDown.value = false
   interactiveFrameLoading = false
@@ -971,8 +1148,8 @@ const closeInteractiveLogin = (notifyServer = true) => {
 
 const refreshInteractiveFrame = async () => {
   if (!interactiveLoginId.value || interactiveFrameLoading) return
-  const status = interactiveLoginStatus.value
-  if (status !== 'running' && status !== 'starting') return
+  // collecting 阶段也要继续拉帧：用户需要在窗口里点频道切换
+  if (!interactiveBrowserLive.value) return
   interactiveFrameLoading = true
   try {
     const response = await fetch(
@@ -1009,6 +1186,26 @@ const completeInteractiveLogin = () => {
   }, 900)
 }
 
+// 视频号"一次扫码、多频道保存"的收尾动作：用户在窗口里切完所有频道后点「完成并关闭」
+const finishInteractiveLogin = async () => {
+  const saved = interactiveSavedCount.value
+  const sessionId = interactiveLoginId.value
+  if (sessionId) {
+    await http.post('/interactiveLogin/stop', { id: sessionId }, { silent: true }).catch(() => {})
+  }
+  clearInteractiveTimers()
+  releaseInteractiveFrame()
+  resetInteractiveLogin()
+  dialogVisible.value = false
+  interactiveLoginActive.value = false
+  reLoginMode.value = false
+  await fetchAccountsQuick()
+  await accountStore.loadHealth()
+  if (saved > 0) {
+    ElMessage.success(`已保存 ${saved} 个视频号频道，共用一个登录会话`)
+  }
+}
+
 const pollInteractiveLogin = async () => {
   if (!interactiveLoginId.value) return
   try {
@@ -1019,6 +1216,22 @@ const pollInteractiveLogin = async () => {
     )
     const data = response.data || {}
     interactiveLoginMessage.value = data.message || interactiveLoginMessage.value
+    if (Number.isFinite(Number(data.saved_count))) {
+      const saved = Number(data.saved_count)
+      // 每保存一个频道就静默刷新一次列表，用户能立刻看到新增的账号
+      if (saved > interactiveSavedCount.value) {
+        interactiveSavedCount.value = saved
+        fetchAccountsQuick()
+        accountStore.loadHealth()
+      }
+    }
+    if (data.status === 'collecting') {
+      // 视频号"一次扫码、多频道保存"：窗口保持打开，等用户切换频道继续保存，
+      // 或点「完成并关闭」。绝不能在这里关窗——关掉就等于开一次新会话，
+      // 会把刚保存的会话挤下线。
+      interactiveLoginStatus.value = 'collecting'
+      return
+    }
     if (data.status === 'success') {
       completeInteractiveLogin()
     } else if (data.status === 'failed' || data.status === 'expired') {
@@ -1038,22 +1251,27 @@ const pollInteractiveLogin = async () => {
   }
 }
 
-const startInteractiveLogin = async (name, accountId = null, platform = 'douyin') => {
+const startInteractiveLogin = async (name, accountId = null, platform = 'douyin', options = {}) => {
   closeInteractiveLogin()
   remoteZoom.value = 1
   const platformLabel = INTERACTIVE_PLATFORM_LABELS[platform] || '抖音'
+  const seeded = Boolean(options.seedAccountId)
   interactiveLoginActive.value = true
   interactiveLoginStarting.value = true
   interactiveLoginStatus.value = 'starting'
-  interactiveLoginMessage.value = `正在打开${platformLabel}官方登录窗口`
+  interactiveLoginMessage.value = seeded
+    ? '正在用现有登录会话打开频道列表…'
+    : `正在打开${platformLabel}官方登录窗口`
   interactiveLoginPlatform.value = platformLabel
+  interactiveSavedCount.value = 0
   currentAccountName.value = name
   currentAccountId.value = accountId
   try {
     const response = await http.post('/interactiveLogin/start', {
       id: name,
       account_id: accountId,
-      platform
+      platform,
+      seed_account_id: options.seedAccountId || null
     })
     const data = response.data || {}
     interactiveLoginId.value = data.session || ''
@@ -1070,6 +1288,13 @@ const startInteractiveLogin = async (name, accountId = null, platform = 'douyin'
   }
 }
 
+// 视频号：用该账号现有会话打开频道列表，把同一微信下其它频道补登进来。
+// 不重新扫码 → 不产生新会话，所以不会把现有账号顶下线。
+const handleSeedChannels = (row) => {
+  if (!row?.id) return
+  startInteractiveLogin(row.name || '补登频道', null, 'tencent', { seedAccountId: row.id })
+}
+
 const retryInteractiveLogin = () => {
   startInteractiveLogin(
     currentAccountName.value || accountForm.name,
@@ -1079,7 +1304,8 @@ const retryInteractiveLogin = () => {
 }
 
 const sendRemoteInput = (kind, payload = {}) => {
-  if (!interactiveLoginId.value || interactiveLoginStatus.value !== 'running') return
+  // collecting 阶段（视频号多频道保存中）也必须能发指令，否则「切换频道」点了没反应
+  if (!interactiveLoginId.value || !interactiveBrowserLive.value) return
   http.post(
     '/interactiveLogin/input',
     { id: interactiveLoginId.value, kind, payload },
@@ -1149,6 +1375,14 @@ const sendRemoteKey = (key) => {
 
 const reloadRemoteBrowser = () => {
   sendRemoteInput('reload')
+}
+
+// 视频号：让登录窗口回到「选择视频号登录」频道列表（同一次会话内切换频道，
+// 不会产生新登录，所以不会把刚保存的频道挤下线）。
+const switchTencentChannel = () => {
+  if (!interactiveLoginId.value) return
+  sendRemoteInput('switch_channel')
+  ElMessage.info('正在回到频道选择页…选定下一个视频号后会自动保存')
 }
 
 // 把后端推送的登录中间态转成用户看得懂的提示。
@@ -1501,6 +1735,16 @@ onBeforeUnmount(() => {
     }
   }
   
+  // 健康度列：最后校验时间 + 失效原因 + 单账号复检
+  .health-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--el-text-color-secondary);
+    white-space: nowrap;
+  }
+
   .account-list-container {
     .account-search {
       display: flex;

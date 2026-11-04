@@ -97,8 +97,8 @@ export const http = {
     return request.put(url, data, config)
   },
   
-  delete(url, params) {
-    return request.delete(url, { params })
+  delete(url, params, config = {}) {
+    return request.delete(url, { ...config, params })
   },
   
   upload(url, formData, onUploadProgress) {

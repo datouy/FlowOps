@@ -46,6 +46,9 @@ def _make_db(base: Path) -> None:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     be = pytest.importorskip("sau_backend")
+    import runtime_config
+
+    monkeypatch.setattr(runtime_config, "ACCESS_TOKEN", "")
     _make_db(tmp_path)
     monkeypatch.setattr(be, "BASE_DIR", tmp_path, raising=True)
     return be.app.test_client()

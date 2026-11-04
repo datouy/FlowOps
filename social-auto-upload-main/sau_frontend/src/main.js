@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import App from './App.vue'
 import router from './router'
 import pinia from './stores'
+import { ensureAccessToken } from './config'
 import './styles/index.scss'
 
 const app = createApp(App)
@@ -16,6 +17,8 @@ const app = createApp(App)
 //
 // 如果某个图标是运行时动态渲染的（:is="变量"），在这里按需补注册。
 
-app.use(router)
-app.use(pinia)
-app.mount('#app')
+ensureAccessToken().finally(() => {
+  app.use(router)
+  app.use(pinia)
+  app.mount('#app')
+})

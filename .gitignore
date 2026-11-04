@@ -23,6 +23,8 @@ frontend*.log
 /*-check.json
 social-auto-upload-main/*-check.json
 social-auto-upload-main/verify_code.txt
+social-auto-upload-main/dm_media/
+social-auto-upload-main/debug_ui_core_*.png
 *.db-wal
 *.db-shm
 

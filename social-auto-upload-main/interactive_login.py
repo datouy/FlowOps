@@ -12,20 +12,39 @@ the server can still persist the resulting cookie.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
 from loguru import logger
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
+from patchright.sync_api import Error as PlaywrightError
+from patchright.sync_api import sync_playwright
 
 from conf import BASE_DIR
+from account_store import file_identity, get_store
 from db_utils import connect as db_connect
+from utils.account_fingerprint import (
+    fingerprint_path,
+    legacy_linux_fingerprint,
+    load_fingerprint,
+    new_fingerprint,
+    save_fingerprint,
+    upgrade_fingerprint,
+)
+from utils.account_browser import (
+    account_fingerprint,
+    open_persistent_account_context_sync,
+)
+from utils.account_environment import (
+    bind_environment,
+    save_environment,
+)
 
 
 DOUYIN_AUTH_COOKIE_NAMES = {
@@ -93,6 +112,32 @@ PLATFORM_LOGIN_TARGETS = {
 }
 
 
+def _audit_enabled() -> bool:
+    """授权审计开关。
+
+    默认写业务库；``FLOWOPS_LOGIN_AUDIT=0`` 关，``=1`` 强制开。
+    测试进程默认关闭：上游用例直接 ``InteractiveLoginManager().start()``
+    造会话，若照写会把一堆假会话写进真实审计表，把运维视图污染掉。
+    """
+    flag = os.environ.get("FLOWOPS_LOGIN_AUDIT")
+    if flag is not None:
+        return flag not in {"0", "false", "False"}
+    return "pytest" not in sys.modules
+
+
+def _audit(action: str, **payload) -> None:
+    if not _audit_enabled():
+        return
+    try:
+        store = get_store(BASE_DIR)
+        if action == "start":
+            store.record_auth_session(**payload)
+        else:
+            store.finish_auth_session(**payload)
+    except Exception as exc:  # 审计失败绝不阻塞登录
+        logger.debug("记录授权会话失败({}): {}", action, exc)
+
+
 class InteractivePlatformLogin:
     """One isolated Chromium login session with a small command queue."""
 
@@ -102,13 +147,24 @@ class InteractivePlatformLogin:
         account_name: str,
         account_id: int | None,
         platform: str = "douyin",
-        timeout_seconds: float = 300,
+        timeout_seconds: float | None = None,
+        seed_storage: str | None = None,
     ):
         self.session_id = session_id
         self.account_name = account_name[:64]
         self.account_id = account_id
         self.platform = platform if platform in PLATFORM_LOGIN_TARGETS else "douyin"
-        self.timeout_seconds = timeout_seconds
+        # 视频号要"一次扫码、多频道保存"，用户得逐个切频道，5 分钟不够用；
+        # 其它平台沿用 5 分钟。
+        default_timeout = 600.0 if self.platform == "tencent" else 300.0
+        self.timeout_seconds = float(
+            timeout_seconds if timeout_seconds is not None else default_timeout
+        )
+        # 补登模式：用已有的 storage_state 打开频道列表，不重新扫码。
+        # 只对视频号有意义——同一微信只保留最新会话，重扫会把现存的号顶下线。
+        self.seed_storage = (
+            str(seed_storage or "") if self.platform == "tencent" else ""
+        )
         self.created_at = time.monotonic()
         self.finished_at: float | None = None
         # 最后一次被前端访问（拉帧/查状态）的时间，用于识别被遗弃的会话。
@@ -118,6 +174,21 @@ class InteractivePlatformLogin:
         self.frame = b""
         self.frame_version = 0
         self.cookie_name = ""
+        self.saved_count = 0
+        self.saved_tencent_identities: set[str] = set()
+        # 视频号把网页会话绑定到设备指纹。每个账号首次登录时生成一份稳定
+        # profile，之后重新登录、巡检和发布都沿用同一份参数。
+        self.fingerprint: dict | None = None
+        self._environment_cookie = (
+            str(seed_storage or "")
+            if self.platform == "tencent"
+            else ""
+        )
+        self._fingerprint_seed = (
+            f"{self.platform}-account:{account_id}"
+            if account_id
+            else f"{self.platform}-session:{session_id}"
+        )
         # 视频号会话探测的节流时间戳：避免登录窗口轮询时频繁开新页面。
         self._last_tencent_probe = 0.0
         # 小红书官方 user 接口返回的登录用户信息（登录成功后缓存）
@@ -168,11 +239,35 @@ class InteractivePlatformLogin:
             self.message = message[:240]
             if status in {"success", "failed", "expired"}:
                 self.finished_at = time.monotonic()
+            cookie_name = self.cookie_name
+        if status in {"success", "failed", "expired"}:
+            # 授权过程落库：进程重启后仍能回答"谁在什么时候授权了哪个账号"。
+            _audit(
+                "finish",
+                session_id=self.session_id,
+                state=status,
+                message=message,
+                cookie_name=cookie_name,
+            )
 
     def _publish_frame(self, frame: bytes) -> None:
         with self.lock:
             self.frame = frame
             self.frame_version += 1
+
+    def _publish_frame_safe(self, page, quality: int = 55) -> None:
+        """推一帧到前端。
+
+        页面正在导航、被关闭、或截图超时都会抛异常；这类失败只影响"看一眼"，
+        绝不能把已经保存好的登录会话打断（历史 bug：这里抛 AttributeError，
+        用户在频道切换阶段直接看到"登录失败"，保存过的账号也白登了）。
+        """
+        try:
+            self._publish_frame(
+                page.screenshot(type="jpeg", quality=quality, timeout=8000)
+            )
+        except Exception:
+            pass
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -182,6 +277,7 @@ class InteractivePlatformLogin:
                 "message": self.message,
                 "version": self.frame_version,
                 "cookie_name": self.cookie_name,
+                "saved_count": self.saved_count,
                 "expires_in": max(
                     0,
                     int(self.timeout_seconds - (time.monotonic() - self.created_at)),
@@ -193,98 +289,182 @@ class InteractivePlatformLogin:
             self.last_seen_at = time.monotonic()
             return self.frame, self.frame_version
 
-    def _record_account(self, context) -> None:
+    @staticmethod
+    def _storage_identity(storage_path: Path) -> str:
+        try:
+            payload = json.loads(storage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return ""
+        for origin in payload.get("origins", []):
+            for item in origin.get("localStorage", []):
+                if item.get("name") == "finder_username":
+                    return str(item.get("value") or "").strip()
+        return ""
+
+    def _find_tencent_account_by_identity(
+        self, identity: str
+    ) -> tuple[int, str, str] | None:
+        """按频道 finder_username 找旧账号，避免同一频道重复入库。"""
+        if not identity:
+            return None
+        try:
+            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+                rows = conn.execute(
+                    "SELECT id, userName, filePath FROM user_info WHERE type=? ORDER BY id",
+                    (self._platform_type,),
+                ).fetchall()
+        except Exception as exc:
+            logger.warning("读取视频号账号身份失败: {}", exc)
+            return None
+        cookies_dir = Path(BASE_DIR / "cookiesFile")
+        for row in rows:
+            stored = self._storage_identity(cookies_dir / str(row[2] or ""))
+            if stored == identity:
+                return int(row[0]), str(row[1] or ""), str(row[2] or "")
+        return None
+
+    def _record_account(
+        self,
+        context,
+        account_name: str | None = None,
+        identity: str = "",
+    ) -> str:
         cookie_name = f"{uuid.uuid4().hex}.json"
         cookie_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
         context.storage_state(path=str(cookie_path))
+        if self.fingerprint:
+            save_fingerprint(cookie_path, self.fingerprint)
 
         platform_type = self._platform_type
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            if self.account_id:
-                cursor.execute(
-                    "UPDATE user_info SET type=?, filePath=?, userName=?, status=1 WHERE id=?",
-                    (platform_type, cookie_name, self.account_name, self.account_id),
-                )
-            if not self.account_id or cursor.rowcount == 0:
-                cursor.execute(
-                    "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
-                    (platform_type, cookie_name, self.account_name, 1),
-                )
-            conn.commit()
+        saved_name = (account_name or self.account_name)[:64]
+        target_id = self.account_id
+        identity_value = identity
+        identity_source = "localStorage:finder_username" if identity else ""
+        if not identity_value:
+            identity_value, identity_source = file_identity(cookie_path, platform_type)
+        if self.platform == "tencent" and identity_value and not target_id:
+            existing = self._find_tencent_account_by_identity(identity_value)
+            if existing:
+                target_id, existing_name, _ = existing
+                # 同一频道再次登录时应刷新原账号，而不是新建一行；保存后
+                # 校验失败也必须回滚为“异常”，不能删除已有账号记录。
+                self.account_id = target_id
+                saved_name = (existing_name or saved_name)[:64]
+            elif self.saved_count:
+                saved_name = self._next_tencent_account_name()
+        # 写入收敛到账号服务：按 (平台, 平台侧身份) 去重，顺带落健康度与审计字段。
+        saved = get_store(BASE_DIR).upsert(
+            platform_type,
+            cookie_name=cookie_name,
+            name=saved_name,
+            account_id=target_id,
+            identity=identity_value,
+            identity_source=identity_source,
+            status=1,
+        )
+        if self.fingerprint:
+            bind_environment(
+                self._environment_cookie or cookie_path,
+                cookie_path,
+                int(saved["id"]),
+            )
+        logger.info(
+            "登录结果已入库：{} 账号 #{}（身份 {}）",
+            saved.get("action"), saved.get("id"), identity_source or "未识别",
+        )
         with self.lock:
             self.cookie_name = cookie_name
+            self.saved_count += 1
+        return cookie_name
 
-    def _recheck_tencent_accounts(self) -> list[str]:
-        """视频号登录成功后复检全部视频号账号并回写状态。
-
-        同一个管理员微信再次扫码登录后，旧网页会话可能被平台挤下线；
-        如果只更新当前账号，其它账号会等到下次巡检才变成"异常"，
-        用户看到的就是"登录完莫名其妙状态异常"。这里立即复检，
-        把刚失效的账号名单直接反馈给用户。
-        """
-        from myUtils.auth import check_cookies_concurrently
-
-        db_path = Path(BASE_DIR / "db" / "database.db")
+    def _tencent_account_slot(self) -> tuple[int, str] | None:
+        if not self.account_id:
+            return None
         try:
-            with db_connect(db_path) as conn:
-                rows = conn.execute(
-                    "SELECT id, filePath, userName FROM user_info WHERE type=2"
-                ).fetchall()
+            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+                row = conn.execute(
+                    "SELECT status, filePath FROM user_info WHERE id=?",
+                    (self.account_id,),
+                ).fetchone()
         except Exception as exc:
-            logger.warning("视频号登录后读取账号列表失败: {}", exc)
-            return []
-        if not rows:
-            return []
-        try:
-            flags = self._run_coro_in_new_thread(
-                lambda: check_cookies_concurrently(
-                    [(2, row[1]) for row in rows], max_concurrent=2
-                )
-            )
-        except Exception as exc:
-            logger.warning("视频号登录后复检失败: {}", exc)
-            return []
-        updates = []
-        dead_names = []
-        for index, row in enumerate(rows):
-            alive = bool(flags.get(index, False))
-            updates.append((1 if alive else 0, row[0]))
-            if not alive:
-                dead_names.append(row[2] or f"账号{row[0]}")
-        try:
-            with db_connect(db_path) as conn:
-                conn.executemany(
-                    "UPDATE user_info SET status=? WHERE id=?", updates
-                )
-                conn.commit()
-        except Exception as exc:
-            logger.warning("视频号登录后状态回写失败: {}", exc)
-        return dead_names
+            logger.warning("读取视频号登录槽位失败: {}", exc)
+            return None
+        if row is None:
+            return None
+        return int(row[0] if row[0] is not None else 0), str(row[1] or "")
 
-    def _verify_tencent_cookie(self) -> bool:
-        # 视频号登录保存 cookie 后立即校验，避免把无效 cookie 当成功。
-        import asyncio
-
-        from myUtils.auth import check_cookie
-
-        if not self.cookie_name:
+    def _tencent_slot_matches_identity(self, identity: str) -> bool:
+        """Reject overwrites that selected a different Channels account."""
+        if not self.account_id or not identity:
+            return True
+        slot = self._tencent_account_slot()
+        if slot is None:
             return False
-        for attempt in range(2):
-            try:
-                # 本线程由 sync_playwright 驱动，内部已有一个 event loop，
-                # 直接 asyncio.run 会报 "cannot be called from a running
-                # event loop"。放到独立线程里跑 async 校验。
-                if self._run_coro_in_new_thread(
-                    lambda: check_cookie(2, self.cookie_name)
-                ):
-                    return True
-            except Exception as exc:
-                logger.warning("视频号 cookie 校验异常: {}", exc)
-            if attempt == 0:
-                time.sleep(2)
-        return False
+        _status, file_name = slot
+        saved_identity = self._storage_identity(
+            Path(BASE_DIR / "cookiesFile" / file_name)
+        )
+        return not saved_identity or saved_identity == identity
+
+    def _prepare_tencent_fingerprint(self, browser_version: str) -> dict:
+        """Load an account profile or assign one stable unique profile once.
+
+        视频号的网页会话是**绑定设备指纹**的：换一套 UA/指纹打开，平台会当成
+        新设备，直接把请求打回登录页（前端看到的就是"登录视频号助手 + 一直转圈"）。
+        所以补登模式必须沿用该账号登录时保存的那份指纹，不能临时生成新的——
+        否则每次「补登频道」都像换了一台电脑，还会触发风控把会话踢掉。
+        """
+        if self.seed_storage:
+            stored = load_fingerprint(self.seed_storage)
+            if stored:
+                return upgrade_fingerprint(stored, self._fingerprint_seed)
+            # 老账号没有指纹文件：沿用当年登录窗口用的 Linux UA，尽量贴近原设备
+            return legacy_linux_fingerprint(browser_version)
+        slot = self._tencent_account_slot()
+        if slot is not None:
+            status, file_name = slot
+            cookie_path = Path(BASE_DIR / "cookiesFile" / file_name)
+            stored = load_fingerprint(cookie_path)
+            if stored:
+                return upgrade_fingerprint(stored, self._fingerprint_seed)
+            # Accounts saved before account isolation used this exact Linux UA.
+            # Keep their working session stable until it is deliberately refreshed.
+            if status == 1:
+                return legacy_linux_fingerprint(browser_version)
+        return new_fingerprint(self._fingerprint_seed, browser_version)
+
+    def _prepare_account_fingerprint(self, browser_version: str) -> dict:
+        if self.platform == "tencent":
+            return self._prepare_tencent_fingerprint(browser_version)
+        return account_fingerprint(
+            self._environment_cookie,
+            account_id=self.account_id,
+            seed=self._fingerprint_seed,
+            browser_version=browser_version,
+        )
+
+    def _next_tencent_account_name(self) -> str:
+        """为同一次管理员登录中发现的额外频道生成不冲突的名称。"""
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM user_info WHERE type=?", (self._platform_type,)
+            ).fetchone()
+        return f"{self._platform_label}账号{int(row[0] if row else 0) + 1}"
+
+    def _verify_tencent_cookie(self, context) -> bool:
+        """Verify the saved account without opening its profile a second time.
+
+        The interactive login still owns the persistent Chromium profile while
+        this check runs.  Launching another browser for the same profile would
+        wait forever on the account lock, so verify positive evidence in the
+        exact logged-in session that produced the saved state.
+        """
+        if not self.cookie_name or not context:
+            return False
+        pages = getattr(context, "pages", None) or []
+        page = pages[-1] if pages else None
+        return bool(page and self._is_logged_in(context, page))
 
     @staticmethod
     def _run_coro_in_new_thread(coro_factory):
@@ -309,9 +489,9 @@ class InteractivePlatformLogin:
         # 登录校验失败时回滚：删除 cookie 文件并把账号状态改回失效。
         try:
             if self.cookie_name:
-                (Path(BASE_DIR / "cookiesFile") / self.cookie_name).unlink(
-                    missing_ok=True
-                )
+                cookie_path = Path(BASE_DIR / "cookiesFile") / self.cookie_name
+                cookie_path.unlink(missing_ok=True)
+                fingerprint_path(cookie_path).unlink(missing_ok=True)
         except Exception as exc:
             logger.warning("回滚删除 cookie 文件失败: {}", exc)
         db_path = Path(BASE_DIR / "db" / "database.db")
@@ -476,6 +656,10 @@ class InteractivePlatformLogin:
         )
 
     def _apply_command(self, page, kind: str, payload: dict) -> None:
+        if kind == "switch_channel":
+            # 视频号：回到「选择视频号登录」频道列表（同一次登录会话内切换频道）。
+            self._switch_tencent_channel(page)
+            return
         if kind == "click":
             x, y = self._point(payload)
             page.mouse.click(x, y)
@@ -538,6 +722,15 @@ class InteractivePlatformLogin:
         if self.platform == "tencent":
             if page is None:
                 return False
+            # 同一管理员微信可能管理多个视频号。扫码成功后平台会先弹出
+            # “选择视频号登录”，此时底层页面已经出现发布按钮，但不能立刻
+            # 保存：否则会把同一个默认频道保存成多个账号。必须等用户选定
+            # 频道，并拿到该频道稳定的 finder_username 后再记录。
+            if self._tencent_channel_selection_pending(page):
+                return False
+            identity = self._tencent_account_identity(page)
+            if identity == "":
+                return False
             # 正面证据：登录后才会出现的功能按钮，每轮都查。
             if self._tencent_dom_logged_in(page):
                 return True
@@ -565,6 +758,152 @@ class InteractivePlatformLogin:
                 return True
             return self._probe_xhs_user(context)
         return True
+
+    def _tencent_channel_selection_pending(self, page) -> bool:
+        """识别扫码后的视频号账号选择层，避免在用户选择前保存。
+
+        旧页面结构没有这个方法时返回 False，保持单测试桩与非视频号调用兼容。
+        """
+        get_by_text = getattr(page, "get_by_text", None)
+        if not callable(get_by_text):
+            return False
+        for text in ("选择视频号登录", "使用其他账号登录"):
+            try:
+                marker = get_by_text(text, exact=False).first
+                if marker.count() and marker.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _tencent_account_identity(self, page) -> str | None:
+        """读取当前视频号频道身份；None 表示测试桩不支持页面脚本。
+
+        优先取 URL 上的 ``finder_username``（切换频道后地址栏通常先更新），
+        再退回 localStorage —— 视频号后台切频道是 SPA 内跳转，localStorage
+        有时要等页面重新挂载才刷新，只读 localStorage 会出现"切了频道但识别
+        不到新频道、于是不保存"的现象。
+        """
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            return None
+        identity = ""
+        try:
+            identity = str(
+                evaluate("() => String(localStorage.getItem('finder_username') || '')")
+                or ""
+            ).strip()
+        except Exception:
+            return None
+
+        try:
+            from urllib.parse import parse_qs, urlparse
+
+            current_url = str(getattr(page, "url", "") or "")
+            if "finder_username=" in current_url:
+                from_url = (parse_qs(urlparse(current_url).query).get("finder_username") or [""])[0]
+                from_url = str(from_url or "").strip()
+                if from_url and from_url != identity:
+                    logger.debug(
+                        "视频号频道身份来自 URL（localStorage 尚未刷新）: {} -> {}",
+                        identity[:32] or "-", from_url[:32],
+                    )
+                identity = from_url or identity
+        except Exception:
+            pass
+
+        return identity[:512] or None
+
+    def _probe_superseded_tencent_accounts(self, current_cookie: str) -> list[str]:
+        """本次登录后，探测其它视频号账号是否已被平台顶下线。
+
+        视频号助手对同一个微信只保留**最近一次**网页会话：每扫一次码，之前登录
+        的会话立刻失效（接口回 errCode 300333/300334）。用户看到的就是"刚登完，
+        前面几个全变异常"，但不知道是被顶掉的。
+
+        这里用一次轻量 HTTP 探测（不是开浏览器，几百毫秒）把死掉的号直接标成
+        异常并写明原因，同时在登录窗口里提示"切换频道把它们补登回来"。
+        """
+        names: list[str] = []
+        try:
+            from account_store import get_store
+            from channels_dm import ChannelsClient
+
+            store = get_store(BASE_DIR)
+            for item in store.list(2):
+                cookie_name = item["cookie"]["name"]
+                if not cookie_name or cookie_name == current_cookie:
+                    continue
+                if not item["cookie"]["exists"]:
+                    continue
+                account = {
+                    "id": item["id"],
+                    "userName": item["name"] or f"账号{item['id']}",
+                    "cookie_path": str(Path(BASE_DIR) / "cookiesFile" / cookie_name),
+                }
+                client = None
+                try:
+                    client = ChannelsClient(account)
+                    alive = client.check_alive()
+                except Exception:
+                    alive = False
+                finally:
+                    try:
+                        if client is not None:
+                            client.close()
+                    except Exception:
+                        pass
+                if not alive:
+                    store.mark_status(
+                        int(item["id"]), 0,
+                        "已被本次登录顶下线（同一微信只保留最新会话），"
+                        "请在本窗口点「切换频道」把它也补登一遍",
+                    )
+                    names.append(str(account["userName"]))
+        except Exception as exc:
+            logger.debug("探测被顶下线的视频号失败: {}", exc)
+        return names
+
+    def _switch_tencent_channel(self, page, announce: bool = True) -> None:
+        """回到「选择视频号登录」频道列表，继续保存下一个频道。
+
+        为什么需要这个：视频号后台把"当前选中的频道"记在
+        ``localStorage.finder_username`` 上，发布页（post/create）本身**没有**
+        切换频道的入口。清掉这几个键再打开助手首页，平台就会重新弹出频道列表
+        （就是登录时那个「选择视频号登录」浮层）。
+
+        关键点：这是**同一次登录会话内**的跳转，不会产生新的微信网页会话，
+        所以不会把刚保存的频道挤下线——这正是"一个微信、多个视频号"要的路径。
+        """
+        try:
+            page.evaluate(
+                "() => {"
+                "  ['finder_username','finder_uin','finder_raw',"
+                "   'oauth_last_set_finder_time','oauth_last_set_session']"
+                "    .forEach(key => { try { localStorage.removeItem(key) } catch (e) {} });"
+                "  return true;"
+                "}"
+            )
+        except Exception as exc:
+            logger.warning("清理视频号频道痕迹失败: {}", exc)
+        try:
+            page.goto(
+                "https://channels.weixin.qq.com/platform",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as exc:
+            logger.warning("打开视频号助手首页失败: {}", exc)
+        if announce:
+            self._set_state(
+                "collecting",
+                "已回到频道选择页，请选择下一个视频号；选定后会自动保存。"
+                "全部保存完点「完成并关闭」。",
+            )
+        logger.info(
+            "视频号已切回频道选择页（announce={} 当前已保存 {} 个频道）",
+            announce, self.saved_count,
+        )
 
     def _tencent_dom_logged_in(self, page) -> bool:
         """视频号登录成功的正面证据：登录后才会出现的功能按钮。"""
@@ -672,17 +1011,39 @@ class InteractivePlatformLogin:
         context = None
         try:
             with sync_playwright() as playwright:
-                browser = self._launch_browser(playwright)
-                version = str(getattr(browser, "version", "") or "")
-                major = version.split(".", 1)[0] if version else "131"
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-                    ),
-                    locale="zh-CN",
-                    timezone_id="Asia/Shanghai",
-                    viewport={"width": 1280, "height": 900},
+                version = "131"
+                if not self._environment_cookie:
+                    self._environment_cookie = str(
+                        Path(BASE_DIR / "cookiesFile" / f".login-{self.session_id}.json")
+                    )
+                environment_cookie = Path(self._environment_cookie)
+                if self.seed_storage and not environment_cookie.is_file():
+                    environment_cookie = Path(self.seed_storage)
+                if not self.seed_storage:
+                    save_environment(environment_cookie, {
+                        "profileKey": f"session-{self.session_id}",
+                    })
+                self.fingerprint = self._prepare_account_fingerprint(version)
+                configured = os.environ.get("INTERACTIVE_LOGIN_HEADLESS")
+                if configured is None:
+                    headless = not (
+                        bool(os.environ.get("DISPLAY")) or os.name == "nt"
+                    )
+                else:
+                    headless = configured.strip().lower() in {"1", "true", "yes"}
+                context = open_persistent_account_context_sync(
+                    playwright,
+                    environment_cookie,
+                    account_id=self.account_id,
+                    fingerprint=self.fingerprint,
+                    headless=headless,
+                    channel="chromium",
+                    args=[
+                        "--no-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                        "--lang=zh-CN",
+                        "--start-maximized",
+                    ],
                 )
                 stealth_path = Path(BASE_DIR / "utils" / "stealth.min.js")
                 if stealth_path.exists():
@@ -691,15 +1052,19 @@ class InteractivePlatformLogin:
                 page.on("dialog", lambda dialog: dialog.dismiss())
 
                 target = PLATFORM_LOGIN_TARGETS[self.platform]
+                seeded = bool(self.platform == "tencent" and self.seed_storage)
                 page.goto(
-                    target["url"],
+                    "https://channels.weixin.qq.com/platform" if seeded else target["url"],
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
                 # The landing animation can finish before the login card is
                 # painted.  Wait for the real official form before exposing the
                 # first frame so users never see an empty background.
-                login_form = page.locator(target["login_form"]).first if target["login_form"] else None
+                login_form = (
+                    page.locator(target["login_form"]).first
+                    if target["login_form"] and not seeded else None
+                )
                 try:
                     if login_form is not None:
                         login_form.wait_for(state="visible", timeout=45000)
@@ -729,12 +1094,35 @@ class InteractivePlatformLogin:
                     # 视频号登录页的二维码 iframe 位于 x≈934，宽度 1280 视口下
                     # 几乎贴着右边缘，用户在对话框里根本看不清。
                     # 把整个登录卡片挪到画面中央再推流。
-                    self._center_tencent_qrcode(page)
+                    if seeded:
+                        # 补登模式：复用现有会话打开后台，不重新扫码。
+                        # 实测"清 localStorage 再刷新"并不能逼出频道列表（平台会从
+                        # 服务端恢复上次频道），所以这里不折腾：把当前频道记为"已保存"，
+                        # 用户自己点左下角头像切频道时，循环检测到新频道才会保存。
+                        seed_identity = ""
+                        try:
+                            seed_identity = str(
+                                page.evaluate(
+                                    "() => String(localStorage.getItem('finder_username') || '')"
+                                ) or ""
+                            ).strip()
+                        except Exception:
+                            seed_identity = ""
+                        if seed_identity:
+                            self.saved_tencent_identities.add(seed_identity)
+                        self._set_state(
+                            "running",
+                            "已用现有登录会话打开视频号后台：点左下角头像 →「切换视频号」"
+                            "选择要补登的频道，选中后会自动保存；也可以点右侧「切换频道」。",
+                        )
+                    else:
+                        self._center_tencent_qrcode(page)
 
                 time.sleep(0.8)
-                self._set_state(
-                    "running", f"请在上方{self._platform_label}官方窗口完成登录"
-                )
+                if not seeded:
+                    self._set_state(
+                        "running", f"请在上方{self._platform_label}官方窗口完成登录"
+                    )
                 last_frame_at = 0.0
 
                 while not self.stop_event.is_set():
@@ -750,11 +1138,69 @@ class InteractivePlatformLogin:
                         self._apply_command(page, kind, payload)
                         last_frame_at = 0.0
 
+                    if (
+                        self.platform == "tencent"
+                        and self.saved_count == 0
+                        and self._tencent_channel_selection_pending(page)
+                    ):
+                        self._set_state(
+                            "running",
+                            "请选择要登录的视频号账号；选定频道后会自动保存",
+                        )
+
                     if self._is_logged_in(context, page):
+                        identity = (
+                            self._tencent_account_identity(page)
+                            if self.platform == "tencent"
+                            else None
+                        )
+                        if self.platform == "tencent" and (
+                            identity is None
+                            or identity in self.saved_tencent_identities
+                        ):
+                            # 已经在"收集频道"阶段：必须继续推流，否则用户看不到
+                            # 频道切换入口，也没法点。所以这里推一帧再 continue。
+                            self._publish_frame_safe(page)
+                            time.sleep(0.2)
+                            continue
+
+                        if (
+                            self.platform == "tencent"
+                            and self.saved_count == 0
+                            and not self._tencent_slot_matches_identity(identity or "")
+                        ):
+                            self._set_state(
+                                "failed",
+                                "当前选择的视频号与要覆盖的账号不一致；"
+                                "请重新打开窗口并选择正确的视频号，原 Cookie 未被覆盖",
+                            )
+                            logger.warning(
+                                "视频号覆盖登录选错频道，已拒绝写入: account_id={} identity={}",
+                                self.account_id,
+                                identity,
+                            )
+                            break
+
                         time.sleep(0.8)
-                        self._record_account(context)
+                        saved_name = self.account_name
+                        self._record_account(
+                            context,
+                            account_name=saved_name,
+                            identity=identity or "",
+                        )
                         if self.platform == "tencent":
-                            if not self._verify_tencent_cookie():
+                            self.saved_tencent_identities.add(identity or "")
+                            # 同一次扫码（同一个浏览上下文 = 同一个微信网页会话）里，
+                            # 一个微信可能管理多个视频号频道。微信的服务端只保留
+                            # "最近一次登录"的会话：如果为每个频道各扫一次码，后扫的
+                            # 会把先扫的挤下线（表现为"登完第三个，前两个全变异常"）。
+                            # 正确做法是：一次扫码 → 在这个窗口里切换频道 → 每个频道
+                            # 各存一份快照（cookies 相同、localStorage 的频道标识不同），
+                            # 这样多个频道共享同一个有效会话，全部都能用。
+                            #
+                            # 所以这里保存成功后**不关窗口**，进入 collecting 状态继续等待
+                            # 下一个频道；用户点「完成并关闭」才结束。
+                            if self.saved_count == 1 and not self._verify_tencent_cookie(context):
                                 self._rollback_account()
                                 self._set_state(
                                     "failed", "视频号登录校验未通过，请重新扫码登录"
@@ -764,23 +1210,32 @@ class InteractivePlatformLogin:
                                     self.account_name,
                                 )
                                 break
-                            success_message = (
-                                f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                            # 顺手探测：这次登录是不是把别的号顶下线了（几百毫秒）
+                            superseded = self._probe_superseded_tencent_accounts(
+                                str(self.cookie_name or "")
                             )
-                            dead_names = self._recheck_tencent_accounts()
-                            others = [
-                                name for name in dead_names
-                                if name != self.account_name
-                            ]
-                            if others:
-                                success_message += (
-                                    "；检测到以下视频号账号登录已失效，需要重新扫码："
-                                    + "、".join(others[:5])
-                                )
-                        else:
-                            success_message = (
-                                f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                            superseded_hint = (
+                                f" 另外 {'、'.join(superseded)} 已被本次登录顶下线，"
+                                "请点「切换频道」把它们补登回来。"
+                                if superseded else ""
                             )
+                            self._set_state(
+                                "collecting",
+                                f"已保存「{saved_name}」（本次共 {self.saved_count} 个频道）。"
+                                "要登录这个微信下的其它视频号，点右侧「切换频道」回到频道列表，"
+                                "选中后会自动保存；全部完成后点「完成并关闭」。"
+                                + superseded_hint,
+                            )
+                            logger.info(
+                                "视频号频道已保存: {} identity={} 累计={} 个，等待其它频道",
+                                saved_name, identity, self.saved_count,
+                            )
+                            self._publish_frame_safe(page)
+                            continue
+
+                        success_message = (
+                            f"{self._platform_label}登录成功，账号与 Cookie 已保存"
+                        )
                         self._set_state("success", success_message)
                         logger.info(
                             "交互式{}登录成功，账号已记录: {}",
@@ -908,6 +1363,7 @@ class InteractiveLoginManager:
         account_name: str,
         account_id: int | None = None,
         platform: str = "douyin",
+        seed_storage: str | None = None,
     ) -> tuple[str, InteractivePlatformLogin]:
         with self.lock:
             self._prune_locked()
@@ -916,9 +1372,21 @@ class InteractiveLoginManager:
                 raise RuntimeError("正在运行的官方登录窗口过多，请先关闭旧窗口")
             session_id = uuid.uuid4().hex
             session = InteractivePlatformLogin(
-                session_id, account_name, account_id, platform=platform
+                session_id,
+                account_name,
+                account_id,
+                platform=platform,
+                seed_storage=seed_storage,
             )
             self.sessions[session_id] = session
+            _audit(
+                "start",
+                session_id=session_id,
+                platform_type=PLATFORM_LOGIN_TARGETS[platform]["type"],
+                account_name=account_name,
+                account_id=account_id,
+                mode="seed" if seed_storage else ("replace" if account_id else "create"),
+            )
             session.start()
             return session_id, session
 
@@ -945,6 +1413,13 @@ class InteractiveLoginManager:
             session.stop()
         except Exception:
             pass
+        _audit(
+            "finish",
+            session_id=session_id,
+            state="stopped",
+            message="用户关闭了登录窗口",
+            cookie_name=session.cookie_name,
+        )
         return True
 
 

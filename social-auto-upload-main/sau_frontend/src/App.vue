@@ -1,5 +1,5 @@
 <template>
-  <div class="main-layout">
+  <div v-if="accessReady" class="main-layout">
     <el-container>
       <el-aside :width="isCollapse ? '64px' : '220px'" class="sidebar">
         <div class="logo-container">
@@ -73,11 +73,34 @@
       </el-container>
     </el-container>
   </div>
+  <el-dialog
+    v-model="accessDialog"
+    title="需要访问令牌"
+    width="460px"
+    :show-close="false"
+    :close-on-click-modal="false"
+    :close-on-press-escape="false"
+  >
+    <p class="access-hint">请输入管理员提供的访问令牌，或直接打开管理员发来的邀请链接。</p>
+    <el-input
+      v-model="tokenInput"
+      type="password"
+      show-password
+      clearable
+      placeholder="访问令牌"
+      @keyup.enter="submitToken"
+    />
+    <template #footer>
+      <el-button type="primary" :loading="checking" @click="submitToken">进入工作台</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { getAccessToken, setAccessToken } from '@/config'
+import { http } from '@/utils/request'
 import {
   HomeFilled, User, DataAnalysis, List, Calendar, MagicStick, Bell, ChatDotRound, Files, Checked, DataLine,
   Fold, Picture, Upload
@@ -85,10 +108,42 @@ import {
 
 const route = useRoute()
 const isCollapse = ref(false)
+const accessReady = ref(false)
+const accessDialog = ref(false)
+const tokenInput = ref(getAccessToken())
+const checking = ref(false)
+
+async function verifyAccess() {
+  try {
+    await http.get('/auth/check', null, { silent: true })
+    accessReady.value = true
+    accessDialog.value = false
+    return true
+  } catch {
+    accessReady.value = false
+    accessDialog.value = true
+    return false
+  }
+}
+
+async function submitToken() {
+  const token = String(tokenInput.value || '').trim()
+  if (!token || checking.value) return
+  checking.value = true
+  setAccessToken(token)
+  try {
+    const ok = await verifyAccess()
+    if (!ok) ElMessage.error('访问令牌不正确')
+  } finally {
+    checking.value = false
+  }
+}
 
 const toggleSidebar = () => {
   isCollapse.value = !isCollapse.value
 }
+
+onMounted(verifyAccess)
 </script>
 
 <style>
@@ -107,6 +162,12 @@ html, body, #app {
 <style scoped>
 .main-layout {
   height: 100%;
+}
+
+.access-hint {
+  margin-bottom: 14px;
+  color: #606266;
+  line-height: 1.6;
 }
 
 .sidebar {

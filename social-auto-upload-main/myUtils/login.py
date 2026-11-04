@@ -5,15 +5,39 @@ import time
 from queue import Empty
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 from loguru import logger
 
 from myUtils.auth import check_cookie
 from utils.base_social_media import set_init_script
+from utils.account_browser import open_persistent_account_context
 import uuid
 from pathlib import Path
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
-from db_utils import connect as db_connect
+
+
+def save_login_account(platform_type, cookie_name, name, account_id=None):
+    """统一保存一次登录结果：身份去重 + 凭据路径 + 健康度（见 account_store）。
+
+    历史版本在 4 个文件里重复写了 12 处 ``INSERT INTO user_info``，
+    结果同一个视频号重复扫码会新增一行、覆盖登录还可能把 A 的 Cookie
+    写进 B 的槽位。这里把写入收敛成一个入口，按"平台侧身份"去重。
+    """
+    from account_store import file_identity, get_store
+
+    store = get_store(BASE_DIR)
+    cookie_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
+    identity, identity_source = file_identity(cookie_path, platform_type)
+    return store.upsert(
+        platform_type,
+        cookie_name=cookie_name,
+        name=name,
+        account_id=account_id,
+        identity=identity,
+        identity_source=identity_source,
+        status=1,
+    )
+
 
 # 统一获取浏览器启动配置（防风控+引入本地浏览器）
 def get_browser_options():
@@ -110,20 +134,8 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         if not result.get("success"):
             raise RuntimeError(result.get("message") or "抖音登录失败")
 
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            if account_id:
-                cursor.execute(
-                    "UPDATE user_info SET type=?, filePath=?, userName=?, status=1 WHERE id=?",
-                    (3, cookie_name, id, account_id),
-                )
-            if not account_id or cursor.rowcount == 0:
-                cursor.execute(
-                    "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
-                    (3, cookie_name, id, 1),
-                )
-            conn.commit()
-        logger.info("抖音账号状态已记录")
+        saved = save_login_account(3, cookie_name, id, account_id)
+        logger.info("抖音账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))
         status_queue.put("200")
         return True
     except Exception as exc:
@@ -422,25 +434,23 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
     scanned_reported = False
     # 会话探测的节流计数：已扫码后每 3 轮探一次，避免频繁开新页面
     probe_counter = 0
-    cookie_name = ""
-    browser = None
+    cookie_name = f"{uuid.uuid1()}.json"
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    cookie_path = cookies_dir / cookie_name
     context = None
     page = None
 
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(**options)
-            # 与 interactive_login / 校验端保持同一套 Linux Chrome UA，
-            # 视频号会话绑定设备指纹，UA 不一致会被微信当成新设备踢下线。
-            version = str(getattr(browser, "version", "") or "")
-            major = version.split(".", 1)[0] if version else "131"
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-                ),
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
+            context = await open_persistent_account_context(
+                playwright,
+                cookie_path,
+                account_id=account_id,
+                headless=bool(options.get('headless', True)),
+                channel="chromium",
+                executable_path=str(options.get('executable_path') or ''),
+                args=list(options.get('args') or []),
             )
             context = await set_init_script(context)
             page = await context.new_page()
@@ -520,10 +530,7 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
                 status_queue.put("500")
                 return False
 
-            cookie_name = f"{uuid.uuid4().hex}.json"
-            cookies_dir = Path(BASE_DIR / "cookiesFile")
-            cookies_dir.mkdir(exist_ok=True)
-            await context.storage_state(path=cookies_dir / cookie_name)
+            await context.storage_state(path=cookie_path)
 
         # 校验 Cookie；偶发失败重试一次，避免把"其实成功了"判成失败
         valid = False
@@ -540,25 +547,13 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
             status_queue.put("LOGIN_ERROR:视频号登录校验未通过，请重新扫码登录")
             status_queue.put("500")
             try:
-                (Path(BASE_DIR / "cookiesFile") / cookie_name).unlink(missing_ok=True)
+                cookie_path.unlink(missing_ok=True)
             except Exception:
                 pass
             return False
 
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            if account_id:
-                cursor.execute('''
-                    UPDATE user_info SET type=?, filePath=?, userName=?, status=1
-                    WHERE id=?
-                    ''', (2, cookie_name, id, account_id))
-            if not account_id or cursor.rowcount == 0:
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                    ''', (2, cookie_name, id, 1))
-            conn.commit()
-            logger.info("视频号账号状态已记录")
+        saved = save_login_account(2, cookie_name, id, account_id)
+        logger.info("视频号账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))
         status_queue.put("200")
         return True
     except Exception as exc:
@@ -569,7 +564,7 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
         status_queue.put("500")
         return False
     finally:
-        for closer in (page, context, browser):
+        for closer in (page, context):
             try:
                 if closer is not None:
                     await closer.close()
@@ -577,82 +572,73 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
                 pass
 
 # 快手登录
-async def get_ks_cookie(id,status_queue):
+async def get_ks_cookie(id, status_queue, account_id=None):
     url_changed_event = asyncio.Event()
+    cookie_name = f"{uuid.uuid1()}.json"
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    cookie_path = cookies_dir / cookie_name
+    original_url = ""
+
     async def on_url_change():
-        # 检查是否是主框架的变化
         if page.url != original_url:
             url_changed_event.set()
+
+    logged_in = False
+    context = None
     async with async_playwright() as playwright:
-        options = {
-            'args': [
-                '--lang en-GB'
-            ],
-            'headless': LOCAL_CHROME_HEADLESS,  # Set headless option here
-        }
-        # Make sure to run headed.
-        browser = await playwright.chromium.launch(**options)
-        # Setup context however you like.
-        context = await browser.new_context()  # Pass any options
+        context = await open_persistent_account_context(
+            playwright,
+            cookie_path,
+            account_id=account_id,
+            headless=LOCAL_CHROME_HEADLESS,
+            channel="chromium",
+            executable_path=LOCAL_CHROME_PATH or "",
+            args=["--lang=zh-CN", "--disable-blink-features=AutomationControlled"],
+        )
         context = await set_init_script(context)
-        # Pause the page, and start recording manually.
         page = await context.new_page()
-        await page.goto("https://cp.kuaishou.com")
-
-        # 定位并点击“立即登录”按钮（类型为 link）
-        await page.get_by_role("link", name="立即登录").click()
-        await page.get_by_text("扫码登录").click()
-        img_locator = page.get_by_role("img", name="qrcode")
-        # 获取 src 属性值
-        src = await img_locator.get_attribute("src")
-        original_url = page.url
-        logger.info("快手登录二维码地址: {}", src)
-        status_queue.put(src)
-        # 监听页面的 'framenavigated' 事件，只关注主框架的变化
-        page.on('framenavigated',
-                lambda frame: asyncio.create_task(on_url_change()) if frame == page.main_frame else None)
-
         try:
-            # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
+            await page.goto("https://cp.kuaishou.com")
+            await page.get_by_role("link", name="立即登录").click()
+            await page.get_by_text("扫码登录").click()
+            img_locator = page.get_by_role("img", name="qrcode")
+            src = await img_locator.get_attribute("src")
+            original_url = page.url
+            logger.info("快手登录二维码地址: {}", src)
+            status_queue.put(src)
+            page.on(
+                'framenavigated',
+                lambda frame: asyncio.create_task(on_url_change()) if frame == page.main_frame else None,
+            )
+            await asyncio.wait_for(url_changed_event.wait(), timeout=200)
             logger.info("快手登录页面跳转成功")
+            await context.storage_state(path=cookie_path)
+            logged_in = True
         except asyncio.TimeoutError:
-            status_queue.put("500")
             logger.warning("快手登录页面跳转超时")
-            await page.close()
+        finally:
             await context.close()
-            await browser.close()
-            return None
-        uuid_v1 = uuid.uuid1()
-        logger.debug("登录凭证文件名: {}", uuid_v1)
-        # 确保cookiesFile目录存在
-        cookies_dir = Path(BASE_DIR / "cookiesFile")
-        cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
-        result = await check_cookie(4, f"{uuid_v1}.json")
-        if not result:
-            status_queue.put("500")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        await page.close()
-        await context.close()
-        await browser.close()
 
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                                        INSERT INTO user_info (type, filePath, userName, status)
-                                        VALUES (?, ?, ?, ?)
-                                        ''', (4, f"{uuid_v1}.json", id, 1))
-            conn.commit()
-            logger.info("快手账号状态已记录")
-        status_queue.put("200")
+    if not logged_in:
+        status_queue.put("500")
+        return None
+    # Validate only after the persistent profile is closed, so this check does
+    # not contend with the login session for the same Chromium profile lock.
+    if not await check_cookie(4, cookie_name):
+        status_queue.put("500")
+        return None
+    saved = save_login_account(4, cookie_name, id, account_id)
+    logger.info("快手账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))
+    status_queue.put("200")
 
 # 小红书登录
 async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
     login_state = {"user": None, "chat_ready": False}
+    cookie_name = f"{uuid.uuid1()}.json"
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    cookie_path = cookies_dir / cookie_name
 
     async def on_response(response):
         try:
@@ -677,14 +663,15 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
             return
 
     async with async_playwright() as playwright:
-        options = get_browser_options()
-        # 主站匿名扫码在无头模式下会触发 IP 安全限制，登录时必须使用有头浏览器。
-        options['headless'] = False
-        browser = await playwright.chromium.launch(**options)
-        context = await browser.new_context(
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            viewport={"width": 1440, "height": 1000},
+        context = await open_persistent_account_context(
+            playwright,
+            cookie_path,
+            account_id=account_id,
+            # Main-site QR login is blocked headless on some IP ranges.
+            headless=False,
+            channel="chromium",
+            executable_path=LOCAL_CHROME_PATH or "",
+            args=["--disable-blink-features=AutomationControlled", "--lang=zh-CN"],
         )
         context = await set_init_script(context)
         page = await context.new_page()
@@ -736,26 +723,11 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
             if "/login" in page.url or "手机号登录" in body or "扫码登录" in body:
                 raise RuntimeError("小红书创作服务平台登录态未建立，请重新扫码")
 
-            uuid_v1 = uuid.uuid1()
-            logger.debug("登录凭证文件名: {}", uuid_v1)
-            cookies_dir = Path(BASE_DIR / "cookiesFile")
-            cookies_dir.mkdir(exist_ok=True)
-            await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
+            logger.debug("登录凭证文件名: {}", cookie_name)
+            await context.storage_state(path=cookie_path)
 
-            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-                cursor = conn.cursor()
-                if account_id:
-                    cursor.execute('''
-                        UPDATE user_info SET type=?, filePath=?, userName=?, status=1
-                        WHERE id=?
-                        ''', (1, f"{uuid_v1}.json", id, account_id))
-                if not account_id or cursor.rowcount == 0:
-                    cursor.execute('''
-                        INSERT INTO user_info (type, filePath, userName, status)
-                        VALUES (?, ?, ?, ?)
-                        ''', (1, f"{uuid_v1}.json", id, 1))
-                conn.commit()
-                logger.info("小红书账号状态已记录")
+            saved = save_login_account(1, cookie_name, id, account_id)
+            logger.info("小红书账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))
             user = login_state["user"]
             logger.info(
                 "小红书主站账号: {} {} {}",
@@ -775,10 +747,6 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
                 await context.close()
             except Exception:
                 pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
     return True
 
 # a = asyncio.run(xiaohongshu_cookie_gen(4,None))
@@ -796,10 +764,7 @@ async def weibo_cookie_gen_sse(user_id, status_queue):
             status_queue.put("data:image/png;base64," + b64)
     result = await weibo_cookie_gen(str(Path(BASE_DIR / "cookiesFile" / ("weibo_" + str(user_id) + ".json"))), qrcode_callback=qrcode_callback)
     if result.get("success"):
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.execute('INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)',
-                         (5, "weibo_" + str(user_id) + ".json", user_id, 1))
-            conn.commit()
+        save_login_account(5, "weibo_" + str(user_id) + ".json", user_id)
         status_queue.put("200")
     else:
         status_queue.put("500")
@@ -815,10 +780,7 @@ async def baijiahao_cookie_gen_sse(user_id, status_queue):
             status_queue.put("data:image/png;base64," + b64)
     result = await baijiahao_cookie_gen(str(Path(BASE_DIR / "cookiesFile" / ("bjh_" + str(user_id) + ".json"))), qrcode_callback=qrcode_callback)
     if result.get("success"):
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            conn.execute('INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)',
-                         (6, "bjh_" + str(user_id) + ".json", user_id, 1))
-            conn.commit()
+        save_login_account(6, "bjh_" + str(user_id) + ".json", user_id)
         status_queue.put("200")
     else:
         status_queue.put("500")

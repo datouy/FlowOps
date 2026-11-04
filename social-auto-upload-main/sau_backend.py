@@ -19,8 +19,22 @@ from publish_jobs import enqueue_job, start_patrol, run_patrol_once, latest_acco
 import verify_codes
 from conf import BASE_DIR
 from db_utils import connect as db_connect
+from account_store import (
+    DEFAULT_FAIL_THRESHOLD,
+    PLATFORMS,
+    STATUS_TEXT,
+    get_store,
+    platform_type_of,
+    read_storage_state,
+)
 import runtime_config
 from app_logging import logger, setup_request_logging
+from utils.keep_awake import hold_system_awake
+from utils.account_environment import (
+    public_environment,
+    remove_environment,
+    update_proxy,
+)
 from interactive_login import PLATFORM_LOGIN_TARGETS, interactive_login_manager
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
@@ -37,6 +51,28 @@ pending_login_lock = threading.Lock()
 # 账号 cookie 校验并发度：每个校验都要开一个 Chromium，等 5~8 秒。
 # 串行做的话 N 个账号要 N×8 秒；并发后总耗时约等于单个账号的耗时。
 ACCOUNT_CHECK_CONCURRENCY = 4
+# 账号校验"单飞"：页面挂载、手动刷新、多个标签页会同时打 /getValidAccounts。
+# 以前三次请求 = 三批 Chromium 同时登录同一套视频号后台，微信会把并发会话
+# 互相挤下线，于是同一份 Cookie 前一秒有效、后一秒失效（列表状态来回跳）。
+# 现在同一时刻只允许一批校验，并在 TTL 内复用结果。
+ACCOUNT_CHECK_CACHE_TTL = 30.0
+ACCOUNT_CHECK_LOCK_TIMEOUT = 45.0
+_ACCOUNT_CHECK_LOCK = threading.Lock()
+_ACCOUNT_CHECK_CACHE: dict = {"at": 0.0, "rows": None}
+
+
+def _account_check_cached():
+    """取 30 秒内的校验结果；没有则返回 None。"""
+    rows = _ACCOUNT_CHECK_CACHE.get("rows")
+    at = float(_ACCOUNT_CHECK_CACHE.get("at") or 0.0)
+    if rows is not None and (time.monotonic() - at) < ACCOUNT_CHECK_CACHE_TTL:
+        return rows
+    return None
+
+
+def _account_check_store_cache(rows) -> None:
+    _ACCOUNT_CHECK_CACHE["rows"] = rows
+    _ACCOUNT_CHECK_CACHE["at"] = time.monotonic()
 app = Flask(__name__)
 setup_request_logging(app)
 import schedule_ops
@@ -96,13 +132,18 @@ def health():
     return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
 
 
+@app.route('/auth/check', methods=['GET'])
+def auth_check():
+    """Authenticated lightweight probe used by the browser access gate."""
+    return jsonify({"code": 200, "msg": None, "data": {"authenticated": True}}), 200
+
+
 # ---------------------------------------------------------------- 登录账号槽位
 #
 # "登录账号选择"：先用平台定位到 type，再列出该平台已有账号，让前端在
 # 「新建账号 / 覆盖已有账号」之间选。key 只认 PLATFORM_LOGIN_TARGETS 里的三个，
 # 中文名与 type 都归一化到这里，避免前端出现 channels / tencent 两套 key。
 PLATFORM_LABELS = {"douyin": "抖音", "xiaohongshu": "小红书", "tencent": "视频号"}
-ACCOUNT_STATUS_TEXT = {1: "正常", 0: "异常", -1: "验证中"}
 
 
 def _resolve_login_platform(value) -> str | None:
@@ -124,23 +165,20 @@ def _resolve_login_platform(value) -> str | None:
 def _platform_accounts(platform_key: str) -> list:
     """读取该登录平台已有的账号行（即可覆盖的登录槽位）。"""
     platform_type = PLATFORM_LOGIN_TARGETS[platform_key]["type"]
-    db_path = Path(BASE_DIR / "db" / "database.db")
-    if not db_path.is_file():
-        return []
-    with db_connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT id, userName, status, filePath FROM user_info WHERE type=? ORDER BY id",
-            (platform_type,),
-        ).fetchall()
+    rows = get_store(BASE_DIR).list(platform_type)
     accounts = []
-    for row in rows:
-        status = int(row[2]) if row[2] is not None else 0
+    for item in rows:
         accounts.append({
-            "id": int(row[0]),
-            "name": row[1] or f"账号{row[0]}",
-            "status": status,
-            "statusText": ACCOUNT_STATUS_TEXT.get(status, "未知"),
-            "cookieName": row[3] or "",
+            "id": item["id"],
+            "name": item["name"] or f"账号{item['id']}",
+            "status": item["status"],
+            "statusText": item["statusText"],
+            "cookieName": item["cookie"]["name"],
+            # 新增：身份与健康度，前端可用来提示"这是同一个频道"或"上次校验失败原因"
+            "identity": item["identity"]["masked"],
+            "identityBound": item["identity"]["bound"],
+            "lastCheckAt": item["lastCheckAt"],
+            "failReason": item["failReason"],
         })
     return accounts
 
@@ -205,6 +243,45 @@ def interactive_login_start():
         account_id = int(data.get('account_id')) if data.get('account_id') else None
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "账号 ID 格式错误", "data": None}), 400
+    # 补登模式（仅视频号）：用已有会话打开频道列表，不重新扫码。
+    try:
+        seed_account_id = int(data.get('seed_account_id')) if data.get('seed_account_id') else None
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "补登账号 ID 格式错误", "data": None}), 400
+    seed_storage = None
+    if seed_account_id is not None:
+        if platform != 'tencent':
+            return jsonify({
+                "code": 400,
+                "msg": "只有视频号支持「从现有会话补登频道」",
+                "data": None,
+            }), 400
+        seed_row = _account_row(seed_account_id)
+        if seed_row is None:
+            return jsonify({
+                "code": 404,
+                "msg": "要补登的账号不存在，请刷新后重试",
+                "data": None,
+            }), 404
+        if seed_row["type"] != PLATFORM_LOGIN_TARGETS["tencent"]["type"]:
+            return jsonify({
+                "code": 400,
+                "msg": "只能用视频号账号的会话补登频道",
+                "data": None,
+            }), 400
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            cookie_row = conn.execute(
+                "SELECT filePath FROM user_info WHERE id=?", (seed_account_id,)
+            ).fetchone()
+        cookie_name = str(cookie_row["filePath"] or "") if cookie_row else ""
+        seed_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
+        if not cookie_name or not seed_path.is_file():
+            return jsonify({
+                "code": 400,
+                "msg": "该账号的 Cookie 文件不存在，请先重新扫码登录一次",
+                "data": None,
+            }), 400
+        seed_storage = str(seed_path)
     # 覆盖登录前先确认这个账号确实属于当前平台，否则会把抖音账号行写进小红书。
     if account_id is not None:
         row = _account_row(account_id)
@@ -226,17 +303,18 @@ def interactive_login_start():
             }), 400
     try:
         session_id, session = interactive_login_manager.start(
-            account_name, account_id, platform=platform
+            account_name, account_id, platform=platform, seed_storage=seed_storage
         )
     except RuntimeError as exc:
         return jsonify({"code": 429, "msg": str(exc), "data": None}), 429
     return jsonify({
         "code": 200,
-        "msg": "官方登录窗口已启动",
+        "msg": "已用现有会话打开频道列表" if seed_storage else "官方登录窗口已启动",
         "data": {
             "session": session_id,
-            "mode": "replace" if account_id else "create",
+            "mode": "seed" if seed_storage else ("replace" if account_id else "create"),
             "accountId": account_id,
+            "seedAccountId": seed_account_id,
             "platform": platform,
             "platformLabel": PLATFORM_LABELS.get(platform, platform),
             **session.snapshot(),
@@ -281,7 +359,7 @@ def interactive_login_input():
     if session is None:
         return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
     kind = str(data.get('kind') or '').strip().lower()
-    if kind not in {'click', 'mouse_down', 'mouse_move', 'mouse_up', 'text', 'key', 'scroll', 'reload'}:
+    if kind not in {'click', 'mouse_down', 'mouse_move', 'mouse_up', 'text', 'key', 'scroll', 'reload', 'switch_channel'}:
         return jsonify({"code": 400, "msg": "不支持的登录窗口操作", "data": None}), 400
     try:
         session.submit(kind, data.get('payload') if isinstance(data.get('payload'), dict) else {})
@@ -298,6 +376,209 @@ def interactive_login_stop():
     if not stopped:
         return jsonify({"code": 404, "msg": "登录窗口不存在或已关闭", "data": None}), 404
     return jsonify({"code": 200, "msg": "登录窗口已关闭", "data": None}), 200
+
+# ---------------------------------------------------------------- 账号服务 v2
+#
+# 账号矩阵式账号模型（详见 docs/账号体系与登录优化.md）：
+#   operator（使用者，可用 YUNCE_ACCESS_TOKEN 做本机校验）
+#     └─ account（媒体号）= (平台, 平台侧身份 platform_user_id) 唯一
+#          ├─ credentials     cookiesFile/<name>.json（Playwright storage_state）
+#          ├─ health          status / lastCheckAt / failReason
+#          └─ auth_sessions   授权审计（谁在什么时候授权了哪个账号）
+#
+# v1 的 /getAccounts 保持 5 列老结构以免动前端；需要结构化数据和运维动作的走这里。
+
+
+def _platform_catalog() -> list:
+    return [
+        {"type": pid, "key": meta["key"], "label": meta["label"]}
+        for pid, meta in sorted(PLATFORMS.items())
+    ]
+
+
+@app.route('/api/v2/accounts', methods=['GET'])
+def api_v2_accounts():
+    """结构化账号列表：平台元数据 + 身份 + 健康度 + 凭据状态 + 汇总。"""
+    platform = request.args.get('platform') or request.args.get('type')
+    store = get_store(BASE_DIR)
+    pid = platform_type_of(platform) if platform else None
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {
+            "accounts": store.list(pid),
+            "stats": store.stats(),
+            "platforms": _platform_catalog(),
+            "statusText": {str(key): value for key, value in STATUS_TEXT.items()},
+        },
+    }), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>', methods=['GET'])
+def api_v2_account(account_id: int):
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    return jsonify({"code": 200, "msg": None, "data": item}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/credentials', methods=['GET'])
+def api_v2_account_credentials(account_id: int):
+    """凭据脱敏预览：只回 Cookie 名称/域名与 localStorage 键名，绝不回值。"""
+    store = get_store(BASE_DIR)
+    item = store.get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    state = read_storage_state(Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"]))
+    if state is None:
+        return jsonify({"code": 404, "msg": "凭据文件不存在或无法解析", "data": None}), 404
+    cookies = [item for item in state.get("cookies") or [] if isinstance(item, dict)]
+    storage_keys = []
+    for origin in state.get("origins") or []:
+        if not isinstance(origin, dict):
+            continue
+        for entry in origin.get("localStorage") or []:
+            if isinstance(entry, dict) and entry.get("name"):
+                storage_keys.append(str(entry["name"]))
+    public_account = {
+        key: value for key, value in item.items() if key != "identity"
+    }
+    public_account["identity"] = {
+        "masked": item["identity"]["masked"],
+        "source": item["identity"]["source"],
+        "bound": item["identity"]["bound"],
+    }
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {
+            "account": public_account,
+            "cookieNames": [str(cookie.get("name") or "") for cookie in cookies],
+            "domains": sorted({str(cookie.get("domain") or "") for cookie in cookies} - {""}),
+            "storageKeyCount": len(storage_keys),
+            "storageKeys": sorted(set(storage_keys))[:200],
+        },
+    }), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/check', methods=['POST'])
+async def api_v2_account_check(account_id: int):
+    """单账号健康检查：立刻回写 status / lastCheckAt / failReason。
+
+    状态仍按"连续 N 次失败才判异常"收敛，所以返回里给的是**落库后的有效状态**，
+    前端据此显示，避免"接口说失效、列表还是正常"的不一致。
+    """
+    store = get_store(BASE_DIR)
+    item = store.get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not item["cookie"]["exists"]:
+        store.mark_status(account_id, 0, "凭据文件缺失，请重新扫码授权")
+        fresh = store.get(account_id) or item
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": {
+                "alive": False,
+                "status": fresh["status"],
+                "statusText": fresh["statusText"],
+                "reason": fresh["failReason"],
+            },
+        }), 200
+    flags = await check_cookies_concurrently(
+        [(item["platform"]["type"], item["cookie"]["name"])], max_concurrent=1
+    )
+    alive = bool(flags.get(0, False))
+    store.mark_checked(
+        account_id, alive, "" if alive else "登录态失效，请重新授权"
+    )
+    fresh = store.get(account_id) or item
+    return jsonify({
+        "code": 200, "msg": None,
+        "data": {
+            "alive": alive,
+            "status": fresh["status"],
+            "statusText": fresh["statusText"],
+            "reason": fresh["failReason"],
+        },
+    }), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/environment', methods=['GET', 'PUT'])
+def api_v2_account_environment(account_id: int):
+    """Read or update the account's persistent profile and proxy settings."""
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None or not item["cookie"].get("name"):
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
+    if request.method == 'GET':
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": public_environment(cookie_path, account_id),
+        }), 200
+    data = request.get_json(silent=True) or {}
+    proxy = data.get("proxy") if isinstance(data.get("proxy"), dict) else {}
+    try:
+        environment = update_proxy(
+            cookie_path,
+            account_id,
+            server=str(proxy.get("server") or "").strip(),
+            username=str(proxy.get("username") or "").strip(),
+            password=(str(proxy.get("password")) if "password" in proxy else None),
+        )
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
+    return jsonify({"code": 200, "msg": "环境配置已保存", "data": environment}), 200
+
+
+@app.route('/api/v2/accounts/prune-cookies', methods=['POST'])
+def api_v2_prune_cookies():
+    """清理没有被任何账号引用的 Cookie 文件；默认 dry-run。"""
+    dry_run = str(request.args.get('dry') or '1') not in {'0', 'false', 'False'}
+    result = get_store(BASE_DIR).prune_orphans(dry_run=dry_run)
+    return jsonify({"code": 200, "msg": None, "data": result}), 200
+
+
+@app.route('/api/v2/accounts/backfill-identities', methods=['POST'])
+def api_v2_backfill_identities():
+    """为历史账号补平台身份（导入旧数据、或身份识别规则升级后手动重跑）。"""
+    force = str(request.args.get('force') or '').lower() in {'1', 'true', 'yes'}
+    result = get_store(BASE_DIR).backfill_identities(force=force)
+    return jsonify({"code": 200, "msg": None, "data": result}), 200
+
+
+@app.route('/api/v2/auth-sessions', methods=['GET'])
+def api_v2_auth_sessions():
+    """授权会话审计：包含已结束/被中断的会话，进程重启后仍可查。"""
+    limit = request.args.get('limit', type=int) or 20
+    return jsonify({
+        "code": 200, "msg": None,
+        "data": get_store(BASE_DIR).list_auth_sessions(limit),
+    }), 200
+
+
+def _alias_v2_routes() -> None:
+    """/v2/* 别名。
+
+    vite 的 dev proxy 把 ``/api`` 前缀 rewrite 掉再转发（见 vite.config.js），
+    因此经由 5173 访问时后端收到的是 ``/v2/accounts``。生产环境 nginx 是整段
+    透传，走的是 ``/api/v2/accounts``。两边都注册一份，避免"本地能开、构建后 404"。
+    """
+    for rule in list(app.url_map.iter_rules()):
+        if not rule.rule.startswith('/api/v2/'):
+            continue
+        alias = rule.rule[len('/api'):]
+        if alias in {item.rule for item in app.url_map.iter_rules()}:
+            continue
+        app.add_url_rule(
+            alias,
+            endpoint=f"alias_{rule.endpoint}",
+            view_func=app.view_functions[rule.endpoint],
+            methods=sorted(rule.methods - {'HEAD', 'OPTIONS'}),
+        )
+
+
+_alias_v2_routes()
+
 
 # 获取当前目录（假设 index.html 和 assets 在这里）
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -410,6 +691,26 @@ def download_file(file_path):
         )
     except NotFound:
         return jsonify({"code": 404, "msg": "File not found", "data": None}), 404
+
+
+@app.route('/dm/media/<path:file_path>', methods=['GET'])
+def dm_media_file(file_path):
+    """Serve locally cached private-message assets inside the DM media root."""
+    if not file_path:
+        return jsonify({"code": 400, "msg": "file path is required", "data": None}), 400
+    normalized = str(file_path).replace('\\', '/').lstrip('/')
+    root = (Path(BASE_DIR) / "dm_media").resolve()
+    target = (root / normalized).resolve()
+    if not target.is_relative_to(root) or target == root:
+        return jsonify({"code": 400, "msg": "Invalid file path", "data": None}), 400
+    try:
+        return send_from_directory(
+            str(root), normalized,
+            as_attachment=request.args.get('download') in ('1', 'true', 'yes'),
+            conditional=True,
+        )
+    except NotFound:
+        return jsonify({"code": 404, "msg": "Media not found", "data": None}), 404
 
 
 @app.route('/uploadSave', methods=['POST'])
@@ -529,25 +830,20 @@ def get_all_files():
 
 @app.route("/getAccounts", methods=['GET'])
 def getAccounts():
-    """快速获取所有账号信息，不进行cookie验证"""
+    """快速获取所有账号信息，不进行cookie验证。
+
+    仍返回历史 5 列结构 ``[id, type, filePath, userName, status]``，前端无需改；
+    结构化字段（平台元数据、身份、健康度、凭据状态）走 ``/api/v2/accounts``。
+    """
     try:
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            SELECT * FROM user_info''')
-            rows = cursor.fetchall()
-            rows_list = [list(row) for row in rows]
-
-            logger.debug("当前数据表内容（快速获取）：")
-            for row in rows:
-                logger.debug("{}", row)
-
-            return jsonify(
-                {
-                    "code": 200,
-                    "msg": None,
-                    "data": rows_list
-                }), 200
+        rows_list = get_store(BASE_DIR).legacy_rows()
+        logger.debug("账号列表（快速获取）：{} 条", len(rows_list))
+        return jsonify(
+            {
+                "code": 200,
+                "msg": None,
+                "data": rows_list
+            }), 200
     except Exception as e:
         logger.exception("获取账号列表时出错: {}", e)
         return jsonify({
@@ -559,55 +855,71 @@ def getAccounts():
 
 @app.route("/getValidAccounts",methods=['GET'])
 async def getValidAccounts():
-    """校验所有账号的登录状态并回写 status。
+    """校验所有账号的登录状态并回写健康度。
 
-    历史实现有三个问题：
-    1. 逐个账号串行校验，每个都要开一次 Chromium、等 5~8 秒，
-       N 个账号就是 N×8 秒（日志里实测 10~15 秒）。
-    2. SQLite 连接在整个浏览器操作期间一直持有（``with`` 块跨越了
-       所有 await），既占连接也拖慢其它请求。
-    3. 视图是 ``async def``，Flask 会用 asgiref 把它包成同步调用，
-       于是整个 waitress 工作线程在 15 秒里什么都干不了。
+    这一版解决三个"状态来回跳"的根因：
 
-    现在改成：先读数据 -> 关连接 -> 并发校验 -> 重新开连接一次性回写。
+    1. **并发重复校验**：页面挂载、手动刷新、多标签页会同时打这个接口。
+       以前三次请求 = 三批 Chromium 同时访问平台后台，视频号同一 wxuin
+       多开会被判定"环境异常"并互相挤下线，于是同一份 Cookie 前一秒有效、
+       后一秒失效。现在用单飞锁 + 30 秒结果缓存：同一时刻只跑一批，
+       并发请求直接拿同一份结果。
+    2. **同平台并发自查**：``check_cookies_concurrently`` 里视频号已改为串行。
+    3. **单次失败就拉红**：改为"连续 2 次失败才判异常"（见 ``mark_checked``）。
+
+    另外：凭据文件缺失是确定状态，不占用失败次数，直接标异常。
     """
-    # 1) 先把账号列表读出来，随即释放数据库连接
-    with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-        rows = conn.execute("SELECT * FROM user_info").fetchall()
-        rows_list = [list(row) for row in rows]
+    store = get_store(BASE_DIR)
+    cached = _account_check_cached()
+    if cached is not None:
+        return jsonify({"code": 200, "msg": None, "data": cached}), 200
 
-    if not rows_list:
-        return jsonify({"code": 200, "msg": None, "data": []}), 200
+    acquired = _ACCOUNT_CHECK_LOCK.acquire(timeout=ACCOUNT_CHECK_LOCK_TIMEOUT)
+    if not acquired:
+        # 另一批校验还在跑且已超时：先返回当前库里的状态，别让请求堆积
+        logger.warning("账号校验排队超时，返回当前库内状态")
+        return jsonify({"code": 200, "msg": None, "data": store.legacy_rows()}), 200
+    try:
+        cached = _account_check_cached()  # 等锁期间别人可能已经跑完
+        if cached is not None:
+            return jsonify({"code": 200, "msg": None, "data": cached}), 200
 
-    # 2) 并发校验各账号登录状态（每个账号独立开浏览器）
-    alive_flags = await check_cookies_concurrently(
-        [(row[1], row[2]) for row in rows_list],
-        max_concurrent=ACCOUNT_CHECK_CONCURRENCY,
-    )
+        accounts = store.list()
+        if not accounts:
+            return jsonify({"code": 200, "msg": None, "data": []}), 200
 
-    # 3) 回写状态：一次事务写完，不在 await 期间持有连接
-    dead_ids = []
-    for index, row in enumerate(rows_list):
-        flag = alive_flags.get(index, False)
-        if not flag:
-            row[4] = 0
-            dead_ids.append(row[0])
-        else:
-            row[4] = 1
-    if dead_ids:
-        try:
-            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-                conn.executemany(
-                    "UPDATE user_info SET status=? WHERE id=?",
-                    [(0, account_id) for account_id in dead_ids],
+        pending = []
+        for index, account in enumerate(accounts):
+            if not account["cookie"]["exists"]:
+                store.mark_status(
+                    account["id"], 0, "凭据文件缺失，请重新扫码授权"
                 )
-        except Exception as exc:
-            logger.exception("回写账号状态失败: {}", exc)
-    logger.info(
-        "账号校验完成：共 {} 个，失效 {} 个",
-        len(rows_list), len(dead_ids),
-    )
-    return jsonify({"code": 200, "msg": None, "data": rows_list}), 200
+                continue
+            pending.append((index, account["platform"]["type"], account["cookie"]["name"]))
+
+        alive_flags = await check_cookies_concurrently(
+            [(platform_type, cookie_name) for _index, platform_type, cookie_name in pending],
+            max_concurrent=ACCOUNT_CHECK_CONCURRENCY,
+        )
+        dead = 0
+        for position, (index, _platform_type, _cookie_name) in enumerate(pending):
+            alive = bool(alive_flags.get(position, False))
+            if not alive:
+                dead += 1
+            store.mark_checked(
+                accounts[index]["id"],
+                alive,
+                "" if alive else "登录态失效，请重新授权",
+            )
+        data = store.legacy_rows()
+        _account_check_store_cache(data)
+        logger.info(
+            "账号校验完成：共 {} 个，其中本次未通过 {} 个（连续 {} 次失败才判异常）",
+            len(accounts), dead, DEFAULT_FAIL_THRESHOLD,
+        )
+        return jsonify({"code": 200, "msg": None, "data": data}), 200
+    finally:
+        _ACCOUNT_CHECK_LOCK.release()
 
 @app.route('/deleteFile', methods=['GET'])
 def delete_file():
@@ -704,6 +1016,10 @@ def delete_account():
             # 删除关联的cookie文件
             if record.get('filePath'):
                 cookie_file_path = Path(BASE_DIR / "cookiesFile" / record['filePath'])
+                try:
+                    remove_environment(cookie_file_path, account_id)
+                except Exception as env_err:
+                    logger.warning("删除账号持久浏览器目录失败: {}", env_err)
                 if cookie_file_path.exists():
                     try:
                         cookie_file_path.unlink()
@@ -714,6 +1030,14 @@ def delete_account():
             # 删除数据库记录
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
             conn.commit()
+
+        # 巡检记录是账号派生台账；账号已经删除后必须同步移除，避免 Todo 和
+        # 状态接口继续统计不存在的账号。历史数据从巡检表本身可追溯。
+        try:
+            publish_jobs.clear_account_patrol(account_id)
+        except Exception as patrol_err:
+            logger.warning("清理账号巡检台账失败（不影响账号删除）: {}", patrol_err)
+        ops_center.invalidate_todo_cache()
 
         # 隐藏该账号在私信中心的会话（聊天记录保留在本地，不再展示）
         try:
@@ -862,6 +1186,174 @@ def list_publish_records():
         rows = [dict(r) for r in c.execute('SELECT * FROM publish_records ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
     rows = stats_reflow.filter_current_account_records(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
+
+
+# ---------------------------------------------------------------- 发布任务（账号级）
+#
+# 一个发布任务在入库后会展开成 (素材 × 账号) 的子任务，每条独立记账。
+# 这里暴露子任务明细、进度、取消与"只重试失败项"：
+#   * 失败能定位到具体账号/素材，而不是整批一个字符串；
+#   * 重试不会把已经成功的账号再发一遍（旧实现的重复发布 bug）；
+#   * 可以中途取消。
+
+@app.route('/publish/jobs/<int:job_id>', methods=['GET'])
+def publish_job_detail(job_id: int):
+    with publish_jobs.get_conn() as c:
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (int(job_id),)).fetchone()
+    if row is None:
+        return jsonify({'code': 404, 'data': None, 'msg': '任务不存在'}), 404
+    return jsonify({
+        'code': 200,
+        'data': {
+            'job': dict(row),
+            'progress': publish_jobs.job_progress(job_id),
+            'items': publish_jobs.job_items(job_id),
+        },
+        'msg': None,
+    }), 200
+
+
+@app.route('/publish/jobs/<int:job_id>/items', methods=['GET'])
+def publish_job_items(job_id: int):
+    """子任务明细 + 进度（前端"发布记录"展开行用）。"""
+    return jsonify({
+        'code': 200,
+        'data': {
+            'progress': publish_jobs.job_progress(job_id),
+            'items': publish_jobs.job_items(job_id),
+        },
+        'msg': None,
+    }), 200
+
+
+@app.route('/publish/jobs/<int:job_id>/cancel', methods=['POST'])
+def publish_job_cancel(job_id: int):
+    result = publish_jobs.cancel_job(job_id)
+    return jsonify({'code': 200, 'data': result, 'msg': '已取消'}), 200
+
+
+@app.route('/publish/jobs/<int:job_id>/retry-failed', methods=['POST'])
+def publish_job_retry_failed(job_id: int):
+    """只重试失败的子任务，已经成功的账号不会重复发布。"""
+    result = publish_jobs.retry_failed_items(job_id)
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': f"已重新排队 {result.get('retried', 0)} 条失败子任务",
+    }), 200
+
+
+@app.route(
+    '/publish/jobs/<int:job_id>/items/<int:item_id>/remote-post',
+    methods=['DELETE'],
+)
+def publish_item_delete_remote_post(job_id: int, item_id: int):
+    """Delete one Channels post after an explicit UI confirmation."""
+    from channels_dm import ChannelsAuthError, ChannelsError
+
+    payload = request.get_json(silent=True) or {}
+    expected_remote_id = str(payload.get('remoteId') or '').strip()
+    if not expected_remote_id:
+        return jsonify({
+            'code': 400, 'data': None,
+            'msg': '请确认要删除的平台作品 ID',
+        }), 400
+    try:
+        result = publish_jobs.delete_remote_item(
+            job_id, item_id, expected_remote_id=expected_remote_id,
+        )
+    except LookupError as exc:
+        return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    except ChannelsAuthError as exc:
+        return jsonify({'code': 401, 'data': None, 'msg': str(exc)}), 401
+    except ChannelsError as exc:
+        return jsonify({'code': 502, 'data': None, 'msg': str(exc)}), 502
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': '平台作品已删除' if not result.get('alreadyDeleted') else '平台作品此前已删除',
+    }), 200
+
+
+@app.route(
+    '/publish/jobs/<int:job_id>/items/<int:item_id>/replacement',
+    methods=['POST'],
+)
+def publish_item_create_replacement(job_id: int, item_id: int):
+    """Correct one item by publishing first and deleting the old post last."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = publish_jobs.create_replacement_job(
+            job_id,
+            item_id,
+            title=str(payload.get('title') or '').strip(),
+            tags=payload.get('tags'),
+            desc=payload.get('desc'),
+        )
+    except LookupError as exc:
+        return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': '替换任务已排队；新作品回查成功后才会删除旧作品',
+    }), 200
+
+@app.route('/dm/health', methods=['GET'])
+def dm_sync_health():
+    """私信同步健康度：三平台汇总 + 账号级状态。
+
+    用来回答"为什么私信中心只有几天前的消息"：
+      * 平台级：最后一次成功同步时间、错误分类、下次计划；
+      * 账号级：每个账号各自最后一次成功/失败原因（最常见的是个别号登录失效）。
+    前端在私信中心顶部据此显示一条可操作的横幅。
+    """
+    managers = (
+        douyin_dm_sync.sync_manager,
+        xiaohongshu_dm_sync.sync_manager,
+        channels_dm_sync.sync_manager,
+    )
+    platforms = []
+    problems = []
+    for manager in managers:
+        payload = manager.health_payload()
+        platforms.append(payload)
+        if payload["noAccounts"]:
+            problems.append({
+                "platform": payload["platform"],
+                "kind": "no_accounts",
+                "message": f"{payload['platform']}：还没有登录账号，去「账号管理」添加后即可同步",
+            })
+            continue
+        expired = [
+            item for item in payload["accounts"]
+            if item.get("errorKind") == "account_expired"
+        ]
+        if expired:
+            names = "、".join(str(item.get("name") or "") for item in expired)[:120]
+            problems.append({
+                "platform": payload["platform"],
+                "kind": "account_expired",
+                "message": (
+                    f"{payload['platform']}：{len(expired)} 个账号登录失效"
+                    f"（{names}），请重新扫码登录后再同步"
+                ),
+            })
+        elif payload.get("errorKind"):
+            problems.append({
+                "platform": payload["platform"],
+                "kind": payload["errorKind"],
+                "message": f"{payload['platform']}：{str(payload.get('lastError') or '')[:160]}",
+            })
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {"platforms": platforms, "problems": problems},
+    }), 200
+
 
 @app.route('/account-status', methods=['GET'])
 def account_status():
@@ -1105,6 +1597,15 @@ def postVideo():
     productTitle = data.get('productTitle', '')
     thumbnail_path = data.get('thumbnail', '')
     is_draft = data.get('isDraft', False)  # 新增参数：是否保存为草稿
+    content_type = str(data.get('contentType') or 'video').strip().lower()
+    if content_type not in ('video', 'image-text'):
+        return jsonify({"code": 400, "msg": "不支持的内容类型", "data": None}), 400
+    try:
+        platform_type = int(type)
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "不支持的平台类型", "data": None}), 400
+    if content_type == 'image-text' and platform_type != 2:
+        return jsonify({"code": 400, "msg": "图文发布目前仅支持视频号", "data": None}), 400
 
     videos_per_day = data.get('videosPerDay')
     daily_times = data.get('dailyTimes')
@@ -1137,9 +1638,9 @@ def postVideo():
         'category': category, 'enableTimer': enableTimer, 'videosPerDay': videos_per_day,
         'dailyTimes': daily_times, 'startDays': start_days, 'isDraft': is_draft,
         'thumbnail': thumbnail_path, 'productLink': productLink, 'productTitle': productTitle,
-        'desc': desc
+        'desc': desc, 'contentType': content_type,
     }
-    job_id = enqueue_job(type, title, tags, file_list, account_list, extra,
+    job_id = enqueue_job(platform_type, title, tags, file_list, account_list, extra,
                          review_required=bool(data.get('reviewRequired')))
     return jsonify({
         "code": 200,
@@ -1372,7 +1873,7 @@ def run_async_function(type, id, status_queue, account_id=None, verify_queue=Non
                     password=auth_password,
                 )
             case '4':
-                coroutine = get_ks_cookie(id, status_queue)
+                coroutine = get_ks_cookie(id, status_queue, account_id=account_id)
             case '5':
                 coroutine = weibo_cookie_gen_sse(id, status_queue)
             case '6':
@@ -1484,6 +1985,10 @@ for _signal in ("SIGINT", "SIGTERM", "SIGBREAK"):
         continue
 
 if __name__ == '__main__':
+    if hold_system_awake():
+        logger.info("Windows 防休眠锁已启用：后台运行期间系统不会自动休眠")
+    elif os.name == "nt":
+        logger.warning("Windows 防休眠锁启用失败；系统仍可能自动休眠")
     if not runtime_config.is_loopback_host(runtime_config.HOST):
         logger.warning(
             "后端正在监听 {}，远程访问已开启且要求 X-YunCe-Token。",

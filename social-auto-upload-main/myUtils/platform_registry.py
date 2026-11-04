@@ -110,7 +110,7 @@ def supports_timer(platform_type: int) -> bool:
 
 def _publish_xhs(**kw):
     from myUtils.postVideo import post_video_xhs
-    post_video_xhs(
+    return post_video_xhs(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
         enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
@@ -120,8 +120,17 @@ def _publish_xhs(**kw):
 
 
 def _publish_tencent(**kw):
+    if kw.get("contentType") == "image-text":
+        from myUtils.postVideo import post_note_tencent
+        return post_note_tencent(
+            title=kw["title"], files=kw["files"], tags=kw["tags"],
+            account_file=kw["account_list"], category=kw.get("category"),
+            enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
+            daily_times=kw.get("dailyTimes"), start_days=kw.get("startDays") or 0,
+            is_draft=bool(kw.get("isDraft")), desc=kw.get("desc", ""),
+        )
     from myUtils.postVideo import post_video_tencent
-    post_video_tencent(
+    return post_video_tencent(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
         enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
@@ -132,7 +141,7 @@ def _publish_tencent(**kw):
 
 def _publish_douyin(**kw):
     from myUtils.postVideo import post_video_DouYin
-    post_video_DouYin(
+    return post_video_DouYin(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
         enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
@@ -200,4 +209,4 @@ def get_publisher(platform_type: int) -> Callable[..., None]:
 
 def dispatch_publish(platform_type: int, **kw) -> None:
     """统一分发入口。publish_jobs 与 sau_backend 都走这里。"""
-    get_publisher(platform_type)(**kw)
+    return get_publisher(platform_type)(**kw)
