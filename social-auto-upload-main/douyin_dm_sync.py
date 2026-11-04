@@ -17,13 +17,16 @@ from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from flask import Blueprint
 
 import dm_ops
+from dm_media_cache import attach_message_media
 from dm_platform_common import (
     BaseDmSync, SyncError, account_name, public_account,
 )
+from utils.account_browser import open_persistent_account_context
 
 bp = Blueprint("douyin_dm_sync", __name__)
 
@@ -56,13 +59,13 @@ VIDEO_UNAVAILABLE_MARKERS = (
 VIDEO_MESSAGE_TYPES = {8}
 IMAGE_MESSAGE_TYPES = {3, 77}
 
-# 常驻浏览器：单独一条 asyncio 事件循环线程承载 Playwright，
-# 每个账号一个 context/page 会话，按 Cookie 修改时间失效重建。
+# 常驻 Playwright 驱动；每轮同步临时独占账号自己的 Chromium user-data
+# profile，结束后立即释放，避免私信扫描永久堵住复检和发布。
 _douyin_browser_guard = threading.Lock()
 _douyin_browser_loop = None
 _douyin_browser_loop_thread = None
 _douyin_browser_loop_ready = threading.Event()
-_douyin_browser_runtime = {"playwright": None, "browser": None, "sessions": {}}
+_douyin_browser_runtime = {"playwright": None, "sessions": {}}
 
 
 def _account_name(account: dict | None) -> str:
@@ -97,6 +100,24 @@ def _platform_time_text(value: Any) -> str:
 def _clean_text(value: Any, limit: int) -> str:
     text = str(value or "").replace("\u200b", "").replace("\ufeff", "").strip()
     return text[:limit]
+
+
+def _safe_media_url(value: Any) -> str:
+    """Keep only real media URLs; creator pages often emit /undefined. """
+    text = _clean_text(value, 1200)
+    if text.startswith("//"):
+        text = "https:" + text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if "/aweme-avatar/" in parsed.path.lower():
+        return ""
+    if parsed.path.rstrip("/").rsplit("/", 1)[-1].lower() in {"undefined", "null"}:
+        return ""
+    return text
 
 
 def _is_placeholder(text: str) -> bool:
@@ -183,80 +204,76 @@ def _is_unread_placeholder(text: str) -> bool:
 
 
 SCAN_SCRIPT = r"""
-(limit) => {
+(args) => {
+  const limit = Number(args?.limit || 50);
+  const tabLabel = String(args?.tab_label || '');
   const rows = [];
   const timePattern = /^(刚刚|\d{1,2}:\d{2}|昨天|前天|星期[一二三四五六日天]|\d{1,2}月\d{1,2}日|\d{2}-\d{2}|20\d{2}-\d{2}-\d{2})$/;
-  // 选中会话后 React 会保留一组隐藏旧行。它们可能与新行复用同一个
-  // conversation，但 DOM 文本已经错位，因此必须让可见行先被采集。
+  const hashCid = value => {
+    let hash = 2166136261;
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `dom-${(hash >>> 0).toString(16)}`;
+  };
+  const canonicalAvatar = value => {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    try {
+      const parsed = new URL(text, window.location.href);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+      // 头像 CDN 会轮换签名参数；只保留域名和路径，避免同一用户每次扫码后变成新会话。
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      return '';
+    }
+  };
+  // 选中会话后 React 会保留一组尺寸为零的隐藏旧行。这些行属于虚拟列表
+  // 的回收节点，文本可能已经错位，不能参与会话身份计算。
   const elements = Array.from(document.querySelectorAll('.semi-list-item'))
     .map((el, index) => {
       const rect = el.getBoundingClientRect();
       return {el, index, visible: rect.width > 1 && rect.height > 1};
     })
-    .sort((a, b) => Number(b.visible) - Number(a.visible) || a.index - b.index)
+    .filter(entry => entry.visible)
+    .sort((a, b) => a.index - b.index)
     .map(entry => entry.el);
-  for (const el of elements.slice(0, Math.max(1, Number(limit) || 20))) {
+  for (const el of elements.slice(0, Math.max(1, limit || 20))) {
     const header = el.querySelector('.semi-list-item-body-header');
     if (!header) continue;
-    const reactKey = Object.keys(header).find(key => key.startsWith('__reactProps$'));
-    if (!reactKey) continue;
-    let conversation = null;
-    try {
-      conversation = header[reactKey]?.children?.props?.conversation || null;
-    } catch (error) {
-      conversation = null;
-    }
-    if (!conversation) continue;
-
-    const content = conversation.content || {};
+    const nameNode = el.querySelector('[class*="item-header-name"]');
+    const timeNode = el.querySelector('[class*="item-header-time"]');
+    const contentNode = el.querySelector('[class*="item-content"]');
+    const avatar = header.querySelector('img')?.currentSrc || header.querySelector('img')?.src || '';
+    const rawName = String(nameNode?.innerText || '').trim();
+    if (!rawName) continue;
+    const cid = hashCid(`${rawName}|${canonicalAvatar(avatar)}`);
+    el.setAttribute('data-flowops-dm-cid', cid);
     const badgeText = String(el.querySelector('.semi-badge-count')?.innerText || '').trim();
-    const unread = Number.parseInt(badgeText, 10) || 0;
-    const lines = String(el.innerText || '').split('\n').map(line => line.trim()).filter(Boolean);
+    const unread = Number.parseInt(badgeText, 10) ||
+      (el.querySelector('.semi-badge-danger') ? 1 : 0);
     const rect = el.getBoundingClientRect();
     const visible = rect.width > 1 && rect.height > 1;
-    const timeIndex = lines.findIndex(line => timePattern.test(line));
-    const nameLines = lines.slice(0, timeIndex >= 0 ? timeIndex : lines.length)
-      .filter(line => !/^\d{1,3}$/.test(line));
-    if (badgeText && nameLines.length && nameLines[0].startsWith(badgeText)) {
-      nameLines[0] = nameLines[0].slice(badgeText.length).trim();
-    }
-    const rawName = String(
-      conversation.coreInfo?.name || conversation.coreInfo?.nickname ||
-      conversation.groupName || conversation.name || ''
-    ).trim();
-
-    let preview = String(content.text || content.push_detail || content.description ||
-      content.content_title || '').trim();
-    if (!preview && timeIndex >= 0) preview = lines.slice(timeIndex + 1).join(' ');
-
-    let createdAt = '';
-    const rawCreated = conversation.createdTime;
-    if (rawCreated instanceof Date && !Number.isNaN(rawCreated.getTime())) {
-      createdAt = rawCreated.toISOString();
-    } else if (typeof rawCreated === 'number' && rawCreated > 0) {
-      const millis = rawCreated > 100000000000 ? rawCreated : rawCreated * 1000;
-      createdAt = new Date(millis).toISOString();
-    } else if (typeof rawCreated === 'string' && rawCreated) {
-      const parsed = new Date(rawCreated);
-      createdAt = Number.isNaN(parsed.getTime()) ? rawCreated : parsed.toISOString();
-    }
+    const displayTime = String(timeNode?.innerText || '').trim();
+    const preview = String(contentNode?.innerText || '').trim();
 
     rows.push({
-      cid: String(conversation.id || conversation.shortId || ''),
-      short_id: String(conversation.shortId || ''),
-      sec_uid: String(conversation.secUid || ''),
-      name: visible ? (nameLines[0] || rawName) : (rawName || nameLines[0]),
+      cid,
+      short_id: '',
+      sec_uid: '',
+      name: rawName,
       name_visible: visible,
-      display_time: timeIndex >= 0 ? lines[timeIndex] : '',
+      display_time: displayTime,
       preview: preview.slice(0, 300),
-      created_at: createdAt,
-      message_type: Number(content.messageType || 0),
-      is_from_me: Boolean(content.isFromMe),
-      is_recalled: Boolean(content.isRecalled),
-      is_group: Boolean(conversation.isGroupChat),
-      is_stranger: Boolean(conversation.isStrangerChat),
+      created_at: '',
+      message_type: 0,
+      is_from_me: false,
+      is_recalled: false,
+      is_group: tabLabel === '群消息',
+      is_stranger: tabLabel === '陌生人私信',
       unread: unread,
-      text: typeof content.text === 'string' ? content.text : '',
+      text: '',
     });
   }
   return rows;
@@ -279,30 +296,71 @@ HISTORY_SCRIPT = r"""
     const textNode = el.querySelector('.text-prz9K6, .text-item-message-zUNhSB');
     const text = String(textNode?.innerText || '').trim();
     const direction = cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound';
+    const httpUrl = value => {
+      let text = String(value || '').trim();
+      if (text.startsWith('//')) text = `https:${text}`;
+      if (!/^https?:\/\//i.test(text)) return '';
+      // 页面偶尔把缺失字段渲染成 /undefined、/null，不能把它当图片下载。
+      if (/\/(?:undefined|null)(?:[?#]|$)/i.test(text)) return '';
+      // 会话头像也会出现在消息容器里，不能作为私信媒体持久化。
+      if (/\/aweme-avatar\//i.test(text)) return '';
+      return text;
+    };
+    const imageNodes = Array.from(el.querySelectorAll('img'))
+      .filter(img => !img.closest(
+        '[class*="avatar"], [class*="author"], [class*="user-info"]'
+      ))
+      .map(img => ({
+        url: httpUrl(img.currentSrc || img.src),
+        width: img.naturalWidth || img.width || 0,
+        height: img.naturalHeight || img.height || 0,
+        alt: String(img.alt || '').trim(),
+        className: String(img.className || ''),
+        node: img,
+      }))
+      .filter(item => item.url && (item.width >= 80 || item.height >= 80))
+      .sort((a, b) => b.width * b.height - a.width * a.height);
+    const backgroundNodes = Array.from(el.querySelectorAll('div,span'))
+      .filter(node => !node.closest(
+        '[class*="avatar"], [class*="author"], [class*="user-info"]'
+      ))
+      .map(node => {
+        const match = String(getComputedStyle(node).backgroundImage || '')
+          .match(/url\(["']?(https?:\/\/[^"')]+)/i);
+        return match ? {url: httpUrl(match[1]), node} : null;
+      })
+      .filter(Boolean);
+    const coverImage = imageNodes.find(item => Boolean(item.node.closest(
+      '[class*="aweme-cover"], [class*="image"], [class*="img"], [class*="pic"]'
+    )));
     // 抖音的视频消息通常只渲染封面 img，播放图标才是可靠的视频特征。
     // 直接消息里的视频不会创建 video 标签；旧逻辑因此把封面误判成图片。
     const videoUnavailable = /分享视频无法查看|视频无法查看/.test(text);
     const hasVideo = Boolean(el.querySelector('video')) || videoUnavailable ||
       Boolean(el.querySelector('svg[class*="play"], [class*="play-icon"], [class*="playIcon"]'));
     if (hasVideo) {
+      const video = el.querySelector('video');
+      const videoUrl = httpUrl(video?.currentSrc || video?.src || video?.getAttribute('src'));
+      const poster = httpUrl(video?.poster) || coverImage?.url
+        || imageNodes[0]?.url || backgroundNodes[0]?.url || '';
       rows.push({
         text: '', media: true,
         media_type: 'video',
+        media_url: videoUrl,
+        media_thumb_url: poster && poster !== videoUrl ? poster : '',
         direction, display_time: currentTime,
       });
       continue;
     }
     if (!text) {
-      const hasImage = Array.from(el.querySelectorAll('img')).some(img => {
-        if (img.closest('[class*="avatar"]')) return false;
-        const width = img.naturalWidth || img.width || 0;
-        return width >= 80 && Boolean(img.closest(
-          '[class*="aweme-cover"], [class*="image"], [class*="img"], [class*="pic"]'
-        ));
-      });
-      if (!hasImage) continue;
+      const image = coverImage || imageNodes[0] || backgroundNodes[0];
+      if (!image) continue;
+      const isSticker = /表情/.test(String(image.alt || '')) ||
+        /emoction|emoji|emotion|sticker/i.test(String(image.className || ''));
       rows.push({
-        text: '', media: true, media_type: 'image',
+        text: '', media: true,
+        media_type: isSticker ? 'sticker' : 'image',
+        media_url: image.url,
         direction, display_time: currentTime,
       });
       continue;
@@ -373,6 +431,31 @@ def _pending_conversation_unread(account_name: str) -> dict[str, int]:
             return result
     except Exception:
         return {}
+
+
+def _legacy_external_ids_by_name(account: str) -> dict[str, str]:
+    """Preserve an existing contact identity when a nickname is unambiguous.
+
+    The current creator page no longer exposes conversation ids in the DOM.
+    When an account has exactly one existing contact with the same nickname,
+    keep that stable id instead of creating a second conversation after an
+    avatar URL rotation or a scanner upgrade.
+    """
+    grouped: dict[str, set[str]] = {}
+    try:
+        with dm_ops.get_conn() as conn:
+            rows = conn.execute("""SELECT nickname,external_user_id FROM dm_contacts
+                WHERE platform='抖音' AND account=?""", (account,)).fetchall()
+        for row in rows:
+            name = _clean_text(row["nickname"], 120)
+            external_id = _clean_text(row["external_user_id"], 160)
+            if name and external_id:
+                grouped.setdefault(name, set()).add(external_id)
+    except Exception:
+        return {}
+    return {
+        name: next(iter(ids)) for name, ids in grouped.items() if len(ids) == 1
+    }
 
 
 def _history_marker_key(account_name: str, cid: str) -> str:
@@ -570,6 +653,9 @@ async def _click_conversation(
     }""")
     await page.wait_for_timeout(350)
     for _ in range(max(1, max_scrolls)):
+        await page.evaluate(
+            SCAN_SCRIPT, {"limit": 200, "tab_label": tab_label},
+        )
         found = await page.evaluate("""(cid) => {
             document.querySelectorAll('[data-flowops-dm-target]').forEach(el => {
                 el.removeAttribute('data-flowops-dm-target');
@@ -582,18 +668,10 @@ async def _click_conversation(
                         style.display !== 'none' && style.visibility !== 'hidden' &&
                         Number(style.opacity || 1) > 0;
                 });
-            for (let index = 0; index < items.length; index++) {
-                const header = items[index].querySelector('.semi-list-item-body-header');
-                if (!header) continue;
-                const key = Object.keys(header).find(name => name.startsWith('__reactProps$'));
-                let conversation = null;
-                try { conversation = header[key]?.children?.props?.conversation; } catch (error) {}
-                if (conversation && String(conversation.id || conversation.shortId || '') === cid) {
-                    items[index].setAttribute('data-flowops-dm-target', '1');
-                    return true;
-                }
-            }
-            return false;
+            const target = items.find(el => el.getAttribute('data-flowops-dm-cid') === cid);
+            if (!target) return false;
+            target.setAttribute('data-flowops-dm-target', '1');
+            return true;
         }""", cid)
         if found:
             # 页面会保留一组零尺寸的旧列表行；索引必须取自可见行，否则
@@ -642,7 +720,8 @@ async def _collect_history(page, quick: bool = False, hours: int = 0) -> list[di
                 continue
             key = (
                 item.get("direction"), item.get("display_time"), text,
-                bool(item.get("media")),
+                bool(item.get("media")), item.get("media_url"),
+                item.get("media_thumb_url"),
             )
             if key not in merged:
                 merged[key] = item
@@ -677,8 +756,12 @@ def _history_items(row: dict, history: list[dict], account: dict,
     for item in history:
         text = _clean_text(item.get("text"), 4000)
         media_type = _clean_text(item.get("media_type"), 20)
+        media_url = _safe_media_url(item.get("media_url"))
+        media_thumb_url = _safe_media_url(item.get("media_thumb_url"))
         if not text and not item.get("media"):
             continue
+        if item.get("media") and not media_type:
+            media_type = "other"
         if text and _is_unread_placeholder(text):
             continue
         if item.get("media"):
@@ -696,8 +779,12 @@ def _history_items(row: dict, history: list[dict], account: dict,
         if cutoff and stamp and stamp < cutoff:
             continue
         marker = "outbound" if direction == "outbound" else ""
-        # 指纹用换算后的绝对时间，避免"昨天 22:26"变成"22:26"后同一条消息被当成新消息。
-        fingerprint = "|".join((cid, created_at or display_time, "7", text, marker))
+        # 抖音虚拟列表会在滚动边界丢失消息前面的时间节点。没有 display_time
+        # 时不能把本次同步时刻写进指纹，否则同一条消息每轮同步都会生成新 ID。
+        # 有可见时间时仍保留时间参与指纹，以免吞掉用户真实重复发送的内容。
+        fingerprint = "|".join((
+            cid, display_time, "7", text, marker, media_url,
+        ))
         if text == UNPARSEABLE_CONTENT:
             fingerprint = "|".join((cid, "unparseable-content", marker))
         status = "replied"
@@ -713,6 +800,7 @@ def _history_items(row: dict, history: list[dict], account: dict,
             "external_user_id": user_id,
             "is_group": bool(row.get("is_group")),
             "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
+            "_douyin_history_message": True,
             "author": nickname if direction == "inbound" else "我",
             "nickname": nickname,
             "content": text,
@@ -724,6 +812,9 @@ def _history_items(row: dict, history: list[dict], account: dict,
             "created_at": created_at,
             "auto_reply": False,
             "intent": dm_ops.detect_intent(text) if direction == "inbound" else "low",
+            "media_type": media_type,
+            "media_url": media_url,
+            "media_thumb_url": media_thumb_url,
         })
     return result
 
@@ -779,41 +870,20 @@ async def _drop_douyin_session(key: str):
         pass
 
 
-async def _ensure_douyin_browser():
+async def _ensure_douyin_playwright():
     runtime = _douyin_browser_runtime
-    browser = runtime.get("browser")
-    if browser is not None and browser.is_connected():
-        return browser
-
-    for key in list(runtime["sessions"]):
-        await _drop_douyin_session(key)
     if runtime.get("playwright") is not None:
-        try:
-            await runtime["playwright"].stop()
-        except Exception:
-            pass
+        return runtime["playwright"]
     runtime["playwright"] = None
-    runtime["browser"] = None
 
     try:
-        from playwright.async_api import async_playwright
+        from patchright.async_api import async_playwright
     except Exception as exc:
         raise SyncError("本机未安装 Playwright，请先安装依赖和 Chromium 浏览器") from exc
 
-    headless = str(os.environ.get("FLOWOPS_DOUYIN_HEADLESS", "1")).lower() not in (
-        "0", "false", "no", "off",
-    )
     playwright = await async_playwright().start()
-    try:
-        browser = await playwright.chromium.launch(headless=headless)
-    except Exception as exc:
-        await playwright.stop()
-        raise SyncError(
-            "Playwright 浏览器启动失败，请确认已执行 playwright install chromium"
-        ) from exc
     runtime["playwright"] = playwright
-    runtime["browser"] = browser
-    return browser
+    return playwright
 
 
 async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
@@ -832,14 +902,25 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
     if session:
         await _drop_douyin_session(key)
 
-    browser = await _ensure_douyin_browser()
-    context = await browser.new_context(
-        storage_state=str(cookie_path), locale="zh-CN",
-        timezone_id="Asia/Shanghai", viewport={"width": 1440, "height": 1000},
+    playwright = await _ensure_douyin_playwright()
+    headless = str(os.environ.get("FLOWOPS_DOUYIN_HEADLESS", "1")).lower() not in (
+        "0", "false", "no", "off",
     )
+    try:
+        context = await open_persistent_account_context(
+            playwright,
+            cookie_path,
+            account_id=account.get("id"),
+            headless=headless,
+            channel="chromium",
+        )
+    except Exception as exc:
+        raise SyncError(
+            "抖音账号持久浏览器启动失败，请确认 Chromium 已安装"
+        ) from exc
     page = await context.new_page()
     try:
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
         try:
             await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=45000)
@@ -892,7 +973,7 @@ async def _scan_douyin_in_browser(
     }
     try:
         try:
-            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from patchright.async_api import TimeoutError as PlaywrightTimeoutError
         except Exception as exc:
             raise SyncError("本机未安装 Playwright，请先安装依赖和 Chromium 浏览器") from exc
 
@@ -922,14 +1003,32 @@ async def _scan_douyin_in_browser(
             limit = min(limit, 20)
         collected = {}
 
-        async def _collect_current_tab() -> None:
+        async def _collect_current_tab(tab_label: str = "") -> None:
             for _ in range(1 if quick else 20):
-                rows = await page.evaluate(SCAN_SCRIPT, limit)
+                rows = await page.evaluate(
+                    SCAN_SCRIPT, {"limit": limit, "tab_label": tab_label},
+                )
                 batch = rows if isinstance(rows, list) else []
                 added = 0
                 for row in batch:
                     cid = str(row.get("cid") or "")
-                    if cid and cid not in collected:
+                    if not cid:
+                        continue
+                    if cid in collected:
+                        existing = collected[cid]
+                        existing["unread"] = max(
+                            int(existing.get("unread") or 0),
+                            int(row.get("unread") or 0),
+                        )
+                        existing["is_group"] = bool(
+                            existing.get("is_group") or row.get("is_group")
+                        )
+                        existing["is_stranger"] = bool(
+                            existing.get("is_stranger") or row.get("is_stranger")
+                        )
+                    else:
+                        if len(collected) >= limit:
+                            break
                         collected[cid] = row
                         added += 1
                 if len(collected) >= limit:
@@ -947,7 +1046,7 @@ async def _scan_douyin_in_browser(
 
         # 先采集当前页签，再遍历其余子页签；未关注/陌生人会话在
         # "陌生人私信"页签下，不切换就永远扫不到。
-        await _collect_current_tab()
+        await _collect_current_tab("全部")
         current_tab_collected = True
         for tab_label in ("陌生人私信", "朋友私信", "群消息"):
             status, already_active = await _select_dm_tab(page, tab_label)
@@ -956,11 +1055,17 @@ async def _scan_douyin_in_browser(
             if already_active and current_tab_collected:
                 current_tab_collected = False
                 continue
-            await _collect_current_tab()
+            await _collect_current_tab(tab_label)
             current_tab_collected = True
         timings["list_ms"] = int((time.monotonic() - started_mono) * 1000)
 
         data = list(collected.values())
+        legacy_ids = _legacy_external_ids_by_name(account_name)
+        for row in data:
+            row["dom_cid"] = str(row.get("cid") or "")
+            legacy_id = legacy_ids.get(_clean_text(row.get("name"), 120))
+            if legacy_id:
+                row["cid"] = legacy_id
         pending_unread = _pending_conversation_unread(account_name)
         seen_history_users: set[str] = set()
         history_hours = _window_hours(settings)
@@ -985,7 +1090,7 @@ async def _scan_douyin_in_browser(
                 if not should_scan_history:
                     continue
                 if await _click_conversation(
-                    page, cid,
+                    page, str(row.get("dom_cid") or cid),
                     max_scrolls=2 if quick else 20,
                     settle_ms=400 if quick else 1600,
                     click_timeout_ms=900 if quick else 5000,
@@ -1009,6 +1114,10 @@ async def _scan_douyin_in_browser(
         if page.is_closed() or "登录" in str(exc):
             await _drop_douyin_session(key)
         raise
+    finally:
+        # The durable identity lives on disk. Keeping a browser open here would
+        # hold the account lock forever and starve account checks and publishes.
+        await _drop_douyin_session(key)
 
 
 def _scan_douyin(settings: dict, account: dict, quick: bool = False) -> dict:
@@ -1038,6 +1147,10 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
     if not text and preview:
         text = preview
     media_type = _media_type_from_text(text, message_type)
+    if not media_type:
+        media_type = _clean_text(
+            row.get("media_type") if row.get("media") else "", 20,
+        )
     allow_auto_reply = (
         message_type == 7 and bool(text) and not media_type and not _is_placeholder(text)
         and not row.get("is_group") and not from_me
@@ -1106,6 +1219,11 @@ def _row_to_item(row: dict, account: dict, history_hours: int = 0) -> tuple[dict
     }
     if created_at_text:
         result["created_at"] = created_at_text
+    result.update({
+        "media_type": media_type,
+        "media_url": _safe_media_url(row.get("media_url")),
+        "media_thumb_url": _safe_media_url(row.get("media_thumb_url")),
+    })
     return result, ""
 
 
@@ -1208,6 +1326,7 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
     name = _account_name(account)
     if not account.get("cookie_path"):
         raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
+    merged_contacts = dm_ops.merge_dom_contact_duplicates()
     scan = _scan_douyin(settings, account, quick=quick)
     # 时间窗口统一由同步设置的 history_days 决定；0 表示不限。
     history_hours = _window_hours(settings)
@@ -1248,6 +1367,10 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
 
     _reconcile_media_placeholders(items, account)
     _reconcile_preview_times(items, account)
+    media_result = attach_message_media(
+        items, account, skip_reasons,
+        referer="https://creator.douyin.com/creator-micro/data/following/chat",
+    )
     # 首版固定只读：即使配置了发送连接器，也只生成待人工发送的回复。
     ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
     for item, result in zip(items, ingest.get("items", [])):
@@ -1274,6 +1397,9 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
         "auto_replies_ready": ready,
         "skip_reasons": skip_reasons,
         "timings": scan.get("timings") or {},
+        "media_downloaded": media_result["downloaded"],
+        "media_failed": media_result["failed"],
+        "merged_contacts": merged_contacts,
         "items": ingest.get("items", []),
     }
 

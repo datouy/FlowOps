@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from flask import Blueprint, Flask
 import pytest
 
@@ -120,5 +122,66 @@ def test_run_sync_releases_lock_when_loading_settings_fails(sync_app, monkeypatc
     monkeypatch.setattr(manager, "load_settings", flaky_load_settings)
     result = manager.run_sync("manual")
 
-    assert result == {"ok": False, "error": "settings temporarily unavailable"}
+    # no_accounts 用于区分"还没登录账号"（正常状态）和真实故障
+    assert result == {
+        "ok": False,
+        "error": "settings temporarily unavailable",
+        "no_accounts": False,
+    }
     assert manager._sync_lock.locked() is False
+
+
+@pytest.fixture
+def no_account_app(tmp_path, monkeypatch):
+    """一个没有任何可用账号的同步管理器。"""
+    monkeypatch.setattr(dm_ops, "DB", tmp_path / "ops_center.db")
+    dm_ops.init_db()
+    monkeypatch.setattr(common, "account_rows", lambda _account_type: [])
+    blueprint = Blueprint("fake_dm_sync_empty", __name__)
+    manager = FakeDmSync(blueprint)
+    manager.init_db()
+    manager.register_routes()
+    app = Flask(__name__)
+    app.register_blueprint(blueprint)
+    return manager, app.test_client()
+
+
+def test_run_sync_without_accounts_is_marked_as_normal_state(no_account_app):
+    """没有账号时应当标记 no_accounts，并且不算作真实故障。"""
+    manager, _ = no_account_app
+    result = manager.run_sync("manual")
+
+    assert result["ok"] is False
+    assert result["no_accounts"] is True
+    assert "未找到" in result["error"]
+
+
+def test_run_sync_without_accounts_uses_long_backoff(no_account_app):
+    """没有账号时下一次调度应该被推远（30 分钟），而不是 30 秒。"""
+    manager, _ = no_account_app
+    manager.run_sync("manual")
+
+    with manager._state_lock:
+        next_run_at = manager._next_run_at
+    assert next_run_at is not None
+    delay = next_run_at - time.time()
+    # no_accounts_backoff 默认 1800 秒
+    assert delay > 900, f"退避间隔过短：{delay:.0f}s"
+
+
+def test_status_payload_flags_missing_accounts(no_account_app):
+    """状态接口应当告诉前端"这是没配置，不是异常"。"""
+    manager, client = no_account_app
+    payload = client.get("/dm/fake/status").get_json()["data"]
+
+    assert payload["no_accounts"] is True
+    assert payload["last_error_is_account_hint"] is True
+
+
+def test_status_payload_no_hint_when_accounts_exist(sync_app):
+    """有账号时不应当给出"未配置"提示。"""
+    _, client = sync_app
+    payload = client.get("/dm/fake/status").get_json()["data"]
+
+    assert payload["no_accounts"] is False
+    assert payload["last_error_is_account_hint"] is False

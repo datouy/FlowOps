@@ -11,10 +11,17 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from dm_platform_common import account_name, clean_text, normalize_timestamp
+from utils.account_browser import open_persistent_account_context_sync
 
 XHS_CHAT_URL = "https://www.xiaohongshu.com/chat"
 XHS_CHAT_LIST_PATH = "/api/im/web/v3/chats"
 XHS_HISTORY_PATH = "/api/im/web/messages/history"
+XHS_SEND_MESSAGE_PATH = "/api/im/web/short_link/send_message"
+XHS_MEDIA_CONFIRM_SELECTOR = ".xhs-im-media-preview-btn-confirm"
+XHS_IMAGE_LIMIT_BYTES = 10 * 1024 * 1024
+XHS_VIDEO_LIMIT_BYTES = 100 * 1024 * 1024
+XHS_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+XHS_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v"}
 
 SYSTEM_CONTENT_TYPES = {0, 4, 5, 10, 15, 18}
 MESSAGE_TYPE_NAMES = {
@@ -33,6 +40,136 @@ MESSAGE_TYPE_NAMES = {
     25: "CARD",
     27: "VOICE",
 }
+MEDIA_TYPE_LABELS = {
+    "image": "[图片]",
+    "video": "[视频]",
+    "emotion": "[表情]",
+    "file": "[文件]",
+}
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _first_http_url(value: object, keys: tuple[str, ...]) -> str:
+    wanted = {key.casefold() for key in keys}
+    for item in _walk_dicts(value):
+        for key, child in item.items():
+            if str(key).casefold() not in wanted:
+                continue
+            if isinstance(child, str) and child.strip().lower().startswith(
+                ("http://", "https://")
+            ):
+                return child.strip()
+            if isinstance(child, dict):
+                direct = child.get("url") or child.get("src") or child.get("origin_url")
+                if isinstance(direct, str) and direct.strip().lower().startswith(
+                    ("http://", "https://")
+                ):
+                    return direct.strip()
+                urls = child.get("url_list") or child.get("urlList") or []
+                if isinstance(urls, list):
+                    for url in urls:
+                        if isinstance(url, str) and url.strip().lower().startswith(
+                            ("http://", "https://")
+                        ):
+                            return url.strip()
+    return ""
+
+
+def _xhs_media(parsed: dict, content_type: int) -> dict[str, str]:
+    if content_type in (2, 77):
+        media_type = "image"
+    elif content_type in (11, 14):
+        media_type = "video"
+    elif content_type in (7, 13, 16):
+        media_type = "emotion"
+    elif content_type == 6:
+        media_type = "file"
+    else:
+        media_type = ""
+    if not media_type:
+        return {"media_type": "", "media_url": "", "media_thumb_url": ""}
+
+    if media_type == "video":
+        url = _first_http_url(parsed, ("video_url", "videoUrl", "origin_video", "url"))
+        thumb = _first_http_url(
+            parsed, ("cover", "cover_url", "coverUrl", "first_frame", "thumb"),
+        )
+    elif media_type == "emotion":
+        url = _first_http_url(parsed, ("url", "image_url", "imageUrl", "src"))
+        thumb = _first_http_url(parsed, ("still", "thumb_url", "thumbUrl", "thumb"))
+    else:
+        url = _first_http_url(
+            parsed,
+            ("origin_url", "originUrl", "image_url", "imageUrl", "url", "src"),
+        )
+        thumb = _first_http_url(parsed, ("thumb", "thumb_url", "thumbUrl", "preview"))
+    return {
+        "media_type": media_type if (url or media_type) else "",
+        "media_url": url,
+        "media_thumb_url": thumb if thumb != url else "",
+    }
+
+
+def _message_text(value: object, media_type: str = "") -> str:
+    if isinstance(value, str):
+        text = clean_text(value, 4000)
+        if text.startswith(("{", "[")) or text.startswith(("http://", "https://")):
+            return MEDIA_TYPE_LABELS.get(media_type, text[:40])
+        return text
+    if isinstance(value, dict):
+        for key in ("content", "text", "title", "caption", "desc"):
+            child = value.get(key)
+            if isinstance(child, str) and child.strip():
+                return _message_text(child, media_type)
+    return MEDIA_TYPE_LABELS.get(media_type, "")
+
+
+def _xhs_media_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in XHS_IMAGE_SUFFIXES:
+        return "image"
+    if suffix in XHS_VIDEO_SUFFIXES:
+        return "video"
+    raise XhsError("小红书私信仅支持 JPG、PNG、GIF、WEBP、BMP 图片或 MP4、MOV、M4V 视频")
+
+
+def _xhs_media_limit(kind: str) -> int:
+    return XHS_VIDEO_LIMIT_BYTES if kind == "video" else XHS_IMAGE_LIMIT_BYTES
+
+
+def _xhs_send_message_id(payload: object) -> str:
+    for item in _walk_dicts(payload):
+        for key in (
+            "messageId", "message_id", "msgId", "msg_id",
+            "storeId", "store_id",
+        ):
+            value = item.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return clean_text(value, 200)
+    return ""
+
+
+def _xhs_input_accepts(accept: str, media_kind: str) -> bool:
+    accept = str(accept or "").strip().lower()
+    if not accept:
+        return True
+    wanted_prefix = "image/" if media_kind == "image" else "video/"
+    for item in accept.split(","):
+        value = item.strip()
+        if value in ("*", "*/*", wanted_prefix + "*"):
+            return True
+        if value.startswith(wanted_prefix):
+            return True
+    return False
 
 
 class XhsError(RuntimeError):
@@ -117,31 +254,24 @@ class XhsClient:
         except Exception as exc:
             raise XhsError("本机未安装 patchright/Playwright，无法读取小红书登录凭证") from exc
 
-        launch_args = [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--lang=zh-CN",
-        ]
-        launch_error = None
         self._playwright = sync_playwright().start()
-        for options in ({"channel": "chrome"}, {}):
-            try:
-                self._browser = self._playwright.chromium.launch(
-                    headless=_headless(), args=launch_args, **options,
-                )
-                break
-            except Exception as exc:
-                launch_error = exc
-        if self._browser is None:
+        try:
+            self._context = open_persistent_account_context_sync(
+                self._playwright,
+                cookie_file,
+                account_id=self.account.get("id"),
+                headless=_headless(),
+                channel="chromium",
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--lang=zh-CN",
+                ],
+            )
+            self._browser = self._context.browser
+        except Exception as exc:
             self.close()
-            raise XhsError(f"无法启动小红书私信浏览器：{clean_text(launch_error, 300)}")
-
-        self._context = self._browser.new_context(
-            storage_state=cookie_file,
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            viewport={"width": 1440, "height": 1000},
-        )
+            raise XhsError(f"无法启动小红书私信浏览器：{clean_text(exc, 300)}") from exc
         self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -449,17 +579,21 @@ class XhsClient:
         if content_type in SYSTEM_CONTENT_TYPES or raw.get("revoked") is True:
             return None
 
+        media = _xhs_media(parsed, content_type)
         content = parsed.get("content")
-        if not isinstance(content, str):
-            content = parsed.get("front_chain") or content_raw or ""
         if isinstance(content, str) and content.strip().startswith("{"):
             try:
                 nested = json.loads(content)
-                if isinstance(nested, dict):
-                    content = nested.get("content") or nested.get("text") or content
+                if isinstance(nested, dict) and nested != parsed:
+                    nested_media = _xhs_media(nested, content_type)
+                    for key, value in nested_media.items():
+                        if value and not media.get(key):
+                            media[key] = value
             except (TypeError, ValueError):
                 pass
-        text = clean_text(content, 4000)
+        if not content:
+            content = parsed.get("front_chain") or content_raw or ""
+        text = _message_text(content, media["media_type"])
         message_type = MESSAGE_TYPE_NAMES.get(content_type, "GENERAL")
         message_id = clean_text(
             raw.get("id") or raw.get("uuid") or raw.get("store_id"), 200,
@@ -467,6 +601,7 @@ class XhsClient:
         return {
             "main_site": True,
             "raw": raw,
+            **media,
             "sixinMessage": {
                 "id": message_id,
                 "content": text,
@@ -506,6 +641,124 @@ class XhsClient:
             "client_message_id": clean_text(state.get("message_id"), 160),
             "transport": "xiaohongshu-main-web",
         }
+
+    def _find_media_input(self, media_kind: str):
+        inputs = self._page.locator("input[type=file]")
+        for index in range(inputs.count()):
+            candidate = inputs.nth(index)
+            accept = candidate.get_attribute("accept") or ""
+            if _xhs_input_accepts(accept, media_kind):
+                return candidate
+        raise XhsError("当前小红书聊天页面没有可用的图片或视频选择入口，请检查平台是否改版")
+
+    def _wait_for_media_response(self, responses: list[dict]) -> dict | None:
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if responses:
+                state = responses[-1]
+                status = int(state.get("status") or 0)
+                payload = state.get("payload")
+                if status < 200 or status >= 300:
+                    raise XhsError(f"小红书媒体发送接口返回 HTTP {status}")
+                if payload is not None and not _is_success(payload):
+                    raise XhsError(_response_error(payload, "小红书媒体发送失败"))
+                return state
+            self._page.wait_for_timeout(300)
+        return None
+
+    def _trigger_media_send(self) -> bool:
+        selectors = (
+            ".xhs-im-input-bar button[class*='send']",
+            ".xhs-im-input-bar .xhs-im-input-bar-send",
+            ".xhs-im-input-bar-send",
+        )
+        for selector in selectors:
+            button = self._page.locator(selector).last
+            if not button.count():
+                continue
+            try:
+                if button.is_visible() and button.is_enabled():
+                    button.click()
+                    return True
+            except Exception:
+                continue
+        editor = self._page.locator(".xhs-im-input-bar-editor").first
+        if editor.count():
+            try:
+                editor.click()
+                editor.press("Enter")
+                return True
+            except Exception:
+                pass
+        return False
+
+    def send_media(self, external_user_id: str, file_path: str | Path) -> dict:
+        """Send one image or video through the Xiaohongshu chat file input."""
+        chat_user_id = clean_text(external_user_id, 200)
+        if not chat_user_id:
+            raise XhsError("缺少小红书会话 ID，无法发送媒体")
+        path = Path(file_path)
+        if not path.is_file():
+            raise XhsError("要发送的小红书媒体文件不存在")
+        media_kind = _xhs_media_kind(path)
+        size = path.stat().st_size
+        if size <= 0:
+            raise XhsError("要发送的小红书媒体文件为空")
+        if size > _xhs_media_limit(media_kind):
+            limit_mb = _xhs_media_limit(media_kind) // (1024 * 1024)
+            raise XhsError(f"小红书私信{media_kind == 'video' and '视频' or '图片'}不能超过 {limit_mb}MB")
+
+        self._open_chat(chat_user_id)
+        responses: list[dict] = []
+
+        def on_response(response):
+            if XHS_SEND_MESSAGE_PATH not in str(response.url or ""):
+                return
+            state = {"status": response.status}
+            try:
+                state["payload"] = response.json()
+            except Exception:
+                pass
+            responses.append(state)
+
+        self._page.on("response", on_response)
+        try:
+            file_input = self._find_media_input(media_kind)
+            file_input.set_input_files(str(path))
+            confirm = self._page.locator(XHS_MEDIA_CONFIRM_SELECTOR).last
+            try:
+                confirm.wait_for(state="visible", timeout=15000)
+                confirm.click()
+            except Exception as exc:
+                # 平台偶尔会自动确认选择；只有接口也没有发出时才判失败。
+                if not self._wait_for_media_response(responses):
+                    raise XhsError("小红书未出现媒体确认按钮，或媒体上传失败") from exc
+
+            state = self._wait_for_media_response(responses)
+            if state is None:
+                self._trigger_media_send()
+                state = self._wait_for_media_response(responses)
+            if state is None:
+                raise XhsError("小红书媒体发送未确认，请检查平台风控或登录状态")
+
+            payload = state.get("payload")
+            message_id = _xhs_send_message_id(payload)
+            return {
+                "message_id": message_id,
+                "client_message_id": message_id,
+                "media_type": media_kind,
+                "content_type": 2 if media_kind == "image" else 11,
+                "transport": "xiaohongshu-web",
+            }
+        except XhsError:
+            raise
+        except Exception as exc:
+            raise XhsError("小红书媒体发送失败，请检查登录状态或稍后重试") from exc
+        finally:
+            try:
+                self._page.remove_listener("response", on_response)
+            except Exception:
+                pass
 
     def _wait_for_sent(self, text: str) -> dict:
         deadline = time.monotonic() + 15

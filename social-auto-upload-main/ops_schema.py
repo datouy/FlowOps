@@ -35,6 +35,9 @@ MESSAGES_DDL = """CREATE TABLE IF NOT EXISTS messages (
     platform TEXT DEFAULT '', account TEXT DEFAULT '',
     msg_type TEXT DEFAULT 'comment', author TEXT DEFAULT '',
     content TEXT NOT NULL, source_content TEXT DEFAULT '',
+    media_type TEXT DEFAULT '', media_url TEXT DEFAULT '',
+    media_thumb_url TEXT DEFAULT '', media_path TEXT DEFAULT '',
+    media_thumb_path TEXT DEFAULT '',
     intent TEXT DEFAULT 'low', status TEXT DEFAULT 'new',
     reply_text TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     handled_at DATETIME, contact_id INTEGER,
@@ -86,6 +89,11 @@ def ensure_messages_columns(conn: sqlite3.Connection) -> list[str]:
         ("reply_text", "TEXT DEFAULT ''"),
         ("handled_at", "DATETIME"),
         ("source_content", "TEXT DEFAULT ''"),
+        ("media_type", "TEXT DEFAULT ''"),
+        ("media_url", "TEXT DEFAULT ''"),
+        ("media_thumb_url", "TEXT DEFAULT ''"),
+        ("media_path", "TEXT DEFAULT ''"),
+        ("media_thumb_path", "TEXT DEFAULT ''"),
     ):
         if ensure_column(conn, "messages", name, ddl):
             added.append(name)

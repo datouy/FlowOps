@@ -93,6 +93,20 @@ def test_history_items_keep_media_kind_even_when_cover_has_text():
     assert items[0]["auto_reply"] is False
 
 
+def test_history_external_id_is_stable_when_virtual_list_loses_time(monkeypatch):
+    row = {"cid": "c-stable", "name": "测试用户", "unread": 0}
+    account = {"id": 1, "userName": "测试账号"}
+    history = [{
+        "text": "同一条消息", "direction": "outbound", "display_time": "",
+    }]
+    monkeypatch.setattr(dy, "_display_time_to_text", lambda _value: "2026-11-04 17:02:00")
+    first = dy._history_items(row, history, account)[0]["external_message_id"]
+    monkeypatch.setattr(dy, "_display_time_to_text", lambda _value: "2026-11-04 17:04:00")
+    second = dy._history_items(row, history, account)[0]["external_message_id"]
+
+    assert first == second
+
+
 def test_row_to_item_maps_platform_video_placeholder_to_explicit_notice():
     item, reason = dy._row_to_item({
         "cid": "c1", "name": "258", "unread": 1,
@@ -107,7 +121,20 @@ def test_row_to_item_maps_platform_video_placeholder_to_explicit_notice():
 def test_history_script_recognizes_play_icon_and_image_cover():
     assert 'svg[class*="play"]' in dy.HISTORY_SCRIPT
     assert '[class*="aweme-cover"]' in dy.HISTORY_SCRIPT
-    assert 'img.closest(\'[class*="avatar"]\')' in dy.HISTORY_SCRIPT
+    assert '[class*="avatar"]' in dy.HISTORY_SCRIPT
+    assert '[class*="author"]' in dy.HISTORY_SCRIPT
+    assert '/undefined' in dy.HISTORY_SCRIPT
+    assert 'aweme-avatar' in dy.HISTORY_SCRIPT
+
+
+def test_scan_script_excludes_hidden_virtual_rows():
+    assert ".filter(entry => entry.visible)" in dy.SCAN_SCRIPT
+    assert ".sort((a, b) => a.index - b.index)" in dy.SCAN_SCRIPT
+
+
+def test_scan_script_uses_stable_avatar_identity():
+    assert "parsed.origin}${parsed.pathname}" in dy.SCAN_SCRIPT
+    assert "hashCid(`${rawName}|${canonicalAvatar(avatar)}`)" in dy.SCAN_SCRIPT
 
 
 def test_reconcile_rewrites_legacy_image_placeholder_without_duplicate(tmp_path, monkeypatch):

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
+from pathlib import Path
 
 from flask import Blueprint
 
 import dm_ops
 from channels_dm import ChannelsAuthError, ChannelsClient, ChannelsError
+from conf import BASE_DIR
 from dm_platform_common import (
     BaseDmSync, SyncError, account_name, clean_text, is_recent, public_account,
     timestamp_text,
@@ -19,6 +22,22 @@ PLATFORM = "视频号"
 ACCOUNT_TYPE = 2
 DEFAULT_HISTORY_DAYS = 7
 PRIVATE_SESSION_TYPES = {1, 3}
+MEDIA_CONTAINER_KEYS = {
+    "imageMsg", "imgMsg", "imagesMsg", "pictureMsg", "videoMsg", "video",
+    "fileMsg", "file", "attachMsg", "attachment", "media", "mediaMsg",
+    "emotionMsg", "stickerMsg", "cardMsg",
+}
+MEDIA_URL_KEYS = (
+    "cdnUrl", "downloadUrl", "videoUrl", "imageUrl", "imgUrl", "fileUrl",
+    "originUrl", "largeUrl", "mediumUrl", "smallUrl", "thumbUrl", "coverUrl",
+    "url",
+)
+MEDIA_THUMB_KEYS = ("thumbUrl", "thumbnailUrl", "coverUrl", "posterUrl", "smallUrl")
+MEDIA_LABELS = {
+    "image": "[图片]", "video": "[视频]", "emotion": "[表情]",
+    "file": "[文件]", "audio": "[音频]", "other": "[非文本消息]",
+}
+MEDIA_PLACEHOLDERS = set(MEDIA_LABELS.values())
 
 
 def _window_label(hours: int) -> str:
@@ -49,8 +68,74 @@ def _message_text(message: dict) -> tuple[str, bool]:
         msg_type = int(message.get("msgType") or message.get("msg_type") or 0)
     except (TypeError, ValueError):
         msg_type = 0
-    labels = {3: "[图片]", 43: "[视频]", 47: "[表情]"}
-    return labels.get(msg_type, "[非文本消息]"), True
+    labels = {3: "图片", 43: "视频", 47: "表情", 49: "文件"}
+    return MEDIA_LABELS[labels.get(msg_type, "other")], True
+
+
+def _first_media_url(value, keys: tuple[str, ...]) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("http://", "https://")):
+            return text
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            found = _first_media_url(item, keys)
+            if found:
+                return found
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    for key in keys:
+        found = _first_media_url(value.get(key), keys)
+        if found:
+            return found
+    return ""
+
+
+def _media_type_for_key(key: str, msg_type: int) -> str:
+    lowered = key.lower()
+    if "video" in lowered:
+        return "video"
+    if "emotion" in lowered or "sticker" in lowered:
+        return "emotion"
+    if "image" in lowered or "img" in lowered or "picture" in lowered:
+        return "image"
+    if "audio" in lowered or "voice" in lowered:
+        return "audio"
+    if "file" in lowered or "attach" in lowered:
+        return "file"
+    return {3: "image", 43: "video", 47: "emotion", 49: "file"}.get(msg_type, "other")
+
+
+def _extract_media(message: dict) -> dict:
+    """Extract platform media without relying on one unstable payload shape."""
+    try:
+        msg_type = int(message.get("msgType") or message.get("msg_type") or 0)
+    except (TypeError, ValueError):
+        msg_type = 0
+    for key, value in message.items():
+        if key not in MEDIA_CONTAINER_KEYS and not any(
+                marker in str(key).lower() for marker in ("image", "video", "media", "file", "attach", "emotion")):
+            continue
+        media_type = _media_type_for_key(str(key), msg_type)
+        url = _first_media_url(value, MEDIA_URL_KEYS)
+        if not url:
+            continue
+        thumb = _first_media_url(value, MEDIA_THUMB_KEYS)
+        return {"media_type": media_type, "media_url": url, "media_thumb_url": thumb}
+    if msg_type in (3, 43, 47, 49):
+        url = _first_media_url(message, MEDIA_URL_KEYS)
+        if url:
+            return {
+                "media_type": _media_type_for_key("", msg_type),
+                "media_url": url,
+                "media_thumb_url": _first_media_url(message, MEDIA_THUMB_KEYS),
+            }
+    return {
+        "media_type": _media_type_for_key("", msg_type) if msg_type in (3, 43, 47, 49) else "",
+        "media_url": "", "media_thumb_url": "",
+    }
 
 
 def _message_id(message: dict, session_id: str, created_at: str, text: str,
@@ -121,11 +206,14 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
         analyzed = []
         for raw in entries:
             text, placeholder = _message_text(raw)
+            media = _extract_media(raw)
             sender_id = clean_text(raw.get("fromUsername"), 300)
             analyzed.append({
                 "raw": raw,
                 "text": text,
                 "placeholder": placeholder,
+                "media": bool(media.get("media_type")),
+                **media,
                 "sender_id": sender_id,
                 "direction": "outbound" if sender_id == finder_username else "inbound",
                 "created_at": _created_at(raw),
@@ -168,7 +256,10 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
             status = "replied"
             if inbound:
                 status = "new" if index == latest_inbound and unanswered else "replied"
-            allow_auto_reply = inbound and status == "new" and not entry["placeholder"]
+            allow_auto_reply = (
+                inbound and status == "new" and not entry["placeholder"]
+                and not entry["media"]
+            )
             items.append({
                 "platform": PLATFORM,
                 "account": account_name(account),
@@ -178,6 +269,9 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
                 ),
                 "author": nickname if inbound else "我",
                 "content": text,
+                "media_type": entry["media_type"],
+                "media_url": entry["media_url"],
+                "media_thumb_url": entry["media_thumb_url"],
                 "source_content": "视频号私信同步",
                 "msg_type": "dm",
                 "direction": "inbound" if inbound else "outbound",
@@ -190,6 +284,105 @@ def _build_items(messages: list[dict], infos: dict[str, dict], account: dict,
     return items, scanned, skipped
 
 
+def _safe_media_stem(item: dict) -> str:
+    raw = str(item.get("external_message_id") or item.get("media_url") or "media")
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")[:80]
+    return raw or hashlib.sha1(str(item.get("media_url")).encode("utf-8")).hexdigest()[:24]
+
+
+def _attach_media(client: ChannelsClient, items: list[dict], account: dict,
+                  skipped: dict[str, int]) -> dict:
+    """Cache message media under dm_media and store portable relative paths."""
+    account_key = str(account.get("id") or account_name(account) or "unknown")
+    account_key = re.sub(r"[^A-Za-z0-9._-]+", "-", account_key)[:80] or "unknown"
+    root = Path(BASE_DIR) / "dm_media" / account_key
+    downloaded = 0
+    failed = 0
+    for item in items:
+        url = str(item.get("media_url") or "")
+        media_type = str(item.get("media_type") or "")
+        thumb_url = str(item.get("media_thumb_url") or "")
+        if not media_type or (not url and not thumb_url):
+            continue
+        stem = _safe_media_stem(item)
+        saved = False
+        if url:
+            try:
+                target, _content_type = client.download_media(url, root, stem)
+                item["media_path"] = target.relative_to(
+                    Path(BASE_DIR) / "dm_media"
+                ).as_posix()
+                saved = True
+            except ChannelsError:
+                pass
+        if media_type == "video" and thumb_url and thumb_url != url:
+            try:
+                thumb, _content_type = client.download_media(
+                    thumb_url, root, stem + "-thumb", max_bytes=8 * 1024 * 1024,
+                )
+                item["media_thumb_path"] = thumb.relative_to(
+                    Path(BASE_DIR) / "dm_media"
+                ).as_posix()
+                saved = True
+            except ChannelsError:
+                pass
+        if saved:
+            downloaded += 1
+        else:
+            failed += 1
+            skipped["媒体下载失败"] = skipped.get("媒体下载失败", 0) + 1
+    return {"downloaded": downloaded, "failed": failed}
+
+
+def _watermark_key(account: dict) -> str:
+    return f"channels_history_seq_{account.get('id') or account.get('name') or ''}"
+
+
+def _load_watermark(account: dict) -> int:
+    """读取该账号上一次同步到的最大消息 seq（增量水位）。"""
+    try:
+        with dm_ops.get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM dm_meta WHERE key=?", (_watermark_key(account),)
+            ).fetchone()
+        return int(str(row["value"])) if row and str(row["value"]).strip().isdigit() else 0
+    except Exception:
+        return 0
+
+
+def _save_watermark(account: dict, seq: int) -> None:
+    if int(seq or 0) <= 0:
+        return
+    try:
+        with dm_ops.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO dm_meta (key,value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_watermark_key(account), str(int(seq))),
+            )
+    except Exception:
+        pass
+
+
+def _filter_new(messages: list[dict], watermark: int) -> list[dict]:
+    """只保留 seq 大于水位的消息。
+
+    没有 seq 的消息（老接口/异常格式）一律保留，交给 ``ingest_many`` 的去重兜底，
+    避免"增量"把真实消息漏掉。
+    """
+    if watermark <= 0:
+        return messages
+    fresh = []
+    for message in messages:
+        try:
+            seq = int(message.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        if seq <= 0 or seq > watermark:
+            fresh.append(message)
+    return fresh
+
+
 def _sync_account(settings: dict, account: dict) -> dict:
     name = account_name(account)
     if not account.get("cookie_path"):
@@ -198,24 +391,34 @@ def _sync_account(settings: dict, account: dict) -> dict:
     try:
         finder_username = client.get_finder_username()
         messages = client.get_history_messages()
-        session_ids = []
+        watermark = _load_watermark(account)
+        newest_seq = 0
         for message in messages:
+            try:
+                newest_seq = max(newest_seq, int(message.get("seq") or 0))
+            except (TypeError, ValueError):
+                continue
+        fresh = _filter_new(messages, watermark)
+        session_ids = []
+        for message in fresh:
             session_id = _session_id(message)
             if session_id and _is_private_message(message) \
                     and session_id not in session_ids:
                 session_ids.append(session_id)
         infos = client.get_session_infos(session_ids)
         items, scanned, skip_reasons = _build_items(
-            messages, infos, account, finder_username,
+            fresh, infos, account, finder_username,
             int(settings.get("history_window_hours") or 0),
             int(settings.get("max_conversations") or 50),
         )
+        media_result = _attach_media(client, items, account, skip_reasons)
         ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
         for contact_id in {
             int(result.get("contact_id")) for result in ingest.get("items", [])
             if result.get("contact_id")
         }:
             dm_ops.dedupe_contact_messages(contact_id)
+        _save_watermark(account, newest_seq)
         ready = sum(
             1 for result in ingest.get("items", [])
             if (result.get("auto_reply") or {}).get("status") == "ready"
@@ -225,10 +428,16 @@ def _sync_account(settings: dict, account: dict) -> dict:
             "account": public_account(account),
             "scanned": scanned,
             "messages_read": len(messages),
+            "messages_fresh": len(fresh),
+            "watermark": watermark,
+            "newest_seq": newest_seq,
+            "incremental": bool(watermark),
             "imported": int(ingest.get("added") or 0),
             "duplicates": int(ingest.get("duplicates") or 0),
             "skipped": sum(skip_reasons.values()),
             "failed": int(ingest.get("failed") or 0),
+            "media_downloaded": media_result["downloaded"],
+            "media_failed": media_result["failed"],
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
             "items": ingest.get("items", []),

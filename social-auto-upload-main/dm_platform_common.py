@@ -50,6 +50,47 @@ class SyncError(RuntimeError):
     """可直接展示给用户的同步错误。"""
 
 
+# ---- 同步错误归因 ------------------------------------------------------
+# 失败原因决定用户该做什么：账号失效 → 去重扫；没登录账号 → 去添加；
+# Cookie 文件丢了 → 重扫；网络 → 等下一轮。前端按分类给提示。
+DM_ERROR_ACCOUNT_EXPIRED = "account_expired"
+DM_ERROR_NO_ACCOUNTS = "no_accounts"
+DM_ERROR_COOKIE_MISSING = "cookie_missing"
+DM_ERROR_NETWORK = "network"
+DM_ERROR_UNKNOWN = "error"
+
+_DM_ERROR_RULES = (
+    # 先判 Cookie 缺失：这类消息里通常也带"请重新扫码"，会被误判成账号失效
+    (
+        DM_ERROR_COOKIE_MISSING,
+        ("Cookie 文件不存在", "Cookie 文件无法读取", "Cookie 文件为空"),
+    ),
+    (
+        DM_ERROR_ACCOUNT_EXPIRED,
+        ("300334", "300333", "300336", "登录已失效", "登录态失效", "重新扫码", "expired"),
+    ),
+    (
+        DM_ERROR_NETWORK,
+        ("连接视频号失败", "连接失败", "Timeout", "超时", "Connection", "ECONN", "SSL"),
+    ),
+)
+
+
+def classify_dm_error(message: str) -> str:
+    """把同步错误翻译成前端可行动的类别；空字符串表示没出错。"""
+    text = str(message or "")
+    if not text:
+        return ""
+    if "未找到" in text and "账号" in text:
+        return DM_ERROR_NO_ACCOUNTS
+    lowered = text.lower()
+    for kind, keywords in _DM_ERROR_RULES:
+        for keyword in keywords:
+            if keyword.lower() in lowered:
+                return kind
+    return DM_ERROR_UNKNOWN
+
+
 def friendly_error(exc: Exception) -> str:
     """把底层异常转换成适合展示给用户的中文提示。"""
     text = str(exc).strip() or exc.__class__.__name__
@@ -253,6 +294,7 @@ class BaseDmSync:
         max_workers: int = 8,
         failure_backoff: float = 30.0,
         continuous_gap: float = 0.5,
+        no_accounts_backoff: float = 1800.0,
         quick_triggers: tuple[str, ...] = ("auto",),
     ):
         self.blueprint = blueprint
@@ -280,6 +322,10 @@ class BaseDmSync:
         self.max_workers = max(1, int(max_workers))
         self.failure_backoff = max(1.0, float(failure_backoff))
         self.continuous_gap = max(0.0, float(continuous_gap))
+        # 没有账号时的重试间隔：默认 30 分钟。
+        # 旧代码对"未找到账号"和真实错误一视同仁，每 30 秒重试一次，
+        # 日志被刷满、后台线程一直在空转。
+        self.no_accounts_backoff = max(self.failure_backoff, float(no_accounts_backoff))
         self.quick_triggers = tuple(quick_triggers or ())
         self._scan_accepts_quick = self._detect_quick_support()
         self.log = logger.bind(dm_sync=key)
@@ -336,6 +382,16 @@ class BaseDmSync:
 
     def no_accounts_message(self) -> str:
         return f"未找到{self.platform}账号，请先在账号管理中登录"
+
+    def no_accounts_is_normal(self) -> bool:
+        """没有可用账号算不算"正常状态"。
+
+        没登录任何账号时，后台定时同步每一轮都会失败。这不是错误，
+        而是"还没配置"的正常状态——用户还没扫码登录而已。
+        默认当作正常状态，日志降级为 INFO，并且拉长重试间隔，
+        免得日志被刷屏、CPU 空转。
+        """
+        return True
 
     def account_name(self, account: dict | None) -> str:
         return account_name(account, self.platform)
@@ -402,6 +458,18 @@ class BaseDmSync:
             ),
         )
         self.init_extra(conn)
+        # 账号级同步健康度：哪台账号最后一次成功同步是什么时候、失败原因是什么。
+        # 汇总在 /dm/health，前端在私信中心顶部给一条"为什么没有新消息"的横幅。
+        conn.execute("""CREATE TABLE IF NOT EXISTS dm_account_sync_state (
+            platform TEXT NOT NULL,
+            account_key TEXT NOT NULL,
+            account_name TEXT NOT NULL DEFAULT '',
+            last_success_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_error_kind TEXT NOT NULL DEFAULT '',
+            last_checked_at TEXT NOT NULL DEFAULT '',
+            last_imported INTEGER DEFAULT 0,
+            PRIMARY KEY (platform, account_key))""")
 
     def _migrate_history_days(self, conn: sqlite3.Connection) -> None:
         """老库补 history_days 列：历史窗口从硬编码 48 小时改成可配置天数。"""
@@ -415,6 +483,19 @@ class BaseDmSync:
             (self.default_history_days,),
         )
 
+    def _ensure_health_table(self, conn: sqlite3.Connection) -> None:
+        """幂等建表：老库的迁移版本已经跑完，新表不能只写在 v1 迁移里。"""
+        conn.execute("""CREATE TABLE IF NOT EXISTS dm_account_sync_state (
+            platform TEXT NOT NULL,
+            account_key TEXT NOT NULL,
+            account_name TEXT NOT NULL DEFAULT '',
+            last_success_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_error_kind TEXT NOT NULL DEFAULT '',
+            last_checked_at TEXT NOT NULL DEFAULT '',
+            last_imported INTEGER DEFAULT 0,
+            PRIMARY KEY (platform, account_key))""")
+
     def init_db(self) -> None:
         migrations = {1: self._create_schema, 2: self._migrate_history_days}
         migrations.update(self.extra_migrations())
@@ -424,6 +505,7 @@ class BaseDmSync:
                 f"dm_sync:{self.settings_table}",
                 migrations,
             )
+            self._ensure_health_table(conn)
 
     def load_settings(self) -> dict:
         with dm_ops.get_conn() as conn:
@@ -560,6 +642,12 @@ class BaseDmSync:
             "continuous" if int(settings.get("interval_seconds") or 0) <= 0 else "interval"
         )
         data["read_only"] = True
+        # 前端据此区分"还没登录账号"（正常）和"同步真的出错了"（异常）。
+        # 没有账号时不应该在页面上挂一个红色报错条。
+        data["no_accounts"] = not selected
+        data["last_error_is_account_hint"] = bool(
+            not selected and self.no_accounts_is_normal()
+        )
         return data
 
     def register_routes(self) -> None:
@@ -693,16 +781,115 @@ class BaseDmSync:
     ) -> list[dict]:
         """按账号并行扫描；结果顺序与账号顺序一致。"""
         if len(accounts) <= 1 or self.max_workers <= 1:
-            return [self._scan_one(settings, account, quick) for account in accounts]
-        workers = max(1, min(self.max_workers, len(accounts)))
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix=f"{self.key}-account",
-        ) as pool:
-            futures = [
-                pool.submit(self._scan_one, settings, account, quick)
-                for account in accounts
-            ]
-            return [future.result() for future in futures]
+            results = [self._scan_one(settings, account, quick) for account in accounts]
+        else:
+            workers = max(1, min(self.max_workers, len(accounts)))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=f"{self.key}-account",
+            ) as pool:
+                futures = [
+                    pool.submit(self._scan_one, settings, account, quick)
+                    for account in accounts
+                ]
+                results = [future.result() for future in futures]
+        for result in results:
+            self._record_account_state(result)
+        return results
+
+    def _record_account_state(self, result: dict) -> None:
+        """把每个账号本轮同步结果落库（健康度/最后成功时间/失败原因）。"""
+        account = result.get("account") or {}
+        key = str(account.get("id") or account.get("name") or "")[:64]
+        if not key:
+            return
+        now = now_text()
+        ok = bool(result.get("ok"))
+        error = "" if ok else str(result.get("error") or "同步失败")[:500]
+        kind = "" if ok else classify_dm_error(error)
+        try:
+            with dm_ops.get_conn() as conn:
+                conn.execute(
+                    """INSERT INTO dm_account_sync_state
+                       (platform, account_key, account_name, last_success_at,
+                        last_error, last_error_kind, last_checked_at, last_imported)
+                       VALUES (?,?,?,?,?,?,?,?)
+                       ON CONFLICT(platform, account_key) DO UPDATE SET
+                         account_name=excluded.account_name,
+                         last_success_at=CASE WHEN excluded.last_success_at != ''
+                                              THEN excluded.last_success_at
+                                              ELSE dm_account_sync_state.last_success_at END,
+                         last_error=excluded.last_error,
+                         last_error_kind=excluded.last_error_kind,
+                         last_checked_at=excluded.last_checked_at,
+                         last_imported=excluded.last_imported""",
+                    (
+                        self.platform, key, self.account_name(account),
+                        now if ok else "", error, kind, now,
+                        int(result.get("imported") or 0),
+                    ),
+                )
+        except Exception as exc:
+            self.log.warning("记录账号同步健康度失败: {}", exc)
+
+    def health_payload(self) -> dict:
+        """同步健康度：给"为什么没有新消息"一个可读的答案。
+
+        平台级 + 账号级两层：平台级看最后一次成功时间与错误分类，
+        账号级看每个账号各自的状态（有些号好好的、个别号失效是最常见的情况）。
+        """
+        settings = self.load_settings()
+        accounts = self.resolve_accounts(self.list_accounts(), settings)
+        states: dict[str, dict] = {}
+        try:
+            with dm_ops.get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM dm_account_sync_state WHERE platform=?",
+                    (self.platform,),
+                ).fetchall()
+            states = {str(row["account_key"]): dict(row) for row in rows}
+        except Exception:
+            states = {}
+
+        now = datetime.now()
+        items = []
+        for account in accounts:
+            key = str(account.get("id") or account.get("name") or "")[:64]
+            state = states.get(key) or {}
+            last_success = str(state.get("last_success_at") or "")
+            stale_hours = None
+            if last_success:
+                try:
+                    stale_hours = round(
+                        (now - datetime.strptime(last_success, "%Y-%m-%d %H:%M:%S"))
+                        .total_seconds() / 3600,
+                        1,
+                    )
+                except ValueError:
+                    stale_hours = None
+            items.append({
+                "id": account.get("id"),
+                "name": self.account_name(account),
+                "lastSuccessAt": last_success,
+                "lastError": str(state.get("last_error") or ""),
+                "errorKind": str(state.get("last_error_kind") or ""),
+                "staleHours": stale_hours,
+                "lastImported": int(state.get("last_imported") or 0),
+            })
+
+        last_error = str(settings.get("last_error") or "")
+        return {
+            "platform": self.platform,
+            "key": self.key,
+            "enabled": bool(settings.get("enabled")),
+            "running": self._sync_lock.locked(),
+            "lastSuccessAt": str(settings.get("last_success_at") or ""),
+            "lastError": last_error,
+            "errorKind": classify_dm_error(last_error),
+            "accountCount": len(accounts),
+            "noAccounts": not accounts,
+            "accounts": items,
+            "nextRunAt": self.next_run_text(),
+        }
 
     def run_sync(self, trigger: str = "manual", wait_seconds: float = 0) -> dict:
         acquired = self._sync_lock.acquire(blocking=False)
@@ -720,11 +907,13 @@ class BaseDmSync:
         started_at = now_text()
         selected_accounts: list[dict] = []
         account_results: list[dict] = []
+        no_accounts = False
         try:
             settings = self.load_settings()
             accounts = self.list_accounts()
             selected_accounts = self.resolve_accounts(accounts, settings)
             if not selected_accounts:
+                no_accounts = True
                 raise SyncError(self.no_accounts_message())
             self.save_settings(
                 last_started_at=started_at,
@@ -821,8 +1010,15 @@ class BaseDmSync:
                 )
             except Exception as save_exc:
                 self.log.exception("failed to persist sync error: {}", save_exc)
-            self.log.error("trigger={} failed: {}", trigger, message)
-            return {"ok": False, "error": message}
+            if no_accounts and self.no_accounts_is_normal():
+                # 没登录账号是"还没配置"，不是故障。
+                # 用 INFO 而不是 ERROR，避免日志被刷屏、告警被误触发。
+                self.log.info(
+                    "trigger={} 跳过：{}", trigger, message,
+                )
+            else:
+                self.log.error("trigger={} failed: {}", trigger, message)
+            return {"ok": False, "error": message, "no_accounts": no_accounts}
         finally:
             self._sync_lock.release()
             try:
@@ -832,6 +1028,9 @@ class BaseDmSync:
             except Exception:
                 interval, enabled = 0, False
             gap = interval if interval > 0 else self.continuous_gap
+            if no_accounts and self.no_accounts_is_normal():
+                # 没账号时不用 30 秒就重试一次，退到 30 分钟。
+                gap = max(gap, self.no_accounts_backoff)
             with self._state_lock:
                 self._next_run_at = time.time() + gap if enabled else None
 
@@ -861,6 +1060,9 @@ class BaseDmSync:
                 gap = interval if interval > 0 else self.continuous_gap
                 if not result.get("ok"):
                     gap = max(gap, self.failure_backoff)
+                    if result.get("no_accounts") and self.no_accounts_is_normal():
+                        # 没配置账号是正常状态，别每 30 秒重试一次
+                        gap = max(gap, self.no_accounts_backoff)
                 with self._state_lock:
                     self._next_run_at = time.time() + gap
             except Exception as exc:

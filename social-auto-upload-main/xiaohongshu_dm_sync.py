@@ -7,6 +7,7 @@ import hashlib
 from flask import Blueprint
 
 import dm_ops
+from dm_media_cache import attach_message_media
 from dm_platform_common import (
     BaseDmSync, SyncError, account_name, clean_text, friendly_error, is_recent,
     now_text, public_account, timestamp_text,
@@ -64,6 +65,21 @@ def _message_text(sixin: dict) -> tuple[str, bool]:
     return label, True
 
 
+def _message_media(message: dict, sixin: dict) -> dict[str, str]:
+    media_type = clean_text(
+        message.get("media_type") or sixin.get("mediaType"), 20,
+    )
+    return {
+        "media_type": media_type,
+        "media_url": clean_text(
+            message.get("media_url") or sixin.get("mediaUrl"), 1200,
+        ),
+        "media_thumb_url": clean_text(
+            message.get("media_thumb_url") or sixin.get("mediaThumbUrl"), 1200,
+        ),
+    }
+
+
 def _direction_detail(message: dict, sixin: dict, extension: dict,
                       porch_user_id: str) -> tuple[str, bool]:
     """返回 (方向, 是否可信)。可信才回写 outbound，避免把客户消息复制成自己发的。"""
@@ -119,12 +135,14 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
     for raw in messages:
         message, sixin, extension = _message_parts(raw)
         text, placeholder = _message_text(sixin)
+        media = _message_media(message, sixin)
+        placeholder = bool(placeholder or media["media_type"])
         direction, confident = _direction_detail(
             message, sixin, extension, porch_user_id,
         )
         analyzed.append({
             "raw": message, "sixin": sixin, "extension": extension,
-            "text": text, "placeholder": placeholder,
+            "text": text, "placeholder": placeholder, "media": media,
             "direction": direction, "confident": confident,
             "created_at": _created_at(sixin, message),
         })
@@ -147,8 +165,9 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
     for index, entry in enumerate(analyzed):
         sixin = entry["sixin"]
         text = entry["text"]
+        media = entry["media"]
         direction = entry["direction"]
-        if not text:
+        if not text and not media["media_type"]:
             skip_reasons["空消息"] = skip_reasons.get("空消息", 0) + 1
             continue
         if direction == "outbound" and not entry["confident"]:
@@ -170,6 +189,7 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
             fingerprint = "|".join((
                 chat_id, entry["created_at"], direction, text,
                 clean_text(sixin.get("senderId"), 120),
+                media["media_url"],
             ))
             external_message_id = "xhs-sync-" + hashlib.sha1(
                 fingerprint.encode("utf-8")
@@ -191,6 +211,7 @@ def _chat_items(chat: dict, messages: list[dict], account: dict,
             "created_at": entry["created_at"],
             "auto_reply": allow_auto_reply,
             "intent": dm_ops.detect_intent(text) if allow_auto_reply else "low",
+            **media,
         })
     return items, skip_reasons
 
@@ -267,6 +288,10 @@ def _sync_account(settings: dict, account: dict) -> dict:
             if marker and client.history_loaded(chat_id):
                 pending_markers[chat_id] = marker
 
+        media_result = attach_message_media(
+            items, account, skip_reasons,
+            referer="https://www.xiaohongshu.com/chat",
+        )
         ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
         for contact_id in {
             int(result.get("contact_id")) for result in ingest.get("items", [])
@@ -288,6 +313,8 @@ def _sync_account(settings: dict, account: dict) -> dict:
             "duplicates": int(ingest.get("duplicates") or 0),
             "skipped": sum(skip_reasons.values()),
             "failed": failed + int(ingest.get("failed") or 0),
+            "media_downloaded": media_result["downloaded"],
+            "media_failed": media_result["failed"],
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
             "items": ingest.get("items", []),

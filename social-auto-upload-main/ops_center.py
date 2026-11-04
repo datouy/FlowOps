@@ -22,6 +22,11 @@ DB = Path(BASE_DIR / "db" / "ops_center.db")
 _TODO_CACHE: dict = {"at": 0.0, "payload": None}
 TODO_CACHE_TTL = 10.0
 
+
+def invalidate_todo_cache() -> None:
+    """账号写操作完成后立即失效待办缓存，避免短暂显示旧账号数。"""
+    _TODO_CACHE.update(at=0.0, payload=None)
+
 INTENT_WORDS = {
     "high": ["价格", "多少钱", "报价", "费用", "报名", "行程", "几天", "优惠", "怎么去", "联系", "微信", "电话"],
     "medium": ["好玩", "值得", "推荐", "攻略", "住宿", "吃", "门票", "孩子", "老人"],

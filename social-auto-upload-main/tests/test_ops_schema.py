@@ -21,6 +21,8 @@ REQUIRED_MESSAGE_COLUMNS = {
     "source_content", "intent", "status", "reply_text", "created_at",
     "handled_at", "contact_id", "external_user_id", "external_message_id",
     "direction", "delivery_status", "auto_reply_status", "matched_rule_id",
+    "media_type", "media_url", "media_thumb_url", "media_path",
+    "media_thumb_path",
 }
 
 

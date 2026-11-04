@@ -9,6 +9,16 @@
       :closable="false"
       style="margin-bottom: 14px;"
     />
+    <el-alert
+      v-for="problem in dmProblems"
+      :key="problem.platform + '|' + problem.kind"
+      :title="`${problem.platform}私信同步有问题`"
+      :description="problem.message"
+      :type="problem.kind === 'no_accounts' ? 'info' : 'warning'"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 10px;"
+    />
     <div class="page-head">
       <div>
         <h2>私信自动回复</h2>
@@ -144,9 +154,43 @@
               </div>
 
               <div ref="messageList" v-loading="loadingMessages" class="message-list">
-                <div v-for="(msg, index) in messages" :key="msg.id || index" class="message-row" :class="msg.direction">
+                <div v-for="(msg, index) in visibleMessages" :key="msg.id || index" class="message-row" :class="msg.direction">
                   <div class="message-bubble">
-                    <div class="message-text">{{ msg.content }}</div>
+                    <div v-if="!mediaOnlyMessage(msg)" class="message-text">{{ msg.content }}</div>
+                    <div v-if="msg.media_type" class="message-media">
+                      <el-image
+                        v-if="['image', 'emotion', 'sticker'].includes(msg.media_type) && msg.media_path"
+                        :src="mediaUrl(msg.media_path)"
+                        :preview-src-list="[mediaUrl(msg.media_path)]"
+                        :preview-teleported="true"
+                        fit="contain"
+                        class="message-image"
+                      />
+                      <video
+                        v-else-if="msg.media_type === 'video' && msg.media_path"
+                        :src="mediaUrl(msg.media_path)"
+                        :poster="msg.media_thumb_path ? mediaUrl(msg.media_thumb_path) : undefined"
+                        controls
+                        preload="metadata"
+                        class="message-video"
+                      />
+                      <template v-else-if="msg.media_type === 'video' && msg.media_thumb_path">
+                        <el-image
+                          :src="mediaUrl(msg.media_thumb_path)"
+                          :preview-src-list="[mediaUrl(msg.media_thumb_path)]"
+                          :preview-teleported="true"
+                          fit="contain"
+                          class="message-image"
+                        />
+                        <div class="media-note">平台仅提供视频封面，原视频暂不可缓存</div>
+                      </template>
+                      <div v-else class="media-fallback">
+                        <el-tag size="small" effect="plain">{{ mediaTypeLabel(msg.media_type) }}暂未缓存</el-tag>
+                      </div>
+                      <div v-if="msg.media_path" class="media-actions">
+                        <a :href="mediaUrl(msg.media_path, true)" target="_blank" rel="noopener">下载 / 打开</a>
+                      </div>
+                    </div>
                     <div class="message-meta">
                       <span>{{ shortDateTime(msg.created_at) }}</span>
                       <el-tag v-if="msg.direction === 'outbound' && msg.auto_reply_status === 'auto'" size="small" effect="plain">自动</el-tag>
@@ -158,7 +202,7 @@
                     <div v-if="msg.source_content" class="message-source">来源内容：{{ msg.source_content }}</div>
                   </div>
                 </div>
-                <el-empty v-if="!loadingMessages && !messages.length" description="还没有消息" :image-size="70" />
+                <el-empty v-if="!loadingMessages && !visibleMessages.length" description="还没有文字或图片消息" :image-size="70" />
               </div>
 
               <div class="composer">
@@ -179,7 +223,23 @@
                 />
                 <div class="composer-footer">
                   <span class="connector-note">{{ connectorNote }}</span>
-                  <el-button type="primary" :loading="sending" @click="sendReply">发送并记录</el-button>
+                  <div class="composer-send-actions">
+                    <input
+                      v-if="mediaSendConfig"
+                      ref="mediaInput"
+                      type="file"
+                      class="hidden-file-input"
+                      :accept="mediaSendConfig.accept"
+                      @change="sendMediaFile"
+                    />
+                    <el-button
+                      v-if="mediaSendConfig"
+                      :loading="sendingMedia"
+                      :title="mediaSendConfig.hint"
+                      @click="mediaInput?.click()"
+                    >{{ mediaSendConfig.button }}</el-button>
+                    <el-button type="primary" :loading="sending" @click="sendReply">发送并记录</el-button>
+                  </div>
                 </div>
               </div>
             </template>
@@ -340,8 +400,8 @@
             </div>
             <el-alert
               v-if="activeSyncStatus.last_error"
-              title="最近一次同步异常"
-              type="error"
+              :title="activeSyncErrorTitle"
+              :type="activeSyncErrorType"
               :closable="false"
               show-icon
               :description="activeSyncStatus.last_error"
@@ -649,7 +709,6 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 <script setup>
 import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
 import { dmApi } from '@/api/dm'
 import { useAccountStore } from '@/stores/account'
 import { API_BASE, withToken } from '@/config'
@@ -689,6 +748,20 @@ const savingSettings = ref(false)
 const syncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const xhsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
 const channelsSyncStatus = ref({ enabled: 0, running: false, accounts: [] })
+
+// 同步健康度（/dm/health）：平台级 + 账号级，用来解释"为什么没有新消息"
+const dmHealth = ref({ platforms: [], problems: [] })
+const dmProblems = computed(() => dmHealth.value.problems || [])
+
+async function loadDmHealth() {
+  try {
+    const res = await dmApi.getHealth()
+    dmHealth.value = res.data || { platforms: [], problems: [] }
+  } catch (error) {
+    // 健康度探测失败不阻塞列表刷新
+    console.warn('加载私信同步健康度失败:', error)
+  }
+}
 const syncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
 const xhsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
 const channelsSyncForm = reactive({ enabled: false, account_ids: [], interval_seconds: 0, recent_only: true, history_days: 7 })
@@ -703,6 +776,16 @@ const accountFilterKey = ref('')
 const loadingConversations = ref(false)
 const currentContact = ref(null)
 const messages = ref([])
+const visibleMessages = computed(() => messages.value.filter(message => {
+  if (currentContact.value?.platform !== '抖音') return true
+  const mediaType = String(message.media_type || '').toLowerCase()
+  const text = String(message.content || '').trim()
+  return !['video', 'share'].includes(mediaType)
+    && !['[视频]', '[分享视频]', '分享[视频]'].includes(text)
+    && !text.startsWith('分享视频无法查看')
+    && !text.startsWith('该内容为视频')
+    && !text.startsWith('该内容为分享内容')
+}))
 const loadingMessages = ref(false)
 const messageList = ref(null)
 const lastMessageId = ref(0)
@@ -712,6 +795,8 @@ const templateId = ref(null)
 const replyText = ref('')
 const drafting = ref(false)
 const sending = ref(false)
+const sendingMedia = ref(false)
+const mediaInput = ref(null)
 const leads = ref([])
 const leadFilters = reactive({ segment: '', stage: '' })
 const loadingLeads = ref(false)
@@ -765,6 +850,26 @@ const syncRunTargets = [
   { platform: '视频号', prefix: '/dm/channels' },
 ]
 const directPlatforms = new Set(['抖音', '小红书', '视频号'])
+const mediaSendConfig = computed(() => {
+  const platform = currentContact.value?.platform
+  if (platform === '视频号') {
+    return {
+      platform,
+      accept: 'image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.zip,.txt',
+      button: '发送图片/附件',
+      hint: '单文件最大 25MB',
+    }
+  }
+  if (platform === '小红书') {
+    return {
+      platform,
+      accept: 'image/*,video/*',
+      button: '发送图片/视频',
+      hint: '图片最大 10MB，视频最大 100MB',
+    }
+  }
+  return null
+})
 const activeSyncMeta = computed(() => syncPlatformMeta[syncPlatform.value])
 const activeSyncStatus = computed(() => {
   if (syncPlatform.value === '小红书') return xhsSyncStatus.value
@@ -811,6 +916,15 @@ const syncSelectedAccountNames = computed(() => {
 })
 const syncSkipSummary = computed(() => Object.entries(activeSyncStatus.value.last_skip_reasons || {})
   .map(([reason, count]) => `${reason} ${count}`).join(' · '))
+// 没登录账号时 last_error 只是"还没配置"的提示，用 info 样式而不是红色报错
+const activeSyncErrorType = computed(() => (
+  activeSyncStatus.value.last_error_is_account_hint ? 'info' : 'error'
+))
+const activeSyncErrorTitle = computed(() => (
+  activeSyncStatus.value.last_error_is_account_hint
+    ? '尚未登录该平台账号'
+    : '最近一次同步异常'
+))
 const syncTargetStates = computed(() => [
   { platform: '抖音', status: syncStatus.value },
   { platform: '小红书', status: xhsSyncStatus.value },
@@ -819,7 +933,10 @@ const syncTargetStates = computed(() => [
 const syncAnyRunning = computed(() => syncTargetStates.value.some(item => item.status.running))
 const syncAllEnabled = computed(() => syncTargetStates.value.every(item => item.status.enabled))
 const syncEnabledCount = computed(() => syncTargetStates.value.filter(item => item.status.enabled).length)
-const syncAllHasError = computed(() => syncTargetStates.value.some(item => item.status.last_error))
+const syncAllHasError = computed(() => syncTargetStates.value.some(
+  // "还没登录账号"属于未配置状态，不算同步异常
+  item => item.status.last_error && !item.status.last_error_is_account_hint,
+))
 const syncAccountCount = computed(() => syncTargetStates.value.reduce(
   (count, item) => count + Number(item.status.account_count || 0), 0,
 ))
@@ -947,7 +1064,7 @@ function setSyncStatus(platform, data) {
   else syncStatus.value = data
 }
 
-async function loadSyncStatus() {
+async function loadSyncStatus() {  loadDmHealth()
   if (hasNoAccounts.value) return []
   const targets = [
     ['抖音', '/dm/sync/status', syncForm, 0],
@@ -1177,7 +1294,12 @@ async function loadConversation(id, silent = false, incremental = false) {
     currentContact.value = res.data.contact
     const incoming = res.data.messages || []
     if (incremental && messages.value.length) {
-      messages.value = [...messages.value, ...incoming]
+      const byId = new Map(messages.value.map(message => [message.id, message]))
+      for (const message of incoming) byId.set(message.id, message)
+      messages.value = [...byId.values()].sort((a, b) => (
+        String(a.created_at || '').localeCompare(String(b.created_at || ''))
+        || Number(a.id || 0) - Number(b.id || 0)
+      ))
     } else {
       messages.value = incoming
     }
@@ -1238,6 +1360,53 @@ async function sendReply() {
     ElMessage.error(error.message || '回复发送失败，内容已恢复')
   }
   finally { sending.value = false }
+}
+
+function mediaUrl(path, download = false) {
+  const safePath = String(path || '').split('/').map(encodeURIComponent).join('/')
+  const query = download ? '?download=1' : ''
+  return withToken(`${apiBase}/dm/media/${safePath}${query}`)
+}
+
+function mediaOnlyMessage(message) {
+  if (!message?.media_type) return false
+  return ['[图片]', '[视频]', '[表情]', '[文件]', '[音频]', '[非文本消息]'].includes(message.content)
+    || /^该内容为.*无法.*展示$/.test(String(message.content || ''))
+}
+
+function mediaTypeLabel(type) {
+  return { image: '图片', video: '视频', emotion: '表情', sticker: '表情', file: '文件', audio: '音频' }[type] || '媒体'
+}
+
+async function sendMediaFile(event) {
+  const file = event?.target?.files?.[0]
+  event.target.value = ''
+  const config = mediaSendConfig.value
+  if (!file || !currentContact.value || !config || sendingMedia.value) return
+  const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|m4v)$/i.test(file.name)
+  let maxBytes = 25 * 1024 * 1024
+  let maxLabel = '25MB'
+  if (config.platform === '小红书') {
+    maxBytes = isVideo ? 100 * 1024 * 1024 : 10 * 1024 * 1024
+    maxLabel = isVideo ? '100MB' : '10MB'
+  }
+  if (file.size > maxBytes) {
+    ElMessage.warning(`${config.platform}私信${isVideo ? '视频' : ''}附件最大 ${maxLabel}`)
+    return
+  }
+  sendingMedia.value = true
+  try {
+    const upload = await dmApi.uploadMedia(file)
+    const res = await dmApi.sendMedia(currentContact.value.id, upload.data)
+    const status = res.data?.delivery_status
+    if (status === 'sent') ElMessage.success(`媒体已发送到${config.platform}`)
+    else ElMessage.error(res.data?.delivery_error || '媒体发送失败')
+    await Promise.all([loadConversation(currentContact.value.id), loadConversations(), loadAnalytics()])
+  } catch (error) {
+    ElMessage.error(error.message || '媒体上传或发送失败')
+  } finally {
+    sendingMedia.value = false
+  }
 }
 
 function openProfile(contact) {
@@ -1433,7 +1602,7 @@ onMounted(async () => {
 .metric-card strong.success { color: #67c23a; }
 
 .main-tabs { background: transparent; }
-.inbox-layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; height: calc(100vh - 320px); min-height: 600px; }
+.inbox-layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; height: calc(100vh - 250px); min-height: 700px; }
 .conversation-pane, .chat-pane { background: #fff; border: 1px solid #ebeef5; border-radius: 10px; overflow: hidden; }
 .conversation-pane { display: flex; flex-direction: column; }
 .conversation-filters { padding: 12px; border-bottom: 1px solid #ebeef5; display: flex; flex-direction: column; gap: 8px; }
@@ -1468,6 +1637,15 @@ onMounted(async () => {
 .message-bubble { max-width: 74%; background: #fff; border: 1px solid #e9ecf2; padding: 10px 12px; border-radius: 10px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
 .message-row.outbound .message-bubble { background: #e8f3ff; border-color: #cfe5ff; }
 .message-text { white-space: pre-wrap; word-break: break-word; line-height: 1.65; color: #303133; font-size: 14px; }
+.message-media { margin-top: 4px; }
+.message-image { display: block; max-width: min(360px, 58vw); max-height: 320px; border-radius: 8px; cursor: zoom-in; }
+.message-video { display: block; width: min(390px, 60vw); max-height: 360px; border-radius: 8px; background: #111; }
+.media-fallback { padding: 8px 2px; }
+.media-note { margin-top: 4px; color: #909399; font-size: 12px; }
+.media-actions { margin-top: 5px; font-size: 12px; }
+.media-actions a { color: #409eff; text-decoration: none; }
+.composer-send-actions { display: flex; align-items: center; gap: 8px; }
+.hidden-file-input { display: none; }
 .message-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: #a0a4ab; font-size: 11px; flex-wrap: wrap; }
 .message-source { margin-top: 6px; color: #909399; font-size: 11px; }
 .composer { border-top: 1px solid #ebeef5; padding: 12px 14px; background: #fff; }

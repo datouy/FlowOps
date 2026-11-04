@@ -9,9 +9,11 @@ from datetime import datetime
 from pathlib import Path
 
 from patchright.sync_api import sync_playwright
+from loguru import logger
 
 from conf import BASE_DIR
 from db_utils import connect
+from utils.account_browser import open_persistent_account_context_sync
 
 MAIN_DB = Path(BASE_DIR / "db" / "database.db")
 COOKIE_DIR = Path(BASE_DIR / "cookiesFile")
@@ -157,8 +159,12 @@ def _find_row(page, cdp, author):
     return None
 
 
-def send_douyin(account_name: str, author: str, text: str) -> dict:
-    """Reply to one Douyin conversation through the creator web UI."""
+def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False) -> dict:
+    """Reply to one Douyin conversation through the creator web UI.
+
+    ``dry_run=True`` 只走到"打开会话、输入内容、确认发送按钮可用"，不点发送。
+    用来在不动真实客户会话的前提下验证链路（改版后排查用）。
+    """
     text = str(text or "").strip()
     author = str(author or "").strip()
     if not text:
@@ -171,14 +177,13 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
 
     with _send_lock:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
+            context = open_persistent_account_context_sync(
+                playwright,
+                str(account["cookie_path"]),
+                account_id=account.get("id"),
                 headless=True,
                 channel="chromium",
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context(
-                storage_state=str(account["cookie_path"]),
-                viewport={"width": 1440, "height": 1000},
             )
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             page = context.new_page()
@@ -192,7 +197,15 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
             page.on("response", on_response)
             try:
                 page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-                page.wait_for_timeout(5500)
+                # 创作者中心首屏接口和虚拟列表是异步渲染的，冷启动实测可能
+                # 超过 6 秒。固定 sleep 会在会话行尚未挂载时误报“找不到客户”。
+                try:
+                    page.locator('[role="gridcell"]').first.wait_for(
+                        state="attached", timeout=20000,
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(800)
                 if any(marker in page.url.lower() for marker in ("/login", "/passport/", "website-login")):
                     raise RuntimeError("抖音登录已失效，请重新扫码登录")
                 body_text = page.locator("body").inner_text()
@@ -206,13 +219,38 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
                 if row is None:
                     raise RuntimeError(f"未找到客户“{author}”的抖音会话，可能不在当前列表")
 
-                box = cdp.send("DOM.getBoxModel", {
-                    "backendNodeId": row["backend_node_id"],
-                })["model"]["content"]
-                page.mouse.click(sum(box[0::2]) / 4, sum(box[1::2]) / 4)
-                page.wait_for_timeout(1800)
-                editor = page.locator(".chat-input-nSWBco").first
-                editor.wait_for(state="visible", timeout=12000)
+                # 关键修复：抖音私信列表是虚拟滚动，目标会话很可能在视口外。
+                # 直接按 DOM 坐标点击会落到可视区之外（点了个寂寞），随后等输入框
+                # 12 秒超时 —— 这就是"发送失败"的真实原因。
+                # 必须先 scrollIntoViewIfNeeded，再重新取坐标点击。
+                editor = None
+                for attempt in range(2):
+                    try:
+                        cdp.send("DOM.scrollIntoViewIfNeeded", {
+                            "backendNodeId": row["backend_node_id"],
+                        })
+                        page.wait_for_timeout(500)
+                        box = cdp.send("DOM.getBoxModel", {
+                            "backendNodeId": row["backend_node_id"],
+                        })["model"]["content"]
+                        page.mouse.click(sum(box[0::2]) / 4, sum(box[1::2]) / 4)
+                    except Exception as exc:
+                        logger.warning("点击抖音会话失败（第 {} 次）: {}", attempt + 1, exc)
+                    page.wait_for_timeout(1800)
+                    candidate = page.locator(".chat-input-nSWBco").first
+                    if candidate.count():
+                        try:
+                            candidate.wait_for(state="visible", timeout=6000)
+                            editor = candidate
+                            break
+                        except Exception:
+                            pass
+                    logger.info("抖音会话未打开，重试点击（第 {} 次）: {}", attempt + 1, author)
+                if editor is None:
+                    raise RuntimeError(
+                        f"打开客户“{author}”的抖音会话超时（已重试一次），"
+                        "可能是列表定位不准或页面改版"
+                    )
                 editor.click()
                 page.keyboard.press("Control+A")
                 page.keyboard.press("Backspace")
@@ -222,6 +260,14 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
                 send_button.wait_for(state="visible", timeout=6000)
                 if send_button.is_disabled():
                     raise RuntimeError("抖音发送按钮不可用，账号可能被限制私信")
+                if dry_run:
+                    # 链路验证：输入框可用、按钮可点，但不清空也不发送
+                    return {
+                        "dry_run": True,
+                        "editor_found": True,
+                        "button_enabled": True,
+                        "transport": "douyin-web",
+                    }
                 send_button.click()
                 page.wait_for_timeout(2500)
 
@@ -239,10 +285,7 @@ def send_douyin(account_name: str, author: str, text: str) -> dict:
                     "transport": "douyin-web",
                 }
             finally:
-                try:
-                    context.close()
-                finally:
-                    browser.close()
+                context.close()
 
 
 def send_xiaohongshu(account_name: str, external_user_id: str, text: str) -> dict:
@@ -265,6 +308,27 @@ def send_xiaohongshu(account_name: str, external_user_id: str, text: str) -> dic
         client.close()
 
 
+def send_xiaohongshu_media(account_name: str, external_user_id: str,
+                           file_path: str | Path) -> dict:
+    """Send one image or video through the Xiaohongshu web session."""
+    external_user_id = str(external_user_id or "").strip()
+    if not external_user_id:
+        raise ValueError("缺少小红书会话 ID，无法发送媒体")
+    path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("要发送的小红书媒体文件不存在")
+    account = _account_by_type(1, account_name)
+    if not account:
+        raise RuntimeError("未找到可用的小红书登录账号，请先在账号管理中登录")
+    from xiaohongshu_dm import XhsClient
+
+    client = XhsClient(account)
+    try:
+        return client.send_media(external_user_id, path)
+    finally:
+        client.close()
+
+
 def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
     """Reply to one WeChat Channels private-message session."""
     text = str(text or "").strip()
@@ -281,5 +345,26 @@ def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
     client = ChannelsClient(account)
     try:
         return client.send_text(external_user_id, text)
+    finally:
+        client.close()
+
+
+def send_channels_media(account_name: str, external_user_id: str,
+                        file_path: str | Path) -> dict:
+    """Send one image or attachment through the Channels web session."""
+    external_user_id = str(external_user_id or "").strip()
+    if not external_user_id:
+        raise ValueError("缺少视频号会话 ID，无法发送媒体")
+    path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("要发送的媒体文件不存在")
+    account = _account_by_type(2, account_name)
+    if not account:
+        raise RuntimeError("未找到可用的视频号登录账号，请先扫码登录")
+    from channels_dm import ChannelsClient
+
+    client = ChannelsClient(account)
+    try:
+        return client.send_media(external_user_id, path)
     finally:
         client.close()
