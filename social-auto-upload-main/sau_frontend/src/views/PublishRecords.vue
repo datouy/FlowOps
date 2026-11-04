@@ -206,7 +206,51 @@
       <el-table-column prop="error" label="失败原因" min-width="160" show-overflow-tooltip />
     </el-table>
 
-    <el-table v-if="view === 'jobs'" :data="jobs" border stripe size="small">
+    <el-table v-if="view === 'jobs'" :data="jobs" row-key="id" border stripe size="small" @expand-change="onExpandJob">
+      <el-table-column type="expand">
+        <template #default="s">
+          <div class="job-items">
+            <div v-if="itemsLoading[s.row.id]" class="job-items-hint">正在加载子任务…</div>
+            <template v-else>
+              <div v-if="jobProgress[s.row.id]" class="job-items-hint">
+                进度 {{ jobProgress[s.row.id].percent }}% ·
+                成功 {{ jobProgress[s.row.id].success }} / 失败 {{ jobProgress[s.row.id].failed }} / 跳过 {{ jobProgress[s.row.id].skipped }}
+              </div>
+              <el-table v-if="(jobItems[s.row.id] || []).length" :data="jobItems[s.row.id]" size="small" border>
+                <el-table-column prop="file" label="素材" min-width="150" show-overflow-tooltip />
+                <el-table-column prop="account_name" label="账号" width="120" show-overflow-tooltip />
+                <el-table-column label="状态" width="88">
+                  <template #default="it">
+                    <el-tag size="small" :type="itemTagType(it.row.status)">{{ itemStatusText(it.row.status) }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="attempts" label="尝试" width="60" />
+                <el-table-column prop="remote_status" label="平台状态" width="96">
+                  <template #default="it">{{ postStateText(it.row.remote_status) }}</template>
+                </el-table-column>
+                <el-table-column prop="remote_id" label="作品 ID" width="150" show-overflow-tooltip />
+                <el-table-column label="作品操作" width="176" fixed="right">
+                  <template #default="it">
+                    <template v-if="it.row.remote_id && it.row.status === 'success' && s.row.type === 2">
+                      <el-tag v-if="it.row.remote_delete_status === 'success'" size="small" type="info">已删除</el-tag>
+                      <template v-else>
+                        <el-button size="small" type="danger" plain @click="deleteRemotePost(s.row, it.row)">删除平台作品</el-button>
+                        <el-button size="small" type="primary" plain @click="openReplacement(s.row, it.row)">更正并替换</el-button>
+                      </template>
+                      <div v-if="it.row.remote_delete_status === 'failed'" class="delete-error">
+                        {{ it.row.remote_delete_error || '上次删除失败' }}
+                      </div>
+                    </template>
+                    <span v-else class="muted-action">—</span>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="error" label="原因" min-width="220" show-overflow-tooltip />
+              </el-table>
+              <div v-else class="job-items-hint">暂无子任务（旧任务未展开，或任务还在排队）</div>
+            </template>
+          </div>
+        </template>
+      </el-table-column>
       <el-table-column prop="id" label="#" width="58" />
       <el-table-column prop="created_at" label="入队时间" width="152" />
       <el-table-column label="平台" width="84">
@@ -215,13 +259,25 @@
       <el-table-column prop="title" label="标题" min-width="170" show-overflow-tooltip />
       <el-table-column label="状态" width="92">
         <template #default="s">
-          <el-tag size="small" :type="s.row.status==='success'?'success':(s.row.status==='running'?'warning':(s.row.status==='pending'?'info':'danger'))">
+          <el-tag size="small" :type="jobTagType(s.row.status)">
             {{ jobStatusText(s.row) }}
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column prop="retry_count" label="重试" width="58" />
-      <el-table-column prop="result" label="结果/原因" min-width="200" show-overflow-tooltip />
+      <el-table-column prop="result" label="结果/原因" min-width="190" show-overflow-tooltip />
+      <el-table-column label="操作" width="130">
+        <template #default="s">
+          <el-button
+            v-if="['pending','running','pending_review'].includes(s.row.status)"
+            size="small" type="warning" @click="cancelJob(s.row)"
+          >取消</el-button>
+          <el-button
+            v-else-if="['failed','partial_success'].includes(s.row.status)"
+            size="small" type="primary" @click="retryFailedJob(s.row)"
+          >重试失败项</el-button>
+        </template>
+      </el-table-column>
       <el-table-column prop="finished_at" label="完成时间" width="152" />
     </el-table>
 
@@ -257,12 +313,38 @@
         <el-button type="primary" :disabled="!linkRecordId" @click="linkContent">确认关联</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="replaceDialog" title="更正并替换视频号作品" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="warning" :closable="false" show-icon
+        title="新作品发布并回查成功后，系统才会删除旧作品；新作品失败时旧作品保持不变。"
+        style="margin-bottom:14px"
+      />
+      <el-form label-width="76px">
+        <el-form-item label="原作品">
+          <span class="replace-source">{{ replaceItem?.remote_id }}</span>
+        </el-form-item>
+        <el-form-item label="标题" required>
+          <el-input v-model="replaceForm.title" maxlength="30" show-word-limit />
+        </el-form-item>
+        <el-form-item label="话题">
+          <el-input v-model="replaceForm.tags" placeholder="多个话题用逗号分隔，最多 8 个" />
+        </el-form-item>
+        <el-form-item label="正文">
+          <el-input v-model="replaceForm.desc" type="textarea" :rows="5" maxlength="1000" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="replaceDialog = false">取消</el-button>
+        <el-button type="primary" :loading="replaceSubmitting" @click="submitReplacement">加入替换队列</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { http } from '@/utils/request'
 import { useAccountStore } from '@/stores/account'
 
@@ -274,6 +356,11 @@ const unmatched = ref([])
 const linkDialog = ref(false)
 const linkStats = ref(null)
 const linkRecordId = ref(null)
+const replaceDialog = ref(false)
+const replaceItem = ref(null)
+const replaceSourceJob = ref(null)
+const replaceSubmitting = ref(false)
+const replaceForm = ref({ title: '', tags: '', desc: '' })
 const notify = ref({ configured: false, type: 'auto' })
 const accountStatus = ref([])
 const patrolling = ref(false)
@@ -324,7 +411,172 @@ function jobStatusText(row) {
   if (row.status === 'pending') return '排队中'
   if (row.status === 'running') return '发布中'
   if (row.status === 'success') return '成功'
+  if (row.status === 'partial_success') return '部分成功'
+  if (row.status === 'cancelled') return '已取消'
+  if (row.status === 'rejected') return '已驳回'
   return '失败'
+}
+
+function jobTagType(status) {
+  if (status === 'success') return 'success'
+  if (status === 'partial_success') return 'warning'
+  if (status === 'running' || status === 'pending') return 'warning'
+  if (status === 'cancelled' || status === 'rejected') return 'info'
+  return 'danger'
+}
+
+// ---- 子任务（账号级）明细 ----
+const jobItems = ref({})
+const jobProgress = ref({})
+const itemsLoading = ref({})
+
+function itemStatusText(status) {
+  const map = {
+    pending: '待发布', running: '发布中', success: '成功',
+    failed: '失败', skipped: '已跳过', cancelled: '已取消',
+  }
+  return map[status] || status
+}
+
+function postStateText(state) {
+  const map = {
+    draft: '草稿', scheduled: '已预约', uploading: '上传中', transcoding: '转码中',
+    review: '审核中', published: '已发表', failed: '审核失败', removed: '已下架',
+    unknown: '状态未知', submitted: '已提交，待回查'
+  }
+  return map[state] || state || '—'
+}
+
+function itemTagType(status) {
+  const map = { success: 'success', failed: 'danger', running: 'warning', skipped: 'info', cancelled: 'info' }
+  return map[status] || 'info'
+}
+
+async function onExpandJob(row, expandedRows) {
+  if (!Array.isArray(expandedRows) || !expandedRows.includes(row)) return
+  if (jobItems.value[row.id]) return
+  itemsLoading.value = { ...itemsLoading.value, [row.id]: true }
+  try {
+    const res = await http.get(`/publish/jobs/${row.id}/items`)
+    jobItems.value = { ...jobItems.value, [row.id]: res.data.items || [] }
+    jobProgress.value = { ...jobProgress.value, [row.id]: res.data.progress || null }
+  } catch (error) {
+    console.error('加载子任务失败:', error)
+  } finally {
+    itemsLoading.value = { ...itemsLoading.value, [row.id]: false }
+  }
+}
+
+async function refreshJob(jobId) {
+  const next = { ...jobItems.value }
+  delete next[jobId]
+  jobItems.value = next
+  await loadAll()
+}
+
+async function cancelJob(row) {
+  try {
+    await http.post(`/publish/jobs/${row.id}/cancel`)
+    ElMessage.success(`任务 #${row.id} 已取消（未开始的子任务不再发布）`)
+    await refreshJob(row.id)
+  } catch (error) {
+    console.error('取消任务失败:', error)
+  }
+}
+
+async function retryFailedJob(row) {
+  try {
+    const res = await http.post(`/publish/jobs/${row.id}/retry-failed`)
+    ElMessage.success(res.msg || '已重新排队失败的子任务')
+    await refreshJob(row.id)
+  } catch (error) {
+    console.error('重试失败子任务失败:', error)
+  }
+}
+
+async function deleteRemotePost(job, item) {
+  try {
+    await ElMessageBox.confirm(
+      `将永久删除视频号作品 ${item.remote_id}。\n账号：${item.account_name || '未知'}；任务：#${job.id}。\n删除后无法在平台恢复。`,
+      '确认删除平台作品',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        distinguishCancelAndClose: true,
+      },
+    )
+  } catch (action) {
+    if (action === 'cancel' || action === 'close') return
+    return
+  }
+  try {
+    const res = await http.delete(
+      `/publish/jobs/${job.id}/items/${item.id}/remote-post`,
+      null,
+      { data: { remoteId: item.remote_id } },
+    )
+    ElMessage.success(res.msg || '平台作品已删除')
+    await loadAll()
+    const detail = await http.get(`/publish/jobs/${job.id}/items`)
+    jobItems.value = { ...jobItems.value, [job.id]: detail.data.items || [] }
+    jobProgress.value = { ...jobProgress.value, [job.id]: detail.data.progress || null }
+  } catch (error) {
+    ElMessage.error(error.message || '删除平台作品失败')
+  }
+}
+
+function parseStoredJson(value, fallback) {
+  try {
+    return JSON.parse(value)
+  } catch (_error) {
+    return fallback
+  }
+}
+
+function openReplacement(job, item) {
+  const extra = parseStoredJson(job.extra || '{}', {})
+  const tags = parseStoredJson(job.tags || '[]', [])
+  replaceSourceJob.value = job
+  replaceItem.value = item
+  replaceForm.value = {
+    title: job.title || '',
+    tags: Array.isArray(tags) ? tags.join(', ') : String(tags || ''),
+    desc: extra.desc || '',
+  }
+  replaceDialog.value = true
+}
+
+async function submitReplacement() {
+  if (!replaceSourceJob.value || !replaceItem.value || replaceSubmitting.value) return
+  const title = replaceForm.value.title.trim()
+  const tags = replaceForm.value.tags
+    .replace(/，/g, ',')
+    .split(',')
+    .map(item => item.trim().replace(/^#/, ''))
+    .filter(Boolean)
+  if (!title) {
+    ElMessage.warning('更正后的标题不能为空')
+    return
+  }
+  if (tags.length > 8) {
+    ElMessage.warning('视频号话题最多 8 个')
+    return
+  }
+  replaceSubmitting.value = true
+  try {
+    const res = await http.post(
+      `/publish/jobs/${replaceSourceJob.value.id}/items/${replaceItem.value.id}/replacement`,
+      { title, tags, desc: replaceForm.value.desc },
+    )
+    ElMessage.success(res.msg || '替换任务已排队')
+    replaceDialog.value = false
+    await loadAll()
+  } catch (error) {
+    ElMessage.error(error.message || '创建替换任务失败')
+  } finally {
+    replaceSubmitting.value = false
+  }
 }
 
 async function loadAll() {
@@ -434,6 +686,11 @@ onUnmounted(() => clearInterval(timer))
 .strong-num { color: #f56c6c; font-weight: 600; }
 .topic-tag { margin-right: 4px; }
 .expand-stats { padding: 10px 28px 14px; }
+.job-items { padding: 6px 14px 10px; }
+.job-items-hint { font-size: 12px; color: #909399; margin-bottom: 6px; }
+.delete-error { color: #f56c6c; font-size: 11px; line-height: 1.4; margin-top: 4px; }
+.muted-action { color: #c0c4cc; }
+.replace-source { color: #606266; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 @media (max-width: 900px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
 }

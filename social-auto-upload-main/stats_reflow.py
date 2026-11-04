@@ -18,6 +18,7 @@ from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
+from utils.account_browser import open_persistent_account_context
 from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
@@ -476,11 +477,14 @@ async def _fetch_douyin(account: dict | None, platform: int) -> list[dict]:
     if not cookie:
         return []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=LOCAL_CHROME_HEADLESS, channel='chromium',
+        context = await open_persistent_account_context(
+            p,
+            cookie,
+            account_id=(account or {}).get('id'),
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
         )
-        context = await browser.new_context(storage_state=str(cookie))
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -549,7 +553,6 @@ async def _fetch_douyin(account: dict | None, platform: int) -> list[dict]:
             return []
         finally:
             await context.close()
-            await browser.close()
 
 
 async def _fetch_xhs(account: dict | None, platform: int) -> list[dict]:
@@ -558,8 +561,13 @@ async def _fetch_xhs(account: dict | None, platform: int) -> list[dict]:
     if not cookie:
         return []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=LOCAL_CHROME_HEADLESS, channel='chromium')
-        context = await browser.new_context(storage_state=str(cookie))
+        context = await open_persistent_account_context(
+            p,
+            cookie,
+            account_id=(account or {}).get('id'),
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
+        )
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -569,7 +577,6 @@ async def _fetch_xhs(account: dict | None, platform: int) -> list[dict]:
             return []
         finally:
             await context.close()
-            await browser.close()
 
 
 async def _fetch_tencent(account: dict | None, platform: int) -> list[dict]:
@@ -578,8 +585,13 @@ async def _fetch_tencent(account: dict | None, platform: int) -> list[dict]:
     if not cookie:
         return []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=LOCAL_CHROME_HEADLESS, channel='chromium')
-        context = await browser.new_context(storage_state=str(cookie))
+        context = await open_persistent_account_context(
+            p,
+            cookie,
+            account_id=(account or {}).get('id'),
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
+        )
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -589,7 +601,6 @@ async def _fetch_tencent(account: dict | None, platform: int) -> list[dict]:
             return []
         finally:
             await context.close()
-            await browser.close()
 
 
 async def _fetch_kuaishou(account: dict | None, platform: int) -> list[dict]:
@@ -598,8 +609,13 @@ async def _fetch_kuaishou(account: dict | None, platform: int) -> list[dict]:
     if not cookie:
         return []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=LOCAL_CHROME_HEADLESS, channel='chromium')
-        context = await browser.new_context(storage_state=str(cookie))
+        context = await open_persistent_account_context(
+            p,
+            cookie,
+            account_id=(account or {}).get('id'),
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
+        )
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -609,7 +625,6 @@ async def _fetch_kuaishou(account: dict | None, platform: int) -> list[dict]:
             return []
         finally:
             await context.close()
-            await browser.close()
 
 
 FETCHERS = {1: _fetch_xhs, 2: _fetch_tencent, 3: _fetch_douyin, 4: _fetch_kuaishou}

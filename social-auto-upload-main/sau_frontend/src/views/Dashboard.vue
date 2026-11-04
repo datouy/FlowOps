@@ -166,7 +166,6 @@ import {
   User, UserFilled, Platform, Document,
   Upload, Timer, DataAnalysis
 } from '@element-plus/icons-vue'
-import { accountApi } from '@/api/account'
 import { materialApi } from '@/api/material'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -247,13 +246,11 @@ const fetchDashboardData = async () => {
   try {
     // 并行获取账号和素材数据
     const [accountRes, materialRes] = await Promise.allSettled([
-      accountApi.getAccounts(),
+      accountStore.loadAccounts(true),
       materialApi.getAllMaterials()
     ])
 
-    if (accountRes.status === 'fulfilled' && accountRes.value.code === 200) {
-      accountStore.setAccounts(accountRes.value.data)
-    }
+    if (accountRes.status === 'rejected') console.error('获取账号数据失败:', accountRes.reason)
     if (materialRes.status === 'fulfilled' && materialRes.value.code === 200) {
       appStore.setMaterials(materialRes.value.data)
     }

@@ -16,15 +16,131 @@ from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
+from utils.account_fingerprint import (
+    context_options as fingerprint_context_options,
+    fingerprint_for_storage,
+    legacy_linux_fingerprint,
+)
 from utils.base_social_media import set_init_script
+from utils.account_browser import open_persistent_account_context
+from utils.account_environment import (
+    account_id_for_cookie,
+)
 from utils.log import tencent_logger
 
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
 TENCENT_HOME_URL = "https://channels.weixin.qq.com/platform"
 TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
+TENCENT_NOTE_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/finderNewLifeCreate"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
+TENCENT_POST_LIST_API = (
+    "https://channels.weixin.qq.com/micro/interaction/cgi-bin/"
+    "mmfinderassistant-bin/post/post_list"
+)
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _first_post_value(item: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def extract_tencent_posts(payload) -> list[dict]:
+    """Normalize post-list response records used for publish verification."""
+    posts = []
+    seen = set()
+    for item in _walk_dicts(payload):
+        post_id = _first_post_value(
+            item, ("objectId", "postId", "feedId", "exportId", "finderPostId", "id"),
+        )
+        title = _first_post_value(
+            item, (
+                "title", "postTitle", "objectTitle", "desc", "description",
+                "objectDesc", "content", "feedDesc",
+            ),
+        )
+        if not post_id or not title:
+            continue
+        marker = (post_id, title[:160])
+        if marker in seen:
+            continue
+        seen.add(marker)
+        posts.append({
+            "post_id": post_id,
+            "title": title,
+            "raw_status": _first_post_value(
+                item,
+                ("auditStatus", "postStatus", "displayStatus", "status", "state", "visibleStatus"),
+            ),
+            "publish_time": _first_post_value(
+                item, ("publishTime", "createTime", "createdAt", "postTime", "timestamp"),
+            ),
+        })
+    return posts
+
+
+def tencent_post_state(raw_status: str) -> str:
+    """Translate the platform list status into a stable publish state."""
+    value = str(raw_status or "").strip().lower()
+    if not value:
+        return "unknown"
+    if any(marker in value for marker in (
+        "removed", "withdrawn", "deleted", "offline", "下架", "撤回", "删除", "不可见",
+    )):
+        return "removed"
+    if any(marker in value for marker in (
+        "failed", "reject", "notpass", "notfound", "not_found", "violation",
+        "失败", "驳回", "未通过", "找不到",
+    )):
+        return "failed"
+    if any(marker in value for marker in ("draft", "草稿")):
+        return "draft"
+    if any(marker in value for marker in ("scheduled", "schedule", "预约", "定时待发")):
+        return "scheduled"
+    if any(marker in value for marker in ("transcod", "processing", "转码")):
+        return "transcoding"
+    if any(marker in value for marker in ("upload", "pend", "wait", "上传中", "等待")):
+        return "uploading"
+    if any(marker in value for marker in ("review", "audit", "check", "审核", "复核")):
+        return "review"
+    if any(marker in value for marker in ("success", "publish", "online", "normal", "visible", "已发表", "发布成功", "正常", "公开")):
+        return "published"
+    return "unknown"
+
+
+def match_tencent_post(payloads: list, title: str) -> dict | None:
+    wanted = " ".join(str(title or "").replace("#", " ").split()).lower()
+    if not wanted:
+        return None
+    candidates = []
+    for payload in payloads:
+        candidates.extend(extract_tencent_posts(payload))
+    exact = []
+    partial = []
+    for item in candidates:
+        normalized = " ".join(str(item.get("title") or "").replace("#", " ").split()).lower()
+        if normalized == wanted:
+            exact.append(item)
+        elif wanted in normalized or normalized in wanted:
+            partial.append(item)
+    selected = (exact or partial or [None])[0]
+    if not selected:
+        return None
+    return {**selected, "state": tencent_post_state(selected.get("raw_status") or "")}
 
 # 视频号的 Cookie 目录必须在任何写文件动作之前建好。
 # 原先这段在 uploader/tencent_uploader/__init__.py 里（import 子模块之前执行），
@@ -46,6 +162,39 @@ def _resolve_account_file(account_file: str | Path) -> str:
         return str((Path(BASE_DIR) / "cookies" / "tencent_uploader" / path).resolve())
 
     return str(path.resolve())
+
+
+def _fingerprint_for_account(account_file: str | Path) -> dict:
+    fingerprint = fingerprint_for_storage(account_file)
+    if fingerprint is None:
+        fingerprint = legacy_linux_fingerprint("131")
+    return fingerprint
+
+
+def _storage_context_kwargs(account_file: str | Path, fingerprint: dict) -> dict:
+    """Replay a Tencent account with the same device profile used to log in."""
+    return {
+        "storage_state": account_file,
+        **fingerprint_context_options(fingerprint),
+    }
+
+
+async def _open_account_context(playwright: Playwright, account_file: str | Path,
+                                fingerprint: dict, headless: bool):
+    """Open the account's persistent Chromium profile and optional proxy."""
+    resolved = _resolve_account_file(account_file)
+    account_id = account_id_for_cookie(resolved)
+    options = _build_launch_kwargs(headless=headless)
+    context = await open_persistent_account_context(
+        playwright,
+        resolved,
+        account_id=account_id,
+        fingerprint=fingerprint,
+        headless=headless,
+        channel=str(options.get("channel") or "chromium"),
+        executable_path=str(options.get("executable_path") or ""),
+    )
+    return await set_init_script(context)
 
 
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
@@ -124,10 +273,12 @@ def format_str_for_short_title(origin_title: str) -> str:
 async def cookie_auth(account_file):
     account_file = _resolve_account_file(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
+        context = None
         try:
-            context = await browser.new_context(storage_state=account_file)
-            context = await set_init_script(context)
+            fingerprint = _fingerprint_for_account(account_file)
+            context = await _open_account_context(
+                playwright, account_file, fingerprint, True,
+            )
             page = await context.new_page()
             await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
 
@@ -152,7 +303,8 @@ async def cookie_auth(account_file):
             tencent_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            if context is not None:
+                await context.close()
 
 
 async def _extract_tencent_qrcode_src(page: Page) -> str:
@@ -400,12 +552,17 @@ async def tencent_cookie_gen(
 ):
     account_file = _resolve_account_file(account_file)
     Path(account_file).parent.mkdir(parents=True, exist_ok=True)
+    qrcode_path = None
+    qrcode_info = None
+    result = _build_login_result(False, "failed", "视频号登录失败", account_file)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
-        context = await browser.new_context()
-        qrcode_path = None
-        result = _build_login_result(False, "failed", "视频号登录失败", account_file)
+        context = await _open_account_context(
+            playwright,
+            account_file,
+            _fingerprint_for_account(account_file),
+            headless,
+        )
         try:
             page = await context.new_page()
             await page.goto(TENCENT_LOGIN_URL)
@@ -430,16 +587,6 @@ async def tencent_cookie_gen(
             if result["success"]:
                 await asyncio.sleep(2)
                 await context.storage_state(path=account_file)
-                if not await cookie_auth(account_file):
-                    result = _build_login_result(
-                        False,
-                        "cookie_invalid",
-                        "视频号扫码流程结束，但 cookie 校验失败",
-                        account_file,
-                        qrcode_info,
-                        page.url,
-                    )
-            return result
         except Exception as exc:
             result = _build_login_result(
                 False,
@@ -448,7 +595,6 @@ async def tencent_cookie_gen(
                 account_file,
                 current_url=page.url if "page" in locals() else "",
             )
-            return result
         finally:
             qrcode_utils = _get_qrcode_utils()
             if qrcode_utils["remove_qrcode_file"](qrcode_path):
@@ -456,7 +602,16 @@ async def tencent_cookie_gen(
             if not result["success"]:
                 tencent_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
+    if result["success"] and not await cookie_auth(account_file):
+        result = _build_login_result(
+            False,
+            "cookie_invalid",
+            "视频号扫码流程结束，但 cookie 校验失败",
+            account_file,
+            qrcode_info,
+            result.get("current_url", ""),
+        )
+    return result
 
 
 async def tencent_setup(
@@ -910,8 +1065,89 @@ class TencentBaseUploader(BaseVideoUploader):
         detail = "；".join(errors[:3])
         raise RuntimeError(headline + (f"：{detail}" if detail else ""))
 
-    async def submit_publish(self, page: Page) -> None:
+    async def _verify_published_post(self, page: Page, title: str,
+                                     captured_responses: list) -> dict:
+        """Verify an immediate post through the authenticated post-list API."""
+        payloads = []
+
+        async def collect():
+            for response in captured_responses:
+                try:
+                    payloads.append(await response.json())
+                except Exception:
+                    continue
+
+        try:
+            await page.goto(TENCENT_MANAGE_URL, timeout=120000, wait_until="domcontentloaded")
+        except Exception as exc:
+            tencent_logger.warning(_msg("⚠️", f"打开视频号作品列表失败，将继续直接回查：{exc}"))
+        await asyncio.sleep(6)
+        await collect()
+        matched = match_tencent_post(payloads, title)
+        if matched:
+            return {
+                "verified": True,
+                "state": matched["state"],
+                "post_id": matched["post_id"],
+                "remote_status": matched["raw_status"],
+                "publish_time": matched["publish_time"],
+                "verification": "post-list-network",
+            }
+
+        # The official list page usually emits the API response itself. If the
+        # micro-frontend changed its polling shape, repeat the same authenticated
+        # call from the page context while retaining its cookies and headers.
+        for _ in range(3):
+            try:
+                payload = await page.evaluate(
+                    """async ({url, title}) => {
+                        const response = await fetch(url, {
+                          method: 'POST', credentials: 'include',
+                          headers: {'Content-Type': 'application/json;charset=UTF-8'},
+                          body: JSON.stringify({offset: 0, pageSize: 30, query: title})
+                        });
+                        const text = await response.text();
+                        if (!response.ok) return {error: `HTTP ${response.status}`, text};
+                        try { return JSON.parse(text); } catch (_) { return {text}; }
+                    }""",
+                    {"url": TENCENT_POST_LIST_API, "title": str(title)},
+                )
+            except Exception:
+                payload = None
+            if payload:
+                payloads.append(payload)
+                matched = match_tencent_post(payloads, title)
+                if matched:
+                    return {
+                        "verified": True,
+                        "state": matched["state"],
+                        "post_id": matched["post_id"],
+                        "remote_status": matched["raw_status"],
+                        "publish_time": matched["publish_time"],
+                        "verification": "post-list-api",
+                    }
+            await asyncio.sleep(3)
+        raise RuntimeError(
+            "视频号表单已提交，但作品列表回查不到该内容，未标记发布成功；请到作品管理核验"
+        )
+
+    async def submit_publish(self, page: Page) -> dict:
         is_draft = getattr(self, "is_draft", False)
+        is_scheduled = (
+            not is_draft
+            and self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED
+            and self.publish_date != 0
+        )
+        captured_responses = []
+
+        def capture_post_list(response):
+            try:
+                if "/post/post_list" in response.url:
+                    captured_responses.append(response)
+            except Exception:
+                pass
+
+        page.on("response", capture_post_list)
         publish_btn = None
         for _ in range(30):
             await self._dismiss_switch_account_dialog(page)
@@ -942,36 +1178,57 @@ class TencentBaseUploader(BaseVideoUploader):
             await publish_btn.evaluate("el => el.click()")
         tencent_logger.info(_msg("🏃", "已点击发表，等待视频号确认..."))
 
+        confirmed = False
         deadline = time.monotonic() + (30 if is_draft else 60)
         while time.monotonic() < deadline:
             await asyncio.sleep(1)
             current_url = page.url
             if is_draft and ("post/list" in current_url or "draft" in current_url):
                 tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
-                return
+                return {"verified": True, "state": "draft", "post_id": "",
+                        "remote_status": "draft", "verification": "page-url"}
             if not is_draft and "/post/create" not in current_url:
-                tencent_logger.success(_msg("🥳", "视频发布成功"))
-                return
+                confirmed = True
+                break
             try:
                 if not await publish_btn.is_visible():
-                    tencent_logger.success(_msg("🥳", "视频发布成功（按钮已消失）"))
-                    return
+                    confirmed = True
+                    break
             except Exception:
-                tencent_logger.success(_msg("🥳", "视频发布成功（表单已关闭）"))
-                return
+                confirmed = True
+                break
             for marker in ("发表成功", "发布成功", "已发表"):
                 locator = page.get_by_text(marker)
                 for index in range(min(await locator.count(), 5)):
                     try:
                         if await locator.nth(index).is_visible():
-                            tencent_logger.success(_msg("🥳", "视频发布成功"))
-                            return
+                            confirmed = True
+                            break
                     except Exception:
                         continue
+                if confirmed:
+                    break
             if await self._visible_publish_errors(page):
                 await self._raise_publish_failure(page, "视频号发表失败")
+            if confirmed:
+                break
 
-        await self._raise_publish_failure(page, "视频号发表超时，请检查表单提示")
+        if not confirmed:
+            await self._raise_publish_failure(page, "视频号发表超时，请检查表单提示")
+        if is_scheduled:
+            tencent_logger.success(_msg("🥳", f"视频号图文/视频已预约发布：{self.publish_date}"))
+            return {
+                "verified": True, "state": "scheduled", "post_id": "",
+                "remote_status": "scheduled", "publish_time": str(self.publish_date),
+                "verification": "page-confirmation",
+            }
+        result = await self._verify_published_post(page, self.title, captured_responses)
+        if result["state"] in {"failed", "removed"}:
+            raise RuntimeError(
+                f"视频号作品状态为 {result['state']}（{result.get('remote_status') or '平台未返回原因'}）"
+            )
+        tencent_logger.success(_msg("🥳", f"作品已回查：{result['state']}，ID {result['post_id']}"))
+        return result
 
 
 class TencentVideo(TencentBaseUploader):
@@ -1145,8 +1402,10 @@ class TencentVideo(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        fingerprint = _fingerprint_for_account(self.account_file)
+        context = await _open_account_context(
+            playwright, self.account_file, fingerprint, self.headless,
+        )
 
         try:
             page = await context.new_page()
@@ -1165,20 +1424,20 @@ class TencentVideo(TencentBaseUploader):
                 await self.set_schedule_time_tencent(page, self.publish_date)
 
             await self.set_short_title(page, self.title, self.short_title)
-            await self.submit_publish(page)
+            self.publish_result = await self.submit_publish(page)
 
             await context.storage_state(path=self.account_file)
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
+            return self.publish_result
         finally:
             await context.close()
-            await browser.close()
 
     async def tencent_upload_video(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)
 
     async def main(self):
-        await self.tencent_upload_video()
+        return await self.tencent_upload_video()
 
 
 class TencentNote(TencentBaseUploader):
@@ -1224,16 +1483,121 @@ class TencentNote(TencentBaseUploader):
         self.image_paths = normalized_image_paths
 
     async def switch_to_note_mode(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.switch_to_note_mode 中补充视频号切换到图文发布模式的逻辑")
+        if "finderNewLifeCreate" in page.url:
+            return
+        candidates = ("发表图文", "图文动态", "图文")
+        for scope in page.frames:
+            for label in candidates:
+                locator = scope.get_by_text(label, exact=True)
+                for index in range(min(await locator.count(), 6)):
+                    item = locator.nth(index)
+                    try:
+                        if not await item.is_visible():
+                            continue
+                        await item.click(timeout=5000)
+                        await page.wait_for_timeout(2500)
+                        if "finderNewLifeCreate" in page.url or any(
+                                "finderNewLifeCreate" in frame.url for frame in page.frames):
+                            return
+                    except Exception:
+                        continue
+        try:
+            await page.goto(
+                TENCENT_NOTE_UPLOAD_URL, timeout=120000, wait_until="domcontentloaded",
+            )
+            await page.wait_for_timeout(2500)
+        except Exception as exc:
+            raise RuntimeError(f"无法打开视频号图文发布页：{str(exc)[:200]}") from exc
+        if "login" in page.url.lower():
+            raise RuntimeError("视频号 cookie 已失效，请重新扫码登录后再发布图文")
 
     async def upload_note_images(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.upload_note_images 中补充视频号图文图片上传逻辑")
+        file_input = None
+        for _ in range(45):
+            for frame in page.frames:
+                try:
+                    preferred = frame.locator('input[type="file"][accept*="image"]')
+                    candidate = preferred.first if await preferred.count() else frame.locator('input[type="file"]').first
+                    if await candidate.count():
+                        file_input = candidate
+                        break
+                except Exception:
+                    continue
+            if file_input is not None:
+                break
+            await asyncio.sleep(1)
+        if file_input is None:
+            raise RuntimeError("未找到视频号图文图片上传框，请检查页面是否改版")
+        try:
+            await file_input.set_input_files(self.image_paths)
+        except Exception:
+            # Some revisions expose one input per image instead of a multi-file
+            # picker. Attach the first file there and fail clearly if the page
+            # rejects additional images.
+            if len(self.image_paths) != 1:
+                raise RuntimeError("视频号当前图文上传框不支持多图，请更新页面适配")
+            await file_input.set_input_files(self.image_paths[0])
+        await page.wait_for_timeout(3000)
+        tencent_logger.info(_msg("🖼️", f"图文图片已提交上传：{len(self.image_paths)} 张"))
 
     async def fill_note_title_and_tags(self, page: Page) -> None:
-        raise NotImplementedError("请在 TencentNote.fill_note_title_and_tags 中补充视频号图文标题/话题填写逻辑")
+        selectors = (
+            'input[placeholder*="标题"]', 'textarea[placeholder*="标题"]',
+            'input[maxlength="30"]', 'input[maxlength="16"]',
+        )
+        field = None
+        for frame in page.frames:
+            for selector in selectors:
+                candidate = frame.locator(selector).first
+                try:
+                    if await candidate.count() and await candidate.is_visible():
+                        field = candidate
+                        break
+                except Exception:
+                    continue
+            if field is not None:
+                break
+        if field is None:
+            raise RuntimeError("未找到视频号图文标题输入框")
+        await field.fill(str(self.title)[:30])
+        tencent_logger.info(_msg("🏷️", f"图文标题已填写：{str(self.title)[:30]}"))
 
     async def fill_note_body(self, page: Page) -> None:
-        return None
+        editor = None
+        preferred = (
+            '[contenteditable="true"][data-placeholder*="描述"]',
+            '[contenteditable="true"][aria-label*="描述"]',
+            'textarea[placeholder*="描述"]', 'textarea[placeholder*="正文"]',
+            'div[contenteditable="true"]', 'textarea',
+        )
+        for frame in page.frames:
+            for selector in preferred:
+                candidate = frame.locator(selector).first
+                try:
+                    if await candidate.count() and await candidate.is_visible():
+                        editor = candidate
+                        break
+                except Exception:
+                    continue
+            if editor is not None:
+                break
+        if editor is None:
+            raise RuntimeError("未找到视频号图文正文编辑器")
+        body = str(self.note or "")
+        try:
+            await editor.fill(body)
+        except Exception:
+            await editor.click()
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(body)
+        if self.tags:
+            await editor.click()
+            await page.keyboard.press("Control+End")
+            for tag in self.tags:
+                await page.keyboard.insert_text(f"\n#{str(tag).lstrip('#')}")
+                await page.keyboard.press("Space")
+        tencent_logger.info(_msg("🏷️", f"图文正文和话题已填写：{len(body)} 字，{len(self.tags)} 个话题"))
 
     async def prepare_note_for_publish(self, page: Page) -> None:
         await self.fill_note_title_and_tags(page)
@@ -1251,9 +1615,10 @@ class TencentNote(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
-        context = await set_init_script(context)
+        fingerprint = _fingerprint_for_account(self.account_file)
+        context = await _open_account_context(
+            playwright, self.account_file, fingerprint, self.headless,
+        )
 
         try:
             page = await context.new_page()
@@ -1265,17 +1630,17 @@ class TencentNote(TencentBaseUploader):
             if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
                 await self.set_schedule_time_tencent(page, self.publish_date)
 
-            await self.submit_publish(page)
+            self.publish_result = await self.submit_publish(page)
 
             await context.storage_state(path=self.account_file)
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
+            return self.publish_result
         finally:
             await context.close()
-            await browser.close()
 
     async def tencent_upload_note(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)
 
     async def main(self):
-        await self.tencent_upload_note()
+        return await self.tencent_upload_note()

@@ -20,11 +20,12 @@ import re
 import time
 from pathlib import Path
 
-from playwright.async_api import Page, Playwright, TimeoutError as PWTimeoutError, async_playwright
+from patchright.async_api import Page, Playwright, TimeoutError as PWTimeoutError, async_playwright
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import weibo_logger
+from utils.account_browser import open_persistent_account_context
 from utils.login_qrcode import build_login_qrcode_path, remove_qrcode_file
 
 
@@ -165,8 +166,12 @@ async def weibo_cookie_gen(account_file, qrcode_callback=None, poll_interval: in
     result = _build_login_result(False, "failed", "微博登录失败", account_file)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
-        context = await browser.new_context()
+        context = await open_persistent_account_context(
+            playwright,
+            account_file,
+            headless=headless,
+            channel="chromium",
+        )
         try:
             page = await context.new_page()
             # 直接导航到 passport 扫码登录页，绕过首页的"登录"按钮（headless 下不可见）
@@ -215,7 +220,6 @@ async def weibo_cookie_gen(account_file, qrcode_callback=None, poll_interval: in
             if not result["success"]:
                 weibo_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
     return result
 
 
@@ -223,9 +227,11 @@ async def cookie_auth(account_file):
     """验证微博 cookie 是否有效。访问首页，检测是否出现登录提示。"""
     account_file = _resolve_account_file(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
+        context = None
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await open_persistent_account_context(
+                playwright, account_file, headless=True, channel="chromium",
+            )
             page = await context.new_page()
             await page.goto(WEIBO_HOME_URL, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
@@ -247,7 +253,8 @@ async def cookie_auth(account_file):
             weibo_logger.warning(_msg("😵", f"cookie 校验出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            if context is not None:
+                await context.close()
 
 
 async def weibo_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
@@ -320,10 +327,11 @@ class WeiBoVideo(BaseVideoUploader):
         await self.validate_upload_args()
         weibo_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(
-            storage_state=self.account_file,
-            viewport={"width": 1280, "height": 2000},  # 高视口，确保发布按钮等在可视区
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
         )
 
         try:
@@ -368,7 +376,6 @@ class WeiBoVideo(BaseVideoUploader):
             weibo_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()
-            await browser.close()
 
     async def _open_video_publish_page(self, page: Page) -> Page:
         """点击首页「视频」入口，等待 popup 视频发布页。"""

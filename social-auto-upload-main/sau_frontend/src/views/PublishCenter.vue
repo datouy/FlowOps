@@ -71,13 +71,13 @@
             />
           </div>
 
-          <!-- 视频上传区域 -->
+          <!-- 素材上传区域 -->
           <div class="upload-section">
-            <h3>视频</h3>
+            <h3>{{ tab.selectedPlatform === 2 && tab.contentType === 'image-text' ? '图文图片' : '视频' }}</h3>
             <div class="upload-options">
               <el-button type="primary" @click="showUploadOptions(tab)" class="upload-btn">
                 <el-icon><Upload /></el-icon>
-                上传视频
+                {{ tab.selectedPlatform === 2 && tab.contentType === 'image-text' ? '上传图片' : '上传视频' }}
               </el-button>
             </div>
             
@@ -128,16 +128,16 @@
               :on-success="(response, file) => handleUploadSuccess(response, file, currentUploadTab)"
               :on-error="handleUploadError"
               multiple
-              accept="video/*"
+              :accept="uploadAccept"
               :headers="uploadHeaders"
             >
               <el-icon class="el-icon--upload"><Upload /></el-icon>
               <div class="el-upload__text">
-                将视频文件拖到此处，或<em>点击上传</em>
+                将{{ currentUploadTab?.contentType === 'image-text' ? '图片' : '视频' }}文件拖到此处，或<em>点击上传</em>
               </div>
               <template #tip>
                 <div class="el-upload__tip">
-                  支持MP4、AVI等视频格式，可上传多个文件
+                  {{ currentUploadTab?.contentType === 'image-text' ? '视频号图文支持多张 JPG、PNG、WebP 图片' : '支持MP4、AVI等视频格式，可上传多个文件' }}
                 </div>
               </template>
             </el-upload>
@@ -320,6 +320,13 @@
                 {{ platform.name }}
               </el-radio>
             </el-radio-group>
+            <div v-if="tab.selectedPlatform === 2" class="content-type-section">
+              <span class="content-type-label">视频号内容类型</span>
+              <el-radio-group v-model="tab.contentType" size="small">
+                <el-radio-button value="video">视频</el-radio-button>
+                <el-radio-button value="image-text">图文</el-radio-button>
+              </el-radio-group>
+            </div>
           </div>
 
           <!-- 原创声明 -->
@@ -650,6 +657,9 @@ const uploadOptionsVisible = ref(false)
 const localUploadVisible = ref(false)
 const materialLibraryVisible = ref(false)
 const currentUploadTab = ref(null)
+const uploadAccept = computed(() => (
+  currentUploadTab.value?.contentType === 'image-text' ? 'image/*' : 'video/*'
+))
 const selectedMaterials = ref([])
 const materials = computed(() => appStore.materials)
 
@@ -685,6 +695,7 @@ const defaultTabInit = {
   displayFileList: [], // 用于显示的文件列表
   selectedAccounts: [], // 选中的账号ID列表
   selectedPlatform: 1, // 选中的平台（单选）
+  contentType: 'video', // 视频号支持 video / image-text
   title: '',
   desc: '', // 正文描述（与标题分开，避免 AI 长文案撑爆标题上限）
   productLink: '', // 商品链接
@@ -927,9 +938,10 @@ const confirmPublish = async (tab) => {
 
   // 数据验证
   if (tab.fileList.length === 0) {
-    ElMessage.error('请先上传视频文件')
+    const message = tab.contentType === 'image-text' ? '请先上传图文图片' : '请先上传视频文件'
+    ElMessage.error(message)
     tab.publishing = false
-    throw new Error('请先上传视频文件')
+    throw new Error(message)
   }
   if (!tab.title.trim()) {
     ElMessage.error('请输入标题')
@@ -966,6 +978,7 @@ const confirmPublish = async (tab) => {
     productLink: tab.productLink.trim() || '',
     productTitle: tab.productTitle.trim() || '',
     isDraft: tab.isDraft,
+    contentType: tab.selectedPlatform === 2 ? tab.contentType : 'video',
     reviewRequired: tab.reviewRequired
   }
 

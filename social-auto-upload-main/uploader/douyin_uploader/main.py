@@ -22,10 +22,14 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import douyin_logger
+from utils.account_browser import open_persistent_account_context
 import verify_codes
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+DOUYIN_MANAGE_URL = "https://creator.douyin.com/creator-micro/content/manage"
+DOUYIN_WORK_LIST_PATH = "/janus/douyin/creator/pc/work_list"
+DOUYIN_PUBLISH_RESPONSE_MARKERS = ("/aweme/create_v2/", "/aweme/create/")
 DOUYIN_AUTH_COOKIE_NAMES = {
     "sessionid",
     "sessionid_ss",
@@ -36,6 +40,132 @@ DOUYIN_AUTH_COOKIE_NAMES = {
     "uid_tt",
     "uid_tt_ss",
 }
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _first_post_value(item: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _normalized_title(value: object) -> str:
+    return " ".join(str(value or "").replace("#", " ").split()).lower()
+
+
+def extract_douyin_posts(payload) -> list[dict]:
+    """Normalize creator work-list records used for publish verification."""
+    posts = []
+    seen = set()
+    for item in _walk_dicts(payload):
+        post_id = _first_post_value(item, ("aweme_id", "awemeId", "item_id", "itemId"))
+        title = _first_post_value(item, ("desc", "caption", "item_title", "itemTitle", "title"))
+        if not post_id or not title:
+            continue
+        marker = (post_id, _normalized_title(title)[:160])
+        if marker in seen:
+            continue
+        seen.add(marker)
+        state = item.get("status") if isinstance(item.get("status"), dict) else {}
+        posts.append({
+            "post_id": post_id,
+            "title": title,
+            "raw_status": _first_post_value(
+                item,
+                ("status_msg", "audit_status", "auditStatus", "status_value", "status"),
+            ),
+            "publish_time": _first_post_value(item, ("create_time", "createTime")),
+            "deleted": bool(state.get("is_delete") or item.get("is_delete")),
+            "prohibited": bool(state.get("is_prohibited") or item.get("is_prohibited")),
+            "reviewing": bool(
+                state.get("in_reviewing") or item.get("in_reviewing")
+                or item.get("review_result") in (1, "1", "reviewing")
+            ),
+            "private": bool(
+                state.get("is_private") or state.get("private_status") in (1, "1")
+                or item.get("is_private")
+            ),
+            "status_value": _first_post_value(item, ("status_value",)),
+        })
+    return posts
+
+
+def douyin_post_state(candidate: dict) -> str:
+    value = str(candidate.get("raw_status") or "").strip().lower()
+    if candidate.get("deleted") or any(
+        marker in value for marker in ("deleted", "removed", "下架", "删除")
+    ):
+        return "removed"
+    if candidate.get("prohibited") or any(
+        marker in value for marker in ("failed", "reject", "violation", "失败", "驳回", "违规")
+    ):
+        return "failed"
+    if any(marker in value for marker in ("draft", "草稿")):
+        return "draft"
+    if any(marker in value for marker in ("scheduled", "schedule", "定时", "预约")):
+        return "scheduled"
+    if candidate.get("reviewing") or any(
+        marker in value for marker in ("review", "audit", "check", "审核", "复核")
+    ):
+        return "review"
+    if candidate.get("private") or str(candidate.get("status_value") or "") == "141":
+        return "private"
+    return "unknown"
+
+
+def match_douyin_post(payloads: list, title: str) -> dict | None:
+    wanted = _normalized_title(title)
+    if not wanted:
+        return None
+    for payload in payloads:
+        for candidate in extract_douyin_posts(payload):
+            candidate_title = _normalized_title(candidate.get("title"))
+            if candidate_title != wanted and wanted not in candidate_title:
+                continue
+            return {**candidate, "state": douyin_post_state(candidate)}
+    return None
+
+
+def published_video_from_submit(url: str, payload, title: str,
+                                scheduled: bool = False) -> dict | None:
+    """Extract an aweme id from the create request's successful response."""
+    if not any(marker in str(url) for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("status_code")
+    if code not in (None, 0, "0"):
+        return None
+    for item in _walk_dicts(payload):
+        post_id = _first_post_value(
+            item, ("aweme_id", "awemeId", "item_id", "itemId"),
+        )
+        if not post_id:
+            continue
+        candidate = {
+            "post_id": post_id,
+            "title": str(title or ""),
+            "raw_status": _first_post_value(item, ("status_msg", "review_result", "status")),
+            "reviewing": bool(item.get("in_reviewing") or item.get("reviewing")),
+            "private": bool(item.get("is_private")),
+            "deleted": False,
+            "prohibited": False,
+            "status_value": "",
+        }
+        state = "scheduled" if scheduled else douyin_post_state(candidate)
+        return {**candidate, "state": state}
+    return None
 
 
 def _desktop_browser_context_options(browser) -> dict:
@@ -215,12 +345,17 @@ async def cookie_auth(account_file):
         return False
 
     use_headless = os.environ.get("DOUYIN_COOKIE_AUTH_HEADLESS", "true").lower() in ("1", "true", "yes")
-    launch_kwargs = {"headless": use_headless, "channel": "chromium", "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"]}
     for _attempt in range(3):
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            context = None
             try:
-                context = await browser.new_context(storage_state=account_file)
+                context = await open_persistent_account_context(
+                    playwright,
+                    account_file,
+                    headless=use_headless,
+                    channel="chromium",
+                    args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                )
                 context = await set_init_script(context)
                 page = await context.new_page()
                 await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
@@ -231,7 +366,8 @@ async def cookie_auth(account_file):
             except Exception:
                 pass
             finally:
-                await browser.close()
+                if context is not None:
+                    await context.close()
     return False
 
 
@@ -647,8 +783,9 @@ async def douyin_form_cookie_gen(
     method_label = "验证码登录" if auth_method == "sms" else "密码登录"
     result = _build_login_result(False, "failed", f"{method_label}失败", account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context(**_desktop_browser_context_options(browser))
+        context = await open_persistent_account_context(
+            playwright, account_file, headless=headless, channel="chromium",
+        )
         context = await set_init_script(context)
         page = await context.new_page()
         try:
@@ -748,7 +885,6 @@ async def douyin_form_cookie_gen(
             )
         finally:
             await context.close()
-            await browser.close()
     return result
 
 
@@ -765,11 +901,15 @@ async def douyin_cookie_gen(
         if cdp_url:
             browser = await playwright.chromium.connect_over_cdp(cdp_url)
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            should_close_context = False
+            owns_context = False
         else:
-            browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-            context = await browser.new_context(**_desktop_browser_context_options(browser))
-            should_close_context = True
+            context = await open_persistent_account_context(
+                playwright,
+                account_file,
+                headless=headless,
+                channel="chromium",
+            )
+            owns_context = True
         context = await set_init_script(context)
         qrcode_path = None
         result = _build_login_result(False, "failed", "抖音登录失败", account_file)
@@ -853,9 +993,8 @@ async def douyin_cookie_gen(
                 douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
             if not result["success"]:
                 douyin_logger.error(_msg("😢", f"登录失败: {result['message']}"))
-            if should_close_context:
+            if owns_context:
                 await context.close()
-            await browser.close()
         return result
 
 
@@ -1502,19 +1641,114 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.warning(_msg("⚠️", "封面弹窗未能关闭，可能挡住自主声明/发布"))
 
 
-    async def upload(self, playwright: Playwright) -> None:
+    async def _verify_published_video(self, page: Page, title: str,
+                                      captured_responses: list,
+                                      scheduled: bool = False) -> dict:
+        payloads = []
+        submitted_result = None
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    DOUYIN_WORK_LIST_PATH in url
+                    or any(marker in url for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payload = await response.json()
+                except Exception:
+                    continue
+                payloads.append((url, payload))
+
+        await collect()
+        for url, payload in reversed(payloads):
+            direct = published_video_from_submit(
+                url, payload, title, scheduled=scheduled,
+            )
+            if direct and direct.get("state") != "unknown":
+                return {
+                    "verified": True,
+                    **direct,
+                    "remote_status": direct.get("raw_status") or direct["state"],
+                    "verification": "publish-api",
+                }
+            if direct and submitted_result is None:
+                submitted_result = direct
+
+        try:
+            if page.url.split("?", 1)[0] != DOUYIN_MANAGE_URL:
+                await page.goto(DOUYIN_MANAGE_URL, wait_until="domcontentloaded", timeout=120000)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"打开抖音作品管理失败，继续直接回查：{exc}"))
+        await asyncio.sleep(7)
+        await collect()
+        matched = match_douyin_post([payload for _url, payload in payloads], title)
+        if matched:
+            verified = matched.get("state") != "unknown"
+            return {
+                "verified": verified,
+                **matched,
+                "remote_status": matched.get("raw_status") or matched["state"],
+                "verification": "work-list-network",
+            }
+        if scheduled:
+            return {
+                "verified": True, "state": "scheduled", "post_id": "",
+                "remote_status": "scheduled", "publish_time": str(self.publish_date),
+                "verification": "page-confirmation",
+            }
+        if submitted_result:
+            return {
+                "verified": False,
+                **{**submitted_result, "state": "submitted"},
+                "remote_status": "submitted",
+                "verification": "publish-api",
+            }
+        raise RuntimeError(
+            "抖音表单已提交，但作品管理回查不到该内容，未标记发布成功；请到作品管理核验"
+        )
+
+    async def upload(self, playwright: Playwright) -> dict:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium", args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context(
-            storage_state=f"{self.account_file}",
-            permissions=["geolocation"],
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            context_kwargs={"permissions": ["geolocation"]},
         )
+        try:
+            return await self._upload_in_context(context)
+        finally:
+            # Every failure path must release the account profile lock so
+            # checks, DM sync and the next publish can reuse the same profile.
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    async def _upload_in_context(self, context) -> dict:
         context = await set_init_script(context)
 
         page = await context.new_page()
+        captured_responses = []
+
+        def capture(response):
+            try:
+                url = str(response.url or "")
+                if DOUYIN_WORK_LIST_PATH in url or any(
+                    marker in url for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS
+                ):
+                    captured_responses.append(response)
+            except Exception:
+                pass
+
+        page.on("response", capture)
         await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
@@ -1604,7 +1838,9 @@ class DouYinVideo(DouYinBaseUploader):
         sms_prompt_logged = False
         sms_request_id = None
         sms_get_code_clicked = False
-        while True:
+        confirmed = False
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline:
             try:
                 # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
                 await page.evaluate(
@@ -1677,7 +1913,7 @@ class DouYinVideo(DouYinBaseUploader):
                     "https://creator.douyin.com/creator-micro/content/manage**",
                     timeout=3000,
                 )
-                douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
+                confirmed = True
                 break
             except Exception:
                 await self.handle_auto_video_cover(page)
@@ -1686,18 +1922,35 @@ class DouYinVideo(DouYinBaseUploader):
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
 
+        if not confirmed:
+            raise RuntimeError("抖音发布超时，未跳转到作品管理；请检查发布按钮和表单提示")
+
+        scheduled = (
+            self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED
+            and self.publish_date != 0
+        )
+        result = await self._verify_published_video(
+            page, self.title, captured_responses, scheduled=scheduled,
+        )
+        if result["state"] in {"failed", "removed"}:
+            raise RuntimeError(
+                f"抖音作品状态为 {result['state']}（{result.get('remote_status') or '平台未返回原因'}）"
+            )
+        douyin_logger.success(
+            _msg("🥳", f"作品已回查：{result['state']}，ID {result['post_id']}")
+        )
+
         await context.storage_state(path=self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
         await asyncio.sleep(2)
-        await context.close()
-        await browser.close()
+        return result
 
     async def douyin_upload_video(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)
 
     async def main(self):
-        await self.douyin_upload_video()
+        return await self.douyin_upload_video()
 
 
 class DouYinNote(DouYinBaseUploader):
@@ -1809,10 +2062,13 @@ class DouYinNote(DouYinBaseUploader):
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium", args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context(
-            storage_state=f"{self.account_file}",
-            permissions=["geolocation"],
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            context_kwargs={"permissions": ["geolocation"]},
         )
         context = await set_init_script(context)
 
@@ -1831,7 +2087,6 @@ class DouYinNote(DouYinBaseUploader):
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
             await context.close()
-            await browser.close()
 
     async def douyin_upload_note(self):
         async with async_playwright() as playwright:

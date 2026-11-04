@@ -15,11 +15,12 @@ import os
 import time
 from pathlib import Path
 
-from playwright.async_api import Page, Playwright, TimeoutError as PWTimeoutError, async_playwright
+from patchright.async_api import Page, Playwright, TimeoutError as PWTimeoutError, async_playwright
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import baijiahao_logger
+from utils.account_browser import open_persistent_account_context
 from utils.login_qrcode import build_login_qrcode_path, decode_qrcode_from_path, print_terminal_qrcode, remove_qrcode_file
 
 
@@ -128,8 +129,12 @@ async def baijiahao_cookie_gen(account_file, qrcode_callback=None, poll_interval
     result = _build_login_result(False, "failed", "百家号登录失败", account_file)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
-        context = await browser.new_context()
+        context = await open_persistent_account_context(
+            playwright,
+            account_file,
+            headless=headless,
+            channel="chromium",
+        )
         try:
             page = await context.new_page()
             await page.goto(BAIJIAHAO_LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
@@ -178,7 +183,6 @@ async def baijiahao_cookie_gen(account_file, qrcode_callback=None, poll_interval
             if not result["success"]:
                 baijiahao_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
     return result
 
 
@@ -186,9 +190,11 @@ async def cookie_auth(account_file):
     """验证百家号 cookie 是否有效。访问后台首页，检测是否出现登录提示。"""
     account_file = _resolve_account_file(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
+        context = None
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await open_persistent_account_context(
+                playwright, account_file, headless=True, channel="chromium",
+            )
             page = await context.new_page()
             await page.goto(BAIJIAHAO_HOME_URL, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
@@ -203,7 +209,8 @@ async def cookie_auth(account_file):
             baijiahao_logger.warning(_msg("😵", f"cookie 校验出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            if context is not None:
+                await context.close()
 
 
 async def baijiahao_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
@@ -270,8 +277,12 @@ class BaiJiaHaoVideo(BaseVideoUploader):
         await self.validate_upload_args()
         baijiahao_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
+        )
         await context.grant_permissions(["geolocation"])
 
         try:
@@ -320,7 +331,6 @@ class BaiJiaHaoVideo(BaseVideoUploader):
             baijiahao_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()
-            await browser.close()
 
     async def _fill_title(self, page: Page) -> None:
         title_field = page.locator('div[class*="contentEditable"]').first

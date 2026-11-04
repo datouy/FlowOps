@@ -17,6 +17,7 @@ from uploader.ks_uploader.main import (
 from uploader.tencent_uploader.main import (
     TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
     TENCENT_PUBLISH_STRATEGY_SCHEDULED,
+    TencentNote,
     TencentVideo,
 )
 from uploader.xiaohongshu_uploader.main import (
@@ -65,12 +66,39 @@ def post_video_tencent(title, files, tags, account_file, category=TencentZoneTyp
         if resolve_publish_strategy(enableTimer) and not is_draft
         else TENCENT_PUBLISH_STRATEGY_IMMEDIATE
     )
+    results = []
     for index, file in enumerate(files):
         for cookie in account_file:
             logger.info("发布素材 path={} file={} title={} tags={}", file, file.name, title, tags)
             app = TencentVideo(title, str(file), tags, publish_datetimes[index], cookie, category,
                                is_draft, desc=desc, publish_strategy=strategy)
-            asyncio.run(app.main(), debug=False)
+            results.append(asyncio.run(app.main(), debug=False))
+    return results
+
+
+def post_note_tencent(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
+                      enableTimer=False, videos_per_day=1, daily_times=None, start_days=0,
+                      is_draft=False, desc=""):
+    """Publish one image-text post per account through the Channels web UI."""
+    account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    files = [Path(BASE_DIR / "videoFile" / file) for file in files]
+    publish_datetimes = build_publish_datetimes(
+        account_file, enableTimer, videos_per_day, daily_times, start_days)
+    strategy = (
+        TENCENT_PUBLISH_STRATEGY_SCHEDULED
+        if resolve_publish_strategy(enableTimer) and not is_draft
+        else TENCENT_PUBLISH_STRATEGY_IMMEDIATE
+    )
+    results = []
+    for index, cookie in enumerate(account_file):
+        logger.info("发布视频号图文 title={} images={} account={}", title, len(files), cookie.name)
+        app = TencentNote(
+            image_paths=[str(path) for path in files], note=desc or title,
+            title=title, tags=tags, publish_date=publish_datetimes[index],
+            account_file=str(cookie), publish_strategy=strategy, is_draft=is_draft,
+        )
+        results.append(asyncio.run(app.main(), debug=False))
+    return results
 
 
 def post_video_DouYin(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
@@ -87,13 +115,15 @@ def post_video_DouYin(title, files, tags, account_file, category=TencentZoneType
         if resolve_publish_strategy(enableTimer)
         else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
     )
+    results = []
     for index, file in enumerate(files):
         for cookie in account_file:
             logger.info("发布素材 path={} file={} title={} tags={}", file, file.name, title, tags)
             app = DouYinVideo(title, str(file), tags, publish_datetimes[index], cookie,
                               thumbnail_path, productLink, productTitle,
                               desc=desc, publish_strategy=strategy)
-            asyncio.run(app.douyin_upload_video(), debug=False)
+            results.append(asyncio.run(app.douyin_upload_video(), debug=False))
+    return results
 
 
 def post_video_ks(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
@@ -128,12 +158,14 @@ def post_video_xhs(title, files, tags, account_file, category=TencentZoneTypes.L
         if resolve_publish_strategy(enableTimer)
         else XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
     )
+    results = []
     for index, file in enumerate(files):
         for cookie in account_file:
             logger.info("发布素材 file={} title={} tags={}", file.name, title, tags)
             app = XiaoHongShuVideo(title, file, tags, publish_datetimes[index], cookie,
                                    desc=desc, publish_strategy=strategy)
-            asyncio.run(app.main(), debug=False)
+            results.append(asyncio.run(app.main(), debug=False))
+    return results
 
 
 # ==================== 扩展平台发布（微博/百家号） ====================

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -20,10 +21,17 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import xiaohongshu_logger
+from utils.account_browser import open_persistent_account_context
 
 XHS_DEFAULT_CREATOR_BASE_URL = "https://creator.xiaohongshu.com"
 XHS_CREATOR_BASE_URL_ENV = "SAU_XHS_CREATOR_BASE_URL"
 XHS_PUBLISH_SUCCESS_URL_PATTERN = "**/publish/success?**"
+XHS_MANAGE_URL = "https://creator.xiaohongshu.com/creator/notes"
+XHS_PUBLISH_RESPONSE_MARKER = "/web_api/sns/v2/note"
+XHS_LIST_RESPONSE_MARKERS = (
+    "/api/galaxy/creator/note", "/api/galaxy/creator/publish",
+    "/web_api/sns/v2/note/manage", "/creator/note",
+)
 XHS_LOGIN_BOX_SELECTOR = "div[class*='login-box']"
 XHS_LOGIN_SWITCH_SELECTOR = "img.css-wemwzq"
 XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
@@ -42,6 +50,138 @@ def _build_xhs_creator_url(path: str) -> str:
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+def _walk_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def _first_value(item: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _normalized_title(value: object) -> str:
+    return " ".join(str(value or "").replace("#", " ").split()).lower()
+
+
+def extract_xhs_posts(payload) -> list[dict]:
+    """Normalize note-list/verification responses into publish candidates."""
+    posts = []
+    seen = set()
+    for item in _walk_dicts(payload):
+        post_id = _first_value(item, ("note_id", "noteId", "noteid"))
+        if not post_id:
+            continue
+        title = _first_value(
+            item,
+            ("title", "display_title", "displayTitle", "caption", "desc", "content"),
+        )
+        if not title:
+            continue
+        marker = (post_id, _normalized_title(title)[:160])
+        if marker in seen:
+            continue
+        seen.add(marker)
+        posts.append({
+            "post_id": post_id,
+            "title": title,
+            "raw_status": _first_value(
+                item,
+                ("audit_status", "auditStatus", "note_status", "noteStatus",
+                 "publish_status", "publishStatus", "status", "state"),
+            ),
+            "publish_time": _first_value(
+                item, ("publish_time", "publishTime", "create_time", "createTime", "time"),
+            ),
+            "private": bool(
+                item.get("is_private") or item.get("isPrivate")
+                or item.get("private") is True
+            ),
+            "deleted": bool(item.get("is_delete") or item.get("isDelete") or item.get("deleted")),
+            "reviewing": bool(
+                item.get("in_reviewing") or item.get("inReviewing")
+                or item.get("reviewing") is True
+            ),
+        })
+    return posts
+
+
+def xhs_post_state(candidate: dict) -> str:
+    value = str(candidate.get("raw_status") or "").strip().lower()
+    if candidate.get("deleted") or any(
+        marker in value for marker in ("deleted", "removed", "withdrawn", "下架", "删除")
+    ):
+        return "removed"
+    if any(marker in value for marker in (
+        "failed", "reject", "violation", "失败", "驳回", "违规",
+    )):
+        return "failed"
+    if any(marker in value for marker in ("draft", "草稿")):
+        return "draft"
+    if any(marker in value for marker in ("scheduled", "schedule", "定时", "预约")):
+        return "scheduled"
+    if candidate.get("reviewing") or any(
+        marker in value for marker in ("review", "audit", "check", "审核", "复核")
+    ):
+        return "review"
+    if candidate.get("private"):
+        return "private"
+    if any(marker in value for marker in (
+        "published", "success", "online", "normal", "visible", "已发布", "公开",
+    )):
+        return "published"
+    return "unknown"
+
+
+def match_xhs_post(payloads: list, title: str) -> dict | None:
+    wanted = _normalized_title(title)
+    if not wanted:
+        return None
+    for payload in payloads:
+        for candidate in extract_xhs_posts(payload):
+            candidate_title = _normalized_title(candidate.get("title"))
+            if candidate_title != wanted and wanted not in candidate_title:
+                continue
+            return {**candidate, "state": xhs_post_state(candidate)}
+    return None
+
+
+def published_note_from_submit(url: str, payload, title: str) -> dict | None:
+    """Extract a note id from the create response that triggered the submit."""
+    if XHS_PUBLISH_RESPONSE_MARKER not in str(url):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if payload.get("success") is False or code not in (None, 0, "0"):
+        return None
+    for item in _walk_dicts(payload):
+        post_id = _first_value(item, ("note_id", "noteId", "noteid"))
+        if not post_id and "id" in item and not any(
+            key in item for key in ("user_id", "userId", "comment_id", "commentId")
+        ):
+            post_id = str(item.get("id") or "").strip()
+        if post_id:
+            candidate = {
+                "post_id": post_id,
+                "title": str(title or ""),
+                "raw_status": _first_value(item, ("audit_status", "status", "state")),
+                "reviewing": bool(item.get("reviewing") or item.get("in_reviewing")),
+                "private": bool(item.get("private") or item.get("is_private")),
+                "deleted": False,
+            }
+            return {**candidate, "state": xhs_post_state(candidate)}
+    return None
 
 
 async def _js_click_by_text(page: Page, text: str) -> bool:
@@ -179,12 +319,15 @@ async def cookie_auth(account_file):
         return False
 
     async with async_playwright() as playwright:
-        if LOCAL_CHROME_PATH:
-            browser = await playwright.chromium.launch(headless=True, executable_path=LOCAL_CHROME_PATH)
-        else:
-            browser = await playwright.chromium.launch(headless=True, channel="chromium")
+        context = None
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await open_persistent_account_context(
+                playwright,
+                account_file,
+                headless=True,
+                executable_path=LOCAL_CHROME_PATH or "",
+                channel="chromium",
+            )
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(
@@ -213,7 +356,8 @@ async def cookie_auth(account_file):
             xiaohongshu_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            if context is not None:
+                await context.close()
 
 
 async def xiaohongshu_setup(
@@ -253,8 +397,9 @@ async def xiaohongshu_cookie_gen(
     account_path.parent.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context()
+        context = await open_persistent_account_context(
+            playwright, account_file, headless=headless, channel="chromium",
+        )
         context = await set_init_script(context)
         qrcode_path = None
         qrcode_info = None
@@ -270,19 +415,11 @@ async def xiaohongshu_cookie_gen(
                 if await _is_xhs_login_completed(page):
                     await asyncio.sleep(2)
                     await context.storage_state(path=account_file)
-                    if await cookie_auth(account_file):
-                        xiaohongshu_logger.success(_msg("🥳", "小红书扫码登录成功，小人开心收工"))
-                        result = _build_login_result(True, "success", "小红书扫码登录成功", account_file, qrcode_info, page.url)
-                    else:
-                        result = _build_login_result(
-                            False,
-                            "cookie_invalid",
-                            "小红书扫码流程结束，但 cookie 校验失败",
-                            account_file,
-                            qrcode_info,
-                            page.url,
-                        )
-                    return result
+                    result = _build_login_result(
+                        True, "success", "小红书扫码登录成功", account_file,
+                        qrcode_info, page.url,
+                    )
+                    break
 
                 await asyncio.sleep(poll_interval)
 
@@ -302,8 +439,16 @@ async def xiaohongshu_cookie_gen(
             if not result["success"]:
                 xiaohongshu_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
-        return result
+    if result["success"] and not await cookie_auth(account_file):
+        result = _build_login_result(
+            False,
+            "cookie_invalid",
+            "小红书扫码流程结束，但 cookie 校验失败",
+            account_file,
+            result.get("qrcode"),
+            result.get("current_url"),
+        )
+    return result
 
 
 class XiaoHongShuBaseUploader(BaseVideoUploader):
@@ -620,7 +765,80 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             except Exception:
                 pass
 
-    async def upload_video_content(self, page: Page) -> None:
+    async def _verify_published_note(self, page: Page, title: str,
+                                     captured_responses: list) -> dict:
+        """Verify an immediate note through the create response or note list."""
+        payloads = []
+        submitted_result = None
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    XHS_PUBLISH_RESPONSE_MARKER in url
+                    or any(marker in url for marker in XHS_LIST_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payload = await response.json()
+                except Exception:
+                    continue
+                payloads.append((url, payload))
+
+        await collect()
+        for url, payload in reversed(payloads):
+            direct = published_note_from_submit(url, payload, title)
+            if direct and direct.get("state") != "unknown":
+                return {
+                    "verified": True,
+                    **direct,
+                    "remote_status": direct.get("raw_status") or direct["state"],
+                    "verification": "publish-api",
+                }
+            if direct and submitted_result is None:
+                submitted_result = direct
+
+        manage_url = _build_xhs_creator_url("/creator/notes")
+        try:
+            await page.goto(manage_url, wait_until="domcontentloaded", timeout=120000)
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("⚠️", f"打开小红书笔记管理失败，继续直接回查：{exc}"))
+        await asyncio.sleep(6)
+        await collect()
+        matched = match_xhs_post([payload for _url, payload in payloads], title)
+        if matched:
+            verified = matched.get("state") != "unknown"
+            return {
+                "verified": verified,
+                **matched,
+                "remote_status": matched.get("raw_status") or matched["state"],
+                "verification": "note-list-network",
+            }
+        if submitted_result:
+            return {
+                "verified": False,
+                **{**submitted_result, "state": "submitted"},
+                "remote_status": "submitted",
+                "verification": "publish-api",
+            }
+        raise RuntimeError(
+            "小红书表单已提交，但笔记列表回查不到该内容，未标记发布成功；请到笔记管理核验"
+        )
+
+    async def upload_video_content(self, page: Page) -> dict:
+        captured_responses = []
+
+        def capture(response):
+            try:
+                url = str(response.url or "")
+                if XHS_PUBLISH_RESPONSE_MARKER in url or any(
+                    marker in url for marker in XHS_LIST_RESPONSE_MARKERS
+                ):
+                    captured_responses.append(response)
+            except Exception:
+                pass
+
+        page.on("response", capture)
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往视频发布页"))
         publish_url = _build_xhs_creator_url(
@@ -680,50 +898,77 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
+        clicked = False
+        clicked_at = 0.0
+        confirmed = False
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
             try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
+                if not clicked or (not captured_responses and time.monotonic() - clicked_at > 20):
+                    if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
+                        await page.locator('button:has-text("定时发布")').click()
+                    else:
+                        await page.locator('button:has-text("发布")').click()
+                    clicked = True
+                    clicked_at = time.monotonic()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000
                 )
-                xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
+                confirmed = True
                 break
             except Exception:
                 xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
+        if not confirmed:
+            raise RuntimeError("小红书发布超时，未出现成功页；请检查发布按钮和表单提示")
+        if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+            xiaohongshu_logger.success(_msg("🥳", f"小红书视频已预约发布：{self.publish_date}"))
+            return {
+                "verified": True, "state": "scheduled", "post_id": "",
+                "remote_status": "scheduled", "publish_time": str(self.publish_date),
+                "verification": "page-confirmation",
+            }
+        result = await self._verify_published_note(page, self.title, captured_responses)
+        if result["state"] in {"failed", "removed"}:
+            raise RuntimeError(
+                f"小红书笔记状态为 {result['state']}（{result.get('remote_status') or '平台未返回原因'}）"
+            )
+        xiaohongshu_logger.success(
+            _msg("🥳", f"视频已回查：{result['state']}，ID {result['post_id']}")
+        )
+        return result
 
-    async def upload(self, playwright: Playwright) -> None:
+    async def upload(self, playwright: Playwright) -> dict:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
+            context_kwargs={"permissions": ["geolocation"]},
         )
         context = await set_init_script(context)
 
         try:
             page = await context.new_page()
-            await self.upload_video_content(page)
+            result = await self.upload_video_content(page)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
+            return result
         finally:
             await context.close()
-            await browser.close()
 
     async def xiaohongshu_upload_video(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)
 
     async def main(self):
-        await self.xiaohongshu_upload_video()
+        return await self.xiaohongshu_upload_video()
 
 
 class XiaoHongShuNote(XiaoHongShuBaseUploader):
@@ -825,10 +1070,12 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
+        context = await open_persistent_account_context(
+            playwright,
+            self.account_file,
+            headless=self.headless,
+            channel="chromium",
+            context_kwargs={"permissions": ["geolocation"]},
         )
         context = await set_init_script(context)
 
@@ -839,7 +1086,6 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()
-            await browser.close()
 
     async def xiaohongshu_upload_note(self):
         async with async_playwright() as playwright:
