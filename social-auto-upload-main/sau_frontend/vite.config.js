@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
@@ -6,8 +6,32 @@ import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import { resolve } from 'path'
 
 // https://vite.dev/config/
-export default defineConfig({
+function localAccessTokenPlugin(token) {
+  return {
+    name: 'yunce-local-access-token',
+    configureServer(server) {
+      server.middlewares.use('/__yunce_local_token', (req, res) => {
+        const address = String(req.socket?.remoteAddress || '')
+        if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address)) {
+          res.statusCode = 403
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ error: 'loopback only' }))
+          return
+        }
+        res.statusCode = token ? 200 : 503
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-store')
+        res.end(JSON.stringify(token ? { token } : { error: 'not configured' }))
+      })
+    },
+  }
+}
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, resolve(__dirname, '..'), '')
+  return {
   plugins: [
+    localAccessTokenPlugin(env.YUNCE_ACCESS_TOKEN),
     vue(),
     // Element Plus 按需引入：只打包用到的组件和样式。
     // 之前是 `app.use(ElementPlus)` 全量引入，产物里有 1MB 的
@@ -37,6 +61,8 @@ export default defineConfig({
     }
   },
   server: {
+    // 局域网同事通过本机 IP 访问，Vite 继续把 API 请求代理到回环地址上的后端。
+    host: '0.0.0.0',
     port: 5173,
     open: true,
     proxy: {
@@ -59,5 +85,6 @@ export default defineConfig({
         }
       }
     }
+  }
   }
 })

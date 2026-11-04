@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,21 @@ def _is_placeholder(value: str) -> bool:
     return len(set(lowered)) <= 2
 
 
+def _is_git_ignored(path: Path) -> bool:
+    """Skip machine-local credentials that Git cannot commit by construction."""
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", str(path.relative_to(ROOT))],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def test_no_real_secrets_in_env_files():
     """``.env`` / ``.env.*`` 文件里不允许出现看起来像真密钥的值。
 
@@ -180,6 +196,8 @@ def test_no_real_secrets_in_env_files():
         if not path.is_file():
             continue
         if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if _is_git_ignored(path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
