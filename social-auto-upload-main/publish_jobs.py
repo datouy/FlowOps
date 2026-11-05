@@ -4,6 +4,7 @@ import threading
 import time
 import traceback
 import queue as _queue
+from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
 from conf import BASE_DIR
@@ -22,6 +23,108 @@ def _ensure_columns(c, table: str, columns: tuple[tuple[str, str], ...]) -> None
     for name, ddl in columns:
         if name not in existing:
             c.execute(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}')
+
+
+def _reconcile_historical_item_stages(c) -> None:
+    """Repair rows written by the old unconditional-success worker."""
+    rows = c.execute(
+        "SELECT id,status,remote_status,verified_at,publish_stage,finished_at "
+        "FROM publish_items WHERE status='success'"
+    ).fetchall()
+    active_map = {
+        'upload': 'upload', 'uploading': 'upload', 'push': 'push',
+        'submitted': 'push', 'pending': 'push', 'transcoding': 'transcoding',
+        'processing': 'transcoding', 'review': 'review', 'audit': 'review',
+        'scheduled': 'scheduled', 'notfound': 'notfound',
+    }
+    for row in rows:
+        state = str(row['remote_status'] or '').strip().lower()
+        item_id = int(row['id'])
+        if state == 'draft':
+            c.execute(
+                "UPDATE publish_items SET status='draft', publish_stage='draft', "
+                "stage_status='success', next_check_at=NULL WHERE id=?",
+                (item_id,),
+            )
+        elif state in {'failed', 'rejected', 'removed', 'withdrawn', 'deleted', 'private'}:
+            stage = 'withdrawn' if state in {'removed', 'withdrawn', 'deleted'} else 'review'
+            c.execute(
+                "UPDATE publish_items SET status='failed', publish_stage=?, "
+                "stage_status='fail', next_check_at=NULL WHERE id=?",
+                (stage, item_id),
+            )
+        elif state in {'published', 'success'} and row['verified_at']:
+            c.execute(
+                "UPDATE publish_items SET status='success', publish_stage='success', "
+                "stage_status='success', next_check_at=NULL WHERE id=?",
+                (item_id,),
+            )
+        else:
+            stage = active_map.get(state, 'push')
+            c.execute(
+                "UPDATE publish_items SET status='processing', publish_stage=?, "
+                "stage_status='doing', next_check_at=datetime(CURRENT_TIMESTAMP,'+5 minutes'), "
+                "verification_started_at=COALESCE(verification_started_at,finished_at,CURRENT_TIMESTAMP), "
+                "finished_at=NULL WHERE id=?",
+                (stage, item_id),
+            )
+    c.execute(
+        """UPDATE jobs SET
+               status=CASE
+                   WHEN EXISTS (SELECT 1 FROM publish_items i
+                                WHERE i.job_id=jobs.id AND i.status='processing')
+                       THEN 'processing'
+                   WHEN EXISTS (SELECT 1 FROM publish_items i
+                                WHERE i.job_id=jobs.id AND i.status='scheduled')
+                       THEN 'scheduled'
+                   WHEN NOT EXISTS (SELECT 1 FROM publish_items i
+                                    WHERE i.job_id=jobs.id AND i.status='success')
+                        AND EXISTS (SELECT 1 FROM publish_items i
+                                    WHERE i.job_id=jobs.id AND i.status='draft')
+                       THEN 'draft'
+                   WHEN EXISTS (SELECT 1 FROM publish_items i
+                                WHERE i.job_id=jobs.id AND i.status='draft')
+                       THEN 'partial_success'
+                   ELSE status
+               END,
+               finished_at=CASE
+                   WHEN EXISTS (SELECT 1 FROM publish_items i
+                                WHERE i.job_id=jobs.id
+                                  AND i.status IN ('processing','scheduled'))
+                       THEN NULL
+                   ELSE finished_at
+               END
+           WHERE status IN ('success','partial_success') AND EXISTS (
+               SELECT 1 FROM publish_items i
+               WHERE i.job_id=jobs.id AND i.status IN ('processing','scheduled','draft')
+           )"""
+    )
+    c.execute(
+        """UPDATE publish_records SET
+               status=(SELECT j.status FROM jobs j WHERE j.id=publish_records.job_id),
+               finished_at=CASE
+                   WHEN (SELECT j.status FROM jobs j WHERE j.id=publish_records.job_id)
+                        IN ('processing','scheduled') THEN NULL
+                   ELSE finished_at
+               END
+           WHERE status IN ('success','partial_success') AND job_id IN (
+               SELECT id FROM jobs WHERE status IN ('processing','scheduled','draft','partial_success')
+           )"""
+    )
+    c.execute(
+        """UPDATE scheduled_items SET
+               status=COALESCE((
+                   SELECT i.status FROM publish_items i
+                   WHERE i.job_id=scheduled_items.job_id
+                     AND i.cookie=scheduled_items.account
+                     AND i.file=scheduled_items.file
+                   ORDER BY i.id LIMIT 1
+               ), status),
+               updated_at=CURRENT_TIMESTAMP
+           WHERE status IN ('pending','running','processing','success') AND job_id IN (
+               SELECT id FROM jobs WHERE status IN ('processing','scheduled','draft')
+           )"""
+    )
 
 def init_db():
     with get_conn() as c:
@@ -92,6 +195,22 @@ def init_db():
             remote_delete_status TEXT DEFAULT '',
             remote_delete_error TEXT DEFAULT '',
             replacement_job_id INTEGER,
+            scheduled_at DATETIME,
+            publish_stage TEXT DEFAULT '',
+            stage_status TEXT DEFAULT '',
+            next_check_at DATETIME,
+            check_attempts INTEGER DEFAULT 0,
+            last_checked_at DATETIME,
+            verification_started_at DATETIME,
+            -- 发布幂等键：同一个 (账号, 素材, 标题) 组合的稳定标识。
+            -- 进程重启后用它做远端预查，避免把已经发出去的作品再发一次。
+            idempotency_key TEXT DEFAULT '',
+            submitted_at DATETIME,
+            -- 可见性（同类产品语义）：public / draft / private。
+            -- 和 publish_stage 分开：draft 是可见性，不是发布阶段。
+            visibility TEXT DEFAULT 'public',
+            -- 内容形态：video / image-text。
+            content_type TEXT DEFAULT 'video',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             started_at DATETIME,
             finished_at DATETIME
@@ -115,8 +234,26 @@ def init_db():
             ('remote_delete_status', "TEXT DEFAULT ''"),
             ('remote_delete_error', "TEXT DEFAULT ''"),
             ('replacement_job_id', "INTEGER"),
+            ('scheduled_at', "DATETIME"),
+            ('publish_stage', "TEXT DEFAULT ''"),
+            ('stage_status', "TEXT DEFAULT ''"),
+            ('next_check_at', "DATETIME"),
+            ('check_attempts', "INTEGER DEFAULT 0"),
+            ('last_checked_at', "DATETIME"),
+            ('verification_started_at', "DATETIME"),
+            ('idempotency_key', "TEXT DEFAULT ''"),
+            ('submitted_at', "DATETIME"),
+            ('visibility', "TEXT DEFAULT 'public'"),
+            ('content_type', "TEXT DEFAULT 'video'"),
         ))
-        record_schema_version(c, "publish_jobs", 4)
+        _ensure_columns(c, 'scheduled_items', (
+            ('updated_at', "DATETIME"),
+            ('last_error', "TEXT DEFAULT ''"),
+        ))
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_publish_items_tracking
+            ON publish_items(status, next_check_at)''')
+        _reconcile_historical_item_stages(c)
+        record_schema_version(c, "publish_jobs", 5)
 
 init_db()
 
@@ -132,19 +269,158 @@ init_db()
 #   * 错误归因（登录失效/风控/文件缺失/网络），登录失效立刻把账号标异常
 #   * 同一账号串行（进程内账号锁），不同账号可并发
 ITEM_PENDING = 'pending'
+ITEM_SCHEDULED = 'scheduled'
 ITEM_RUNNING = 'running'
+ITEM_PROCESSING = 'processing'
 ITEM_SUCCESS = 'success'
 ITEM_FAILED = 'failed'
 ITEM_SKIPPED = 'skipped'
 ITEM_CANCELLED = 'cancelled'
+ITEM_DRAFT = 'draft'
+# 已提交但平台不支持发布后回查：既不能算成功，也不能算失败。
+# 旧状态机里这些平台会走 processing → 24 小时后被判失败，
+# 实际作品可能已经正常发布。
+ITEM_SUBMITTED = 'submitted'
+# 进程在"已提交到平台"和"写入结果"之间崩溃：状态未知，既不能直接重发
+# （可能重复发布），也不能直接判失败。
+ITEM_UNCERTAIN = 'uncertain'
 ITEM_ACTIVE = (ITEM_PENDING, ITEM_FAILED)
+ITEM_TERMINAL = (
+    ITEM_SUCCESS, ITEM_FAILED, ITEM_SKIPPED, ITEM_CANCELLED, ITEM_DRAFT,
+    ITEM_SUBMITTED,
+)
 MAX_ITEM_ATTEMPTS = 2
+
+STAGE_UPLOAD = 'upload'
+STAGE_PUSH = 'push'
+STAGE_TRANSCODING = 'transcoding'
+STAGE_REVIEW = 'review'
+STAGE_SCHEDULED = 'scheduled'
+STAGE_SUCCESS = 'success'
+STAGE_NOTFOUND = 'notfound'
+STAGE_WITHDRAWN = 'withdrawn'
+STAGE_DRAFT = 'draft'
+# 已提交、未验证：平台没有回查能力，只能由人工确认。
+STAGE_UNVERIFIED = 'unverified'
+STAGE_DOING = 'doing'
+STAGE_FAIL = 'fail'
+# 审核/转码超过阈值后进入"低频复查"，不自动判失败。
+STAGE_TIMEOUT_REVIEW = 'timeout_review'
+REVIEW_TIMEOUT_HOURS = 24
+TIMEOUT_RECHECK_HOURS = 12
+
+_FINAL_PUBLISH_STATES = {'published', 'success'}
+_ACTIVE_STAGE_BY_STATE = {
+    'upload': STAGE_UPLOAD,
+    'uploading': STAGE_UPLOAD,
+    'push': STAGE_PUSH,
+    'submitted': STAGE_PUSH,
+    'pending': STAGE_PUSH,
+    'transcoding': STAGE_TRANSCODING,
+    'processing': STAGE_TRANSCODING,
+    'review': STAGE_REVIEW,
+    'audit': STAGE_REVIEW,
+    'scheduled': STAGE_SCHEDULED,
+    'notfound': STAGE_NOTFOUND,
+    'withdrawn': STAGE_WITHDRAWN,
+}
+
+
+def _tracking_time(value: datetime | None = None) -> str:
+    return (value or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _parse_time(value) -> datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            stamp = int(text)
+            if stamp > 10_000_000_000:
+                stamp //= 1000
+            return datetime.fromtimestamp(stamp)
+        except (OSError, OverflowError, ValueError):
+            pass
+    for fmt in (
+        '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d',
+        '%Y/%m/%d %H:%M:%S', '%Y/%m/%d %H:%M', '%Y/%m/%d',
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _platform_supports_verification(platform_type: int) -> bool:
+    """平台是否支持发布后回查（结果来自平台注册表，避免两处硬编码）。"""
+    try:
+        from myUtils.platform_registry import supports_verification
+
+        return supports_verification(platform_type)
+    except Exception:
+        # 注册表不可用时保守地认为"不支持"：宁可显示"已提交，未验证"，
+        # 也不要把实际已发布的作品在 24 小时后判成失败。
+        return False
+
+
+def classify_publish_result(result: dict | None, *, platform_type: int | None = None) -> dict:
+    """Map an uploader result onto the platform stage/state contract.
+
+    Only an authenticated remote check that finds the item in ``published`` or
+    ``success`` is terminal success.  Review, transcoding, scheduled and merely
+    submitted responses remain active and must be queried again.
+
+    ``platform_type`` matters for platforms without remote verification
+    (快手/微博/百家号): their publish call can only report "submitted".  Such a
+    result must land on the ``unverified`` stage instead of pretending to be an
+    active publish that will eventually fail.
+    """
+    payload = result if isinstance(result, dict) else {}
+    state = str(
+        payload.get('state') or payload.get('remote_status') or 'submitted'
+    ).strip().lower()
+    verified = payload.get('verified') is True
+    stage = _ACTIVE_STAGE_BY_STATE.get(state, STAGE_PUSH)
+    stage_status = STAGE_DOING
+    if state in {'failed', 'reject', 'rejected'}:
+        stage, stage_status = STAGE_REVIEW, STAGE_FAIL
+    elif state in {'removed', 'withdrawn', 'deleted'}:
+        stage, stage_status = STAGE_WITHDRAWN, STAGE_FAIL
+    elif state == 'notfound':
+        stage, stage_status = STAGE_NOTFOUND, STAGE_DOING
+    elif state == 'private':
+        stage, stage_status = STAGE_REVIEW, STAGE_FAIL
+    elif state == STAGE_DRAFT:
+        stage, stage_status = STAGE_DRAFT, 'success'
+    elif state in _FINAL_PUBLISH_STATES and verified:
+        stage, stage_status = STAGE_SUCCESS, 'success'
+    elif state in _FINAL_PUBLISH_STATES and not verified:
+        # 平台说"已发布"但我们没有通过鉴权回查过：不能算成功。
+        stage, stage_status = STAGE_PUSH, STAGE_DOING
+    elif (
+        platform_type is not None
+        and not verified
+        and state in {'submitted', 'push', 'pending'}
+        and not _platform_supports_verification(platform_type)
+    ):
+        # 没有回查能力的平台：已提交即最终状态，既不成功也不失败。
+        stage, stage_status = STAGE_UNVERIFIED, 'submitted'
+    return {
+        'state': state,
+        'verified': verified,
+        'stage': stage,
+        'stage_status': stage_status,
+    }
 
 KIND_LOGIN_EXPIRED = 'login_expired'
 KIND_RISK_CONTROL = 'risk_control'
 KIND_ACCOUNT_EXPIRED = 'account_expired'
 KIND_FILE_MISSING = 'file_missing'
 KIND_NETWORK = 'network'
+# 平台没有发布后回查能力，结果只能停在"已提交，未验证"。
+KIND_UNVERIFIED = 'unverified'
 KIND_UNKNOWN = 'unknown'
 
 _ERROR_RULES = (
@@ -201,6 +477,43 @@ def _load_accounts(cookies) -> dict:
     return {str(row['filePath']): dict(row) for row in rows}
 
 
+def _row_get(row, key: str, default=None):
+    """Read a column from a dict or a ``sqlite3.Row``.
+
+    ``sqlite3.Row`` has no ``.get()``，直接调用会在展开子任务时抛
+    AttributeError。这里统一处理，避免每个调用点都写类型判断。
+    """
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _idempotency_key(
+    platform_type: int, cookie: str, file_name: str, title: str,
+) -> str:
+    """发布幂等键：同一平台 + 账号 + 素材 + 标题的稳定指纹。
+
+    进程重启后用它做远端预查：如果平台上已经有同名作品，说明上一次其实
+    发布成功了，只是 FlowOps 没写完结果就崩了。这时应该补记成功而不是
+    再发一遍。
+    """
+    import hashlib
+
+    raw = "|".join((
+        str(int(platform_type or 0)),
+        str(cookie or ""),
+        Path(str(file_name or "")).name,
+        str(title or "").strip(),
+    ))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 def _expand_publish_items(job) -> None:
     """把 job 展开成 (素材 × 账号) 子任务；已展开过则跳过。"""
     job_id = int(job['id'])
@@ -213,23 +526,49 @@ def _expand_publish_items(job) -> None:
     files = json_loads(job['file_list'])
     cookies = [str(item) for item in json_loads(job['account_list'])]
     accounts = _load_accounts(cookies)
-    extra = json_loads(dict(job).get('extra') or '{}')
+    extra = json_loads(_row_get(job, 'extra') or '{}')
+    if not isinstance(extra, dict):
+        extra = {}
     image_text = extra.get('contentType') == 'image-text'
+    # 可见性与发布阶段分开：草稿是可见性（visibility=draft），
+    # 不是"还没发出去"这个阶段。
+    visibility = 'draft' if extra.get('isDraft') else 'public'
+    content_type = 'image-text' if image_text else 'video'
     rows = []
     item_files = [str(files[0])] if image_text and files else files
+    with get_conn() as c:
+        schedule_rows = c.execute(
+            "SELECT account,file,scheduled_at FROM scheduled_items "
+            "WHERE job_id=? AND scheduled_at IS NOT NULL",
+            (job_id,),
+        ).fetchall()
+    schedule = {
+        (str(row['account']), str(row['file'])): str(row['scheduled_at'])
+        for row in schedule_rows
+    }
     for file_name in item_files:
         for cookie in cookies:
             account = accounts.get(cookie) or {}
             rows.append((
                 job_id, int(job['type']), str(file_name),
                 account.get('id'), account.get('userName') or '', cookie,
+                schedule.get((str(cookie), str(file_name))),
+                ITEM_SCHEDULED if extra.get('enableTimer') else ITEM_PENDING,
+                _idempotency_key(
+                    int(job['type']), cookie, str(file_name),
+                    str(_row_get(job, 'title') or ''),
+                ),
+                visibility,
+                content_type,
             ))
     if not rows:
         return
     with get_conn() as c:
         c.executemany(
-            'INSERT INTO publish_items (job_id,type,file,account_id,account_name,cookie)'
-            ' VALUES (?,?,?,?,?,?)',
+            'INSERT INTO publish_items ('
+            ' job_id,type,file,account_id,account_name,cookie,scheduled_at,status,'
+            ' idempotency_key,visibility,content_type'
+            ') VALUES (?,?,?,?,?,?,?,?,?,?,?)',
             rows,
         )
     logger.info("发布任务 {} 展开为 {} 个子任务", job_id, len(rows))
@@ -241,6 +580,34 @@ def job_items(job_id: int) -> list[dict]:
             'SELECT * FROM publish_items WHERE job_id=? ORDER BY id', (int(job_id),)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _link_schedule_to_items(job_id: int) -> None:
+    """Attach persisted schedule rows to account-level items.
+
+    This also migrates timer jobs created by the older worker flow, where all
+    items were already ``pending`` and would otherwise all publish at the first
+    due time.
+    """
+    with get_conn() as c:
+        schedules = c.execute(
+            "SELECT account,file,scheduled_at,status FROM scheduled_items "
+            "WHERE job_id=? AND scheduled_at IS NOT NULL",
+            (int(job_id),),
+        ).fetchall()
+        for row in schedules:
+            if str(row['status'] or '') != 'pending':
+                continue
+            c.execute(
+                "UPDATE publish_items SET scheduled_at=?,"
+                " status=CASE WHEN status='pending' THEN ? ELSE status END "
+                "WHERE job_id=? AND cookie=? AND file=? AND status IN (?,?)",
+                (
+                    str(row['scheduled_at']), ITEM_SCHEDULED, int(job_id),
+                    str(row['account']), str(row['file']), ITEM_PENDING,
+                    ITEM_SCHEDULED,
+                ),
+            )
 
 
 def get_job_item(job_id: int, item_id: int) -> dict | None:
@@ -288,13 +655,23 @@ def _mark_account_expired(cookie: str, reason: str) -> None:
         logger.exception("回写账号失效状态失败: {}", cookie)
 
 
-def _execute_item(item: dict, job, extra: dict) -> None:
-    """执行单条子任务：一次只发一个素材到一个账号。"""
+def _execute_item(item: dict, job, extra: dict) -> dict:
+    """执行单条子任务：一次只发一个素材到一个账号。
+
+    发布前先做一次远端预查：如果平台上已经有同名作品（上次其实发成功了，
+    只是 FlowOps 没写完结果就崩了），直接补记成功，不再发一遍。
+    """
     from myUtils.platform_registry import dispatch_publish
 
     files = [item['file']]
     if extra.get('contentType') == 'image-text':
         files = json_loads(job['file_list'])
+
+    # 幂等预查：只在支持回查的平台上有意义。
+    precheck = _precheck_existing_post(item, job)
+    if precheck is not None:
+        return precheck
+
     result = dispatch_publish(
         int(job['type']),
         title=job['title'],
@@ -302,7 +679,11 @@ def _execute_item(item: dict, job, extra: dict) -> None:
         tags=json_loads(job['tags']),
         account_list=[item['cookie']],
         category=extra.get('category'),
-        enableTimer=extra.get('enableTimer'),
+        # Local scheduling already decided *when* this item runs.  At this
+        # point the platform must publish immediately; asking the platform to
+        # schedule as well would create a second scheduler and leave the item
+        # in ``scheduled`` for an unknown period.
+        enableTimer=False,
         videosPerDay=extra.get('videosPerDay'),
         dailyTimes=extra.get('dailyTimes'),
         startDays=extra.get('startDays', 0),
@@ -321,6 +702,385 @@ def _execute_item(item: dict, job, extra: dict) -> None:
     return result or {}
 
 
+def _precheck_existing_post(item: dict, job) -> dict | None:
+    """远端预查：平台上已经有这篇作品时，直接返回成功结果。
+
+    返回 ``None`` 表示"没查到，可以正常发布"。这样进程重启后重跑一条
+    状态未知的子任务时，不会把已经发出去的作品再发一次。
+    """
+    platform_type = int(item.get('type') or job['type'])
+    if not _platform_supports_verification(platform_type):
+        return None
+    try:
+        from publish_status import query_publish_status
+
+        result = query_publish_status(item, dict(job))
+    except Exception as exc:
+        # 预查失败不能挡住正常发布：真正的发布流程还会再做一次回查。
+        logger.warning("发布前远端预查失败，按正常发布继续: {}", exc)
+        return None
+    if not isinstance(result, dict):
+        return None
+    if not result.get('verified'):
+        return None
+    state = str(result.get('state') or '').strip().lower()
+    if state not in _FINAL_PUBLISH_STATES:
+        # 平台上已经是进行中的状态（审核中/转码中）：同样不要再发一次。
+        return {
+            **result,
+            "verification": str(result.get("verification") or "") + "+idempotency-precheck",
+        }
+    return {
+        **result,
+        "verification": str(result.get("verification") or "") + "+idempotency-precheck",
+    }
+
+
+def _tracking_delay_minutes(attempts: int, stage: str) -> int:
+    base = 5 if stage in (STAGE_REVIEW, STAGE_TRANSCODING) else 2
+    return min(60, base * (2 ** min(max(attempts, 0), 5)))
+
+
+def _sync_scheduled_item(item: dict, status: str, error: str = '') -> None:
+    with get_conn() as c:
+        c.execute(
+            "UPDATE scheduled_items SET status=?, last_error=?, updated_at=? "
+            "WHERE job_id=? AND account=? AND file=? "
+            "AND status IN ('running','processing','success','failed')",
+            (
+                status, str(error or '')[:500], _tracking_time(),
+                int(item['job_id']), str(item['cookie']), str(item['file']),
+            ),
+        )
+
+
+def _record_publish_result(item: dict, result: dict | None) -> None:
+    """Persist the uploader result without promoting active stages to success."""
+    payload = result if isinstance(result, dict) else {}
+    platform_type = int(item.get('type') or 0)
+    classified = classify_publish_result(payload, platform_type=platform_type)
+    state = classified['state']
+    stage = classified['stage']
+    stage_status = classified['stage_status']
+    if stage_status == 'success' and stage == STAGE_SUCCESS:
+        item_status = ITEM_SUCCESS
+        error = ''
+        error_kind = ''
+    elif stage == STAGE_DRAFT:
+        item_status = ITEM_DRAFT
+        error = ''
+        error_kind = ''
+    elif stage == STAGE_UNVERIFIED:
+        # 平台不支持发布后回查：停在"已提交，未验证"，既不判成功也不判失败。
+        item_status = ITEM_SUBMITTED
+        error = '平台不支持发布后回查，已提交但未验证，请人工到平台确认'
+        error_kind = KIND_UNVERIFIED
+    elif stage_status == STAGE_FAIL:
+        item_status = ITEM_FAILED
+        error = f"平台状态为 {state}，未发布成功"
+        error_kind = KIND_UNKNOWN
+    else:
+        item_status = ITEM_PROCESSING
+        error = ''
+        error_kind = ''
+    now = datetime.now()
+    next_check = (
+        _tracking_time(now + timedelta(minutes=_tracking_delay_minutes(0, stage)))
+        if item_status == ITEM_PROCESSING
+        else (_tracking_time(now + timedelta(hours=6)) if item_status == ITEM_SUCCESS else None)
+    )
+    remote_id = str(payload.get('post_id') or payload.get('remote_id') or '')[:200]
+    _update_item(
+        int(item['id']),
+        status=item_status,
+        error=error,
+        error_kind=error_kind,
+        remote_id=remote_id,
+        remote_status=state[:80],
+        verified_at=_tracking_time(now) if item_status == ITEM_SUCCESS else None,
+        verification=json_dumps(payload) if payload else '{}',
+        publish_stage=stage,
+        stage_status=stage_status,
+        next_check_at=next_check,
+        check_attempts=0,
+        last_checked_at=_tracking_time(now),
+        verification_started_at=_tracking_time(now)
+        if item_status == ITEM_PROCESSING else item.get('verification_started_at'),
+        finished_at=_tracking_time(now) if item_status in ITEM_TERMINAL else None,
+    )
+    updated = get_job_item(int(item['job_id']), int(item['id'])) or item
+    _sync_scheduled_item(updated, item_status, error)
+
+
+def _record_tracking_result(item: dict, result: dict) -> None:
+    """Update one active item from an authenticated platform status query."""
+    payload = result if isinstance(result, dict) else {}
+    platform_type = int(item.get('type') or 0)
+    classified = classify_publish_result(payload, platform_type=platform_type)
+    state = classified['state']
+    stage = classified['stage']
+    stage_status = classified['stage_status']
+    now = datetime.now()
+    attempts = int(item.get('check_attempts') or 0) + 1
+    was_success = item.get('status') == ITEM_SUCCESS
+    started = _parse_time(item.get('verification_started_at')) or now
+    if was_success and not (stage == STAGE_SUCCESS and classified['verified']):
+        # A confirmed post becoming unreadable is a new active observation.
+        # Give notfound/review transitions a grace window before changing the
+        # final result, instead of failing on one transient empty list.
+        started = now
+    error = ''
+    error_kind = ''
+
+    if stage == STAGE_UNVERIFIED:
+        # 平台不支持回查：停在这里等人工确认，既不判成功也不判失败。
+        item_status = ITEM_SUBMITTED
+        next_check = None
+        error = '平台不支持发布后回查，已提交但未验证，请人工到平台确认'
+        error_kind = KIND_UNVERIFIED
+    elif stage == STAGE_SUCCESS and classified['verified']:
+        item_status = ITEM_SUCCESS
+        # Keep a low-frequency check after publication so a later withdrawal or
+        # deletion is reflected in FlowOps instead of freezing the first result.
+        next_check = _tracking_time(
+            now + timedelta(hours=6 if now - started < timedelta(hours=24) else 12)
+        )
+    elif stage == STAGE_DRAFT:
+        item_status = ITEM_DRAFT
+        next_check = None
+    elif stage_status == STAGE_FAIL:
+        item_status = ITEM_FAILED
+        next_check = None
+        error = (
+            '平台作品已下架或无可见作品'
+            if stage == STAGE_WITHDRAWN
+            else (
+                '平台作品不是公开状态，未确认发布成功'
+                if state == 'private' else f'平台审核失败：{state}'
+            )
+        )
+        error_kind = KIND_UNKNOWN
+    else:
+        item_status = ITEM_PROCESSING
+        publish_at = _parse_time(payload.get('publish_time'))
+        if publish_at is None:
+            previous = json_loads(item.get('verification') or '{}')
+            if isinstance(previous, dict):
+                publish_at = _parse_time(previous.get('publish_time'))
+        reference = publish_at if publish_at and publish_at > started else started
+        notfound_expired = (
+            stage == STAGE_NOTFOUND
+            and not (publish_at and publish_at > now)
+            and now - reference >= timedelta(minutes=30)
+        )
+        general_expired = now - reference >= timedelta(hours=REVIEW_TIMEOUT_HOURS)
+        scheduled_in_future = bool(publish_at and publish_at > now)
+        if notfound_expired:
+            item_status = ITEM_FAILED
+            stage = STAGE_NOTFOUND
+            stage_status = STAGE_FAIL
+            next_check = None
+            error = '发布后持续查不到作品，未确认发布成功'
+            error_kind = KIND_UNKNOWN
+        elif general_expired and not scheduled_in_future:
+            # 平台审核可能超过 24 小时。这里不再直接判失败，而是转入
+            # "审核超时，低频复查"，保留人工确认入口。
+            stage = STAGE_TIMEOUT_REVIEW
+            stage_status = STAGE_DOING
+            item_status = ITEM_PROCESSING
+            next_check = _tracking_time(
+                now + timedelta(hours=TIMEOUT_RECHECK_HOURS)
+            )
+            error = (
+                f'平台处理超过 {REVIEW_TIMEOUT_HOURS} 小时仍未确认结果，'
+                '已转为低频复查，请在平台后台人工确认'
+            )
+            error_kind = KIND_UNKNOWN
+        else:
+            delay = _tracking_delay_minutes(attempts, stage)
+            if scheduled_in_future:
+                delay = max(5, int((publish_at - now).total_seconds() / 60) + 2)
+            next_check = _tracking_time(now + timedelta(minutes=min(delay, 360)))
+
+    verification = json_dumps(payload) if payload else str(item.get('verification') or '{}')
+    _update_item(
+        int(item['id']),
+        status=item_status,
+        error=error,
+        error_kind=error_kind,
+        remote_id=str(payload.get('post_id') or item.get('remote_id') or '')[:200],
+        remote_status=state[:80],
+        verified_at=(
+            item.get('verified_at') or _tracking_time(now)
+            if item_status == ITEM_SUCCESS else item.get('verified_at')
+        ),
+        verification=verification,
+        publish_stage=stage,
+        stage_status=stage_status,
+        next_check_at=next_check,
+        check_attempts=attempts,
+        last_checked_at=_tracking_time(now),
+        verification_started_at=_tracking_time(started),
+        finished_at=(
+            item.get('finished_at') or _tracking_time(now)
+            if item_status == ITEM_SUCCESS else (
+                _tracking_time(now) if item_status in ITEM_TERMINAL else None
+            )
+        ),
+    )
+    updated = get_job_item(int(item['job_id']), int(item['id'])) or item
+    _sync_scheduled_item(updated, item_status, error)
+
+
+def run_tracking_once(now: datetime | None = None) -> list[dict]:
+    """Poll active publish items and advance them to terminal states.
+
+    同一账号的多条作品会合并成一次查询（共用一个 Chromium），
+    避免每条作品都启动一次浏览器。
+    """
+    now = now or datetime.now()
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM publish_items WHERE "
+            "(status IN (?,?) OR (status=? AND next_check_at IS NOT NULL)) "
+            "AND (next_check_at IS NULL OR next_check_at<=?) "
+            "ORDER BY CASE WHEN status IN (?,?) THEN 0 ELSE 1 END, "
+            "datetime(next_check_at), id LIMIT 20",
+            (
+                ITEM_PROCESSING, ITEM_UNCERTAIN, ITEM_SUCCESS,
+                _tracking_time(now), ITEM_PROCESSING, ITEM_UNCERTAIN,
+            ),
+        ).fetchall()
+    updated = []
+    finalize_jobs: set[int] = set()
+
+    # 先取任务，再按账号分组。
+    items: list[dict] = []
+    jobs: dict[int, dict] = {}
+    for row in rows:
+        item = dict(row)
+        job_id = int(item.get('job_id') or 0)
+        if job_id not in jobs:
+            with get_conn() as c:
+                job_row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if job_row is None:
+                continue
+            jobs[job_id] = dict(job_row)
+        items.append(item)
+
+    results = _query_tracking_results(items, jobs)
+
+    for item in items:
+        job_id = int(item.get('job_id') or 0)
+        result = results.get((job_id, int(item.get('id') or 0)))
+        if result is None:
+            continue
+        lock = _account_lock(item.get('account_id'))
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            if result.get('error') and not result.get('state'):
+                message = str(result.get('error'))[:500] or result.get('error')
+                kind = classify_publish_error(message)
+                attempts = int(item.get('check_attempts') or 0) + 1
+                if kind == KIND_LOGIN_EXPIRED:
+                    _mark_account_expired(str(item.get('cookie') or ''), message)
+                    if item.get('status') == ITEM_SUCCESS:
+                        _update_item(
+                            int(item['id']), error=f'作品状态复查失败：{message}',
+                            error_kind=kind,
+                            next_check_at=_tracking_time(now + timedelta(hours=6)),
+                            check_attempts=attempts,
+                            last_checked_at=_tracking_time(now),
+                        )
+                    else:
+                        _update_item(
+                            int(item['id']), status=ITEM_FAILED, error=message,
+                            error_kind=kind, publish_stage=STAGE_PUSH,
+                            stage_status=STAGE_FAIL, next_check_at=None,
+                            check_attempts=attempts,
+                            last_checked_at=_tracking_time(now),
+                            finished_at=_tracking_time(now),
+                        )
+                elif attempts >= 12:
+                    if item.get('status') == ITEM_SUCCESS:
+                        _update_item(
+                            int(item['id']),
+                            error=f'作品状态复查连续失败：{message}',
+                            error_kind=kind,
+                            next_check_at=_tracking_time(now + timedelta(hours=12)),
+                            check_attempts=attempts,
+                            last_checked_at=_tracking_time(now),
+                        )
+                    else:
+                        _update_item(
+                            int(item['id']), status=ITEM_FAILED,
+                            error=f'作品状态查询连续失败：{message}',
+                            error_kind=kind, publish_stage=STAGE_NOTFOUND,
+                            stage_status=STAGE_FAIL, next_check_at=None,
+                            check_attempts=attempts,
+                            last_checked_at=_tracking_time(now),
+                            finished_at=_tracking_time(now),
+                        )
+                else:
+                    _update_item(
+                        int(item['id']), error=f'状态查询失败，将重试：{message}',
+                        check_attempts=attempts, last_checked_at=_tracking_time(now),
+                        next_check_at=_tracking_time(
+                            now + timedelta(minutes=_tracking_delay_minutes(attempts, STAGE_PUSH))
+                        ),
+                    )
+            else:
+                _record_tracking_result(item, result)
+            current = get_job_item(job_id, int(item['id']))
+            if current:
+                updated.append(current)
+                _sync_scheduled_item(current, str(current.get('status') or ''), str(current.get('error') or ''))
+                if str(current.get('status') or '') != str(item.get('status') or ''):
+                    finalize_jobs.add(job_id)
+        finally:
+            lock.release()
+    for job_id in sorted(finalize_jobs):
+        _finalize_existing_job(job_id)
+    return updated
+
+
+def _query_tracking_results(
+    items: list[dict], jobs: dict[int, dict],
+) -> dict[tuple[int, int], dict]:
+    """查询一批子任务的平台状态，按 (job_id, item_id) 索引返回。"""
+    if not items:
+        return {}
+    try:
+        from publish_status import query_publish_status_batch
+
+        raw = query_publish_status_batch(items, jobs)
+    except Exception as exc:
+        logger.warning("批量状态查询不可用，退回逐条查询: {}", exc)
+        raw = []
+        for item in items:
+            job = jobs.get(int(item.get('job_id') or 0)) or {}
+            try:
+                from publish_status import query_publish_status
+
+                raw.append(query_publish_status(item, job))
+            except Exception as exc2:
+                raw.append({
+                    'verified': False, 'found': False, 'state': 'unknown',
+                    'remote_status': 'unknown', 'error': str(exc2)[:500],
+                    'post_id': str(item.get('remote_id') or ''),
+                })
+    result_map: dict[tuple[int, int], dict] = {}
+    for index, item in enumerate(items):
+        if index >= len(raw):
+            break
+        result = raw[index]
+        if not isinstance(result, dict):
+            result = {'error': '状态查询返回异常'}
+        result_map[(int(item.get('job_id') or 0), int(item.get('id') or 0))] = result
+    return result_map
+
+
 def _summarize_items(job_id: int) -> dict:
     with get_conn() as c:
         rows = c.execute(
@@ -334,10 +1094,7 @@ def job_progress(job_id: int) -> dict:
     """给前端/接口用的进度快照。"""
     counts = _summarize_items(job_id)
     total = sum(counts.values())
-    done = sum(
-        counts.get(status, 0)
-        for status in (ITEM_SUCCESS, ITEM_FAILED, ITEM_SKIPPED, ITEM_CANCELLED)
-    )
+    done = sum(counts.get(status, 0) for status in ITEM_TERMINAL)
     return {
         "jobId": int(job_id),
         "total": total,
@@ -346,7 +1103,12 @@ def job_progress(job_id: int) -> dict:
         "skipped": counts.get(ITEM_SKIPPED, 0),
         "cancelled": counts.get(ITEM_CANCELLED, 0),
         "pending": counts.get(ITEM_PENDING, 0),
+        "scheduled": counts.get(ITEM_SCHEDULED, 0),
         "running": counts.get(ITEM_RUNNING, 0),
+        "processing": counts.get(ITEM_PROCESSING, 0),
+        "draft": counts.get(ITEM_DRAFT, 0),
+        "submitted": counts.get(ITEM_SUBMITTED, 0),
+        "uncertain": counts.get(ITEM_UNCERTAIN, 0),
         "percent": int(done * 100 / total) if total else 0,
     }
 
@@ -356,23 +1118,89 @@ def cancel_job(job_id: int) -> dict:
     with get_conn() as c:
         cur = c.execute(
             "UPDATE publish_items SET status=?, error='用户取消', finished_at=CURRENT_TIMESTAMP"
-            " WHERE job_id=? AND status IN (?,?)",
-            (ITEM_CANCELLED, int(job_id), ITEM_PENDING, ITEM_FAILED),
+            " WHERE job_id=? AND status IN (?,?,?)",
+            (
+                ITEM_CANCELLED, int(job_id), ITEM_PENDING, ITEM_FAILED,
+                ITEM_SCHEDULED,
+            ),
         )
         cancelled = cur.rowcount or 0
         c.execute(
             "UPDATE jobs SET status='cancelled', finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP)"
-            " WHERE id=? AND status IN ('pending','running','pending_review')",
+            " WHERE id=? AND status IN ('pending','running','pending_review','scheduled')",
+            (int(job_id),),
+        )
+        c.execute(
+            "UPDATE scheduled_items SET status='cancelled', updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND status IN ('pending','running','processing')",
             (int(job_id),),
         )
     return {"jobId": int(job_id), "cancelled": cancelled, **job_progress(job_id)}
+
+
+VISIBILITY_PUBLIC = 'public'
+VISIBILITY_DRAFT = 'draft'
+VISIBILITY_PRIVATE = 'private'
+VISIBILITY_VALUES = (VISIBILITY_PUBLIC, VISIBILITY_DRAFT, VISIBILITY_PRIVATE)
+
+
+def set_item_visibility(job_id: int, item_id: int, visibility: str) -> dict:
+    """修改一条子任务的可见性。
+
+    可见性和发布阶段是两件事：
+    - ``draft`` → ``public``：草稿转公开，可以走正常发布流程；
+    - ``public`` → ``draft``：撤回为草稿（平台支持时才真正执行撤回）。
+
+    这里只改本地记录；真正的平台侧撤回走作品管理接口。
+    """
+    item = get_job_item(job_id, item_id)
+    if item is None:
+        raise LookupError("发布子任务不存在，或不属于指定任务")
+    value = str(visibility or '').strip().lower()
+    if value not in VISIBILITY_VALUES:
+        raise ValueError("可见性只能是 public / draft / private")
+    with get_conn() as c:
+        c.execute(
+            "UPDATE publish_items SET visibility=? WHERE id=? AND job_id=?",
+            (value, int(item_id), int(job_id)),
+        )
+    return get_job_item(job_id, item_id) or item
+
+
+def publish_draft_items(job_id: int) -> dict:
+    """把草稿子任务转为待发布（草稿继续发布）。
+
+    草稿状态不应该把子任务永久卡住：这里把它放回 pending，让调度器接手。
+    """
+    with get_conn() as c:
+        cur = c.execute(
+            "UPDATE publish_items SET status=?, visibility=?, error='', error_kind='', "
+            "publish_stage='', stage_status='', next_check_at=NULL, finished_at=NULL "
+            "WHERE job_id=? AND visibility=? AND status IN (?,?,?)",
+            (
+                ITEM_PENDING, VISIBILITY_PUBLIC, int(job_id), VISIBILITY_DRAFT,
+                ITEM_DRAFT, ITEM_PENDING, ITEM_FAILED,
+            ),
+        )
+        queued = cur.rowcount or 0
+    if queued:
+        with get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET status='pending', finished_at=NULL WHERE id=?",
+                (int(job_id),),
+            )
+        _start_workers()
+        _q.put(int(job_id))
+    return {"jobId": int(job_id), "queued": queued, **job_progress(job_id)}
 
 
 def retry_failed_items(job_id: int) -> dict:
     """只重试失败的子任务（不重发已成功的账号）。"""
     with get_conn() as c:
         cur = c.execute(
-            "UPDATE publish_items SET status=?, attempts=0, error='' "
+            "UPDATE publish_items SET status=?, attempts=0, error='', error_kind='', "
+            "publish_stage='', stage_status='', next_check_at=NULL, check_attempts=0, "
+            "last_checked_at=NULL, verification_started_at=NULL, finished_at=NULL "
             "WHERE job_id=? AND status=?",
             (ITEM_PENDING, int(job_id), ITEM_FAILED),
         )
@@ -388,7 +1216,83 @@ def retry_failed_items(job_id: int) -> dict:
     return {"jobId": int(job_id), "retried": retried, **job_progress(job_id)}
 
 
-def _video_channels_account_for_item(item: dict) -> tuple[dict, dict]:
+def resolve_uncertain_item(
+    job_id: int,
+    item_id: int,
+    action: str,
+    *,
+    remote_id: str = '',
+    note: str = '',
+) -> dict:
+    """人工处理"状态未知"的子任务。
+
+    进程在提交到平台和写入结果之间崩溃时，子任务会停在 ``uncertain``。
+    自动重发可能造成重复发布，所以这里要求人工明确给出结论：
+
+    - ``confirm_published``：平台上确实有这篇作品，补记成功；
+    - ``confirm_missing``：平台上确实没有这篇作品，允许重新发布；
+    - ``mark_failed``：直接判失败（例如平台明确拒绝了）。
+    """
+    item = get_job_item(job_id, item_id)
+    if item is None:
+        raise LookupError("发布子任务不存在，或不属于指定任务")
+    if str(item.get('status') or '') != ITEM_UNCERTAIN:
+        raise ValueError("只有状态未知的子任务需要人工确认")
+    action = str(action or '').strip().lower()
+    now = _tracking_time()
+    if action == 'confirm_published':
+        _update_item(
+            int(item_id),
+            status=ITEM_SUCCESS,
+            error='',
+            error_kind='',
+            remote_id=str(remote_id or item.get('remote_id') or '')[:200],
+            remote_status='published',
+            verified_at=now,
+            publish_stage=STAGE_SUCCESS,
+            stage_status='success',
+            next_check_at=None,
+            finished_at=now,
+        )
+    elif action == 'confirm_missing':
+        # 允许重发：清掉幂等标记，重新排队。
+        _update_item(
+            int(item_id),
+            status=ITEM_PENDING,
+            error=str(note or '人工确认平台上没有该作品，已重新排队')[:300],
+            error_kind='',
+            attempts=0,
+            submitted_at=None,
+            publish_stage='',
+            stage_status='',
+            next_check_at=None,
+            finished_at=None,
+        )
+        with get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET status='pending', finished_at=NULL WHERE id=?",
+                (int(job_id),),
+            )
+        _start_workers()
+        _q.put(int(job_id))
+    elif action == 'mark_failed':
+        _update_item(
+            int(item_id),
+            status=ITEM_FAILED,
+            error=str(note or '人工确认发布失败')[:300],
+            error_kind=KIND_UNKNOWN,
+            publish_stage=STAGE_PUSH,
+            stage_status=STAGE_FAIL,
+            next_check_at=None,
+            finished_at=now,
+        )
+    else:
+        raise ValueError("未知的处理方式，请使用 confirm_published / confirm_missing / mark_failed")
+    _finalize_existing_job(int(job_id))
+    return get_job_item(job_id, item_id) or item
+
+
+def _platform_account_for_item(item: dict) -> tuple[dict, dict]:
     """Resolve the exact account/cookie that produced one publish item."""
     cookie = str(item.get('cookie') or '').strip()
     if not cookie:
@@ -405,21 +1309,34 @@ def _video_channels_account_for_item(item: dict) -> tuple[dict, dict]:
     if row is None:
         raise LookupError("作品所属账号已不存在，不能操作平台作品")
     account = dict(row)
-    if int(account.get('type') or 0) != 2:
-        raise ValueError("目前只支持管理视频号作品")
+    platform_type = int(item.get('type') or 0)
+    if platform_type not in (1, 2, 3):
+        raise ValueError("该平台暂不支持作品管理")
     cookie_path = Path(BASE_DIR / 'cookiesFile' / cookie)
     if not cookie_path.is_file():
         raise ValueError("作品所属账号的凭据文件不存在，请重新登录")
     return account, {
         "id": int(account['id']),
         "name": str(account.get('userName') or ''),
+        "type": platform_type,
         "cookie_path": str(cookie_path),
     }
 
 
+# 兼容旧调用点：原本只处理视频号的账号解析。
+_video_channels_account_for_item = _platform_account_for_item
+
+
 def _validate_remote_item(item: dict) -> str:
-    if int(item.get('type') or 0) != 2:
-        raise ValueError("目前只支持管理视频号作品")
+    platform_type = int(item.get('type') or 0)
+    try:
+        from myUtils.platform_registry import supports_remote_manage
+
+        allowed = supports_remote_manage(platform_type)
+    except Exception:
+        allowed = platform_type in (1, 2, 3)
+    if not allowed:
+        raise ValueError("该平台暂不支持作品管理")
     if str(item.get('status') or '') != ITEM_SUCCESS:
         raise ValueError("只有发布成功的子任务才能管理平台作品")
     remote_id = str(item.get('remote_id') or '').strip()
@@ -448,16 +1365,23 @@ def delete_remote_item(
     if str(item.get('remote_delete_status') or '') == 'success':
         return {**item, "alreadyDeleted": True}
 
-    account, channels_account = _video_channels_account_for_item(item)
-    from channels_dm import ChannelsClient
+    account, platform_account = _platform_account_for_item(item)
+    platform_type = int(item.get('type') or 0)
 
     try:
         with _account_lock(int(account['id'])):
-            client = ChannelsClient(channels_account)
-            try:
-                result = client.delete_post(remote_id)
-            finally:
-                client.close()
+            if platform_type == 2:
+                from channels_dm import ChannelsClient
+
+                client = ChannelsClient(platform_account)
+                try:
+                    result = client.delete_post(remote_id)
+                finally:
+                    client.close()
+            else:
+                from publish_remote_manage import delete_remote_post
+
+                result = delete_remote_post(platform_type, platform_account, remote_id)
     except Exception as exc:
         message = str(exc)[:500] or exc.__class__.__name__
         with get_conn() as c:
@@ -477,7 +1401,7 @@ def delete_remote_item(
             "remote_delete_error='', remote_deleted_at=? WHERE id=? AND job_id=?",
             (now, int(item_id), int(job_id)),
         )
-    logger.info("已删除视频号作品 {}（任务 {} / 子任务 {}）", remote_id, job_id, item_id)
+    logger.info("已删除平台作品 {}（任务 {} / 子任务 {}）", remote_id, job_id, item_id)
     return {
         **(get_job_item(job_id, item_id) or item),
         "alreadyDeleted": False,
@@ -510,15 +1434,37 @@ def create_replacement_job(
     if job is None:
         raise LookupError("原发布任务不存在")
     job = dict(job)
-    if int(job.get('type') or 0) != 2:
-        raise ValueError("目前只支持更正视频号作品")
+    platform_type = int(job.get('type') or 0)
+    try:
+        from myUtils.platform_registry import supports_remote_manage
+
+        allowed = supports_remote_manage(platform_type)
+    except Exception:
+        allowed = platform_type in (1, 2, 3)
+    if not allowed:
+        raise ValueError("该平台暂不支持更正作品")
+    platform_name = ''
+    try:
+        from myUtils.platform_registry import platform_name as _platform_name
+
+        platform_name = _platform_name(platform_type)
+    except Exception:
+        platform_name = ''
+    title_limit = 30
+    tags_limit = 8
+    if platform_type == 1:
+        title_limit, tags_limit = 30, 10
+    elif platform_type == 3:
+        title_limit, tags_limit = 55, 5
     existing_replacement = int(item.get('replacement_job_id') or 0)
     if existing_replacement:
         with get_conn() as c:
             existing = c.execute(
                 "SELECT status FROM jobs WHERE id=?", (existing_replacement,)
             ).fetchone()
-        if existing and str(existing['status']) in ('pending', 'running', 'success'):
+        if existing and str(existing['status']) in (
+            'pending', 'running', 'scheduled', 'processing', 'success',
+        ):
             raise ValueError("该作品已有替换任务，请等待完成或刷新查看")
 
     original_extra = json_loads(job.get('extra') or '{}')
@@ -527,8 +1473,8 @@ def create_replacement_job(
     new_title = str(title or job.get('title') or '').strip()
     if not new_title:
         raise ValueError("更正后的标题不能为空")
-    if len(new_title) > 30:
-        raise ValueError("视频号标题不能超过 30 个字符")
+    if len(new_title) > title_limit:
+        raise ValueError(f"{platform_name or '该平台'}标题不能超过 {title_limit} 个字符")
     if isinstance(tags, str):
         new_tags = [part.strip() for part in tags.replace('，', ',').split(',') if part.strip()]
     elif isinstance(tags, list):
@@ -537,8 +1483,8 @@ def create_replacement_job(
         new_tags = json_loads(job.get('tags') or '[]')
     if not isinstance(new_tags, list):
         new_tags = []
-    if len(new_tags) > 8:
-        raise ValueError("视频号话题不能超过 8 个")
+    if len(new_tags) > tags_limit:
+        raise ValueError(f"{platform_name or '该平台'}话题不能超过 {tags_limit} 个")
     new_desc = str(original_extra.get('desc', '') if desc is None else desc)[:1000]
     original_files = json_loads(job.get('file_list') or '[]')
     files = original_files if original_extra.get('contentType') == 'image-text' else [item['file']]
@@ -624,10 +1570,15 @@ def _recover_interrupted_jobs() -> list[int]:
     永远不会自己收尾——旧版本只恢复 `status='pending'` 的任务，于是这些
     僵尸记录会永远挂在前端"发布记录"页面上。
 
-    这里做两件事：
+    这里做三件事：
     1. `publish_records` 里卡住的 running 行标成 failed，写明是进程中断，
        避免前端一直显示"发布中"。
-    2. 对应的 `jobs` 回滚成 pending 并把 retry_count +1，重新入队重跑。
+    2. 子任务分两类：
+       - 还没提交到平台的（没有 submitted_at）→ 回到 pending，重跑安全；
+       - 已经提交但结果没写完的（有 submitted_at）→ 标记为 uncertain，
+         **不自动重发**。这类任务先做一次远端预查，确认平台上确实没有
+         作品后才允许重发，否则只标记"提交中/状态未知"，等人工确认。
+    3. 对应的 `jobs` 回滚成 pending 并把 retry_count +1，重新入队重跑。
        retry_count 沿用既有语义（>=1 就不再自动重试），所以反复崩溃的
        任务最终会落到 failed，而不是无限重启循环。
     """
@@ -639,11 +1590,18 @@ def _recover_interrupted_jobs() -> list[int]:
                          error=COALESCE(NULLIF(error,''),'进程重启，发布中断，请重新发布'),
                          finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP)
                      WHERE status='running'""")
-        # 子任务同理：running 的回到 pending，等 job 重新入队时接着跑
-        # （已成功的不会重跑，避免重启后重复发布）。
+        # 子任务分两类：未提交的可以安全重跑，已提交但结果未知的不能重发。
         c.execute("""UPDATE publish_items
                      SET status='pending',
                          error=COALESCE(NULLIF(error,''),'进程重启，等待重新执行')
+                     WHERE status='running' AND (submitted_at IS NULL OR submitted_at='')""")
+        c.execute("""UPDATE publish_items
+                     SET status='uncertain',
+                         error=COALESCE(NULLIF(error,''),'进程重启时已提交到平台但结果未写入，状态未知，为避免重复发布已暂停自动重发，请人工确认后处理'),
+                         error_kind='unverified',
+                         publish_stage='push',
+                         stage_status='doing',
+                         next_check_at=NULL
                      WHERE status='running'""")
         rows = c.execute(
             "SELECT id FROM jobs WHERE status='running' ORDER BY id"
@@ -726,6 +1684,18 @@ def _run_job(job_id):
         logger.info("任务 {} 状态为 {}，跳过执行", job_id, job['status'])
         return
 
+    # A due schedule can be discovered by both restart recovery and the
+    # scheduler during startup.  Claim the job atomically so duplicate queue
+    # entries cannot publish the same items twice.
+    with get_conn() as c:
+        claimed = c.execute(
+            "UPDATE jobs SET status='running' WHERE id=? AND status='pending'",
+            (int(job_id),),
+        ).rowcount
+    if not claimed:
+        logger.info("任务 {} 已被其它 worker 领取或已结束，跳过重复队列项", job_id)
+        return
+
     type = job['type']
     title = job['title']
     file_list = json_loads(job['file_list'])
@@ -738,7 +1708,6 @@ def _run_job(job_id):
     _expand_publish_items(job)
 
     with get_conn() as c:
-        c.execute("UPDATE jobs SET status='running' WHERE id=?", (job_id,))
         rec_id = c.execute(
             'INSERT INTO publish_records (job_id,type,title,files,accounts,status)'
             ' VALUES (?,?,?,?,?,?)',
@@ -751,6 +1720,12 @@ def _run_job(job_id):
     try:
         for item in _pending_items(job_id):
             item_id = int(item['id'])
+            latest = get_job_item(job_id, item_id)
+            if latest is None or latest.get('status') not in (ITEM_PENDING, ITEM_FAILED):
+                # The user may have cancelled or paused this item after the
+                # worker loaded its batch.
+                continue
+            item = latest
             account_id = int(item['account_id'] or 0)
             cookie = str(item['cookie'] or '')
             now = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -778,18 +1753,24 @@ def _run_job(job_id):
 
             with _account_lock(account_id):
                 attempts = int(item['attempts'] or 0) + 1
-                _update_item(item_id, status=ITEM_RUNNING, attempts=attempts, started_at=now)
+                with get_conn() as c:
+                    claimed_item = c.execute(
+                        "UPDATE publish_items SET status=?, attempts=?, started_at=? "
+                        "WHERE id=? AND status IN (?,?)",
+                        (
+                            ITEM_RUNNING, attempts, now, item_id,
+                            ITEM_PENDING, ITEM_FAILED,
+                        ),
+                    ).rowcount
+                if not claimed_item:
+                    continue
                 try:
+                    # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
+                    # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
+                    # 后者不会被自动重发。
+                    _update_item(item_id, submitted_at=now)
                     result = _execute_item(item, job, extra) or {}
-                    remote_id = str(result.get('post_id') or result.get('remote_id') or '')[:200]
-                    remote_status = str(result.get('state') or result.get('remote_status') or '')[:80]
-                    _update_item(
-                        item_id, status=ITEM_SUCCESS, error='', error_kind='',
-                        remote_id=remote_id, remote_status=remote_status,
-                        verified_at=time.strftime('%Y-%m-%d %H:%M:%S') if result.get('verified') else None,
-                        verification=json_dumps(result) if result else '{}',
-                        finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
-                    )
+                    _record_publish_result(item, result)
                 except Exception as exc:
                     message = str(exc)[:500] or exc.__class__.__name__
                     kind = classify_publish_error(message)
@@ -820,35 +1801,65 @@ def _run_job(job_id):
     _finalize_replacement(job_id, extra)
 
 
-def _finalize_job(job_id: int, rec_id, job, first_error: str = '') -> None:
-    """汇总子任务结果并决定 job 的最终状态；需要时只重跑失败的子任务。"""
+def _finalize_job(
+    job_id: int,
+    rec_id=None,
+    job=None,
+    first_error: str = '',
+) -> None:
+    """Reconcile item stages into a job status.
+
+    Future schedule rows and active platform stages keep the job open.  A job
+    becomes successful only after every item is terminal and at least one item
+    has an authenticated published/success result.
+    """
     job_id = int(job_id)
-    now = time.strftime('%Y-%m-%d %H:%M:%S')
+    now = _tracking_time()
+    if job is None:
+        with get_conn() as c:
+            row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if row is None:
+            return
+        job = dict(row)
+    elif not isinstance(job, dict):
+        # sqlite3.Row 没有 .get()，统一转成 dict 再读字段。
+        job = dict(job)
     counts = _summarize_items(job_id)
     pending = counts.get(ITEM_PENDING, 0)
-    retry_round = int(job['retry_count'] or 0)
+    retry_round = int(job.get('retry_count') or 0)
 
-    if pending and retry_round < 1:
+    if pending and retry_round < 1 and first_error:
         progress = job_progress(job_id)
         with get_conn() as c:
             c.execute(
-                "UPDATE jobs SET status='pending', retry_count=retry_count+1, progress=? WHERE id=?",
+                "UPDATE jobs SET status='pending', retry_count=retry_count+1, "
+                "progress=?, finished_at=NULL WHERE id=?",
                 (json_dumps(progress), job_id),
             )
-            c.execute(
-                "UPDATE publish_records SET status='failed', error=?, finished_at=? WHERE id=?",
-                ('部分子任务失败，已自动重试（只重跑失败项）', now, rec_id),
-            )
+            if rec_id is not None:
+                c.execute(
+                    "UPDATE publish_records SET status='failed', error=?, finished_at=? "
+                    "WHERE id=?",
+                    ('部分子任务失败，已自动重试（只重跑失败项）', now, rec_id),
+                )
         logger.info("任务 {} 有 {} 个子任务待重试，已重新入队", job_id, pending)
         _q.put(job_id)
         return
 
-    if pending:
-        # 重试次数用尽：剩余 pending 落 failed，避免任务永远挂在 running
+    if pending and not first_error:
         with get_conn() as c:
             c.execute(
-                "UPDATE publish_items SET status=?, error=COALESCE(NULLIF(error,''),'重试次数用尽'),"
-                " finished_at=? WHERE job_id=? AND status=?",
+                "UPDATE jobs SET status='pending', progress=?, finished_at=NULL WHERE id=?",
+                (json_dumps(job_progress(job_id)), job_id),
+            )
+        _q.put(job_id)
+        return
+
+    if pending:
+        with get_conn() as c:
+            c.execute(
+                "UPDATE publish_items SET status=?, error=COALESCE(NULLIF(error,''),"
+                "'重试次数用尽'), finished_at=? WHERE job_id=? AND status=?",
                 (ITEM_FAILED, now, job_id, ITEM_PENDING),
             )
         counts = _summarize_items(job_id)
@@ -857,15 +1868,53 @@ def _finalize_job(job_id: int, rec_id, job, first_error: str = '') -> None:
     bad = counts.get(ITEM_FAILED, 0)
     skipped = counts.get(ITEM_SKIPPED, 0)
     cancelled = counts.get(ITEM_CANCELLED, 0)
+    drafts = counts.get(ITEM_DRAFT, 0)
+    submitted = counts.get(ITEM_SUBMITTED, 0)
+    processing = counts.get(ITEM_PROCESSING, 0)
+    scheduled = counts.get(ITEM_SCHEDULED, 0)
     summary = json_dumps({
-        "success": ok, "failed": bad, "skipped": skipped, "cancelled": cancelled,
+        "success": ok, "failed": bad, "skipped": skipped,
+        "cancelled": cancelled, "draft": drafts, "submitted": submitted,
+        "processing": processing, "scheduled": scheduled,
     })
 
-    if ok and (bad or skipped or cancelled):
-        status = 'partial_success'
-    elif ok:
+    for item in job_items(job_id):
+        _sync_scheduled_item(
+            item, str(item.get('status') or ''), str(item.get('error') or '')
+        )
+
+    if processing or scheduled:
+        status = 'processing' if processing else 'scheduled'
+        with get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET status=?, result=?, progress=?, finished_at=NULL "
+                "WHERE id=?",
+                (status, summary, json_dumps(job_progress(job_id)), job_id),
+            )
+            if rec_id is not None:
+                c.execute(
+                    "UPDATE publish_records SET status=?, error=?, finished_at=NULL "
+                    "WHERE job_id=? AND status IN "
+                    "('running','processing','scheduled','success','partial_success')",
+                    (status, first_error[:500], job_id),
+                )
+        return
+
+    if ok and not (bad or skipped or cancelled or drafts or submitted):
         status = 'success'
-    elif cancelled and not (bad or skipped):
+    elif ok:
+        # A draft is an active outcome, never a published success.  Keep mixed
+        # success/draft batches partial so the record cannot claim every item
+        # was published.
+        status = 'partial_success'
+    elif submitted and not (bad or skipped or cancelled or drafts):
+        # 全部是"已提交但平台不支持回查"：不是失败，但也不能说成功。
+        status = 'submitted'
+    elif submitted and ok:
+        status = 'partial_success'
+    elif drafts and not (bad or skipped or cancelled or submitted):
+        status = 'draft'
+    elif cancelled and not (bad or skipped or submitted):
         status = 'cancelled'
     else:
         status = 'failed'
@@ -873,17 +1922,22 @@ def _finalize_job(job_id: int, rec_id, job, first_error: str = '') -> None:
     with get_conn() as c:
         c.execute(
             "UPDATE jobs SET status=?, result=?, progress=?, finished_at=? WHERE id=?",
-            (status, summary if status != 'success' else 'ok', json_dumps(job_progress(job_id)),
-             now, job_id),
+            (
+                status, 'ok' if status == 'success' else summary,
+                json_dumps(job_progress(job_id)), now, job_id,
+            ),
         )
-        c.execute(
-            "UPDATE publish_records SET status=?, error=?, finished_at=? WHERE id=?",
-            (status, first_error[:500] if status in ('failed', 'partial_success') else '',
-             now, rec_id),
-        )
-        if status == 'success':
-            c.execute("UPDATE scheduled_items SET status='success' WHERE job_id=?", (job_id,))
-
+        if rec_id is not None:
+            c.execute(
+                "UPDATE publish_records SET status=?, error=?, finished_at=? "
+                "WHERE job_id=? AND status IN "
+                "('running','processing','scheduled','success','partial_success')",
+                (
+                    status,
+                    first_error[:500] if status in ('failed', 'partial_success') else '',
+                    now, job_id,
+                ),
+            )
     if status in ('failed', 'partial_success'):
         try:
             from notify_ops import notify
@@ -893,12 +1947,41 @@ def _finalize_job(job_id: int, rec_id, job, first_error: str = '') -> None:
                 '发布失败' if status == 'failed' else '发布部分失败',
                 '平台：%s' % names.get(int(job['type']), job['type'])
                 + '\n标题：' + str(job['title'])
-                + '\n结果：成功 %d / 失败 %d / 跳过 %d' % (ok, bad, skipped)
-                + '\n原因：' + (first_error or '账号登录态失效，已跳过'),
+                + '\n结果：成功 %d / 失败 %d / 跳过 %d / 草稿 %d'
+                % (ok, bad, skipped, drafts)
+                + '\n原因：' + (first_error or '平台未确认发布成功'),
                 'error',
             )
         except Exception:
             pass
+
+
+def _finalize_existing_job(job_id: int) -> None:
+    with get_conn() as c:
+        job_row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if job_row is None:
+            return
+        record = c.execute(
+            'SELECT id,error FROM publish_records WHERE job_id=? ORDER BY id DESC LIMIT 1',
+            (job_id,),
+        ).fetchone()
+    job = dict(job_row)
+    if str(job.get('status') or '') in ('pending', 'running'):
+        # The worker owns retry/queue reconciliation while it is active.  A
+        # tracker can finish another account at the same moment; finalizing
+        # here would confuse queued work with a failed-subtask retry.
+        return
+    _finalize_job(
+        job_id,
+        int(record['id']) if record else None,
+        job,
+        str(record['error'] or '') if record else '',
+    )
+    with get_conn() as c:
+        current = c.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
+    extra = json_loads(job.get('extra') or '{}')
+    if current and str(current['status']) == 'success' and isinstance(extra, dict):
+        _finalize_replacement(job_id, extra)
 
 
 
@@ -952,13 +2035,31 @@ def _ensure_thumbnail(file_list, extra):
 def backfill_scheduled_items():
     """Expand schedules for existing timer-enabled jobs that have no rows yet."""
     with get_conn() as c:
-        job_ids = [r['id'] for r in c.execute(
-            "SELECT id FROM jobs WHERE status='pending'").fetchall()]
-    for jid in job_ids:
+        rows = c.execute(
+            "SELECT * FROM jobs WHERE status IN ('pending','scheduled')"
+        ).fetchall()
+    for row in rows:
         try:
-            _expand_schedule(jid)
+            job = dict(row)
+            extra = json_loads(job.get('extra') or '{}')
+            if not isinstance(extra, dict) or not extra.get('enableTimer'):
+                continue
+            _expand_schedule(int(job['id']))
+            _expand_publish_items(job)
+            _link_schedule_to_items(int(job['id']))
+            with get_conn() as c:
+                running_schedule = c.execute(
+                    "SELECT 1 FROM scheduled_items WHERE job_id=? AND status='running' LIMIT 1",
+                    (int(job['id']),),
+                ).fetchone()
+            if job['status'] == 'pending' and running_schedule is None:
+                with get_conn() as c:
+                    c.execute(
+                        "UPDATE jobs SET status='scheduled', finished_at=NULL WHERE id=?",
+                        (int(job['id']),),
+                    )
         except Exception:
-            pass
+            logger.exception("迁移定时任务失败: {}", row['id'])
 
 
 def _expand_schedule(job_id):
@@ -985,21 +2086,103 @@ def _expand_schedule(job_id):
 
     file_list = json_loads(job['file_list'])
     account_list = json_loads(job['account_list'])
+    image_text = extra.get('contentType') == 'image-text'
+    task_count = len(account_list) if image_text else len(file_list) * len(account_list)
     try:
         from utils.files_times import generate_schedule_time_next_day
         videos_per_day = int(extra.get('videosPerDay') or 1)
         daily_times = extra.get('dailyTimes') or ['10:00']
         start_days = int(extra.get('startDays') or 0)
-        dts = generate_schedule_time_next_day(len(file_list), videos_per_day, daily_times, start_days=start_days)
-    except Exception:
-        dts = []
+        dts = generate_schedule_time_next_day(
+            max(1, task_count), videos_per_day, daily_times, start_days=start_days
+        )
+    except Exception as exc:
+        raise RuntimeError("生成定时排期失败，未写入无法执行的空计划") from exc
+    units = []
+    if image_text:
+        first_file = str(file_list[0]) if file_list else ''
+        units = [(first_file, str(account)) for account in account_list]
+    else:
+        units = [
+            (str(file_name), str(account))
+            for file_name in file_list for account in account_list
+        ]
+    if not units:
+        raise RuntimeError("定时任务缺少可发布的素材或账号")
+    if len(dts) < len(units):
+        raise RuntimeError(
+            f"定时排期数量不足：需要 {len(units)} 个时间点，仅生成 {len(dts)} 个"
+        )
     with get_conn() as c:
-        for fi, f in enumerate(file_list):
-            dt = dts[fi] if fi < len(dts) else None
-            for acc in account_list:
-                c.execute(
-                    'INSERT INTO scheduled_items (job_id, account, file, scheduled_at) VALUES (?,?,?,?)',
-                    (job_id, str(acc), str(f), dt.strftime('%Y-%m-%d %H:%M') if dt else None))
+        for index, (file_name, account) in enumerate(units):
+            dt = dts[index] if index < len(dts) else None
+            c.execute(
+                'INSERT INTO scheduled_items (job_id, account, file, scheduled_at, updated_at)'
+                ' VALUES (?,?,?,?,CURRENT_TIMESTAMP)',
+                (
+                    int(job_id), account, file_name,
+                    dt.strftime('%Y-%m-%d %H:%M') if dt else None,
+                ),
+            )
+
+
+def run_schedule_once(now: datetime | None = None) -> list[int]:
+    """Move due local schedule rows into the publish queue."""
+    current = now or datetime.now()
+    cutoff = current.strftime('%Y-%m-%d %H:%M:%S')
+    with get_conn() as c:
+        rows = c.execute(
+            """SELECT s.*, j.status AS job_status
+               FROM scheduled_items s JOIN jobs j ON j.id=s.job_id
+               WHERE s.status='pending' AND s.scheduled_at IS NOT NULL
+                 AND datetime(s.scheduled_at)<=datetime(?)
+                 AND j.status IN ('pending','scheduled','processing')
+               ORDER BY datetime(s.scheduled_at), s.id""",
+            (cutoff,),
+        ).fetchall()
+    due_rows = [dict(row) for row in rows]
+    due_jobs = {int(row['job_id']) for row in due_rows}
+    for job_id in sorted(due_jobs):
+        with get_conn() as c:
+            job_row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not job_row:
+            continue
+        _expand_publish_items(dict(job_row))
+        _link_schedule_to_items(job_id)
+
+    claimed_jobs: set[int] = set()
+    with get_conn() as c:
+        for row in due_rows:
+            job_id = int(row['job_id'])
+            job_available = c.execute(
+                "UPDATE jobs SET status='pending', finished_at=NULL "
+                "WHERE id=? AND status IN ('pending','scheduled','processing')",
+                (job_id,),
+            ).rowcount
+            if not job_available:
+                continue
+            claimed = c.execute(
+                "UPDATE scheduled_items SET status='running', updated_at=? "
+                "WHERE id=? AND status='pending'",
+                (cutoff, int(row['id'])),
+            ).rowcount
+            if not claimed:
+                continue
+            c.execute(
+                "UPDATE publish_items SET status=? "
+                "WHERE job_id=? AND cookie=? AND file=? AND status=?",
+                (
+                    ITEM_PENDING, job_id, str(row['account']), str(row['file']),
+                    ITEM_SCHEDULED,
+                ),
+            )
+            claimed_jobs.add(job_id)
+    if claimed_jobs:
+        _start_workers()
+        for job_id in sorted(claimed_jobs):
+            _q.put(job_id)
+        logger.info("本地排期到点，已入队任务: {}", ", ".join(map(str, sorted(claimed_jobs))))
+    return sorted(claimed_jobs)
 
 def enqueue_job(type, title, tags, file_list, account_list, extra, review_required=False):
     import json
@@ -1007,19 +2190,34 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
         tags = [item.strip() for item in tags.split(',') if item.strip()]
     elif not isinstance(tags, list):
         tags = []
+    timer_enabled = bool((extra or {}).get('enableTimer'))
     with get_conn() as c:
-        status = 'pending_review' if review_required else 'pending'
+        status = (
+            'pending_review' if review_required
+            else ('scheduled' if timer_enabled else 'pending')
+        )
         cur = c.execute('INSERT INTO jobs (type,title,tags,file_list,account_list,extra,status) VALUES (?,?,?,?,?,?,?)',
             (type, title, json.dumps(tags, ensure_ascii=False), json.dumps(file_list), json.dumps(account_list), json.dumps(extra or {}), status))
         job_id = cur.lastrowid
     # 排期在任务创建时就算好并落库，之后不再重算，
     # 这样重启/重试/巡检都不会把发布时间顺延。
-    if (extra or {}).get('enableTimer'):
+    if timer_enabled:
         try:
             _expand_schedule(job_id)
-        except Exception:
+            with get_conn() as c:
+                row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row:
+                _expand_publish_items(dict(row))
+                _link_schedule_to_items(job_id)
+        except Exception as exc:
             logger.exception("展开定时排期失败: job_id={}", job_id)
-    if not review_required:
+            with get_conn() as c:
+                c.execute(
+                    "UPDATE jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP "
+                    "WHERE id=?",
+                    (str(exc)[:500] or "定时排期生成失败", int(job_id)),
+                )
+    if not review_required and not timer_enabled:
         _start_workers()
         _q.put(job_id)
     return job_id
@@ -1027,14 +2225,75 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
 
 def approve_job(job_id):
     with get_conn() as c:
-        c.execute("UPDATE jobs SET status='pending' WHERE id=? AND status='pending_review'", (job_id,))
-    _start_workers()
-    _q.put(job_id)
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if row is None:
+            return
+        extra = json_loads(row['extra'] or '{}')
+        timer_enabled = isinstance(extra, dict) and bool(extra.get('enableTimer'))
+        c.execute(
+            "UPDATE jobs SET status=? WHERE id=? AND status='pending_review'",
+            ('scheduled' if timer_enabled else 'pending', int(job_id)),
+        )
+        if timer_enabled:
+            c.execute(
+                "UPDATE scheduled_items SET status='pending' WHERE job_id=? AND status='cancelled'",
+                (int(job_id),),
+            )
+    if timer_enabled:
+        run_schedule_once()
+    else:
+        _start_workers()
+        _q.put(int(job_id))
 
 
 def reject_job(job_id):
     with get_conn() as c:
         c.execute("UPDATE jobs SET status='rejected', finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_review'", (job_id,))
+        c.execute(
+            "UPDATE scheduled_items SET status='cancelled', updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND status IN ('pending','running')",
+            (int(job_id),),
+        )
+
+
+_scheduler_started = False
+_tracker_started = False
+
+
+def start_publish_runtime(
+    schedule_interval_seconds: int = 20,
+    tracking_interval_seconds: int = 60,
+) -> None:
+    """Start the local schedule scanner and post-submit status tracker."""
+    global _scheduler_started, _tracker_started
+    _start_workers()
+    with _lock:
+        start_scheduler = not _scheduler_started
+        start_tracker = not _tracker_started
+        _scheduler_started = True
+        _tracker_started = True
+
+    if start_scheduler:
+        def _schedule_loop():
+            while True:
+                try:
+                    run_schedule_once()
+                except Exception:
+                    traceback.print_exc()
+                time.sleep(max(5, int(schedule_interval_seconds)))
+
+        threading.Thread(target=_schedule_loop, daemon=True, name='publish-scheduler').start()
+
+    if start_tracker:
+        def _tracking_loop():
+            while True:
+                try:
+                    run_tracking_once()
+                except Exception:
+                    traceback.print_exc()
+                time.sleep(max(15, int(tracking_interval_seconds)))
+
+        threading.Thread(target=_tracking_loop, daemon=True, name='publish-tracker').start()
 
 # ---------- account patrol ----------
 _patrol_started = False

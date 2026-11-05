@@ -6,6 +6,7 @@ import hashlib
 
 from flask import Blueprint
 
+import dm_cursor
 import dm_ops
 from dm_media_cache import attach_message_media
 from dm_platform_common import (
@@ -317,6 +318,7 @@ def _sync_account(settings: dict, account: dict) -> dict:
             "media_failed": media_result["failed"],
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
+            "cursor": dm_cursor.cursor_from_items(items),
             "items": ingest.get("items", []),
         }
     finally:
@@ -364,12 +366,13 @@ sync_manager = XiaohongshuDmSync(
     settings_table="xiaohongshu_dm_sync_settings",
     route_prefix="/dm/xhs",
     min_interval=0,
-    default_interval=0,
+    default_interval=120,
     default_max_conversations=50,
     default_history_days=DEFAULT_HISTORY_DAYS,
     error_types=(XhsError, XhsAuthError),
     max_workers=8,
     failure_backoff=30,
+    continuous_gap=60,
 )
 sync_manager.register_routes()
 

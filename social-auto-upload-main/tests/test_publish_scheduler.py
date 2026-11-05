@@ -81,6 +81,12 @@ def _patch_dispatcher(monkeypatch, behaviour):
         cookie = kwargs["account_list"][0]
         calls.append(cookie)
         behaviour(cookie)
+        return [{
+            "verified": True,
+            "state": "published",
+            "remote_status": "published",
+            "post_id": f"post-{len(calls)}",
+        }]
 
     monkeypatch.setattr(registry, "dispatch_publish", fake, raising=True)
     return calls
@@ -213,7 +219,7 @@ def test_error_classification():
     assert pj.classify_publish_error("something odd") == "unknown"
 
 
-def test_structured_tencent_verification_is_persisted(env, monkeypatch):
+def test_nonterminal_tencent_stage_is_not_reported_as_success(env, monkeypatch):
     pj, _base = env
     import myUtils.platform_registry as registry
 
@@ -234,11 +240,15 @@ def test_structured_tencent_verification_is_persisted(env, monkeypatch):
     pj._run_job(job_id)
 
     item = pj.job_items(job_id)[0]
-    assert item["status"] == "success"
+    assert item["status"] == "processing"
     assert item["remote_id"] == "post-123"
     assert item["remote_status"] == "review"
-    assert item["verified_at"]
+    assert item["publish_stage"] == "review"
+    assert item["stage_status"] == "doing"
+    assert item["verified_at"] is None
     assert json.loads(item["verification"])["verification"] == "post-list-network"
+    with pj.get_conn() as c:
+        assert c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0] == "processing"
 
 
 def test_image_text_job_sends_one_post_per_account(env, monkeypatch):
@@ -265,3 +275,162 @@ def test_image_text_job_sends_one_post_per_account(env, monkeypatch):
     assert all(call["files"] == ["1.png", "2.png"] for call in calls)
     assert all(call["contentType"] == "image-text" for call in calls)
     assert len(pj.job_items(job_id)) == 2
+
+
+def test_platform_without_verification_is_not_reported_as_success(env, monkeypatch):
+    """快手/微博/百家号没有回查能力：只能记"已提交，未验证"，不能判成功也不能判失败。"""
+    pj, _base = env
+    import myUtils.platform_registry as registry
+
+    def publish(platform_type, **kwargs):
+        assert platform_type == 4
+        return [{"verified": False, "state": "submitted", "post_id": ""}]
+
+    monkeypatch.setattr(registry, "dispatch_publish", publish, raising=True)
+    job_id = _create_job(pj, ["v1.mp4"], [COOKIE_A], platform=4)
+
+    pj._run_job(job_id)
+
+    item = pj.job_items(job_id)[0]
+    assert item["status"] == "submitted", "没有回查能力的平台不能被判成成功"
+    assert item["publish_stage"] == "unverified"
+    assert item["error_kind"] == "unverified"
+    assert item["verified_at"] is None
+    with pj.get_conn() as c:
+        job = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+    assert job["status"] == "submitted", "整批都未验证时，任务状态是 submitted 而不是 success"
+
+
+def test_review_timeout_moves_to_low_frequency_recheck(env, monkeypatch):
+    """审核超过 24 小时不判失败，转入"审核超时，低频复查"。"""
+    pj, _base = env
+    import myUtils.platform_registry as registry
+
+    def publish(_platform_type, **kwargs):
+        return [{"verified": True, "state": "review", "post_id": "p-1"}]
+
+    monkeypatch.setattr(registry, "dispatch_publish", publish, raising=True)
+    job_id = _create_job(pj, ["v1.mp4"], [COOKIE_A])
+    pj._run_job(job_id)
+
+    item = pj.job_items(job_id)[0]
+    assert item["status"] == "processing"
+
+    # 把验证起点往前推 48 小时，模拟平台审核了很久。
+    with pj.get_conn() as c:
+        c.execute(
+            "UPDATE publish_items SET verification_started_at=? WHERE job_id=?",
+            ("2020-01-01 00:00:00", job_id),
+        )
+
+    pj._record_tracking_result(
+        pj.job_items(job_id)[0],
+        {"verified": True, "state": "review", "post_id": "p-1"},
+    )
+
+    updated = pj.job_items(job_id)[0]
+    assert updated["status"] == "processing", "审核超时不能判失败"
+    assert updated["publish_stage"] == "timeout_review"
+    assert updated["next_check_at"], "低频复查仍需安排下一次检查"
+
+
+def test_interrupted_publish_is_not_republished(env, monkeypatch):
+    """进程在提交后崩溃：子任务进入 uncertain，不会被自动重发。"""
+    pj, _base = env
+    import myUtils.platform_registry as registry
+
+    calls = []
+
+    def publish(_platform_type, **kwargs):
+        calls.append(kwargs)
+        return [{"verified": True, "state": "published", "post_id": "p-1"}]
+
+    monkeypatch.setattr(registry, "dispatch_publish", publish, raising=True)
+    job_id = _create_job(pj, ["v1.mp4"], [COOKIE_A])
+    pj._expand_publish_items(
+        {"id": job_id, "type": 2, "title": "测试标题",
+         "file_list": json.dumps(["v1.mp4"]),
+         "account_list": json.dumps([COOKIE_A])}
+    )
+    # 模拟"已经提交到平台但结果没写完"的崩溃现场。
+    with pj.get_conn() as c:
+        c.execute(
+            "UPDATE publish_items SET status='running', submitted_at='2024-01-01 00:00:00' "
+            "WHERE job_id=?",
+            (job_id,),
+        )
+        c.execute("UPDATE jobs SET status='running' WHERE id=?", (job_id,))
+
+    pj._recover_interrupted_jobs()
+
+    item = pj.job_items(job_id)[0]
+    assert item["status"] == "uncertain", "已提交但结果未知的子任务不能自动重发"
+    assert item["submitted_at"], "提交时间要保留，供人工判断"
+
+    # 不确定状态的子任务不进入自动重跑队列。
+    pj._run_job(job_id)
+    assert calls == [], "状态未知的子任务不能被自动重新发布"
+
+
+def test_resolve_uncertain_item_confirm_missing_requeues(env, monkeypatch):
+    """人工确认"平台上确实没有"之后才允许重新发布。"""
+    pj, _base = env
+    import myUtils.platform_registry as registry
+
+    calls = []
+
+    def publish(_platform_type, **kwargs):
+        calls.append(kwargs)
+        return [{"verified": True, "state": "published", "post_id": "p-1"}]
+
+    monkeypatch.setattr(registry, "dispatch_publish", publish, raising=True)
+    job_id = _create_job(pj, ["v1.mp4"], [COOKIE_A])
+    pj._expand_publish_items(
+        {"id": job_id, "type": 2, "title": "测试标题",
+         "file_list": json.dumps(["v1.mp4"]),
+         "account_list": json.dumps([COOKIE_A])}
+    )
+    with pj.get_conn() as c:
+        c.execute(
+            "UPDATE publish_items SET status='uncertain', submitted_at='2024-01-01 00:00:00' "
+            "WHERE job_id=?",
+            (job_id,),
+        )
+
+    pj.resolve_uncertain_item(job_id, 1, "confirm_missing")
+    assert pj.job_items(job_id)[0]["status"] == "pending"
+
+    pj._run_job(job_id)
+    assert len(calls) == 1, "人工确认之后才重新发布"
+    assert pj.job_items(job_id)[0]["status"] == "success"
+
+
+def test_idempotency_precheck_skips_duplicate_publish(env, monkeypatch):
+    """远端已经有同名作品时不再发布一次（防重复发布）。"""
+    pj, _base = env
+    import myUtils.platform_registry as registry
+
+    calls = []
+
+    def publish(_platform_type, **kwargs):
+        calls.append(kwargs)
+        return [{"verified": True, "state": "published", "post_id": "p-1"}]
+
+    monkeypatch.setattr(registry, "dispatch_publish", publish, raising=True)
+
+    def fake_query(_item, _job):
+        return {
+            "verified": True, "found": True, "state": "published",
+            "remote_status": "published", "post_id": "p-1",
+            "verification": "post-list-api",
+        }
+
+    monkeypatch.setattr("publish_status.query_publish_status", fake_query, raising=True)
+
+    job_id = _create_job(pj, ["v1.mp4"], [COOKIE_A])
+    pj._run_job(job_id)
+
+    assert calls == [], "远端已有作品时不应再次提交"
+    item = pj.job_items(job_id)[0]
+    assert item["status"] == "success"
+    assert "idempotency-precheck" in item["verification"]

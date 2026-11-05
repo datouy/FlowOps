@@ -73,11 +73,11 @@
 
           <!-- 素材上传区域 -->
           <div class="upload-section">
-            <h3>{{ tab.selectedPlatform === 2 && tab.contentType === 'image-text' ? '图文图片' : '视频' }}</h3>
+            <h3>{{ isImageText(tab) ? '图文图片' : '视频' }}</h3>
             <div class="upload-options">
               <el-button type="primary" @click="showUploadOptions(tab)" class="upload-btn">
                 <el-icon><Upload /></el-icon>
-                {{ tab.selectedPlatform === 2 && tab.contentType === 'image-text' ? '上传图片' : '上传视频' }}
+                {{ isImageText(tab) ? '上传图片' : '上传视频' }}
               </el-button>
             </div>
             
@@ -320,8 +320,8 @@
                 {{ platform.name }}
               </el-radio>
             </el-radio-group>
-            <div v-if="tab.selectedPlatform === 2" class="content-type-section">
-              <span class="content-type-label">视频号内容类型</span>
+            <div v-if="supportsImageText(tab.selectedPlatform)" class="content-type-section">
+              <span class="content-type-label">{{ platformName(tab.selectedPlatform) }}内容类型</span>
               <el-radio-group v-model="tab.contentType" size="small">
                 <el-radio-button value="video">视频</el-radio-button>
                 <el-radio-button value="image-text">图文</el-radio-button>
@@ -678,6 +678,22 @@ const platforms = [
   { key: 6, name: '百家号' }
 ]
 
+// 支持图文发布的平台（必须与后端 myUtils/platform_registry.py 保持一致）
+const IMAGE_TEXT_PLATFORMS = [1, 2, 3]
+
+function supportsImageText(platformKey) {
+  return IMAGE_TEXT_PLATFORMS.includes(Number(platformKey))
+}
+
+function platformName(platformKey) {
+  return platforms.find(item => item.key === Number(platformKey))?.name || '平台'
+}
+
+// 当前标签页是否处于图文模式
+function isImageText(tab) {
+  return Boolean(tab) && tab.contentType === 'image-text' && supportsImageText(tab.selectedPlatform)
+}
+
 // 各平台标题字数上限，必须与后端 compliance.PLATFORM_RULES 保持一致
 const PLATFORM_TITLE_MAX = {
   1: 30, // 小红书
@@ -978,7 +994,7 @@ const confirmPublish = async (tab) => {
     productLink: tab.productLink.trim() || '',
     productTitle: tab.productTitle.trim() || '',
     isDraft: tab.isDraft,
-    contentType: tab.selectedPlatform === 2 ? tab.contentType : 'video',
+    contentType: isImageText(tab) ? tab.contentType : 'video',
     reviewRequired: tab.reviewRequired
   }
 

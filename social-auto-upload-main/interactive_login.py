@@ -43,6 +43,8 @@ from utils.account_browser import (
 )
 from utils.account_environment import (
     bind_environment,
+    bind_tencent_channel_environment,
+    load_environment,
     save_environment,
 )
 
@@ -175,6 +177,7 @@ class InteractivePlatformLogin:
         self.frame_version = 0
         self.cookie_name = ""
         self.saved_count = 0
+        self._last_saved_account_id = 0
         self.saved_tencent_identities: set[str] = set()
         # 视频号把网页会话绑定到设备指纹。每个账号首次登录时生成一份稳定
         # profile，之后重新登录、巡检和发布都沿用同一份参数。
@@ -333,7 +336,7 @@ class InteractivePlatformLogin:
         cookie_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
         context.storage_state(path=str(cookie_path))
-        if self.fingerprint:
+        if self.fingerprint and self.platform != "tencent":
             save_fingerprint(cookie_path, self.fingerprint)
 
         platform_type = self._platform_type
@@ -361,9 +364,31 @@ class InteractivePlatformLogin:
             account_id=target_id,
             identity=identity_value,
             identity_source=identity_source,
-            status=1,
+            # The target Channels environment is still being verified.  Keep
+            # the account out of the publish queue until that check succeeds.
+            status=0 if self.platform == "tencent" else 1,
         )
-        if self.fingerprint:
+        self._last_saved_account_id = int(saved["id"])
+        if self.platform == "tencent":
+            # The interactive context is a WeChat discovery session.  Persist
+            # its lineage, but give every discovered Channels account its own
+            # profile key, fingerprint and proxy sidecar before it is used by
+            # publishing, polling or DM sync.
+            #
+            # The proxy is deliberately NOT inherited from the login session:
+            # several channels discovered by one administrator must not share
+            # one egress IP.  Instead each channel gets an unused entry from
+            # the proxy pool; when the pool is empty the channel runs on the
+            # local IP and the risk is surfaced to the user.
+            bind_tencent_channel_environment(
+                self._environment_cookie or cookie_path,
+                cookie_path,
+                int(saved["id"]),
+                identity_value,
+                login_session_id=self.session_id,
+                proxy=_assigned_channel_proxy(int(saved["id"])),
+            )
+        elif self.fingerprint:
             bind_environment(
                 self._environment_cookie or cookie_path,
                 cookie_path,
@@ -377,6 +402,11 @@ class InteractivePlatformLogin:
             self.cookie_name = cookie_name
             self.saved_count += 1
         return cookie_name
+
+    def _mark_tencent_verified(self) -> None:
+        account_id = int(self._last_saved_account_id or 0)
+        if account_id:
+            get_store(BASE_DIR).mark_status(account_id, 1, "")
 
     def _tencent_account_slot(self) -> tuple[int, str] | None:
         if not self.account_id:
@@ -452,19 +482,40 @@ class InteractivePlatformLogin:
             ).fetchone()
         return f"{self._platform_label}账号{int(row[0] if row else 0) + 1}"
 
-    def _verify_tencent_cookie(self, context) -> bool:
-        """Verify the saved account without opening its profile a second time.
-
-        The interactive login still owns the persistent Chromium profile while
-        this check runs.  Launching another browser for the same profile would
-        wait forever on the account lock, so verify positive evidence in the
-        exact logged-in session that produced the saved state.
-        """
-        if not self.cookie_name or not context:
+    def _verify_tencent_cookie(
+        self,
+        cookie_name: str | None = None,
+        context=None,
+    ) -> bool:
+        """Verify the saved channel through its own isolated environment."""
+        target_name = str(cookie_name or self.cookie_name or "").strip()
+        if not target_name:
             return False
-        pages = getattr(context, "pages", None) or []
-        page = pages[-1] if pages else None
-        return bool(page and self._is_logged_in(context, page))
+        cookie_path = Path(BASE_DIR / "cookiesFile" / target_name)
+
+        target_profile = load_environment(cookie_path).get("profileKey")
+        source_profile = (
+            load_environment(self._environment_cookie).get("profileKey")
+            if self._environment_cookie else ""
+        )
+        if context and source_profile and source_profile == target_profile:
+            # Re-login an existing channel: the discovery window already owns
+            # that channel's target profile.  Opening it again would deadlock on
+            # the profile lock, so use its authenticated page as the target
+            # environment check.
+            pages = getattr(context, "pages", None) or []
+            page = pages[-1] if pages else None
+            return bool(page and self._is_logged_in(context, page))
+
+        async def _check():
+            from myUtils.auth import cookie_auth_tencent
+
+            return await cookie_auth_tencent(cookie_path)
+
+        # The saved channel uses a newly derived profile, so it does not hold
+        # the interactive discovery profile's lock.  Validate a real launch of
+        # that target environment instead of trusting the shared QR context.
+        return self._run_coro_in_new_thread(_check)
 
     @staticmethod
     def _run_coro_in_new_thread(coro_factory):
@@ -1183,7 +1234,7 @@ class InteractivePlatformLogin:
 
                         time.sleep(0.8)
                         saved_name = self.account_name
-                        self._record_account(
+                        saved_cookie_name = self._record_account(
                             context,
                             account_name=saved_name,
                             identity=identity or "",
@@ -1200,16 +1251,20 @@ class InteractivePlatformLogin:
                             #
                             # 所以这里保存成功后**不关窗口**，进入 collecting 状态继续等待
                             # 下一个频道；用户点「完成并关闭」才结束。
-                            if self.saved_count == 1 and not self._verify_tencent_cookie(context):
+                            if not self._verify_tencent_cookie(
+                                saved_cookie_name, context
+                            ):
                                 self._rollback_account()
                                 self._set_state(
-                                    "failed", "视频号登录校验未通过，请重新扫码登录"
+                                    "failed",
+                                    "视频号独立环境校验未通过，请重新扫码登录",
                                 )
                                 logger.warning(
-                                    "视频号登录后 cookie 校验失败，已回滚: {}",
+                                    "视频号独立环境校验失败，已回滚: {}",
                                     self.account_name,
                                 )
                                 break
+                            self._mark_tencent_verified()
                             # 顺手探测：这次登录是不是把别的号顶下线了（几百毫秒）
                             superseded = self._probe_superseded_tencent_accounts(
                                 str(self.cookie_name or "")
@@ -1276,6 +1331,32 @@ class InteractivePlatformLogin:
                     browser.close()
             except Exception:
                 pass
+
+
+def _assigned_channel_proxy(account_id: int) -> dict[str, str]:
+    """Pick an unused proxy for a newly discovered Channels account.
+
+    Returns an empty binding when no proxy pool is configured or the pool is
+    exhausted.  In that case the channel runs on the local IP; the account
+    management page surfaces the "多个账号共用本机 IP" warning.
+    """
+    try:
+        from utils.proxy_pool import (
+            assign_proxy_from_pool,
+            load_proxy_pool,
+            proxy_usage_map,
+        )
+        from utils.account_environment import _all_proxy_bindings
+
+        pool = load_proxy_pool()
+        if not pool:
+            return {}
+        bindings, _names = _all_proxy_bindings()
+        taken = set(proxy_usage_map(bindings))
+        return assign_proxy_from_pool(account_id, pool, taken)
+    except Exception as exc:
+        logger.warning("为视频号分配代理失败，使用本机 IP: {}", exc)
+        return {}
 
 
 class InteractiveLoginManager:

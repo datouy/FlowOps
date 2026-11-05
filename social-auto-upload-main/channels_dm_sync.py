@@ -8,6 +8,7 @@ from pathlib import Path
 
 from flask import Blueprint
 
+import dm_cursor
 import dm_ops
 from channels_dm import ChannelsAuthError, ChannelsClient, ChannelsError
 from conf import BASE_DIR
@@ -390,8 +391,9 @@ def _sync_account(settings: dict, account: dict) -> dict:
     client = ChannelsClient(account)
     try:
         finder_username = client.get_finder_username()
-        messages = client.get_history_messages()
         watermark = _load_watermark(account)
+        # 增量读取：水位以上才算新消息，命中旧页就提前结束分页。
+        messages = client.get_history_messages(since_seq=watermark)
         newest_seq = 0
         for message in messages:
             try:
@@ -423,6 +425,16 @@ def _sync_account(settings: dict, account: dict) -> dict:
             1 for result in ingest.get("items", [])
             if (result.get("auto_reply") or {}).get("status") == "ready"
         )
+        cursor = dm_cursor.cursor_from_items([
+            {
+                "created_at": _created_at(message),
+                "external_message_id": clean_text(
+                    message.get("svrMsgId") or message.get("msgId")
+                    or message.get("cliMsgId"), 200,
+                ),
+            }
+            for message in fresh
+        ])
         return {
             "ok": True,
             "account": public_account(account),
@@ -440,6 +452,7 @@ def _sync_account(settings: dict, account: dict) -> dict:
             "media_failed": media_result["failed"],
             "auto_replies_ready": ready,
             "skip_reasons": skip_reasons,
+            "cursor": cursor,
             "items": ingest.get("items", []),
         }
     finally:
@@ -459,12 +472,14 @@ sync_manager = ChannelsDmSync(
     settings_table="channels_dm_sync_settings",
     route_prefix="/dm/channels",
     min_interval=0,
-    default_interval=0,
+    default_interval=120,
     default_max_conversations=50,
     default_history_days=DEFAULT_HISTORY_DAYS,
     error_types=(ChannelsError, ChannelsAuthError),
     max_workers=8,
     failure_backoff=30,
+    # 持续轮询模式下的轮次间隔：原来默认 0.5 秒，循环几乎等于热转。
+    continuous_gap=60,
 )
 sync_manager.register_routes()
 

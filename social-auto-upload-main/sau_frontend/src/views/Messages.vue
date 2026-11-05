@@ -29,6 +29,9 @@
           {{ settings.enabled ? '自动回复运行中' : '自动回复已暂停' }}
         </el-tag>
         <el-tag :type="syncTagType" effect="plain" round>{{ syncTagText }}</el-tag>
+        <el-tag v-if="tierSummaryText" :type="nightMode ? 'warning' : 'info'" effect="plain" round>
+          {{ tierSummaryText }}
+        </el-tag>
         <el-tag type="success" effect="plain" round>界面 5 秒自动刷新</el-tag>
         <el-button @click="helpDialog = true">接入说明</el-button>
         <el-button :loading="syncing || syncAnyRunning" :disabled="syncAnyRunning" @click="runAllPlatformSync">同步全部私信</el-button>
@@ -198,6 +201,9 @@
                         {{ deliveryText(msg.delivery_status) }}
                       </el-tag>
                       <el-button v-if="msg.direction === 'outbound' && msg.delivery_status !== 'sent'" link size="small" @click="copyText(msg.content, '回复已复制')">复制</el-button>
+                    </div>
+                    <div v-if="msg.direction === 'outbound' && msg.delivery_status === 'failed' && msg.delivery_error" class="message-error">
+                      失败原因：{{ msg.delivery_error }}
                     </div>
                     <div v-if="msg.source_content" class="message-source">来源内容：{{ msg.source_content }}</div>
                   </div>
@@ -952,6 +958,25 @@ const syncTagType = computed(() => {
   if (syncAnyRunning.value || syncing.value) return 'warning'
   return syncAllEnabled.value ? 'success' : 'info'
 })
+// 账号分级：活跃账号高频、冷账号低频，夜间还会整体降频。
+const tierSummary = computed(() => {
+  const totals = { active: 0, cold: 0 }
+  for (const item of syncTargetStates.value) {
+    const summary = item.status.tier_summary || {}
+    totals.active += Number(summary.active || 0)
+    totals.cold += Number(summary.cold || 0)
+  }
+  return totals
+})
+const nightMode = computed(() => syncTargetStates.value.some(
+  item => item.status.night_mode,
+))
+const tierSummaryText = computed(() => {
+  const { active, cold } = tierSummary.value
+  if (!active && !cold) return ''
+  const base = `活跃账号 ${active} · 冷账号 ${cold}`
+  return nightMode.value ? `${base} · 夜间降频中` : base
+})
 const aiStatusText = computed(() => aiStatus.value.configured
   ? `已配置（${aiStatus.value.model || '默认模型'}）`
   : '未配置 API Key，AI 回复不可用')
@@ -1648,6 +1673,7 @@ onMounted(async () => {
 .hidden-file-input { display: none; }
 .message-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: #a0a4ab; font-size: 11px; flex-wrap: wrap; }
 .message-source { margin-top: 6px; color: #909399; font-size: 11px; }
+.message-error { margin-top: 6px; color: #f56c6c; font-size: 11px; line-height: 1.5; word-break: break-word; }
 .composer { border-top: 1px solid #ebeef5; padding: 12px 14px; background: #fff; }
 .composer-tools { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .composer-tools .el-select { width: 180px; }

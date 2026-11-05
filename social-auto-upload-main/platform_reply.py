@@ -58,105 +58,372 @@ def _account(account_name: str):
     return _account_by_type(3, account_name)
 
 
-def _snapshot_rows(cdp):
-    snapshot = cdp.send("DOMSnapshot.captureSnapshot", {
-        "computedStyles": [], "includeDOMRects": True, "includePaintOrder": True,
-    })
-    strings = snapshot["strings"]
-    nodes = snapshot["documents"][0]["nodes"]
-
-    def attrs(index):
-        values = nodes["attributes"][index]
-        result = {}
-        for offset in range(0, len(values), 2):
-            if offset + 1 >= len(values):
-                continue
-            key, value = values[offset], values[offset + 1]
-            result[strings[key] if 0 <= key < len(strings) else str(key)] = (
-                strings[value] if 0 <= value < len(strings) else str(value)
-            )
-        return result
-
-    def text(index):
-        value = nodes["nodeValue"][index]
-        return strings[value] if 0 <= value < len(strings) else ""
-
-    parents = nodes["parentIndex"]
-
-    def descendants(row_index):
-        indexes = []
-        for index in range(row_index + 1, len(parents)):
-            parent = parents[index]
-            while parent >= 0 and parent != row_index:
-                parent = parents[parent]
-            if parent == row_index:
-                indexes.append(index)
-        return indexes
-
-    rows = []
-    for index, node_type in enumerate(nodes["nodeType"]):
-        if node_type != 1 or attrs(index).get("role") != "gridcell":
-            continue
-        style = attrs(index).get("style", "")
-        if "top:" not in style or "height:" not in style:
-            continue
-        values = []
-        for child in descendants(index):
-            if nodes["nodeType"][child] == 3 and text(child):
-                values.append({
-                    "text": text(child),
-                    "class": attrs(parents[child]).get("class", ""),
-                })
-        name = next((item["text"] for item in values if item["class"].startswith("item-header-name-")), "")
-        if not name:
-            continue
-        rows.append({
-            "name": name,
-            "backend_node_id": nodes["backendNodeId"][index],
-        })
-    return rows
+def _select_douyin_tab(page, label: str) -> None:
+    """Select a current Douyin DM tab without relying on a hashed CSS class."""
+    page.evaluate("""(label) => {
+        document.querySelectorAll('[data-flowops-send-tab]').forEach(
+            el => el.removeAttribute('data-flowops-send-tab')
+        );
+        const tabs = Array.from(document.querySelectorAll(
+            '[class*="sub-tab-item"], [class*="semi-tabs-tab"]'
+        )).filter(el => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 1 && rect.height > 1 &&
+                String(el.innerText || '').trim() === label;
+        });
+        const current = tabs.find(el => String(el.className || '').includes('active'));
+        if (current || !tabs.length) return false;
+        tabs[0].setAttribute('data-flowops-send-tab', '1');
+        return true;
+    }""", label)
+    marker = page.locator('[data-flowops-send-tab="1"]')
+    if marker.count():
+        marker.click(timeout=5000)
+        page.wait_for_timeout(600)
 
 
-def _click_text(page, cdp, target):
-    snapshot = cdp.send("DOMSnapshot.captureSnapshot", {
-        "computedStyles": [], "includeDOMRects": True, "includePaintOrder": True,
-    })
-    strings = snapshot["strings"]
-    nodes = snapshot["documents"][0]["nodes"]
-    for index, (node_type, value) in enumerate(zip(nodes["nodeType"], nodes["nodeValue"])):
-        if node_type != 3 or value < 0 or value >= len(strings) or strings[value].strip() != target:
-            continue
-        try:
-            box = cdp.send("DOM.getBoxModel", {
-                "backendNodeId": nodes["backendNodeId"][index],
-            })["model"]["content"]
-            page.mouse.click(sum(box[0::2]) / 4, sum(box[1::2]) / 4)
-            return True
-        except Exception:
-            return False
-    return False
-
-
-def _find_row(page, cdp, author):
-    for _ in range(20):
-        rows = _snapshot_rows(cdp)
-        row = next((item for item in rows if item["name"] == author), None)
-        if row is None:
-            row = next((item for item in rows
-                        if item["name"].startswith(author) or author.startswith(item["name"])), None)
-        if row is not None:
-            return row
+def _find_douyin_conversation(page, author: str):
+    """Find an exact conversation row in the current virtualized DM list."""
+    page.locator(".semi-list-item").first.wait_for(
+        state="visible", timeout=45000,
+    )
+    page.evaluate("""() => {
+        const grid = document.querySelector('.ReactVirtualized__Grid');
+        if (grid) grid.scrollTop = 0;
+    }""")
+    page.wait_for_timeout(500)
+    for _ in range(30):
+        found = page.evaluate("""(target) => {
+            document.querySelectorAll('[data-flowops-send-target]').forEach(
+                el => el.removeAttribute('data-flowops-send-target')
+            );
+            const items = Array.from(document.querySelectorAll('.semi-list-item'))
+                .filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 1 && rect.height > 1 &&
+                        style.display !== 'none' && style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0;
+                });
+            const match = items.find(el => {
+                const node = el.querySelector('[class*="item-header-name"]');
+                return String(node?.innerText || '').trim() === target;
+            });
+            if (!match) return false;
+            match.setAttribute('data-flowops-send-target', '1');
+            return true;
+        }""", author)
+        if found:
+            return page.locator('.semi-list-item[data-flowops-send-target="1"]').first
         moved = page.evaluate("""() => {
             const grid = document.querySelector('.ReactVirtualized__Grid');
             if (!grid) return false;
             const before = grid.scrollTop;
-            grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
+            grid.scrollTop = Math.min(
+                grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85
+            );
             return grid.scrollTop !== before;
         }""")
         if not moved:
             break
         page.wait_for_timeout(500)
     return None
+
+
+def _douyin_editor(page):
+    """Return the visible rich-text editor used by Douyin creator chat."""
+    for selector in (
+        '.chat-input-nSWBco[contenteditable="true"]',
+        '[contenteditable="true"]',
+    ):
+        locator = page.locator(selector)
+        for index in range(locator.count()):
+            candidate = locator.nth(index)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def _douyin_send_acknowledged(responses: list[dict]) -> bool:
+    """Return True only for a successful HTTP and business response."""
+    for response in responses or []:
+        try:
+            status = int(response.get("status") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 200 <= status < 300:
+            continue
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            return True
+        rejected = False
+        for key in ("status_code", "statusCode", "code"):
+            if key not in payload:
+                continue
+            try:
+                code = int(payload.get(key))
+            except (TypeError, ValueError):
+                rejected = True
+                break
+            if code not in (0, 200):
+                rejected = True
+                break
+        if rejected:
+            continue
+        return True
+    return False
+
+
+def _watch_douyin_send_responses(page) -> list[dict]:
+    """Capture message-send status codes and business result bodies."""
+    responses: list[dict] = []
+
+    def on_response(response):
+        if "message/send" not in response.url.lower():
+            return
+        status = int(response.status)
+        payload = None
+        if 200 <= status < 300:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+        responses.append({"status": status, "payload": payload})
+
+    page.on("response", on_response)
+    return responses
+
+
+def _open_douyin_conversation(page, cdp, author: str):
+    """定位并打开客户会话，返回输入框 locator。
+
+    抖音私信列表是虚拟滚动，目标会话很可能在视口外。直接按 DOM 坐标点击会落到
+    可视区之外（点了个寂寞），随后等输入框超时——这就是"发送失败"的真实原因。
+    必须先 scrollIntoViewIfNeeded，再重新取坐标点击。
+    """
+    page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=90000)
+    # 当前创作者中心使用 semi-list-item；首屏接口与虚拟列表均可能
+    # 在 20 秒后才完成，不能沿用旧 gridcell 的短超时。
+    try:
+        page.locator(".semi-list-item").first.wait_for(
+            state="visible", timeout=45000,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "抖音私信会话列表未在 45 秒内加载，请检查网络或登录状态"
+        ) from exc
+    if any(marker in page.url.lower() for marker in ("/login", "/passport/", "website-login")):
+        raise RuntimeError("抖音登录已失效，请重新扫码登录")
+    body_text = page.locator("body").inner_text()
+    if "私信管理" not in body_text:
+        raise RuntimeError("当前抖音账号无法访问私信管理页面")
+
+    _select_douyin_tab(page, "全部")
+    row = _find_douyin_conversation(page, author)
+    if row is None:
+        raise RuntimeError(f"未找到客户“{author}”的抖音会话，可能不在当前列表")
+
+    editor = None
+    for attempt in range(3):
+        try:
+            row.scroll_into_view_if_needed(timeout=5000)
+            row.click(timeout=5000)
+        except Exception as exc:
+            logger.warning("点击抖音会话失败（第 {} 次）: {}", attempt + 1, exc)
+        page.wait_for_timeout(1800)
+        editor = _douyin_editor(page)
+        if editor is not None:
+            break
+        logger.info("抖音会话未打开，重试点击（第 {} 次）: {}", attempt + 1, author)
+    if editor is None:
+        raise RuntimeError(
+            f"打开客户“{author}”的抖音会话超时（已重试一次），"
+            "可能是列表定位不准或页面改版"
+        )
+    return editor
+
+
+def _douyin_upload_triggers(page):
+    """返回可能的“图片/附件”上传入口，按可靠度排序。"""
+    selectors = [
+        'input[type="file"]',
+        'button[title*="图片"]',
+        'button[aria-label*="图片"]',
+        'button[title*="表情"]',
+        'button[aria-label*="表情"]',
+        'button[title*="附件"]',
+        'button[aria-label*="附件"]',
+        'button:has-text("图片")',
+        '[class*="chat-icon"]',
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if locator.count():
+                return selector, locator
+        except Exception:
+            continue
+    return "", None
+
+
+def _wait_douyin_upload_ready(page, timeout_ms: int = 30000) -> bool:
+    """等待抖音图片上传完成。
+
+    抖音上传完成后会在输入区插入一张缩略图预览，并且发送按钮变为可用。
+    这里同时看这两个信号，避免"还在上传就点了发送"。
+    """
+    deadline = time.time() + max(5, timeout_ms // 1000)
+    while time.time() < deadline:
+        try:
+            preview = page.locator(
+                'img[class*="upload"], img[class*="preview"], '
+                '[class*="image-preview"], [class*="upload-image"]'
+            )
+            if preview.count():
+                return True
+        except Exception:
+            pass
+        try:
+            send_button = page.locator("button.chat-btn").first
+            if send_button.count() and not send_button.is_disabled():
+                # 按钮可用说明编辑器里有内容（图片已进草稿区）。
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(600)
+    return False
+
+
+def send_douyin_media(account_name: str, author: str,
+                      file_path: str | Path) -> dict:
+    """Send one image through the Douyin creator web chat.
+
+    抖音创作者网页版只提供图片（表情/图片）入口，不支持任意附件。
+    这里覆盖三种上传方式，适配平台改版：
+    1. 直接命中隐藏的 ``input[type=file]``（最稳）；
+    2. 点击上传按钮触发 file chooser；
+    3. 找不到入口时回退到剪贴板粘贴（部分页面支持）。
+    """
+    author = str(author or "").strip()
+    if not author:
+        raise ValueError("客户昵称为空，无法定位抖音会话")
+    path = Path(file_path)
+    if not path.is_file():
+        raise ValueError("要发送的图片文件不存在")
+    account = _account(account_name)
+    if not account:
+        raise RuntimeError("未找到可用的抖音登录账号，请先在账号管理中登录")
+
+    with _send_lock:
+        with sync_playwright() as playwright:
+            context = open_persistent_account_context_sync(
+                playwright,
+                str(account["cookie_path"]),
+                account_id=account.get("id"),
+                headless=True,
+                channel="chromium",
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            page = context.new_page()
+            cdp = context.new_cdp_session(page)
+            send_responses = _watch_douyin_send_responses(page)
+            try:
+                editor = _open_douyin_conversation(page, cdp, author)
+                editor.click()
+                page.wait_for_timeout(400)
+
+                uploaded = False
+                # 1) 直接给隐藏的 file input 塞文件。
+                try:
+                    file_input = page.locator('input[type="file"]').first
+                    if file_input.count():
+                        file_input.set_input_files(str(path))
+                        uploaded = True
+                        logger.info("抖音图片已通过 file input 上传")
+                except Exception as exc:
+                    logger.warning("抖音 file input 上传失败: {}", exc)
+
+                # 2) 触发上传入口，捕获 file chooser。
+                if not uploaded:
+                    selector, locator = _douyin_upload_triggers(page)
+                    if locator is not None and selector != 'input[type="file"]':
+                        try:
+                            with page.expect_file_chooser(timeout=8000) as chooser_info:
+                                locator.first.click()
+                            chooser_info.value.set_files(str(path))
+                            uploaded = True
+                            logger.info("抖音图片已通过文件选择器上传")
+                        except Exception as exc:
+                            logger.warning("抖音文件选择器上传失败: {}", exc)
+
+                # 3) 兜底：粘贴剪贴板里的图片。
+                if not uploaded:
+                    try:
+
+                        import base64
+
+                        data = base64.b64encode(path.read_bytes()).decode("ascii")
+                        uploaded = bool(page.evaluate(
+                            """async (b64) => {
+                                const res = await fetch('data:image/png;base64,' + b64);
+                                const blob = await res.blob();
+                                const file = new File([blob], 'image.png', {type: 'image/png'});
+                                const dt = new DataTransfer();
+                                dt.items.add(file);
+                                const input = document.querySelector('input[type=file]');
+                                if (input) {
+                                    input.files = dt.files;
+                                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return true;
+                                }
+                                return false;
+                            }""",
+                            data,
+                        ))
+                        if uploaded:
+                            logger.info("抖音图片已通过 DataTransfer 兜底上传")
+                    except Exception as exc:
+                        logger.warning("抖音图片兜底上传失败: {}", exc)
+
+                if not uploaded:
+                    raise RuntimeError(
+                        "未找到抖音私信的图片上传入口，平台可能已改版，请更新发送脚本"
+                    )
+
+                if not _wait_douyin_upload_ready(page):
+                    raise RuntimeError("抖音图片上传未在预期时间内完成，可能被平台限流")
+
+                send_button = page.locator("button.chat-btn").first
+                send_button.wait_for(state="visible", timeout=8000)
+                if send_button.is_disabled():
+                    raise RuntimeError("抖音发送按钮不可用，账号可能被限制私信")
+                send_button.click()
+                page.wait_for_timeout(2500)
+
+                # 页面清空不能证明平台已接收；例如请求返回 5xx 时编辑器也会
+                # 清空。只有发送接口的 HTTP 与业务码都成功才算发送成功。
+                delivered = _douyin_send_acknowledged(send_responses)
+                if not delivered:
+                    statuses = [item.get("status") for item in send_responses]
+                    raise RuntimeError(
+                        "抖音图片发送未获平台确认"
+                        + (f"（响应码 {statuses}）" if statuses else "（未捕获发送接口）")
+                    )
+                return {
+                    "client_message_id": hashlib.sha1(
+                        f"{account['id']}|{author}|media|{path.name}|{time.time()}".encode("utf-8")
+                    ).hexdigest(),
+                    "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "transport": "douyin-web",
+                    "media_file": path.name,
+                    "ack_statuses": [item.get("status") for item in send_responses],
+                }
+            finally:
+                context.close()
 
 
 def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False) -> dict:
@@ -188,69 +455,9 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
             context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             page = context.new_page()
             cdp = context.new_cdp_session(page)
-            send_responses = []
-
-            def on_response(response):
-                if "/v1/message/send" in response.url.lower():
-                    send_responses.append(response.status)
-
-            page.on("response", on_response)
+            send_responses = _watch_douyin_send_responses(page)
             try:
-                page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-                # 创作者中心首屏接口和虚拟列表是异步渲染的，冷启动实测可能
-                # 超过 6 秒。固定 sleep 会在会话行尚未挂载时误报“找不到客户”。
-                try:
-                    page.locator('[role="gridcell"]').first.wait_for(
-                        state="attached", timeout=20000,
-                    )
-                except Exception:
-                    pass
-                page.wait_for_timeout(800)
-                if any(marker in page.url.lower() for marker in ("/login", "/passport/", "website-login")):
-                    raise RuntimeError("抖音登录已失效，请重新扫码登录")
-                body_text = page.locator("body").inner_text()
-                if "私信管理" not in body_text:
-                    raise RuntimeError("当前抖音账号无法访问私信管理页面")
-
-                if not _click_text(page, cdp, "全部"):
-                    _click_text(page, cdp, "全部私信")
-                page.wait_for_timeout(700)
-                row = _find_row(page, cdp, author)
-                if row is None:
-                    raise RuntimeError(f"未找到客户“{author}”的抖音会话，可能不在当前列表")
-
-                # 关键修复：抖音私信列表是虚拟滚动，目标会话很可能在视口外。
-                # 直接按 DOM 坐标点击会落到可视区之外（点了个寂寞），随后等输入框
-                # 12 秒超时 —— 这就是"发送失败"的真实原因。
-                # 必须先 scrollIntoViewIfNeeded，再重新取坐标点击。
-                editor = None
-                for attempt in range(2):
-                    try:
-                        cdp.send("DOM.scrollIntoViewIfNeeded", {
-                            "backendNodeId": row["backend_node_id"],
-                        })
-                        page.wait_for_timeout(500)
-                        box = cdp.send("DOM.getBoxModel", {
-                            "backendNodeId": row["backend_node_id"],
-                        })["model"]["content"]
-                        page.mouse.click(sum(box[0::2]) / 4, sum(box[1::2]) / 4)
-                    except Exception as exc:
-                        logger.warning("点击抖音会话失败（第 {} 次）: {}", attempt + 1, exc)
-                    page.wait_for_timeout(1800)
-                    candidate = page.locator(".chat-input-nSWBco").first
-                    if candidate.count():
-                        try:
-                            candidate.wait_for(state="visible", timeout=6000)
-                            editor = candidate
-                            break
-                        except Exception:
-                            pass
-                    logger.info("抖音会话未打开，重试点击（第 {} 次）: {}", attempt + 1, author)
-                if editor is None:
-                    raise RuntimeError(
-                        f"打开客户“{author}”的抖音会话超时（已重试一次），"
-                        "可能是列表定位不准或页面改版"
-                    )
+                editor = _open_douyin_conversation(page, cdp, author)
                 editor.click()
                 page.keyboard.press("Control+A")
                 page.keyboard.press("Backspace")
@@ -271,18 +478,20 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
                 send_button.click()
                 page.wait_for_timeout(2500)
 
-                editor_cleared = not editor.inner_text().strip()
-                delivered = bool(send_responses) or (
-                    editor_cleared and text in page.locator("body").inner_text()
-                )
+                delivered = _douyin_send_acknowledged(send_responses)
                 if not delivered:
-                    raise RuntimeError("未能确认抖音消息已发送，请检查平台风控或登录状态")
+                    statuses = [item.get("status") for item in send_responses]
+                    raise RuntimeError(
+                        "抖音消息发送未获平台确认"
+                        + (f"（响应码 {statuses}）" if statuses else "（未捕获发送接口）")
+                    )
                 return {
                     "client_message_id": hashlib.sha1(
                         f"{account['id']}|{author}|{text}|{time.time()}".encode("utf-8")
                     ).hexdigest(),
                     "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "transport": "douyin-web",
+                    "ack_statuses": [item.get("status") for item in send_responses],
                 }
             finally:
                 context.close()

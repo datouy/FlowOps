@@ -7,6 +7,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -15,6 +16,7 @@ from patchright.async_api import async_playwright
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils import browser_timeout
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -182,6 +184,130 @@ def published_note_from_submit(url: str, payload, title: str) -> dict | None:
             }
             return {**candidate, "state": xhs_post_state(candidate)}
     return None
+
+
+async def query_published_note_in_page(
+    page,
+    title: str,
+    post_id: str = '',
+    deadline: 'browser_timeout.Deadline | None' = None,
+) -> dict:
+    """Read one note's creator status from an already-open page.
+
+    复用浏览器时用这个版本：外部负责准备页面，这里自己挂响应捕获并解析。
+
+    **必须有总超时**：这个函数跑在账号的浏览器 Profile 锁内部，一旦卡住
+    （最常见的是响应体永远读不完），锁就不会释放，同账号的后续私信发送、
+    发布、登录会全部堵死。页面加载、固定等待、响应解析共用同一份预算。
+    """
+    budget = deadline or browser_timeout.Deadline(label='小红书作品状态回查')
+    captured = []
+
+    def capture(response):
+        url = str(response.url or '')
+        if any(marker in url for marker in XHS_LIST_RESPONSE_MARKERS):
+            captured.append(response)
+
+    page.on('response', capture)
+    try:
+        await page.goto(
+            _build_xhs_creator_url('/creator/notes'),
+            wait_until='domcontentloaded',
+            timeout=budget.timeout_ms(cap=90000),
+        )
+        budget.check()
+        await asyncio.sleep(min(8, max(budget.remaining, 0)))
+        budget.check()
+        if 'login' in str(page.url or '').lower():
+            raise RuntimeError('小红书登录已失效，请重新扫码登录')
+        payloads = []
+        for response in captured[-40:]:
+            # 响应体读取必须单独设限：请求回来了但响应体不结束，是这条链路上
+            # 最典型的无限等待点。
+            try:
+                payloads.append(await browser_timeout.read_json(
+                    response, timeout=budget.remaining,
+                ))
+            except browser_timeout.PlatformReadTimeout:
+                raise
+            except Exception:
+                continue
+        budget.check()
+        matched = None
+        wanted_id = str(post_id or '').strip()
+        if wanted_id:
+            for payload in payloads:
+                matched = next(
+                    (item for item in extract_xhs_posts(payload)
+                     if item.get('post_id') == wanted_id),
+                    None,
+                )
+                if matched:
+                    matched = {**matched, 'state': xhs_post_state(matched)}
+                    break
+        if matched is None:
+            matched = match_xhs_post(payloads, title)
+        if matched is None:
+            return {
+                'verified': False, 'found': False, 'state': 'notfound',
+                'remote_status': 'notfound', 'post_id': wanted_id,
+                'verification': 'note-list-network',
+            }
+        state = matched.get('state') or 'unknown'
+        return {
+            'verified': state not in {'unknown', 'notfound'},
+            'found': True,
+            'state': state,
+            'remote_status': matched.get('raw_status') or state,
+            'post_id': matched.get('post_id') or wanted_id,
+            'publish_time': matched.get('publish_time') or '',
+            'verification': 'note-list-network',
+        }
+    finally:
+        try:
+            page.remove_listener('response', capture)
+        except Exception:
+            pass
+
+
+async def query_published_note(
+    account_file: str | Path,
+    title: str,
+    post_id: str = '',
+    on_context: Any = None,
+) -> dict:
+    """Read one note's current creator status without submitting again.
+
+    与 ``query_published_note_in_page`` 复用同一套解析逻辑，只多一层
+    "自带浏览器"的包装。总超时与响应体超时都在 ``browser_timeout`` 里统一
+    管理——这条路径跑在账号 Profile 锁内部，卡住就是全局卡住。
+
+    ``on_context`` 用于把浏览器上下文交给调用方：调用方超时后可以强杀
+    浏览器进程，让卡住的线程走到 ``finally`` 释放 Profile 锁。
+    """
+    async with async_playwright() as playwright:
+        context = await open_persistent_account_context(
+            playwright,
+            account_file,
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
+            args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+        )
+        if on_context is not None:
+            try:
+                on_context(context)
+            except Exception:
+                pass
+        try:
+            context = await set_init_script(context)
+            page = await context.new_page()
+            return await query_published_note_in_page(page, title, post_id)
+        finally:
+            # 关闭浏览器也要有界：浏览器进程僵死时 close() 可能永远不返回，
+            # 清理动作不能变成第二个卡点。
+            await browser_timeout.close_async_resource_async(
+                context, label='关闭小红书创作者后台',
+            )
 
 
 async def _js_click_by_text(page: Page, text: str) -> bool:
@@ -665,6 +791,142 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             except Exception:
                 pass
 
+    async def _verify_direct_publish(self, page: Page, title: str,
+                                     captured_responses: list,
+                                     post_id: str = "") -> dict:
+        """直发之后的回查。
+
+        直发已经拿到了平台的笔记 ID，所以即使列表里暂时查不到（平台还在
+        审核，列表还没刷新），也不能判定失败——把笔记 ID 记下来交给状态
+        查询线程继续跟踪即可。
+        """
+        post_id = str(post_id or "").strip()
+        payloads = []
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    XHS_PUBLISH_RESPONSE_MARKER in url
+                    or any(marker in url for marker in XHS_LIST_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payloads.append(await response.json())
+                except Exception:
+                    continue
+
+        await collect()
+        matched = None
+        if post_id:
+            for payload in payloads:
+                matched = next(
+                    (item for item in extract_xhs_posts(payload)
+                     if item.get("post_id") == post_id),
+                    None,
+                )
+                if matched:
+                    matched = {**matched, "state": xhs_post_state(matched)}
+                    break
+        if matched is None:
+            matched = match_xhs_post(payloads, title)
+        if matched:
+            state = matched.get("state") or "unknown"
+            return {
+                "verified": state not in {"unknown", "notfound"},
+                "found": True,
+                "state": state,
+                "remote_status": matched.get("raw_status") or state,
+                "post_id": matched.get("post_id") or post_id,
+                "publish_time": matched.get("publish_time") or "",
+                "verification": "hybrid-api",
+                "transport": "hybrid",
+            }
+        # 列表里还没出现：平台还在审核，笔记 ID 已经拿到，交给状态查询线程。
+        return {
+            "verified": False,
+            "found": False,
+            "state": "submitted",
+            "remote_status": "submitted",
+            "post_id": post_id,
+            "verification": "hybrid-api",
+            "transport": "hybrid",
+        }
+
+    async def _verify_published_note(self, page: Page, title: str,
+                                     captured_responses: list,
+                                     strict: bool = True) -> dict:
+        """Verify an immediate note through the create response or note list.
+
+        ``strict=False`` 用于图文发布：回查不到时返回"已提交"而不是抛错，
+        由后续的状态查询线程继续回查（小红书支持远端回查）。
+        """
+        payloads = []
+        submitted_result = None
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    XHS_PUBLISH_RESPONSE_MARKER in url
+                    or any(marker in url for marker in XHS_LIST_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payload = await response.json()
+                except Exception:
+                    continue
+                payloads.append((url, payload))
+
+        await collect()
+        for url, payload in reversed(payloads):
+            direct = published_note_from_submit(url, payload, title)
+            if direct and direct.get("state") != "unknown":
+                return {
+                    "verified": True,
+                    **direct,
+                    "remote_status": direct.get("raw_status") or direct["state"],
+                    "verification": "publish-api",
+                }
+            if direct and submitted_result is None:
+                submitted_result = direct
+
+        manage_url = _build_xhs_creator_url("/creator/notes")
+        try:
+            await page.goto(manage_url, wait_until="domcontentloaded", timeout=120000)
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("⚠️", f"打开小红书笔记管理失败，继续直接回查：{exc}"))
+        await asyncio.sleep(6)
+        await collect()
+        matched = match_xhs_post([payload for _url, payload in payloads], title)
+        if matched:
+            verified = matched.get("state") != "unknown"
+            return {
+                "verified": verified,
+                **matched,
+                "remote_status": matched.get("raw_status") or matched["state"],
+                "verification": "note-list-network",
+            }
+        if submitted_result:
+            return {
+                "verified": False,
+                **{**submitted_result, "state": "submitted"},
+                "remote_status": "submitted",
+                "verification": "publish-api",
+            }
+        if strict:
+            raise RuntimeError(
+                "小红书表单已提交，但笔记列表回查不到该内容，未标记发布成功；请到笔记管理核验"
+            )
+        return {
+            "verified": False,
+            "state": "submitted",
+            "remote_status": "submitted",
+            "post_id": "",
+            "verification": "publish-api",
+        }
+
+
 
 class XiaoHongShuVideo(XiaoHongShuBaseUploader):
     def __init__(
@@ -765,66 +1027,6 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             except Exception:
                 pass
 
-    async def _verify_published_note(self, page: Page, title: str,
-                                     captured_responses: list) -> dict:
-        """Verify an immediate note through the create response or note list."""
-        payloads = []
-        submitted_result = None
-
-        async def collect():
-            for response in captured_responses:
-                url = str(getattr(response, "url", "") or "")
-                if not (
-                    XHS_PUBLISH_RESPONSE_MARKER in url
-                    or any(marker in url for marker in XHS_LIST_RESPONSE_MARKERS)
-                ):
-                    continue
-                try:
-                    payload = await response.json()
-                except Exception:
-                    continue
-                payloads.append((url, payload))
-
-        await collect()
-        for url, payload in reversed(payloads):
-            direct = published_note_from_submit(url, payload, title)
-            if direct and direct.get("state") != "unknown":
-                return {
-                    "verified": True,
-                    **direct,
-                    "remote_status": direct.get("raw_status") or direct["state"],
-                    "verification": "publish-api",
-                }
-            if direct and submitted_result is None:
-                submitted_result = direct
-
-        manage_url = _build_xhs_creator_url("/creator/notes")
-        try:
-            await page.goto(manage_url, wait_until="domcontentloaded", timeout=120000)
-        except Exception as exc:
-            xiaohongshu_logger.warning(_msg("⚠️", f"打开小红书笔记管理失败，继续直接回查：{exc}"))
-        await asyncio.sleep(6)
-        await collect()
-        matched = match_xhs_post([payload for _url, payload in payloads], title)
-        if matched:
-            verified = matched.get("state") != "unknown"
-            return {
-                "verified": verified,
-                **matched,
-                "remote_status": matched.get("raw_status") or matched["state"],
-                "verification": "note-list-network",
-            }
-        if submitted_result:
-            return {
-                "verified": False,
-                **{**submitted_result, "state": "submitted"},
-                "remote_status": "submitted",
-                "verification": "publish-api",
-            }
-        raise RuntimeError(
-            "小红书表单已提交，但笔记列表回查不到该内容，未标记发布成功；请到笔记管理核验"
-        )
-
     async def upload_video_content(self, page: Page) -> dict:
         captured_responses = []
 
@@ -839,6 +1041,33 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 pass
 
         page.on("response", capture)
+
+        # 混合通道：先挂录制器（录创建接口 + 收素材 ID），上传完成后尝试直发。
+        from publish_transport import (
+            HybridPublisher, form_signature, hybrid_enabled,
+        )
+
+        hybrid = None
+        if hybrid_enabled(1):
+            hybrid = HybridPublisher(
+                1, self.account_file, self.title, self.desc, self.tags,
+                signature=form_signature(
+                    thumbnail=self.thumbnail_path or "",
+                    scheduled=(
+                        self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+                        and self.publish_date != 0
+                    ),
+                    scheduled_at=(
+                        self.publish_date
+                        if (
+                            self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+                            and self.publish_date != 0
+                        ) else ""
+                    ),
+                ),
+            )
+            hybrid.attach(page)
+
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往视频发布页"))
         publish_url = _build_xhs_creator_url(
@@ -885,6 +1114,36 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             except Exception as e:
                 xiaohongshu_logger.debug(_msg("😵", f"上传状态还没稳定下来，小人继续观察: {e}"))
             await asyncio.sleep(2)
+
+        # ── 混合通道：文件传完了，先试平台接口直发 ──
+        # 直发省掉整套表单填写（标题、正文、话题、封面、原创声明、定时），
+        # 这是页面自动化最脆也最慢的一段。
+        #
+        # 只有"表单选项和模板一致"才敢直发（模板里带着上次的这些值）；
+        # 接口结果不确定时绝不再点一次发布按钮，避免重复发布。
+        if hybrid is not None:
+            direct = await hybrid.attempt(page)
+            direct_status = str(direct.get("status") or "")
+            if direct_status == "accepted":
+                xiaohongshu_logger.success(
+                    _msg("🥳", f"已通过平台接口直接发布，笔记 ID {direct.get('post_id') or '待回查'}")
+                )
+                return await self._verify_direct_publish(
+                    page, self.title, captured_responses,
+                    post_id=str(direct.get("post_id") or ""),
+                )
+            if direct_status == "unknown":
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", "平台接口结果不确定，停止重复提交，请到笔记管理人工确认")
+                )
+                from publish_transport import submitted_result
+
+                return submitted_result(
+                    1, str(direct.get("error") or direct.get("reason") or ""),
+                )
+            reason = str(direct.get("reason") or direct.get("raw_status") or "")
+            if reason:
+                xiaohongshu_logger.info(_msg("🧍", f"直发未启用（{reason}），改用页面发布"))
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
@@ -1013,9 +1272,35 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             normalized_image_paths.append(str(self.validate_image_file(image_path)))
         self.image_paths = normalized_image_paths
 
-    async def upload_note_content(self, page: Page) -> None:
+    async def upload_note_content(self, page: Page, captured_responses: list) -> dict:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
+
+        # 混合通道：先挂录制器（录创建接口 + 收素材 ID）。
+        from publish_transport import (
+            HybridPublisher, form_signature, hybrid_enabled,
+        )
+
+        hybrid = None
+        if hybrid_enabled(1):
+            hybrid = HybridPublisher(
+                1, self.account_file, self.title, self.desc, self.tags,
+                signature=form_signature(
+                    scheduled=(
+                        self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+                        and self.publish_date != 0
+                    ),
+                    scheduled_at=(
+                        self.publish_date
+                        if (
+                            self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+                            and self.publish_date != 0
+                        ) else ""
+                    ),
+                ),
+            )
+            hybrid.attach(page)
+
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=image"
         )
@@ -1039,6 +1324,31 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             except Exception:
                 xiaohongshu_logger.debug(_msg("🧍", "图文素材还在上传，小人继续等一会"))
                 await asyncio.sleep(1)
+
+        # ── 混合通道：图片传完了，先试平台接口直发 ──
+        if hybrid is not None:
+            direct = await hybrid.attempt(page)
+            direct_status = str(direct.get("status") or "")
+            if direct_status == "accepted":
+                xiaohongshu_logger.success(
+                    _msg("🥳", f"已通过平台接口直接发布，笔记 ID {direct.get('post_id') or '待回查'}")
+                )
+                return await self._verify_direct_publish(
+                    page, self.title, captured_responses,
+                    post_id=str(direct.get("post_id") or ""),
+                )
+            if direct_status == "unknown":
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", "平台接口结果不确定，停止重复提交，请到笔记管理人工确认")
+                )
+                from publish_transport import submitted_result
+
+                return submitted_result(
+                    1, str(direct.get("error") or direct.get("reason") or ""),
+                )
+            reason = str(direct.get("reason") or direct.get("raw_status") or "")
+            if reason:
+                xiaohongshu_logger.info(_msg("🧍", f"直发未启用（{reason}），改用页面发布"))
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
@@ -1066,7 +1376,24 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
 
-    async def upload(self, playwright: Playwright) -> None:
+        if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+            xiaohongshu_logger.success(_msg("🥳", f"小红书图文已预约发布：{self.publish_date}"))
+            return {
+                "verified": True, "state": "scheduled", "post_id": "",
+                "remote_status": "scheduled", "publish_time": str(self.publish_date),
+                "verification": "page-confirmation",
+            }
+        result = await self._verify_published_note(page, self.title, captured_responses)
+        if result["state"] in {"failed", "removed"}:
+            raise RuntimeError(
+                f"小红书图文状态为 {result['state']}（{result.get('remote_status') or '平台未返回原因'}）"
+            )
+        xiaohongshu_logger.success(
+            _msg("🥳", f"图文已回查：{result['state']}，ID {result.get('post_id') or '待回查'}")
+        )
+        return result
+
+    async def upload(self, playwright: Playwright) -> dict:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
@@ -1081,15 +1408,26 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         try:
             page = await context.new_page()
-            await self.upload_note_content(page)
+            captured_responses = []
+
+            def capture(response):
+                url = str(getattr(response, "url", "") or "")
+                if XHS_PUBLISH_RESPONSE_MARKER in url or any(
+                    marker in url for marker in XHS_LIST_RESPONSE_MARKERS
+                ):
+                    captured_responses.append(response)
+
+            page.on("response", capture)
+            result = await self.upload_note_content(page, captured_responses)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
+            return result
         finally:
             await context.close()
 
     async def xiaohongshu_upload_note(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)
 
     async def main(self):
-        await self.xiaohongshu_upload_note()
+        return await self.xiaohongshu_upload_note()

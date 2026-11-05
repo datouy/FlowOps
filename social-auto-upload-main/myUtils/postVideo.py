@@ -29,6 +29,21 @@ from utils.constant import TencentZoneTypes
 from utils.files_times import generate_schedule_time_next_day
 
 
+def _unverified_result() -> dict:
+    """结果模板：平台不支持发布后回查。
+
+    只能确认"表单已提交"。返回 ``verified=False`` 让状态机把它落到
+    "已提交，未验证"，既不误报成功，也不自动判失败。
+    """
+    return {
+        "verified": False,
+        "state": "submitted",
+        "remote_status": "submitted",
+        "post_id": "",
+        "verification": "no-remote-verification",
+    }
+
+
 def resolve_publish_strategy(enableTimer):
     """把前端的"是否定时"开关翻译成各平台自己的发布策略常量。
 
@@ -138,12 +153,77 @@ def post_video_ks(title, files, tags, account_file, category=TencentZoneTypes.LI
         if resolve_publish_strategy(enableTimer)
         else KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
     )
+    results = []
     for index, file in enumerate(files):
         for cookie in account_file:
             logger.info("发布素材 path={} file={} title={} tags={}", file, file.name, title, tags)
             app = KSVideo(title, str(file), tags, publish_datetimes[index], cookie,
                           publish_strategy=strategy, desc=desc)
             asyncio.run(app.main(), debug=False)
+            results.append(_unverified_result())
+    return results
+
+
+def post_note_xhs(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
+                  enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, desc=""):
+    """Publish one image-text note per account through the Xiaohongshu web UI."""
+    from uploader.xiaohongshu_uploader.main import XiaoHongShuNote
+
+    account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    files = [Path(BASE_DIR / "videoFile" / file) for file in files]
+    publish_datetimes = build_publish_datetimes(
+        account_file, enableTimer, videos_per_day, daily_times, start_days)
+    strategy = (
+        XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+        if resolve_publish_strategy(enableTimer)
+        else XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
+    )
+    results = []
+    for index, cookie in enumerate(account_file):
+        logger.info("发布小红书图文 title={} images={} account={}", title, len(files), cookie.name)
+        app = XiaoHongShuNote(
+            image_paths=[str(path) for path in files],
+            note=desc or title,
+            tags=tags,
+            publish_date=publish_datetimes[index],
+            account_file=str(cookie),
+            title=title,
+            desc=desc or "",
+            publish_strategy=strategy,
+        )
+        results.append(asyncio.run(app.main(), debug=False))
+    return results
+
+
+def post_note_DouYin(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
+                     enableTimer=False, videos_per_day=1, daily_times=None, start_days=0,
+                     desc=""):
+    """Publish one image-text post per account through the Douyin web UI."""
+    from uploader.douyin_uploader.main import DouYinNote
+
+    account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    files = [Path(BASE_DIR / "videoFile" / file) for file in files]
+    publish_datetimes = build_publish_datetimes(
+        account_file, enableTimer, videos_per_day, daily_times, start_days)
+    strategy = (
+        DOUYIN_PUBLISH_STRATEGY_SCHEDULED
+        if resolve_publish_strategy(enableTimer)
+        else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
+    )
+    results = []
+    for index, cookie in enumerate(account_file):
+        logger.info("发布抖音图文 title={} images={} account={}", title, len(files), cookie.name)
+        app = DouYinNote(
+            image_paths=[str(path) for path in files],
+            note=desc or title,
+            tags=tags,
+            publish_date=publish_datetimes[index],
+            account_file=str(cookie),
+            title=title,
+            publish_strategy=strategy,
+        )
+        results.append(asyncio.run(app.main(), debug=False))
+    return results
 
 
 def post_video_xhs(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
@@ -176,19 +256,25 @@ def post_video_weibo(title, files, tags, account_file, publish_date=0, thumbnail
     from uploader.weibo_uploader.main import WeiBoVideo
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     files = [Path(BASE_DIR / "videoFile" / file) for file in files]
+    results = []
     for file in files:
         for cookie in account_file:
             app = WeiBoVideo(title, str(file), tags, str(cookie), publish_date=publish_date,
                              desc=desc, thumbnail_path=thumbnail_path)
             asyncio.run(app.main(), debug=False)
+            results.append(_unverified_result())
+    return results
 
 
 def post_video_baijiahao(title, files, tags, account_file, publish_date=0, thumbnail_path="", desc=""):
     from uploader.baijiahao_uploader.main import BaiJiaHaoVideo
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     files = [Path(BASE_DIR / "videoFile" / file) for file in files]
+    results = []
     for file in files:
         for cookie in account_file:
             app = BaiJiaHaoVideo(title, str(file), tags, str(cookie), publish_date=publish_date,
                                  desc=desc, thumbnail_path=thumbnail_path)
             asyncio.run(app.main(), debug=False)
+            results.append(_unverified_result())
+    return results

@@ -409,3 +409,42 @@ def test_api_v2_prune_and_backfill(client):
 
     backfill = http.post("/api/v2/accounts/backfill-identities").get_json()["data"]
     assert set(backfill) == {"filled", "conflicts"}
+
+
+def test_api_v2_publish_transport_reports_and_clears_templates(client, monkeypatch):
+    """发布通道接口：报出通道模式和模板状态，并能清掉模板。"""
+    be, http = client
+    monkeypatch.setenv("FLOWOPS_PUBLISH_TRANSPORT", "hybrid")
+    store = be.get_store(be.BASE_DIR)
+    account = store.upsert(
+        3, cookie_name=DOUYIN_COOKIE, name="抖音号", identity="douyin-A",
+    )
+    cookie_path = be.BASE_DIR / "cookiesFile" / DOUYIN_COOKIE
+
+    from publish_transport import save_template
+
+    save_template(cookie_path, 3, {
+        "url": "https://creator.douyin.com/web/api/media/aweme/create_v2/?aid=1128",
+        "method": "POST",
+        "headers": {},
+        "body": {"vid": "{{media:vid}}"},
+        "signature": "sig",
+    })
+
+    payload = http.get(
+        f"/api/v2/accounts/{account['id']}/publish-transport"
+    ).get_json()["data"]
+    douyin_row = next(row for row in payload if row["platformType"] == 3)
+    assert douyin_row["hybridEnabled"] is True
+    assert douyin_row["templateReady"] is True
+
+    cleared = http.delete(
+        f"/api/v2/accounts/{account['id']}/publish-transport"
+    ).get_json()["data"]
+    assert cleared["cleared"] is True
+
+    payload = http.get(
+        f"/api/v2/accounts/{account['id']}/publish-transport"
+    ).get_json()["data"]
+    douyin_row = next(row for row in payload if row["platformType"] == 3)
+    assert douyin_row["templateReady"] is False

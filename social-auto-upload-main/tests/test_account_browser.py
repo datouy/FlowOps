@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
 
 from utils.account_browser import (
+    _ProfileGuard,
     account_fingerprint,
     open_persistent_account_context,
     persistent_account_context,
@@ -169,3 +175,41 @@ def test_closing_handle_releases_profile_lock(tmp_path):
             pass
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
+def test_profile_lock_is_shared_across_processes(tmp_path, monkeypatch):
+    profile = tmp_path / "browser_profiles" / "auth-account-21"
+    code = """
+import sys
+from pathlib import Path
+from utils.account_browser import _ProfileGuard
+
+guard = _ProfileGuard(Path(sys.argv[1]))
+guard.acquire()
+print("READY", flush=True)
+sys.stdin.readline()
+guard.release()
+"""
+    project_root = Path(__file__).resolve().parents[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(profile)],
+        cwd=project_root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "READY"
+        monkeypatch.setenv("FLOWOPS_PROFILE_LOCK_TIMEOUT_SECONDS", "0.3")
+        with pytest.raises(RuntimeError, match="正被其他任务占用"):
+            _ProfileGuard(profile).acquire()
+        child.stdin.write("release\n")
+        child.stdin.flush()
+        assert child.wait(timeout=5) == 0
+        with _ProfileGuard(profile):
+            pass
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)

@@ -128,9 +128,63 @@
         </el-table>
       </el-card>
 
+      <el-row :gutter="12" class="panel-row">
+        <el-col :span="14">
+          <el-card shadow="never" class="panel-card">
+            <template #header>
+              <span>月度趋势</span>
+              <el-button size="small" text @click="loadTrend">刷新</el-button>
+            </template>
+            <el-table :data="trend.series || []" size="small" stripe>
+              <el-table-column prop="month" label="月份" width="88" />
+              <el-table-column prop="jobs" label="发布" width="66" />
+              <el-table-column prop="success" label="成功" width="66" />
+              <el-table-column label="播放" min-width="90">
+                <template #default="s">{{ formatNum(s.row.plays) }}</template>
+              </el-table-column>
+              <el-table-column label="环比" width="86">
+                <template #default="s">
+                  <span v-if="s.row.plays_growth === null || s.row.plays_growth === undefined" class="muted-action">—</span>
+                  <span v-else :class="s.row.plays_growth >= 0 ? 'growth-up' : 'growth-down'">
+                    {{ s.row.plays_growth >= 0 ? '+' : '' }}{{ s.row.plays_growth }}%
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="点赞" width="80">
+                <template #default="s">{{ formatNum(s.row.likes) }}</template>
+              </el-table-column>
+              <el-table-column label="评论" width="80">
+                <template #default="s">{{ formatNum(s.row.comments) }}</template>
+              </el-table-column>
+            </el-table>
+            <el-empty v-if="!(trend.series || []).length" description="暂无趋势数据" :image-size="60" />
+          </el-card>
+        </el-col>
+        <el-col :span="10">
+          <el-card shadow="never" class="panel-card">
+            <template #header>
+              <span>成交漏斗</span>
+              <el-button size="small" text @click="loadFunnel">刷新</el-button>
+            </template>
+            <div v-for="stage in (funnel.stages || [])" :key="stage.stage" class="funnel-stage">
+              <span class="funnel-name">{{ stage.name }}</span>
+              <span class="funnel-count">{{ stage.count }}</span>
+              <span class="funnel-rate">{{ stage.rate }}%</span>
+            </div>
+            <el-empty v-if="!(funnel.stages || []).length" description="暂无漏斗数据" :image-size="60" />
+            <div v-if="funnel.inbound_messages !== undefined" class="funnel-hint">
+              口径说明：以上按「客户数」统计，窗口内收到私信
+              {{ funnel.inbound_messages }} 条、发出回复 {{ funnel.outbound_messages }} 条。
+            </div>
+            <div v-if="completion.estimated" class="funnel-hint">
+              估算完播指标：{{ completion.estimated_completion }}（非平台真实完播率）
+            </div>
+          </el-card>
+        </el-col>
+      </el-row>
+
       <el-card shadow="never" class="panel-card top-card">
-        <template #header><span>播放量 Top 作品</span></template>
-        <el-table :data="summary.top_contents" size="small" stripe>
+        <template #header><span>播放量 Top 作品</span></template>        <el-table :data="summary.top_contents" size="small" stripe>
           <el-table-column type="index" label="#" width="52" />
           <el-table-column label="平台" width="84">
             <template #default="s"><el-tag size="small" :type="platformTag(s.row.platform)">{{ platformName(s.row.platform) }}</el-tag></template>
@@ -198,8 +252,8 @@
       </el-table-column>
       <el-table-column label="结果" width="84">
         <template #default="s">
-          <el-tag size="small" :type="s.row.status==='success'?'success':(s.row.status==='running'?'warning':'danger')">
-            {{ s.row.status==='success'?'成功':(s.row.status==='running'?'进行中':'失败') }}
+          <el-tag size="small" :type="jobTagType(s.row.status)">
+            {{ recordStatusText(s.row.status) }}
           </el-tag>
         </template>
       </el-table-column>
@@ -214,7 +268,9 @@
             <template v-else>
               <div v-if="jobProgress[s.row.id]" class="job-items-hint">
                 进度 {{ jobProgress[s.row.id].percent }}% ·
-                成功 {{ jobProgress[s.row.id].success }} / 失败 {{ jobProgress[s.row.id].failed }} / 跳过 {{ jobProgress[s.row.id].skipped }}
+                成功 {{ jobProgress[s.row.id].success }} / 处理中 {{ jobProgress[s.row.id].processing || 0 }} /
+                定时 {{ jobProgress[s.row.id].scheduled || 0 }} / 失败 {{ jobProgress[s.row.id].failed }} / 跳过 {{ jobProgress[s.row.id].skipped }}
+                <span v-if="jobProgress[s.row.id].draft"> / 草稿 {{ jobProgress[s.row.id].draft }}</span>
               </div>
               <el-table v-if="(jobItems[s.row.id] || []).length" :data="jobItems[s.row.id]" size="small" border>
                 <el-table-column prop="file" label="素材" min-width="150" show-overflow-tooltip />
@@ -224,6 +280,23 @@
                     <el-tag size="small" :type="itemTagType(it.row.status)">{{ itemStatusText(it.row.status) }}</el-tag>
                   </template>
                 </el-table-column>
+                <el-table-column label="平台阶段" width="106">
+                  <template #default="it">
+                    {{ publishStageText(it.row.publish_stage, it.row.stage_status) }}
+                  </template>
+                </el-table-column>
+                <el-table-column label="可见性" width="90">
+                  <template #default="it">
+                    <el-tag size="small" :type="it.row.visibility === 'draft' ? 'info' : 'success'">
+                      {{ visibilityText(it.row.visibility) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="内容形态" width="86">
+                  <template #default="it">
+                    {{ it.row.content_type === 'image-text' ? '图文' : '视频' }}
+                  </template>
+                </el-table-column>
                 <el-table-column prop="attempts" label="尝试" width="60" />
                 <el-table-column prop="remote_status" label="平台状态" width="96">
                   <template #default="it">{{ postStateText(it.row.remote_status) }}</template>
@@ -231,7 +304,7 @@
                 <el-table-column prop="remote_id" label="作品 ID" width="150" show-overflow-tooltip />
                 <el-table-column label="作品操作" width="176" fixed="right">
                   <template #default="it">
-                    <template v-if="it.row.remote_id && it.row.status === 'success' && s.row.type === 2">
+                    <template v-if="it.row.remote_id && it.row.status === 'success' && canManageWorks(s.row)">
                       <el-tag v-if="it.row.remote_delete_status === 'success'" size="small" type="info">已删除</el-tag>
                       <template v-else>
                         <el-button size="small" type="danger" plain @click="deleteRemotePost(s.row, it.row)">删除平台作品</el-button>
@@ -269,13 +342,17 @@
       <el-table-column label="操作" width="130">
         <template #default="s">
           <el-button
-            v-if="['pending','running','pending_review'].includes(s.row.status)"
+            v-if="['pending','running','pending_review','scheduled'].includes(s.row.status)"
             size="small" type="warning" @click="cancelJob(s.row)"
           >取消</el-button>
           <el-button
             v-else-if="['failed','partial_success'].includes(s.row.status)"
             size="small" type="primary" @click="retryFailedJob(s.row)"
           >重试失败项</el-button>
+          <el-button
+            v-if="s.row.status === 'draft'"
+            size="small" type="primary" @click="publishDrafts(s.row)"
+          >草稿转发布</el-button>
         </template>
       </el-table-column>
       <el-table-column prop="finished_at" label="完成时间" width="152" />
@@ -373,7 +450,33 @@ const summary = ref({
   last_fetched_at: null,
   sync: {},
 })
+// 月度趋势与成交漏斗（账号矩阵式统计）。
+const trend = ref({ months: 6, series: [] })
+const funnel = ref({ days: 30, stages: [], inbound_messages: 0, outbound_messages: 0 })
+const completion = ref({ estimated: false, estimated_completion: 0 })
 let timer = null
+
+async function loadTrend() {
+  try {
+    const res = await http.get('/stats/trend', { months: 6 })
+    trend.value = res.data || { months: 6, series: [] }
+  } catch (error) {
+    console.warn('加载月度趋势失败:', error)
+  }
+}
+
+async function loadFunnel() {
+  try {
+    const [funnelRes, completionRes] = await Promise.all([
+      http.get('/stats/funnel', { days: 30 }),
+      http.get('/stats/completion', { days: 30 }),
+    ])
+    funnel.value = funnelRes.data || { days: 30, stages: [], inbound_messages: 0, outbound_messages: 0 }
+    completion.value = completionRes.data || { estimated: false }
+  } catch (error) {
+    console.warn('加载成交漏斗失败:', error)
+  }
+}
 
 const platformNames = {1:'小红书',2:'视频号',3:'抖音',4:'快手',5:'微博',6:'百家号'}
 const platformTags = {1:'info',2:'warning',3:'danger',4:'success',5:'danger',6:'primary'}
@@ -410,6 +513,10 @@ function jobStatusText(row) {
   if (row.status === 'pending' && row.retry_count > 0) return '重试中'
   if (row.status === 'pending') return '排队中'
   if (row.status === 'running') return '发布中'
+  if (row.status === 'scheduled') return '等待定时'
+  if (row.status === 'processing') return '平台处理中'
+  if (row.status === 'submitted') return '已提交，未验证'
+  if (row.status === 'draft') return '草稿'
   if (row.status === 'success') return '成功'
   if (row.status === 'partial_success') return '部分成功'
   if (row.status === 'cancelled') return '已取消'
@@ -420,8 +527,8 @@ function jobStatusText(row) {
 function jobTagType(status) {
   if (status === 'success') return 'success'
   if (status === 'partial_success') return 'warning'
-  if (status === 'running' || status === 'pending') return 'warning'
-  if (status === 'cancelled' || status === 'rejected') return 'info'
+  if (['running','pending','scheduled','processing','submitted'].includes(status)) return 'warning'
+  if (['cancelled','rejected','draft'].includes(status)) return 'info'
   return 'danger'
 }
 
@@ -429,11 +536,17 @@ function jobTagType(status) {
 const jobItems = ref({})
 const jobProgress = ref({})
 const itemsLoading = ref({})
+const expandedJobIds = ref([])
 
 function itemStatusText(status) {
   const map = {
-    pending: '待发布', running: '发布中', success: '成功',
+    pending: '待发布', scheduled: '等待定时', running: '发布中',
+    processing: '平台处理中', success: '成功', draft: '草稿',
     failed: '失败', skipped: '已跳过', cancelled: '已取消',
+    // 平台没有发布后回查能力：已提交但未验证，既不是成功也不是失败。
+    submitted: '已提交，未验证',
+    // 进程在提交与写入结果之间崩溃：状态未知，需要人工确认。
+    uncertain: '状态未知，待确认',
   }
   return map[status] || status
 }
@@ -442,28 +555,80 @@ function postStateText(state) {
   const map = {
     draft: '草稿', scheduled: '已预约', uploading: '上传中', transcoding: '转码中',
     review: '审核中', published: '已发表', failed: '审核失败', removed: '已下架',
-    unknown: '状态未知', submitted: '已提交，待回查'
+    unknown: '状态未知', submitted: '已提交，待回查', notfound: '未查到作品',
+    private: '非公开'
   }
   return map[state] || state || '—'
 }
 
 function itemTagType(status) {
-  const map = { success: 'success', failed: 'danger', running: 'warning', skipped: 'info', cancelled: 'info' }
+  const map = {
+    success: 'success', failed: 'danger', running: 'warning', pending: 'info',
+    scheduled: 'warning', processing: 'warning', draft: 'info', skipped: 'info',
+    cancelled: 'info', submitted: 'warning', uncertain: 'warning',
+  }
   return map[status] || 'info'
 }
 
+function publishStageText(stage, stageStatus) {
+  const labels = {
+    upload: '上传', push: '投递', transcoding: '转码', review: '审核',
+    scheduled: '预约', success: '成功', notfound: '未查到', withdrawn: '下架',
+    draft: '草稿',
+    // 平台不支持发布后回查。
+    unverified: '已提交未验证',
+    // 审核/转码超过 24 小时，转入低频复查。
+    timeout_review: '审核超时',
+  }
+  const states = { doing: '进行中', success: '完成', fail: '失败', submitted: '已提交' }
+  const label = labels[stage]
+  if (!label) return '—'
+  if (stageStatus === 'submitted') return label
+  return `${label} · ${states[stageStatus] || '处理中'}`
+}
+
+// 支持作品管理的平台（与后端 supports_remote_manage 一致）。
+const REMOTE_MANAGE_PLATFORMS = [1, 2, 3]
+
+function canManageWorks(job) {
+  return REMOTE_MANAGE_PLATFORMS.includes(Number(job?.type))
+}
+
+function visibilityText(visibility) {
+  const map = { public: '公开', draft: '草稿', private: '仅自己可见' }
+  return map[visibility] || '公开'
+}
+
+function recordStatusText(status) {
+    const labels = {
+    success: '成功', running: '进行中', processing: '平台处理中',
+    scheduled: '等待定时', draft: '草稿',
+    partial_success: '部分成功', failed: '失败', cancelled: '已取消',
+    rejected: '已驳回', submitted: '已提交，未验证',
+  }
+  return labels[status] || status || '—'
+}
+
 async function onExpandJob(row, expandedRows) {
-  if (!Array.isArray(expandedRows) || !expandedRows.includes(row)) return
-  if (jobItems.value[row.id]) return
-  itemsLoading.value = { ...itemsLoading.value, [row.id]: true }
+  const rows = Array.isArray(expandedRows) ? expandedRows : []
+  expandedJobIds.value = rows.map(item => item.id)
+  if (!rows.includes(row)) return
+  await loadJobItems(row.id)
+}
+
+async function loadJobItems(jobId, force = false) {
+  if (!force && jobItems.value[jobId]) return
+  if (!jobItems.value[jobId]) {
+    itemsLoading.value = { ...itemsLoading.value, [jobId]: true }
+  }
   try {
-    const res = await http.get(`/publish/jobs/${row.id}/items`)
-    jobItems.value = { ...jobItems.value, [row.id]: res.data.items || [] }
-    jobProgress.value = { ...jobProgress.value, [row.id]: res.data.progress || null }
+    const res = await http.get(`/publish/jobs/${jobId}/items`)
+    jobItems.value = { ...jobItems.value, [jobId]: res.data.items || [] }
+    jobProgress.value = { ...jobProgress.value, [jobId]: res.data.progress || null }
   } catch (error) {
     console.error('加载子任务失败:', error)
   } finally {
-    itemsLoading.value = { ...itemsLoading.value, [row.id]: false }
+    itemsLoading.value = { ...itemsLoading.value, [jobId]: false }
   }
 }
 
@@ -494,10 +659,20 @@ async function retryFailedJob(row) {
   }
 }
 
+async function publishDrafts(row) {
+  try {
+    const res = await http.post(`/publish/jobs/${row.id}/publish-drafts`)
+    ElMessage.success(res.msg || '已把草稿转为待发布')
+    await refreshJob(row.id)
+  } catch (error) {
+    console.error('草稿转发布失败:', error)
+  }
+}
+
 async function deleteRemotePost(job, item) {
   try {
     await ElMessageBox.confirm(
-      `将永久删除视频号作品 ${item.remote_id}。\n账号：${item.account_name || '未知'}；任务：#${job.id}。\n删除后无法在平台恢复。`,
+      `将永久删除${platformName(job.type)}作品 ${item.remote_id}。\n账号：${item.account_name || '未知'}；任务：#${job.id}。\n删除后无法在平台恢复。`,
       '确认删除平台作品',
       {
         type: 'warning',
@@ -594,6 +769,8 @@ async function loadAll() {
     accountStatus.value = accountResult.data
     unmatched.value = unmatchedResult.data
     notify.value = notifyResult.data
+    await Promise.all([loadTrend(), loadFunnel()])
+    await Promise.all(expandedJobIds.value.map(jobId => loadJobItems(jobId, true)))
   } catch (error) {
     console.error(error)
   }
@@ -691,6 +868,19 @@ onUnmounted(() => clearInterval(timer))
 .delete-error { color: #f56c6c; font-size: 11px; line-height: 1.4; margin-top: 4px; }
 .muted-action { color: #c0c4cc; }
 .replace-source { color: #606266; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.panel-row { margin-bottom: 16px; }
+.growth-up { color: #67c23a; font-weight: 600; }
+.growth-down { color: #f56c6c; font-weight: 600; }
+.funnel-stage {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 2px; border-bottom: 1px dashed #ebeef5;
+  font-size: 13px;
+}
+.funnel-stage:last-of-type { border-bottom: none; }
+.funnel-name { flex: 1; color: #606266; }
+.funnel-count { font-weight: 600; color: #303133; }
+.funnel-rate { width: 68px; text-align: right; color: #909399; font-size: 12px; }
+.funnel-hint { margin-top: 10px; font-size: 11px; color: #909399; line-height: 1.5; }
 @media (max-width: 900px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
 }

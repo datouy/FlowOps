@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import requests
 
 from conf import BASE_DIR
+from utils.account_http import account_headers, account_proxies, cookie_path_of
 
 MAX_MESSAGE_MEDIA_BYTES = 80 * 1024 * 1024
 NON_MEDIA_CONTENT_TYPES = {
@@ -36,26 +37,29 @@ def download_media(
     *,
     referer: str = "",
     max_bytes: int = MAX_MESSAGE_MEDIA_BYTES,
+    cookie_path: str | Path | None = None,
 ) -> tuple[Path, str]:
-    """Download one bounded media file and return its local path and MIME type."""
+    """Download one bounded media file and return its local path and MIME type.
+
+    ``cookie_path`` 指向账号的凭据文件：媒体下载必须用**该账号**的指纹 UA 和
+    代理出口，否则同一个账号会在平台侧出现两种设备指纹和两个来源 IP。
+    """
     url = str(url or "").strip()
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("媒体地址格式不正确")
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
+    headers = account_headers(cookie_path, {
         "Accept": "image/avif,image/webp,image/*,video/*,*/*;q=0.8",
-    }
+    })
     if referer:
         headers["Referer"] = referer
+    proxies = account_proxies(cookie_path)
     try:
-        response = requests.get(url, headers=headers, timeout=60, stream=True)
+        response = requests.get(
+            url, headers=headers, timeout=60, stream=True, proxies=proxies or None,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(f"下载媒体失败：{str(exc)[:200]}") from exc
@@ -109,13 +113,19 @@ def attach_message_media(
     skipped: dict[str, int] | None = None,
     *,
     referer: str = "",
+    cookie_path: str | Path | None = None,
 ) -> dict[str, int]:
-    """Download message media and store portable paths relative to ``dm_media``."""
+    """Download message media and store portable paths relative to ``dm_media``.
+
+    媒体下载复用账号的指纹 UA 与代理：``cookie_path`` 缺省时从 ``account``
+    里取，保证直连通道与浏览器通道是同一个设备身份、同一个出口 IP。
+    """
     skipped = skipped if skipped is not None else {}
     account_key = str(account.get("id") or account.get("userName") or "unknown")
     account_key = re.sub(r"[^A-Za-z0-9._-]+", "-", account_key)[:80] or "unknown"
     root = Path(BASE_DIR) / "dm_media"
     target_dir = root / account_key
+    resolved_cookie = str(cookie_path or cookie_path_of(account) or "")
     downloaded = 0
     failed = 0
     for item in items:
@@ -130,6 +140,7 @@ def attach_message_media(
             try:
                 target, _content_type = download_media(
                     url, target_dir, stem, referer=referer,
+                    cookie_path=resolved_cookie,
                 )
                 item["media_path"] = target.relative_to(root).as_posix()
                 saved = True
@@ -143,6 +154,7 @@ def attach_message_media(
                 thumb, _content_type = download_media(
                     thumb_url, target_dir, stem + "-thumb", referer=referer,
                     max_bytes=8 * 1024 * 1024,
+                    cookie_path=resolved_cookie,
                 )
                 item["media_thumb_path"] = thumb.relative_to(root).as_posix()
                 saved = True

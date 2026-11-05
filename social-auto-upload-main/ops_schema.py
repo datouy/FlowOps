@@ -50,6 +50,35 @@ MESSAGE_TEMPLATES_DDL = """CREATE TABLE IF NOT EXISTS message_templates (
     name TEXT NOT NULL, content TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"""
 
+# 评论运营专用表。
+#
+# 为什么不在 messages 表里凑合：评论操作（回复 / 点赞 / 删除 / 置顶）需要
+# **平台侧的评论 ID 和所属作品 ID**，这两个字段在 messages 表里没有；而
+# messages 表是私信与评论共用的，塞进去会让私信查询平白变宽。
+#
+# 这张表是评论的运营视图：一条评论一行，记录平台标识 + 操作状态
+# （已点赞 / 已置顶 / 已回复），前端据此渲染按钮的开关态。
+COMMENT_ITEMS_DDL = """CREATE TABLE IF NOT EXISTS comment_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL DEFAULT '',
+    account TEXT NOT NULL DEFAULT '',
+    account_id INTEGER,
+    comment_id TEXT NOT NULL DEFAULT '',
+    source_id TEXT NOT NULL DEFAULT '',
+    source_title TEXT DEFAULT '',
+    author TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    created_at TEXT DEFAULT '',
+    like_count INTEGER DEFAULT 0,
+    reply_count INTEGER DEFAULT 0,
+    liked INTEGER DEFAULT 0,
+    pinned INTEGER DEFAULT 0,
+    replied_at TEXT DEFAULT '',
+    reply_text TEXT DEFAULT '',
+    deleted_at TEXT DEFAULT '',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(platform, account, comment_id))"""
+
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """返回表的列名集合。"""
@@ -101,13 +130,22 @@ def ensure_messages_columns(conn: sqlite3.Connection) -> list[str]:
 
 
 def ensure_core_schema(conn: sqlite3.Connection) -> list[str]:
-    """确保 messages / message_templates 存在且字段齐全。
+    """确保 messages / message_templates / comment_items 存在且字段齐全。
 
     这是 ``ops_center`` 和 ``dm_ops`` 都会调用的公共部分。
     返回本次补齐的列名列表。
     """
     conn.execute(MESSAGES_DDL)
     conn.execute(MESSAGE_TEMPLATES_DDL)
+    conn.execute(COMMENT_ITEMS_DDL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_comment_items_account "
+        "ON comment_items(platform, account)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_comment_items_source "
+        "ON comment_items(source_id)"
+    )
     return ensure_messages_columns(conn)
 
 

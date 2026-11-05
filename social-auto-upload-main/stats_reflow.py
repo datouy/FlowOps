@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -837,6 +837,309 @@ def start_stats_loop(interval_hours: int = 24):
 def stats_status() -> dict:
     with _lock:
         return dict(_state)
+
+
+# ---------------------------------------------------------------- 月度趋势
+
+def monthly_trend(months: int = 6) -> dict:
+    """按月汇总发布量、播放、互动，给出统一月度趋势。
+
+    账号矩阵式的月度趋势：每个月一行，包含发布条数、成功条数、播放、点赞、
+    评论、收藏、涨粉，以及环比增长率。
+    """
+    months = max(1, min(int(months or 6), 24))
+    accounts = _account_rows()
+    now = datetime.now()
+    first_month = now.replace(day=1)
+    # 回退 (months - 1) 个月。
+    for _ in range(months - 1):
+        first_month = (first_month - timedelta(days=1)).replace(day=1)
+    since = first_month.strftime('%Y-%m-%d 00:00:00')
+
+    with get_conn() as c:
+        jobs = [
+            dict(row) for row in c.execute(
+                "SELECT type,status,title,created_at,finished_at FROM jobs "
+                "WHERE created_at>=? ORDER BY id",
+                (since,),
+            ).fetchall()
+        ]
+        stats_rows = [
+            dict(row) for row in c.execute(
+                "SELECT platform,account,content_key,plays,likes,comments,collects,"
+                "shares,followers,published_at,fetched_at FROM content_stats "
+                "WHERE content_key IS NOT NULL AND content_key!=''"
+            ).fetchall()
+        ]
+    jobs = filter_current_account_jobs(jobs, accounts) if accounts else jobs
+    stats_rows = filter_current_account_rows(stats_rows, accounts) if accounts else stats_rows
+
+    def _month_key(value: Any) -> str:
+        parsed = _parse_time(value)
+        return parsed.strftime('%Y-%m') if parsed else ''
+
+    buckets: dict[str, dict] = {}
+    for offset in range(months):
+        # 从 first_month 往后推 offset 个月。
+        year = first_month.year + (first_month.month - 1 + offset) // 12
+        month = (first_month.month - 1 + offset) % 12 + 1
+        key = f"{year:04d}-{month:02d}"
+        buckets[key] = {
+            'month': key,
+            'jobs': 0,
+            'success': 0,
+            'failed': 0,
+            'contents': 0,
+            'plays': 0,
+            'likes': 0,
+            'comments': 0,
+            'collects': 0,
+            'shares': 0,
+            'followers': 0,
+        }
+
+    for job in jobs:
+        key = _month_key(job.get('created_at'))
+        bucket = buckets.get(key)
+        if bucket is None:
+            continue
+        bucket['jobs'] += 1
+        status = str(job.get('status') or '')
+        if status in ('success', 'partial_success'):
+            bucket['success'] += 1
+        elif status in ('failed', 'rejected'):
+            bucket['failed'] += 1
+
+    for row in stats_rows:
+        key = _month_key(row.get('published_at') or row.get('fetched_at'))
+        bucket = buckets.get(key)
+        if bucket is None:
+            continue
+        bucket['contents'] += 1
+        for metric in ('plays', 'likes', 'comments', 'collects', 'shares', 'followers'):
+            bucket[metric] += int(row.get(metric) or 0)
+
+    series = [buckets[key] for key in sorted(buckets.keys())]
+    # 环比增长率。
+    for index, bucket in enumerate(series):
+        if index == 0:
+            bucket['plays_growth'] = None
+            bucket['jobs_growth'] = None
+            continue
+        previous = series[index - 1]
+        for metric, growth_key in (('plays', 'plays_growth'), ('jobs', 'jobs_growth')):
+            base = int(previous.get(metric) or 0)
+            current = int(bucket.get(metric) or 0)
+            bucket[growth_key] = (
+                round((current - base) / base * 100, 1) if base else None
+            )
+        bucket['avg_plays'] = (
+            round(bucket['plays'] / bucket['contents'], 1) if bucket['contents'] else 0
+        )
+    if series:
+        series[0]['avg_plays'] = (
+            round(series[0]['plays'] / series[0]['contents'], 1)
+            if series[0]['contents'] else 0
+        )
+    return {'months': months, 'series': series}
+
+
+def _empty_funnel_stages() -> list[dict]:
+    """空漏斗的阶段骨架（私信库不可用时返回）。"""
+    return [
+        {'stage': 'received', 'name': '收到私信', 'count': 0, 'rate': 0.0},
+        {'stage': 'high_intent', 'name': '高意向', 'count': 0, 'rate': 0.0},
+        {'stage': 'replied', 'name': '已回复', 'count': 0, 'rate': 0.0},
+        {'stage': 'lead', 'name': '沉淀线索', 'count': 0, 'rate': 0.0},
+        {'stage': 'converted', 'name': '成交', 'count': 0, 'rate': 0.0},
+    ]
+
+
+def _contacts_in_window(contact_rows: list[dict], since: str) -> set[int]:
+    """挑出落在时间窗口内的联系人 id。
+
+    用 ``last_message_at``（最后一条消息时间）判断，没有就用 ``created_at``。
+    两个字段都为空的老数据按"在窗口内"处理——宁可多算一个线索，
+    也不能让历史线索凭空消失。
+    """
+    result: set[int] = set()
+    for row in contact_rows or []:
+        try:
+            contact_id = int(row.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if not contact_id:
+            continue
+        stamp = str(row.get('last_message_at') or row.get('created_at') or '').strip()
+        if not stamp or stamp >= since:
+            result.add(contact_id)
+    return result
+
+
+def conversion_funnel(days: int = 30) -> dict:
+    """成交漏斗：从私信到线索到成交。
+
+    阶段：
+
+    1. 收到私信 —— 窗口内有来信的**客户数**
+    2. 识别为高意向 —— 其中被标记为 high 的客户数
+    3. 已回复 —— 其中收到过已发送回复的客户数
+    4. 沉淀为线索 —— 其中 segment 落在线索类的客户数
+    5. 成交 —— 其中 segment 为 converted 的客户数
+
+    **两个关键约束**（之前的实现都踩了）：
+
+    * **数据来源必须走私信库**。``messages`` / ``dm_contacts`` 都住在
+      ``ops_center.db``，而本模块的 ``get_conn()`` 指向 ``publish_jobs.db``。
+      之前这里直接用发布库连接去查私信表，接口必然抛
+      ``OperationalError: no such table: messages``——漏斗看板完全打不开。
+
+    * **五级必须同一个单位（客户数）且逐级收敛**。之前"收到私信 / 高意向"
+      统计的是**消息条数**，"已回复 / 线索 / 成交"统计的是**客户数**，
+      拿消息条数当分母算客户数，转化率会冒出 218% 这种数字，运营完全无法
+      解读。现在统一按客户统计，并让后一级严格包含于前一级。
+    """
+    days = max(1, min(int(days or 30), 365))
+    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        import dm_ops
+
+        scope_sql, scope_args = dm_ops.account_scope_sql("m.platform", "m.account")
+        dm_conn = dm_ops.get_conn
+    except Exception:
+        scope_sql, scope_args = "", []
+        dm_conn = None
+    if dm_conn is None:
+        # 私信模块不可用时给出空漏斗，而不是让接口 500。
+        return {'days': days, 'stages': _empty_funnel_stages()}
+    # 联系人侧也要按账号范围过滤：私信表用 (platform, account) 标识发信账号。
+    # 单独取一份 scope SQL（列名不带 m. 别名），不能靠字符串替换。
+    try:
+        contact_scope_sql, contact_scope_args = dm_ops.account_scope_sql(
+            "platform", "account")
+    except Exception:
+        contact_scope_sql, contact_scope_args = "", []
+    with dm_conn() as c:
+        rows = [
+            dict(row) for row in c.execute(
+                "SELECT m.direction,m.intent,m.status,m.delivery_status,m.contact_id,"
+                "m.created_at FROM messages m WHERE m.created_at>=?" + scope_sql,
+                [since, *scope_args],
+            ).fetchall()
+        ]
+        contact_rows = [
+            dict(row) for row in c.execute(
+                "SELECT id,segment,stage,last_message_at,created_at FROM dm_contacts"
+                " WHERE COALESCE(account_deleted,0)=0" + contact_scope_sql,
+                list(contact_scope_args),
+            ).fetchall()
+        ]
+
+    inbound = [row for row in rows if row.get('direction') == 'inbound']
+    outbound_sent = [
+        row for row in rows
+        if row.get('direction') == 'outbound'
+        and str(row.get('delivery_status') or '') == 'sent'
+    ]
+
+    def _contact_ids(source: list[dict]) -> set[int]:
+        result: set[int] = set()
+        for row in source:
+            value = row.get('contact_id')
+            if value in (None, ''):
+                continue
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    # 所有阶段都以"窗口内有来信的客户"为起点，逐级收敛。
+    received = _contact_ids(inbound)
+    high_intent = _contact_ids([
+        row for row in inbound if str(row.get('intent') or '') == 'high'
+    ])
+    replied = received & _contact_ids(outbound_sent)
+    # 线索/成交必须落在同一个时间窗口里：否则"最近 30 天成交 3 单"会变成
+    # "历史累计成交 50 单"，漏斗的时间维度形同虚设。
+    window_contact_ids = _contacts_in_window(contact_rows, since)
+    lead = {
+        int(row['id']) for row in contact_rows
+        if int(row['id']) in window_contact_ids
+        and str(row.get('segment') or '') in ('qualified', 'contacted', 'converted')
+    } & received
+    converted = {
+        int(row['id']) for row in contact_rows
+        if int(row['id']) in window_contact_ids
+        and str(row.get('segment') or '') == 'converted'
+    } & lead
+
+    stages = [
+        {'stage': 'received', 'name': '收到私信', 'count': len(received)},
+        {'stage': 'high_intent', 'name': '高意向', 'count': len(high_intent & received)},
+        {'stage': 'replied', 'name': '已回复', 'count': len(replied)},
+        {'stage': 'lead', 'name': '沉淀线索', 'count': len(lead)},
+        {'stage': 'converted', 'name': '成交', 'count': len(converted)},
+    ]
+    # 逐级转化率（相对上一阶段）。
+    for index, item in enumerate(stages):
+        if index == 0:
+            item['rate'] = 100.0 if item['count'] else 0.0
+            continue
+        previous = stages[index - 1]['count']
+        item['rate'] = (
+            round(item['count'] / previous * 100, 1) if previous else 0.0
+        )
+    return {
+        'days': days,
+        'stages': stages,
+        # 消息条数与客户数不是一回事：阶段计数按客户算，这里额外给出消息量，
+        # 免得运营把"客户数变少"误读成"没人找我们了"。
+        'inbound_messages': len(inbound),
+        'outbound_messages': len(outbound_sent),
+    }
+
+
+def completion_rate(days: int = 30) -> dict:
+    """完播率/完读率。
+
+    平台不直接给完播率，这里用"播放 / 发布条数"作为近似指标，
+    并明确标注是估算值，不冒充平台的真实完播率。
+    """
+    days = max(1, min(int(days or 30), 365))
+    since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    accounts = _account_rows()
+    with get_conn() as c:
+        jobs = [
+            dict(row) for row in c.execute(
+                "SELECT type,status,created_at FROM jobs WHERE created_at>=?",
+                (since,),
+            ).fetchall()
+        ]
+        stats_rows = [
+            dict(row) for row in c.execute(
+                "SELECT platform,account,plays,published_at,fetched_at FROM content_stats "
+                "WHERE content_key IS NOT NULL AND content_key!=''"
+            ).fetchall()
+        ]
+    jobs = filter_current_account_jobs(jobs, accounts) if accounts else jobs
+    stats_rows = filter_current_account_rows(stats_rows, accounts) if accounts else stats_rows
+    published = sum(
+        1 for job in jobs
+        if str(job.get('status') or '') in ('success', 'partial_success')
+    )
+    plays = sum(int(row.get('plays') or 0) for row in stats_rows)
+    contents = len(stats_rows)
+    return {
+        'days': days,
+        'published': published,
+        'contents': contents,
+        'plays': plays,
+        'avg_plays': round(plays / contents, 1) if contents else 0,
+        # 估算的"每条内容播放完成度"指标：不是平台真实完播率。
+        'estimated_completion': round(plays / published, 1) if published else 0,
+        'estimated': True,
+    }
 
 
 def stats_summary() -> dict:

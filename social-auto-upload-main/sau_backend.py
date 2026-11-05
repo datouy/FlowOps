@@ -8,11 +8,13 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Any
 from flask_cors import CORS
 from myUtils.auth import check_cookies_concurrently
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory, g
 from werkzeug.exceptions import NotFound
 from werkzeug.utils import secure_filename
 from publish_jobs import enqueue_job, start_patrol, run_patrol_once, latest_account_status
@@ -28,17 +30,32 @@ from account_store import (
     read_storage_state,
 )
 import runtime_config
+import access_scope
+import comment_ops
 from app_logging import logger, setup_request_logging
 from utils.keep_awake import hold_system_awake
 from utils.account_environment import (
+    _all_proxy_bindings,
+    assign_pool_proxy,
     public_environment,
     remove_environment,
     update_proxy,
+)
+from utils.proxy_pool import (
+    load_proxy_pool,
+    no_proxy_warning,
+    save_proxy_pool,
+    shared_proxy_warnings,
 )
 from interactive_login import PLATFORM_LOGIN_TARGETS, interactive_login_manager
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
 # 平台发布统一走 myUtils.platform_registry，避免这里重复维护平台清单。
+from myUtils.platform_registry import (
+    PLATFORM_META,
+    platform_name,
+    supports_image_text,
+)
 
 runtime_config.validate_server_config()
 
@@ -115,15 +132,58 @@ CORS(
 # 限制上传文件大小（与 runtime_config.MAX_CONTENT_LENGTH、Nginx 的 200m 一致）
 app.config['MAX_CONTENT_LENGTH'] = runtime_config.MAX_CONTENT_LENGTH
 
+# 账号范围判定必须和路由读同一个账号库：把 BASE_DIR 的解析方式交给 access_scope。
+access_scope.bind_base_dir(lambda: BASE_DIR)
+
 
 @app.before_request
 def _guard_access_token():
-    """可选访问令牌：仅在设置了 YUNCE_ACCESS_TOKEN 时生效。"""
+    """可选访问令牌：仅在设置了 YUNCE_ACCESS_TOKEN / YUNCE_TOKENS_FILE 时生效。
+
+    校验通过后把身份（用户名、角色、账号范围）挂到 ``g``，
+    后面的接口可以按角色和范围做细粒度控制。
+    """
     if runtime_config.access_allowed(
         request.method, request.path, request.headers, request.args
     ):
+        identity = runtime_config.authenticate(
+            runtime_config.extract_token(request.headers, request.args)
+        )
+        if identity is not None:
+            g.identity = identity
         return None
     return jsonify({"code": 401, "msg": "未授权：缺少或错误的访问令牌", "data": None}), 401
+
+
+@app.route('/api/v2/session', methods=['GET'])
+def session_identity():
+    """当前访问身份：用户名、角色、权限点和账号范围。"""
+    identity = getattr(g, 'identity', None)
+    if identity is None:
+        return jsonify({
+            'code': 200,
+            'data': {
+                'user': '',
+                'role': 'anonymous',
+                'permissions': [],
+                'scope': [],
+                'authRequired': bool(
+                    runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE
+                ),
+            },
+            'msg': None,
+        }), 200
+    return jsonify({
+        'code': 200,
+        'data': {
+            'user': identity.get('user') or '',
+            'role': identity.get('role') or 'viewer',
+            'permissions': identity.get('permissions') or [],
+            'scope': identity.get('scope') or [],
+            'authRequired': True,
+        },
+        'msg': None,
+    }), 200
 
 
 @app.route('/health', methods=['GET'])
@@ -209,7 +269,7 @@ def account_slots():
             "msg": "platform 仅支持 douyin / xiaohongshu / tencent（或中文名、type 编号）",
             "data": None,
         }), 400
-    accounts = _platform_accounts(platform_key)
+    accounts = access_scope.filter_accounts(_platform_accounts(platform_key))
     return jsonify({
         "code": 200,
         "msg": None,
@@ -239,6 +299,13 @@ def interactive_login_start():
             "msg": "该平台暂不支持官方登录窗口（目前支持 抖音 / 小红书 / 视频号）",
             "data": None,
         }), 400
+    # 登录会创建/覆盖账号，属于账号管理操作。
+    denied = access_scope.require_permission(
+        runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
+    )
+    if denied is not None:
+        return denied
+
     try:
         account_id = int(data.get('account_id')) if data.get('account_id') else None
     except (TypeError, ValueError):
@@ -248,6 +315,12 @@ def interactive_login_start():
         seed_account_id = int(data.get('seed_account_id')) if data.get('seed_account_id') else None
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "补登账号 ID 格式错误", "data": None}), 400
+    # 覆盖/补登都指向一个具体账号：越权访问别人的号必须在这里拦住。
+    for target_id in (account_id, seed_account_id):
+        if target_id is None:
+            continue
+        if not access_scope.account_in_scope(account_id=target_id):
+            return access_scope.forbidden("无权操作该账号")
     seed_storage = None
     if seed_account_id is not None:
         if platform != 'tencent':
@@ -402,16 +475,41 @@ def api_v2_accounts():
     platform = request.args.get('platform') or request.args.get('type')
     store = get_store(BASE_DIR)
     pid = platform_type_of(platform) if platform else None
+    # 多人协作：只返回令牌范围内的账号。汇总数字也按过滤后的集合统计，
+    # 否则运营能看到"全公司 30 个号"这种范围外的元信息。
+    accounts = access_scope.filter_accounts(store.list(pid))
     return jsonify({
         "code": 200,
         "msg": None,
         "data": {
-            "accounts": store.list(pid),
-            "stats": store.stats(),
+            "accounts": accounts,
+            "stats": _scoped_account_stats(accounts),
             "platforms": _platform_catalog(),
             "statusText": {str(key): value for key, value in STATUS_TEXT.items()},
         },
     }), 200
+
+
+def _scoped_account_stats(accounts: list[dict]) -> dict:
+    """按可见账号集合统计汇总信息。"""
+    by_platform: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for item in accounts:
+        label = str((item.get("platform") or {}).get("label") or "")
+        by_platform[label] = by_platform.get(label, 0) + 1
+        status_text = str(item.get("statusText") or "")
+        by_status[status_text] = by_status.get(status_text, 0) + 1
+    return {
+        "total": len(accounts),
+        "byPlatform": by_platform,
+        "byStatus": by_status,
+        "unboundIdentity": sum(
+            1 for item in accounts if not (item.get("identity") or {}).get("bound")
+        ),
+        "missingCookie": sum(
+            1 for item in accounts if not (item.get("cookie") or {}).get("exists")
+        ),
+    }
 
 
 @app.route('/api/v2/accounts/<int:account_id>', methods=['GET'])
@@ -419,6 +517,12 @@ def api_v2_account(account_id: int):
     item = get_store(BASE_DIR).get(account_id)
     if item is None:
         return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
     return jsonify({"code": 200, "msg": None, "data": item}), 200
 
 
@@ -429,6 +533,12 @@ def api_v2_account_credentials(account_id: int):
     item = store.get(account_id)
     if item is None:
         return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
     state = read_storage_state(Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"]))
     if state is None:
         return jsonify({"code": 404, "msg": "凭据文件不存在或无法解析", "data": None}), 404
@@ -472,6 +582,12 @@ async def api_v2_account_check(account_id: int):
     item = store.get(account_id)
     if item is None:
         return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
     if not item["cookie"]["exists"]:
         store.mark_status(account_id, 0, "凭据文件缺失，请重新扫码授权")
         fresh = store.get(account_id) or item
@@ -509,6 +625,12 @@ def api_v2_account_environment(account_id: int):
     item = get_store(BASE_DIR).get(account_id)
     if item is None or not item["cookie"].get("name"):
         return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str(item["cookie"].get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
     cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
     if request.method == 'GET':
         return jsonify({
@@ -528,6 +650,141 @@ def api_v2_account_environment(account_id: int):
     except ValueError as exc:
         return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
     return jsonify({"code": 200, "msg": "环境配置已保存", "data": environment}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/proxy/assign', methods=['POST'])
+def api_v2_account_proxy_assign(account_id: int):
+    """从代理池给这个账号分配一个还没被别的账号用过的出口。"""
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None or not item["cookie"].get("name"):
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str(item["cookie"].get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
+    environment = assign_pool_proxy(cookie_path, account_id)
+    return jsonify({
+        "code": 200,
+        "msg": (
+            "已分配独立代理出口"
+            if environment.get("proxyAssigned")
+            else str(environment.get("proxyWarning") or "代理池中没有可用出口")
+        ),
+        "data": environment,
+    }), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/publish-transport', methods=['GET', 'DELETE'])
+def api_v2_account_publish_transport(account_id: int):
+    """发布通道状态：当前走哪条通道、有没有可复用的直发模板。
+
+    ``DELETE`` 清除该账号的直发模板，下次发布回到纯 RPA 重新录制模板。
+    """
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None or not item["cookie"].get("name"):
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str(item["cookie"].get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
+    platform_type = int((item.get("platform") or {}).get("type") or 0)
+    if request.method == 'DELETE':
+        from publish_transport import clear_template
+
+        for candidate in (platform_type, 1, 3):
+            if candidate:
+                clear_template(cookie_path, candidate)
+        return jsonify({
+            "code": 200, "msg": "已清除直发模板，下次发布将重新录制",
+            "data": {"cleared": True},
+        }), 200
+    from publish_transport import transport_status
+
+    statuses = [
+        transport_status(candidate, cookie_path)
+        for candidate in sorted({platform_type, 1, 3})
+    ]
+    return jsonify({"code": 200, "msg": None, "data": statuses}), 200
+
+
+@app.route('/api/v2/proxy-pool', methods=['GET', 'PUT'])
+def api_v2_proxy_pool():
+    """代理池：读取配置（密码脱敏）或整体替换。
+
+    代理池是全局资源（所有账号共用一份出口清单），因此按团队级权限管控，
+    而不是按账号范围。
+    """
+    denied = access_scope.require_permission(
+        runtime_config.PERM_TEAM, "当前身份没有团队管理权限",
+    )
+    if denied is not None:
+        return denied
+    if request.method == 'GET':
+        pool = load_proxy_pool()
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": {
+                "proxies": [
+                    {
+                        "server": item.get("server") or "",
+                        "username": item.get("username") or "",
+                        "hasPassword": bool(item.get("password")),
+                    }
+                    for item in pool
+                ],
+                "count": len(pool),
+            },
+        }), 200
+    data = request.get_json(silent=True) or {}
+    entries = data.get("proxies")
+    if not isinstance(entries, list):
+        return jsonify({"code": 400, "msg": "代理列表格式不正确", "data": None}), 400
+    try:
+        saved = save_proxy_pool(entries)
+    except OSError as exc:
+        return jsonify({"code": 500, "msg": f"保存代理池失败：{exc}", "data": None}), 500
+    return jsonify({
+        "code": 200, "msg": f"已保存 {len(saved)} 个代理",
+        "data": {"count": len(saved)},
+    }), 200
+
+
+@app.route('/api/v2/proxy-risks', methods=['GET'])
+def api_v2_proxy_risks():
+    """代理出口风险检查：谁和谁共用了同一个出口。"""
+    denied = access_scope.require_permission(
+        runtime_config.PERM_TEAM, "当前身份没有团队管理权限",
+    )
+    if denied is not None:
+        return denied
+    bindings, names = _all_proxy_bindings()
+    warnings = shared_proxy_warnings(bindings, names)
+    proxy_count = len(bindings)
+    if not proxy_count:
+        warnings.insert(0, no_proxy_warning(len(bindings) or _account_count()))
+    return jsonify({
+        "code": 200, "msg": None,
+        "data": {
+            "warnings": warnings,
+            "boundAccounts": proxy_count,
+            "totalAccounts": _account_count(),
+        },
+    }), 200
+
+
+def _account_count() -> int:
+    try:
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM user_info").fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
 
 
 @app.route('/api/v2/accounts/prune-cookies', methods=['POST'])
@@ -552,7 +809,9 @@ def api_v2_auth_sessions():
     limit = request.args.get('limit', type=int) or 20
     return jsonify({
         "code": 200, "msg": None,
-        "data": get_store(BASE_DIR).list_auth_sessions(limit),
+        "data": access_scope.filter_auth_sessions(
+            get_store(BASE_DIR).list_auth_sessions(limit)
+        ),
     }), 200
 
 
@@ -836,7 +1095,9 @@ def getAccounts():
     结构化字段（平台元数据、身份、健康度、凭据状态）走 ``/api/v2/accounts``。
     """
     try:
-        rows_list = get_store(BASE_DIR).legacy_rows()
+        rows_list = access_scope.filter_legacy_rows(
+            get_store(BASE_DIR).legacy_rows()
+        )
         logger.debug("账号列表（快速获取）：{} 条", len(rows_list))
         return jsonify(
             {
@@ -872,19 +1133,29 @@ async def getValidAccounts():
     store = get_store(BASE_DIR)
     cached = _account_check_cached()
     if cached is not None:
-        return jsonify({"code": 200, "msg": None, "data": cached}), 200
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": access_scope.filter_legacy_rows(cached),
+        }), 200
 
     acquired = _ACCOUNT_CHECK_LOCK.acquire(timeout=ACCOUNT_CHECK_LOCK_TIMEOUT)
     if not acquired:
         # 另一批校验还在跑且已超时：先返回当前库里的状态，别让请求堆积
         logger.warning("账号校验排队超时，返回当前库内状态")
-        return jsonify({"code": 200, "msg": None, "data": store.legacy_rows()}), 200
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": access_scope.filter_legacy_rows(store.legacy_rows()),
+        }), 200
     try:
         cached = _account_check_cached()  # 等锁期间别人可能已经跑完
         if cached is not None:
-            return jsonify({"code": 200, "msg": None, "data": cached}), 200
+            return jsonify({
+                "code": 200, "msg": None,
+                "data": access_scope.filter_legacy_rows(cached),
+            }), 200
 
-        accounts = store.list()
+        # 只校验令牌范围内的账号：范围外的账号不应该被本用户的请求触发登录。
+        accounts = access_scope.filter_accounts(store.list())
         if not accounts:
             return jsonify({"code": 200, "msg": None, "data": []}), 200
 
@@ -917,7 +1188,10 @@ async def getValidAccounts():
             "账号校验完成：共 {} 个，其中本次未通过 {} 个（连续 {} 次失败才判异常）",
             len(accounts), dead, DEFAULT_FAIL_THRESHOLD,
         )
-        return jsonify({"code": 200, "msg": None, "data": data}), 200
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": access_scope.filter_legacy_rows(data),
+        }), 200
     finally:
         _ACCOUNT_CHECK_LOCK.release()
 
@@ -1013,6 +1287,20 @@ def delete_account():
 
             record = dict(record)
 
+            # 删除账号属于账号管理动作：既要有 account 权限点，
+            # 目标账号也必须在令牌范围内。
+            denied = access_scope.require_permission(
+                runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
+            )
+            if denied is not None:
+                return denied
+            if not access_scope.account_in_scope(
+                account_id=account_id,
+                account_name=str(record.get("userName") or ""),
+                cookie_file=str(record.get("filePath") or ""),
+            ):
+                return access_scope.forbidden("无权删除该账号")
+
             # 删除关联的cookie文件
             if record.get('filePath'):
                 cookie_file_path = Path(BASE_DIR / "cookiesFile" / record['filePath'])
@@ -1094,6 +1382,8 @@ def list_jobs():
     with publish_jobs.get_conn() as c:
         rows = [dict(r) for r in c.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
     rows = stats_reflow.filter_current_account_jobs(rows)
+    # 多人协作：只返回令牌范围内的任务。
+    rows = access_scope.filter_jobs(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 @app.route('/jobs/<int:job_id>', methods=['GET'])
@@ -1102,7 +1392,10 @@ def get_job(job_id):
         row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
     if not row:
         return jsonify({'code': 404, 'msg': 'job not found'}), 404
-    return jsonify({'code': 200, 'data': dict(row), 'msg': None}), 200
+    job = dict(row)
+    if not access_scope.job_in_scope(job):
+        return access_scope.forbidden("无权访问该发布任务")
+    return jsonify({'code': 200, 'data': job, 'msg': None}), 200
 
 
 def _verify_request_payload(item):
@@ -1165,17 +1458,24 @@ def review_pending():
     with publish_jobs.get_conn() as c:
         rows = [dict(r) for r in c.execute(
             'SELECT * FROM jobs WHERE status=? ORDER BY id DESC', (status,)).fetchall()]
+    rows = access_scope.filter_jobs(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 
 @app.route('/review/<int:job_id>/approve', methods=['POST'])
 def review_approve(job_id):
+    denied = _guard_publish_job(job_id, "approve")
+    if denied is not None:
+        return denied
     publish_jobs.approve_job(job_id)
     return jsonify({'code': 200, 'msg': 'approved'}), 200
 
 
 @app.route('/review/<int:job_id>/reject', methods=['POST'])
 def review_reject(job_id):
+    denied = _guard_publish_job(job_id, "reject")
+    if denied is not None:
+        return denied
     publish_jobs.reject_job(job_id)
     return jsonify({'code': 200, 'msg': 'rejected'}), 200
 
@@ -1185,7 +1485,27 @@ def list_publish_records():
     with publish_jobs.get_conn() as c:
         rows = [dict(r) for r in c.execute('SELECT * FROM publish_records ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
     rows = stats_reflow.filter_current_account_records(rows)
+    rows = access_scope.filter_jobs(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
+
+
+def _guard_publish_job(job_id: int, action: str = "") -> Any:
+    """发布任务的操作前置校验：权限点 + 账号范围。
+
+    返回 None 表示放行，返回响应表示拒绝。
+    """
+    denied = access_scope.require_permission(
+        runtime_config.PERM_PUBLISH, "当前身份没有发布权限",
+    )
+    if denied is not None:
+        return denied
+    with publish_jobs.get_conn() as c:
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (int(job_id),)).fetchone()
+    if row is None:
+        return jsonify({'code': 404, 'data': None, 'msg': '任务不存在'}), 404
+    if not access_scope.job_in_scope(dict(row)):
+        return access_scope.forbidden("无权操作该发布任务")
+    return None
 
 
 # ---------------------------------------------------------------- 发布任务（账号级）
@@ -1202,25 +1522,36 @@ def publish_job_detail(job_id: int):
         row = c.execute('SELECT * FROM jobs WHERE id=?', (int(job_id),)).fetchone()
     if row is None:
         return jsonify({'code': 404, 'data': None, 'msg': '任务不存在'}), 404
+    if not access_scope.job_in_scope(dict(row)):
+        return access_scope.forbidden("无权访问该发布任务")
     return jsonify({
         'code': 200,
         'data': {
             'job': dict(row),
             'progress': publish_jobs.job_progress(job_id),
-            'items': publish_jobs.job_items(job_id),
+            'items': _scoped_publish_items(job_id),
         },
         'msg': None,
     }), 200
 
 
+def _scoped_publish_items(job_id: int) -> list[dict]:
+    """按账号范围过滤子任务明细。"""
+    items = publish_jobs.job_items(job_id)
+    return access_scope.filter_publish_items(items)
+
+
 @app.route('/publish/jobs/<int:job_id>/items', methods=['GET'])
 def publish_job_items(job_id: int):
     """子任务明细 + 进度（前端"发布记录"展开行用）。"""
+    denied = _guard_publish_job(job_id)
+    if denied is not None:
+        return denied
     return jsonify({
         'code': 200,
         'data': {
             'progress': publish_jobs.job_progress(job_id),
-            'items': publish_jobs.job_items(job_id),
+            'items': _scoped_publish_items(job_id),
         },
         'msg': None,
     }), 200
@@ -1228,6 +1559,9 @@ def publish_job_items(job_id: int):
 
 @app.route('/publish/jobs/<int:job_id>/cancel', methods=['POST'])
 def publish_job_cancel(job_id: int):
+    denied = _guard_publish_job(job_id, "cancel")
+    if denied is not None:
+        return denied
     result = publish_jobs.cancel_job(job_id)
     return jsonify({'code': 200, 'data': result, 'msg': '已取消'}), 200
 
@@ -1235,6 +1569,9 @@ def publish_job_cancel(job_id: int):
 @app.route('/publish/jobs/<int:job_id>/retry-failed', methods=['POST'])
 def publish_job_retry_failed(job_id: int):
     """只重试失败的子任务，已经成功的账号不会重复发布。"""
+    denied = _guard_publish_job(job_id, "retry")
+    if denied is not None:
+        return denied
     result = publish_jobs.retry_failed_items(job_id)
     return jsonify({
         'code': 200,
@@ -1243,14 +1580,100 @@ def publish_job_retry_failed(job_id: int):
     }), 200
 
 
+@app.route('/publish/jobs/<int:job_id>/publish-drafts', methods=['POST'])
+def publish_job_publish_drafts(job_id: int):
+    """把草稿子任务转为待发布（草稿继续发布）。"""
+    denied = _guard_publish_job(job_id, "publish-drafts")
+    if denied is not None:
+        return denied
+    result = publish_jobs.publish_draft_items(job_id)
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': f"已把 {result.get('queued', 0)} 条草稿转为待发布",
+    }), 200
+
+
+@app.route(
+    '/publish/jobs/<int:job_id>/items/<int:item_id>/visibility',
+    methods=['POST'],
+)
+def publish_item_set_visibility(job_id: int, item_id: int):
+    """修改一条子任务的可见性（public / draft / private）。"""
+    denied = _guard_publish_item(job_id, item_id)
+    if denied is not None:
+        return denied
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = publish_jobs.set_item_visibility(
+            job_id, item_id, str(payload.get('visibility') or ''),
+        )
+    except LookupError as exc:
+        return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    return jsonify({'code': 200, 'data': result, 'msg': '可见性已更新'}), 200
+
+
+def _guard_publish_item(job_id: int, item_id: int) -> Any:
+    """单条子任务的操作前置校验：权限点 + 任务范围 + 子任务所属账号。"""
+    denied = _guard_publish_job(job_id, "item")
+    if denied is not None:
+        return denied
+    item = publish_jobs.get_job_item(job_id, item_id)
+    if item is None:
+        return jsonify({'code': 404, 'data': None, 'msg': '发布子任务不存在'}), 404
+    if not access_scope.account_in_scope(
+        account_id=item.get("account_id"),
+        account_name=str(item.get("account_name") or ""),
+        cookie_file=str(item.get("cookie") or ""),
+    ):
+        return access_scope.forbidden("无权操作该发布子任务")
+    return None
+
+
+@app.route(
+    '/publish/jobs/<int:job_id>/items/<int:item_id>/resolve',
+    methods=['POST'],
+)
+def publish_item_resolve_uncertain(job_id: int, item_id: int):
+    """人工确认一条"状态未知"的子任务。
+
+    进程在提交到平台和写入结果之间崩溃时，子任务会停在 uncertain。
+    自动重发可能造成重复发布，所以必须由人工给出结论。
+    """
+    payload = request.get_json(silent=True) or {}
+    denied = _guard_publish_item(job_id, item_id)
+    if denied is not None:
+        return denied
+    try:
+        result = publish_jobs.resolve_uncertain_item(
+            job_id,
+            item_id,
+            str(payload.get('action') or ''),
+            remote_id=str(payload.get('remoteId') or '').strip(),
+            note=str(payload.get('note') or '').strip(),
+        )
+    except LookupError as exc:
+        return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': '已按人工确认更新该子任务',
+    }), 200
+
+
 @app.route(
     '/publish/jobs/<int:job_id>/items/<int:item_id>/remote-post',
     methods=['DELETE'],
 )
 def publish_item_delete_remote_post(job_id: int, item_id: int):
-    """Delete one Channels post after an explicit UI confirmation."""
-    from channels_dm import ChannelsAuthError, ChannelsError
-
+    """Delete one platform post after an explicit UI confirmation."""
+    denied = _guard_publish_item(job_id, item_id)
+    if denied is not None:
+        return denied
     payload = request.get_json(silent=True) or {}
     expected_remote_id = str(payload.get('remoteId') or '').strip()
     if not expected_remote_id:
@@ -1266,10 +1689,11 @@ def publish_item_delete_remote_post(job_id: int, item_id: int):
         return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
     except ValueError as exc:
         return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
-    except ChannelsAuthError as exc:
-        return jsonify({'code': 401, 'data': None, 'msg': str(exc)}), 401
-    except ChannelsError as exc:
-        return jsonify({'code': 502, 'data': None, 'msg': str(exc)}), 502
+    except Exception as exc:
+        return jsonify({
+            'code': 502, 'data': None,
+            'msg': f'平台作品删除失败：{str(exc)[:300]}',
+        }), 502
     return jsonify({
         'code': 200,
         'data': result,
@@ -1278,11 +1702,66 @@ def publish_item_delete_remote_post(job_id: int, item_id: int):
 
 
 @app.route(
+    '/publish/jobs/<int:job_id>/items/<int:item_id>/remote-posts',
+    methods=['GET'],
+)
+def publish_item_list_remote_posts(job_id: int, item_id: int):
+    """List one account's platform works and locate the published item.
+
+    抖音、小红书、视频号都支持作品列表查询：前端可以在删除前先核对
+    平台上的真实状态（审核失败、下架、已删除）。
+    """
+    denied = _guard_publish_item(job_id, item_id)
+    if denied is not None:
+        return denied
+    item = publish_jobs.get_job_item(job_id, item_id)
+    if item is None:
+        return jsonify({'code': 404, 'data': None, 'msg': '发布子任务不存在'}), 404
+    platform_type = int(item.get('type') or 0)
+    try:
+        from myUtils.platform_registry import supports_remote_manage
+
+        if not supports_remote_manage(platform_type):
+            return jsonify({
+                'code': 400, 'data': None,
+                'msg': '该平台暂不支持作品列表查询',
+            }), 400
+    except Exception:
+        pass
+    try:
+        account, platform_account = publish_jobs._platform_account_for_item(item)
+        with publish_jobs.get_conn() as conn:
+            job_row = conn.execute(
+                'SELECT * FROM jobs WHERE id=?', (int(job_id),)
+            ).fetchone()
+        title = str(job_row['title'] or '') if job_row else ''
+        from publish_remote_manage import list_remote_posts
+
+        result = list_remote_posts(
+            platform_type, platform_account, title=title,
+            post_id=str(item.get('remote_id') or ''),
+        )
+    except LookupError as exc:
+        return jsonify({'code': 404, 'data': None, 'msg': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({
+            'code': 502, 'data': None,
+            'msg': f'平台作品列表查询失败：{str(exc)[:300]}',
+        }), 502
+    return jsonify({'code': 200, 'data': result, 'msg': None}), 200
+
+
+@app.route(
     '/publish/jobs/<int:job_id>/items/<int:item_id>/replacement',
     methods=['POST'],
 )
 def publish_item_create_replacement(job_id: int, item_id: int):
     """Correct one item by publishing first and deleting the old post last."""
+    denied = _guard_publish_item(job_id, item_id)
+    if denied is not None:
+        return denied
     payload = request.get_json(silent=True) or {}
     try:
         result = publish_jobs.create_replacement_job(
@@ -1375,6 +1854,291 @@ def trigger_patrol():
 @app.route('/stats/summary', methods=['GET'])
 def stats_summary():
     return jsonify({'code': 200, 'data': stats_reflow.stats_summary(), 'msg': None}), 200
+
+
+@app.route('/stats/trend', methods=['GET'])
+def stats_trend():
+    """统一月度趋势（账号矩阵式）：发布量、播放、互动与环比。"""
+    months = request.args.get('months', 6)
+    try:
+        data = stats_reflow.monthly_trend(int(months))
+    except (TypeError, ValueError):
+        data = stats_reflow.monthly_trend(6)
+    return jsonify({'code': 200, 'data': data, 'msg': None}), 200
+
+
+@app.route('/stats/funnel', methods=['GET'])
+def stats_funnel():
+    """成交漏斗：从私信到线索到成交。"""
+    days = request.args.get('days', 30)
+    try:
+        data = stats_reflow.conversion_funnel(int(days))
+    except (TypeError, ValueError):
+        data = stats_reflow.conversion_funnel(30)
+    return jsonify({'code': 200, 'data': data, 'msg': None}), 200
+
+
+@app.route('/stats/completion', methods=['GET'])
+def stats_completion():
+    """完播率近似指标（估算值，非平台真实完播率）。"""
+    days = request.args.get('days', 30)
+    try:
+        data = stats_reflow.completion_rate(int(days))
+    except (TypeError, ValueError):
+        data = stats_reflow.completion_rate(30)
+    return jsonify({'code': 200, 'data': data, 'msg': None}), 200
+
+
+@app.route('/comments/status', methods=['GET'])
+def comments_status():
+    """评论自动同步状态。"""
+    import comment_sync
+
+    return jsonify({
+        'code': 200,
+        'data': comment_sync.comment_status(),
+        'msg': None,
+    }), 200
+
+
+@app.route('/comments/sync', methods=['POST'])
+def comments_sync():
+    """立即触发一轮评论自动同步。"""
+    import comment_sync
+
+    result = comment_sync.run_comment_sync_once()
+    return jsonify({
+        'code': 200,
+        'data': result,
+        'msg': f"已同步 {result.get('synced', 0)} 条新评论",
+    }), 200
+
+
+# ---------------------------------------------------------------- 评论运营
+
+def _comment_conn():
+    """私信（运营）库连接——评论运营表 ``comment_items`` 就住在这里。"""
+    import dm_ops
+
+    return dm_ops.get_conn()
+
+
+def _comment_account(account_name: str, platform: str = ""):
+    """按账号名找账号行（含 cookie 路径），用于评论操作。"""
+    base = Path(BASE_DIR)
+    db_path = base / "db" / "database.db"
+    if not db_path.is_file():
+        return None
+    with db_connect(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id,type,userName,filePath,status FROM user_info ORDER BY id"
+        ).fetchall()]
+    target = str(account_name or "").strip()
+    matched = [
+        row for row in rows
+        if str(row.get("userName") or "").strip() == target
+    ]
+    if not matched:
+        return None
+    if platform:
+        platform_type = comment_ops.platform_type_of(platform)
+        matched = [row for row in matched if int(row.get("type") or 0) == platform_type]
+    if len(matched) > 1:
+        raise ValueError(f"存在多个同名账号“{target}”，请先重命名再操作评论")
+    row = matched[0]
+    cookie = base / "cookiesFile" / Path(str(row.get("filePath") or "")).name
+    row["cookie_path"] = str(cookie) if cookie.is_file() else ""
+    return row
+
+
+@app.route('/comments', methods=['GET'])
+def comments_list():
+    """评论列表（运营视图）。
+
+    只返回令牌范围内的账号的评论；范围外的评论连 id 都不该出现。
+    """
+    platform = request.args.get('platform') or ''
+    account = request.args.get('account') or ''
+    source_id = request.args.get('source_id') or ''
+    try:
+        limit = max(1, min(int(request.args.get('limit') or 100), 500))
+    except (TypeError, ValueError):
+        limit = 100
+
+    # 评论表用 (platform, account) 标识所属账号，与私信侧一致，
+    # 直接复用同一套账号名范围。
+    allowed_names = access_scope.allowed_account_names()
+    sql = "SELECT * FROM comment_items WHERE 1=1"
+    args: list = []
+    if allowed_names is not None:
+        if not allowed_names:
+            return jsonify({'code': 200, 'data': {'items': []}, 'msg': None}), 200
+        placeholders = ",".join("?" for _ in allowed_names)
+        sql += f" AND account IN ({placeholders})"
+        args.extend(sorted(allowed_names))
+    if platform:
+        sql += " AND platform=?"
+        args.append(platform)
+    if account:
+        sql += " AND account=?"
+        args.append(account)
+    if source_id:
+        sql += " AND source_id=?"
+        args.append(source_id)
+    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    args.append(limit)
+    try:
+        with _comment_conn() as conn:
+            rows = [dict(row) for row in conn.execute(sql, args).fetchall()]
+    except Exception as exc:
+        logger.warning("读取评论列表失败: {}", exc)
+        return jsonify({'code': 500, 'msg': f"读取评论列表失败：{str(exc)[:200]}"}), 500
+    return jsonify({
+        'code': 200,
+        'data': {
+            'items': rows,
+            'capabilities': comment_ops.platform_capabilities(),
+        },
+        'msg': None,
+    }), 200
+
+
+def _load_comment_for_action(comment_id: int):
+    """取一条评论并校验账号范围；返回 (comment, account_row, error_response)。"""
+    try:
+        with _comment_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM comment_items WHERE id=?", (int(comment_id),)
+            ).fetchone()
+    except Exception as exc:
+        logger.warning("读取评论失败: {}", exc)
+        return None, None, (
+            jsonify({'code': 500, 'msg': f"读取评论失败：{str(exc)[:200]}"}), 500
+        )
+    if row is None:
+        return None, None, (
+            jsonify({'code': 404, 'msg': '评论不存在，请重新同步评论'}), 404
+        )
+    comment = dict(row)
+    if not access_scope.account_in_scope(
+        account_id=comment.get("account_id"),
+        account_name=str(comment.get("account") or ""),
+    ):
+        return None, None, access_scope.forbidden("无权操作该账号下的评论")
+    try:
+        account_row = _comment_account(
+            str(comment.get("account") or ""), str(comment.get("platform") or "")
+        )
+    except ValueError as exc:
+        return None, None, (jsonify({'code': 400, 'msg': str(exc)}), 400)
+    if account_row is None:
+        return None, None, (
+            jsonify({'code': 404, 'msg': '账号不存在或已删除，无法操作评论'}), 404
+        )
+    return comment, account_row, None
+
+
+def _apply_comment_action(comment_id: int, action: str, text: str = ""):
+    """执行评论动作并回写状态。"""
+    denied = access_scope.require_permission(
+        runtime_config.PERM_MESSAGE, "当前身份没有私信/评论操作权限",
+    )
+    if denied is not None:
+        return denied
+    comment, account_row, error = _load_comment_for_action(comment_id)
+    if error is not None:
+        return error
+    try:
+        result = comment_ops.run_comment_action(
+            account_row, comment, action, text=text,
+        )
+    except comment_ops.CommentNotSupported as exc:
+        return jsonify({'code': 400, 'msg': str(exc)}), 400
+    except comment_ops.CommentActionError as exc:
+        return jsonify({'code': 400, 'msg': str(exc)}), 400
+    except Exception as exc:
+        logger.warning("评论操作异常: {}", exc)
+        return jsonify({'code': 500, 'msg': f"评论操作失败：{str(exc)[:200]}"}), 500
+
+    # 回写操作状态，前端据此渲染按钮开关态。
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    updates: dict = {}
+    if action == comment_ops.ACTION_LIKE:
+        updates['liked'] = 1
+    elif action == comment_ops.ACTION_UNLIKE:
+        updates['liked'] = 0
+    elif action == comment_ops.ACTION_PIN:
+        updates['pinned'] = 1
+    elif action == comment_ops.ACTION_UNPIN:
+        updates['pinned'] = 0
+    elif action == comment_ops.ACTION_REPLY:
+        updates['replied_at'] = now
+        updates['reply_text'] = str(text or '')
+    elif action == comment_ops.ACTION_DELETE:
+        updates['deleted_at'] = now
+    if updates:
+        assignments = ",".join(f"{key}=?" for key in updates)
+        with _comment_conn() as conn:
+            conn.execute(
+                f"UPDATE comment_items SET {assignments},updated_at=? WHERE id=?",
+                (*updates.values(), now, int(comment_id)),
+            )
+    return jsonify({
+        'code': 200, 'data': result, 'msg': _comment_action_label(action),
+    }), 200
+
+
+def _comment_action_label(action: str) -> str:
+    return {
+        comment_ops.ACTION_REPLY: '回复已发送',
+        comment_ops.ACTION_LIKE: '已点赞',
+        comment_ops.ACTION_UNLIKE: '已取消点赞',
+        comment_ops.ACTION_DELETE: '评论已删除',
+        comment_ops.ACTION_PIN: '评论已置顶',
+        comment_ops.ACTION_UNPIN: '已取消置顶',
+    }.get(action, '操作完成')
+
+
+@app.route('/comments/<int:comment_id>/reply', methods=['POST'])
+def comment_reply(comment_id: int):
+    """回复一条评论。"""
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get('text') or '').strip()
+    if not text:
+        return jsonify({'code': 400, 'msg': '回复内容不能为空'}), 400
+    return _apply_comment_action(comment_id, comment_ops.ACTION_REPLY, text)
+
+
+@app.route('/comments/<int:comment_id>/like', methods=['POST'])
+def comment_like(comment_id: int):
+    """点赞一条评论（``liked=0`` 时取消点赞）。"""
+    payload = request.get_json(silent=True) or {}
+    liked = payload.get('liked', True)
+    action = comment_ops.ACTION_LIKE if liked else comment_ops.ACTION_UNLIKE
+    return _apply_comment_action(comment_id, action)
+
+
+@app.route('/comments/<int:comment_id>/delete', methods=['POST'])
+def comment_delete(comment_id: int):
+    """删除一条评论。"""
+    return _apply_comment_action(comment_id, comment_ops.ACTION_DELETE)
+
+
+@app.route('/comments/<int:comment_id>/pin', methods=['POST'])
+def comment_pin(comment_id: int):
+    """置顶一条评论（``pinned=0`` 时取消置顶）。"""
+    payload = request.get_json(silent=True) or {}
+    pinned = payload.get('pinned', True)
+    action = comment_ops.ACTION_PIN if pinned else comment_ops.ACTION_UNPIN
+    return _apply_comment_action(comment_id, action)
+
+
+@app.route('/comments/capabilities', methods=['GET'])
+def comments_capabilities():
+    """各平台的评论操作能力矩阵。"""
+    return jsonify({
+        'code': 200, 'data': comment_ops.platform_capabilities(), 'msg': None,
+    }), 200
 
 
 @app.route('/stats/run', methods=['POST'])
@@ -1574,6 +2338,48 @@ def login_verify():
     verify_queue.put({"phone": phone, "code": code, "stage": stage})
     return jsonify({"code": 200, "msg": "已提交验证信息", "data": {"duplicate": False}}), 200
 
+def _accounts_out_of_scope(account_list) -> list[str]:
+    """返回不在令牌范围内的账号标识（Cookie 文件名 / 账号名 / 账号 id）。
+
+    发布接口的 ``accountList`` 里放的是账号的 Cookie 文件名。这里把它们
+    还原成账号行后逐一核对范围——直接拿文件名比对是不够的，因为令牌里的
+    scope 可能写的是账号 id 或账号名。
+    """
+    refs = [str(item).strip() for item in (account_list or []) if str(item).strip()]
+    if not refs:
+        return []
+    if access_scope.unrestricted():
+        return []
+    out: list[str] = []
+    table = {
+        str(row.get("id") or ""): row for row in access_scope._account_table()
+    }
+    for ref in refs:
+        row = table.get(ref)
+        if row is None:
+            for candidate in access_scope._account_table():
+                if str(candidate.get("userName") or "").strip() == ref:
+                    row = candidate
+                    break
+                file_path = str(candidate.get("filePath") or "")
+                if file_path and (
+                    file_path == ref or Path(file_path).name == ref
+                ):
+                    row = candidate
+                    break
+        if row is None:
+            # 账号不存在：不属于任何人的范围，直接拒绝，避免静默发布到未知目标。
+            out.append(ref)
+            continue
+        if not access_scope.account_in_scope(
+            account_id=row.get("id"),
+            account_name=str(row.get("userName") or ""),
+            cookie_file=str(row.get("filePath") or ""),
+        ):
+            out.append(ref)
+    return out
+
+
 @app.route('/postVideo', methods=['POST'])
 def postVideo():
     # 获取JSON数据
@@ -1581,6 +2387,12 @@ def postVideo():
 
     if not data:
         return jsonify({"code": 400, "msg": "请求数据不能为空", "data": None}), 400
+
+    denied = access_scope.require_permission(
+        runtime_config.PERM_PUBLISH, "当前身份没有发布权限",
+    )
+    if denied is not None:
+        return denied
 
     # 从JSON数据中提取fileList和accountList
     file_list = data.get('fileList', [])
@@ -1604,20 +2416,37 @@ def postVideo():
         platform_type = int(type)
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": "不支持的平台类型", "data": None}), 400
-    if content_type == 'image-text' and platform_type != 2:
-        return jsonify({"code": 400, "msg": "图文发布目前仅支持视频号", "data": None}), 400
+    if content_type == 'image-text' and not supports_image_text(platform_type):
+        supported = '、'.join(
+            platform_name(value) for value, item in PLATFORM_META.items()
+            if item.get('supports_image_text')
+        )
+        return jsonify({
+            "code": 400,
+            "msg": f"图文发布目前仅支持 {supported or '无'}",
+            "data": None,
+        }), 400
 
     videos_per_day = data.get('videosPerDay')
     daily_times = data.get('dailyTimes')
     start_days = data.get('startDays')
 
     # 参数校验
+    if not type:
+        return jsonify({"code": 400, "msg": "平台类型不能为空", "data": None}), 400
+
+    # 目标账号必须在令牌范围内：否则运营可以把内容发到别人的号上。
+    # 放在参数校验之前，让越权请求优先暴露为 403 而不是 400。
+    out_of_scope = _accounts_out_of_scope(account_list)
+    if out_of_scope:
+        return access_scope.forbidden(
+            "无权向以下账号发布：" + "、".join(out_of_scope)
+        )
+
     if not file_list:
         return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
     if not account_list:
         return jsonify({"code": 400, "msg": "账号列表不能为空", "data": None}), 400
-    if not type:
-        return jsonify({"code": 400, "msg": "平台类型不能为空", "data": None}), 400
     if not title:
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
 
@@ -1653,10 +2482,18 @@ def updateUserinfo():
     # 获取JSON数据
     data = request.get_json()
 
+    denied = access_scope.require_permission(
+        runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
+    )
+    if denied is not None:
+        return denied
+
     # 从JSON数据中提取 type 和 userName
     user_id = data.get('id')
     type = data.get('type')
     userName = data.get('userName')
+    if user_id is not None and not access_scope.account_in_scope(account_id=user_id):
+        return access_scope.forbidden("无权修改该账号")
     try:
         # 获取数据库连接
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
@@ -1691,6 +2528,24 @@ def postVideoBatch():
 
     if not isinstance(data_list, list):
         return jsonify({"code": 400, "msg": "Expected a JSON array", "data": None}), 400
+
+    denied = access_scope.require_permission(
+        runtime_config.PERM_PUBLISH, "当前身份没有发布权限",
+    )
+    if denied is not None:
+        return denied
+
+    # 批量发布同样要逐条核对目标账号范围。
+    for index, data in enumerate(data_list):
+        if not isinstance(data, dict):
+            continue
+        out_of_scope = _accounts_out_of_scope(data.get('accountList', []))
+        if out_of_scope:
+            return access_scope.forbidden(
+                f"第 {index + 1} 条任务无权向以下账号发布："
+                + "、".join(out_of_scope)
+            )
+
     for data in data_list:
         # 从JSON数据中提取fileList和accountList
         file_list = data.get('fileList', [])
@@ -1735,6 +2590,12 @@ def postVideoBatch():
 @app.route('/uploadCookie', methods=['POST'])
 def upload_cookie():
     try:
+        denied = access_scope.require_permission(
+            runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
+        )
+        if denied is not None:
+            return denied
+
         if 'file' not in request.files:
             return jsonify({
                 "code": 400,
@@ -1827,6 +2688,11 @@ def download_cookie():
                 "msg": "非法文件路径",
                 "data": None
             }), 400
+
+        # 下载 Cookie 等同于导出凭据，必须受账号范围限制。
+        # 放在存在性检查之前：越权请求不该因为"文件恰好不存在"而变成 404。
+        if not access_scope.account_in_scope(cookie_file=file_path):
+            return access_scope.forbidden("无权下载该账号的 Cookie")
 
         if not cookie_file_path.exists():
             return jsonify({
@@ -1930,11 +2796,18 @@ def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
 
 import publish_jobs
 
+publish_jobs.start_publish_runtime()
 start_patrol()
 stats_reflow.start_stats_loop(24)
 douyin_dm_sync.start_background()
 xiaohongshu_dm_sync.start_background()
 channels_dm_sync.start_background()
+try:
+    import comment_sync
+
+    comment_sync.start_comment_loop()
+except Exception:
+    logger.exception("评论自动同步启动失败")
 
 
 def _dm_storage_maintenance():

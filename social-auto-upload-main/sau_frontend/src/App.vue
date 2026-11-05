@@ -24,6 +24,10 @@
             <el-icon><ChatDotRound /></el-icon>
             <span>私信中心</span>
           </el-menu-item>
+          <el-menu-item index="/comments">
+            <el-icon><ChatLineSquare /></el-icon>
+            <span>评论运营</span>
+          </el-menu-item>
           <el-menu-item index="/account-management">
             <el-icon><User /></el-icon>
             <span>账号管理</span>
@@ -102,8 +106,8 @@ import { useRoute } from 'vue-router'
 import { getAccessToken, setAccessToken } from '@/config'
 import { http } from '@/utils/request'
 import {
-  HomeFilled, User, DataAnalysis, List, Calendar, MagicStick, Bell, ChatDotRound, Files, Checked, DataLine,
-  Fold, Picture, Upload
+  HomeFilled, User, DataAnalysis, List, Calendar, MagicStick, Bell, ChatDotRound, ChatLineSquare,
+  Files, Checked, DataLine, Fold, Picture, Upload
 } from '@element-plus/icons-vue'
 
 const route = useRoute()

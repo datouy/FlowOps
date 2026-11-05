@@ -17,6 +17,7 @@ from flask import Blueprint, jsonify, request
 from loguru import logger
 
 from conf import BASE_DIR
+import dm_cursor
 import dm_ops
 from db_utils import apply_migrations, connect
 
@@ -204,6 +205,37 @@ def resolve_accounts(accounts: list[dict], selected_ids: list[int]) -> list[dict
 def validate_account_ids(accounts: list[dict], selected_ids: list[int]) -> list[int]:
     known = {int(item.get("id") or 0) for item in accounts}
     return [item for item in selected_ids if item not in known]
+
+
+def _out_of_scope_account_ids(selected_ids: list[int]) -> list[int]:
+    """返回"存在但不在令牌范围内"的账号 id。
+
+    ``list_accounts`` 已经按范围过滤过了，所以这里的"缺失"有两种可能：
+    账号真被删了，或者账号存在但属于别的运营。这里把后者挑出来，
+    便于接口返回 403 而不是含糊的 400。
+    """
+    try:
+        import access_scope
+    except Exception:
+        return []
+    try:
+        if access_scope.unrestricted():
+            return []
+    except Exception:
+        return []
+    out: list[int] = []
+    for account_id in selected_ids or []:
+        try:
+            value = int(account_id)
+        except (TypeError, ValueError):
+            continue
+        if access_scope.account_in_scope(account_id=value):
+            continue
+        # 账号真的不存在时不算越权。
+        if not access_scope.account_exists(value):
+            continue
+        out.append(value)
+    return out
 
 
 def normalize_timestamp(value: Any) -> datetime | None:
@@ -579,6 +611,13 @@ class BaseDmSync:
                 0 if int(row.get("status") or 0) == 1 else 1,
                 -int(row.get("id") or 0),
             ))
+        # 多人协作：只暴露令牌范围内的账号。没有请求上下文（后台同步线程）
+        # 时不过滤。
+        try:
+            import access_scope
+            rows = access_scope.filter_accounts(rows)
+        except Exception:
+            pass
         return rows
 
     def resolve_accounts(self, accounts: list[dict], settings: dict) -> list[dict]:
@@ -648,6 +687,9 @@ class BaseDmSync:
         data["last_error_is_account_hint"] = bool(
             not selected and self.no_accounts_is_normal()
         )
+        # 分级概览：活跃/冷账号数量 + 夜间降频标记。
+        data["tier_summary"] = dm_cursor.summary(self.platform)
+        data["night_mode"] = dm_cursor.is_night()
         return data
 
     def register_routes(self) -> None:
@@ -701,6 +743,14 @@ class BaseDmSync:
         accounts = self.list_accounts()
         missing = validate_account_ids(accounts, account_ids)
         if missing:
+            # 越权选别人范围的账号时返回 403（而不是混在 400 里），
+            # 让"越权"和"账号不存在"在日志与前端上可区分。
+            out_of_scope = _out_of_scope_account_ids(account_ids)
+            if out_of_scope:
+                return jsonify({
+                    "code": 403,
+                    "msg": f"无权操作{self.platform}账号：" + "、".join(str(x) for x in out_of_scope),
+                }), 403
             return jsonify({
                 "code": 400, "msg": f"所选{self.platform}账号不存在或已删除",
             }), 400
@@ -776,25 +826,76 @@ class BaseDmSync:
             )
             return self._failed_account_result(account, message)
 
+    def _account_key(self, account: dict) -> str:
+        return str(account.get("id") or self.account_name(account) or "")[:64]
+
     def _scan_accounts(
         self, settings: dict, accounts: list[dict], quick: bool = False,
     ) -> list[dict]:
-        """按账号并行扫描；结果顺序与账号顺序一致。"""
-        if len(accounts) <= 1 or self.max_workers <= 1:
-            results = [self._scan_one(settings, account, quick) for account in accounts]
+        """按账号并行扫描；结果顺序与账号顺序一致。
+
+        冷账号按分级调度跳过：本轮还没到它的执行时间就不扫描，
+        避免每个账号都用同样的高频轮询。
+        """
+        due_accounts = []
+        skipped_cold = 0
+        for account in accounts:
+            try:
+                if dm_cursor.is_due(self.platform, self._account_key(account)):
+                    due_accounts.append(account)
+                else:
+                    skipped_cold += 1
+            except Exception:
+                due_accounts.append(account)
+        self._skipped_cold = skipped_cold
+        if not due_accounts:
+            return []
+        if len(due_accounts) <= 1 or self.max_workers <= 1:
+            results = [self._scan_one(settings, account, quick) for account in due_accounts]
         else:
-            workers = max(1, min(self.max_workers, len(accounts)))
+            workers = max(1, min(self.max_workers, len(due_accounts)))
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix=f"{self.key}-account",
             ) as pool:
                 futures = [
                     pool.submit(self._scan_one, settings, account, quick)
-                    for account in accounts
+                    for account in due_accounts
                 ]
                 results = [future.result() for future in futures]
         for result in results:
             self._record_account_state(result)
+            self._update_account_cursor(result)
         return results
+
+    def _update_account_cursor(self, result: dict) -> None:
+        """保存账号游标并更新分级（活跃/冷）与下次执行时间。"""
+        account = result.get("account") or {}
+        key = self._account_key(account)
+        if not key:
+            return
+        try:
+            if result.get("ok"):
+                cursor = dm_cursor.decode_cursor(result.get("cursor"))
+                if not cursor:
+                    cursor = dm_cursor.cursor_from_items(result.get("items") or [])
+                existing = dm_cursor.load_cursor(self.platform, key)
+                dm_cursor.save_cursor(
+                    self.platform, key,
+                    last_message_id=cursor.get("lastMessageId")
+                    or existing.get("lastMessageId") or "",
+                    last_message_at=cursor.get("lastMessageAt")
+                    or existing.get("lastMessageAt") or "",
+                    message_count=int(
+                        cursor.get("messageCount") or existing.get("messageCount") or 0
+                    ),
+                )
+            dm_cursor.update_after_sync(
+                self.platform, key,
+                ok=bool(result.get("ok")),
+                new_messages=int(result.get("imported") or 0),
+            )
+        except Exception as exc:
+            logger.warning("更新私信游标失败: {}", exc)
 
     def _record_account_state(self, result: dict) -> None:
         """把每个账号本轮同步结果落库（健康度/最后成功时间/失败原因）。"""
@@ -1058,6 +1159,9 @@ class BaseDmSync:
                 except Exception:
                     interval = 0
                 gap = interval if interval > 0 else self.continuous_gap
+                if dm_cursor.is_night():
+                    # 夜间降频：整体节奏放慢，减少平台侧风控压力。
+                    gap = max(gap, dm_cursor.effective_interval(self.failure_backoff))
                 if not result.get("ok"):
                     gap = max(gap, self.failure_backoff)
                     if result.get("no_accounts") and self.no_accounts_is_normal():

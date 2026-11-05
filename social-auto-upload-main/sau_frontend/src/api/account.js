@@ -59,6 +59,15 @@ export const accountApi = {
     return http.put(`/api/v2/accounts/${id}/environment`, { proxy })
   },
 
+  // 发布通道状态（API 直发 / 页面自动化）
+  getPublishTransport(id) {
+    return http.get(`/api/v2/accounts/${id}/publish-transport`)
+  },
+
+  clearPublishTransport(id) {
+    return http.delete(`/api/v2/accounts/${id}/publish-transport`)
+  },
+
   // 授权会话审计（含已结束/被中断的会话）
   getAuthSessions(limit = 20) {
     return http.get('/api/v2/auth-sessions', { limit })

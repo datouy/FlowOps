@@ -8,6 +8,7 @@ import PublishCalendar from '../views/PublishCalendar.vue'
 import PublishRecords from '../views/PublishRecords.vue'
 import AIContent from '../views/AIContent.vue'
 import Messages from '../views/Messages.vue'
+import Comments from '../views/Comments.vue'
 import Todo from '../views/Todo.vue'
 import ContentPack from '../views/ContentPack.vue'
 import Review from '../views/Review.vue'
@@ -43,6 +44,11 @@ const routes = [
     path: '/messages',
     name: 'Messages',
     component: Messages
+  },
+  {
+    path: '/comments',
+    name: 'Comments',
+    component: Comments
   },
   {
     path: '/todo',

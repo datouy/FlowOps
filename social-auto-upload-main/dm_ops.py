@@ -99,7 +99,15 @@ def active_account_pairs() -> list[tuple[str, str]]:
         (ACCOUNT_PLATFORM_NAMES.get(int(row["type"]), ""), str(row["userName"] or "").strip())
         for row in rows
     }
-    return sorted((platform, account) for platform, account in pairs if platform and account)
+    result = sorted((platform, account) for platform, account in pairs if platform and account)
+    try:
+        import access_scope
+        # 多人协作：私信会话、统计、导出都基于这里的账号对，
+        # 因此过滤一次即可让下游查询天然只覆盖令牌范围内的账号。
+        result = access_scope.filter_account_pairs(result)
+    except Exception:
+        pass
+    return result
 
 
 def account_scope_sql(platform_col: str = "platform",
@@ -117,6 +125,40 @@ def is_active_account_contact(contact: dict) -> bool:
     platform = str(contact.get("platform") or "").strip()
     account = str(contact.get("account") or "").strip()
     return bool(platform and account and (platform, account) in active_account_pairs())
+
+
+def contact_out_of_scope(contact: dict) -> bool:
+    """会话所属账号是否在当前令牌的账号范围之外。
+
+    私信表里用 ``(platform, account)`` 标识发信账号，账号名与账号表里的
+    ``userName`` 对应。范围外的账号既不能看也不能改——但也不能静默当成
+    "会话不存在"，否则前端会误以为是消息被删了。
+    """
+    platform = str(contact.get("platform") or "").strip()
+    account = str(contact.get("account") or "").strip()
+    if not platform or not account:
+        return False
+    try:
+        import access_scope
+    except Exception:
+        return False
+    try:
+        if access_scope.unrestricted():
+            return False
+        return not access_scope.dm_account_in_scope(platform, account)
+    except Exception:
+        return False
+
+
+def _guard_contact(contact: dict):
+    """范围外的会话返回 403 响应；范围内返回 None。"""
+    if not contact_out_of_scope(contact):
+        return None
+    return jsonify({
+        "code": 403,
+        "data": None,
+        "msg": "无权访问该会话：所属账号不在你的账号范围内",
+    }), 403
 
 
 def _now() -> str:
@@ -1392,12 +1434,9 @@ def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
     }
     media_file = str(payload.get("media_file") or "")
     if media_file:
-        if platform not in ("视频号", "小红书"):
+        if platform not in ("视频号", "小红书", "抖音"):
             status = "failed"
-            if platform == "抖音":
-                error = "抖音创作者网页版暂不支持私信图片或附件发送，请改用文字发送"
-            else:
-                error = f"{platform or '当前平台'}暂不支持发送本地媒体，请改用文本"
+            error = f"{platform or '当前平台'}暂不支持发送本地媒体，请改用文本"
             transport = ""
         else:
             try:
@@ -1408,15 +1447,23 @@ def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
                     result = platform_reply.send_xiaohongshu_media(
                         payload.get("account"), external_user_id, media_file,
                     )
+                elif platform == "抖音":
+                    # 抖音走昵称定位会话，没有 external_user_id 时无法定位。
+                    if not nickname:
+                        raise ValueError("客户昵称为空，无法定位抖音会话")
+                    result = platform_reply.send_douyin_media(
+                        payload.get("account"), nickname, media_file,
+                    )
                 else:
                     result = platform_reply.send_channels_media(
                         payload.get("account"), external_user_id, media_file,
                     )
                 status = "sent"
                 error = ""
-                transport = _clean((result or {}).get("transport"), 40) or (
-                    "xiaohongshu-web" if platform == "小红书" else "channels-web"
-                )
+                transport = _clean((result or {}).get("transport"), 40) or {
+                    "小红书": "xiaohongshu-web",
+                    "抖音": "douyin-web",
+                }.get(platform, "channels-web")
             except Exception as exc:
                 status, transport = "failed", ""
                 error = f"{platform}媒体直发失败：{str(exc)[:300]}"
@@ -2137,7 +2184,12 @@ def conversation_detail(cid: int):
         after = 0
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
-        if not row or row["account_deleted"] or not is_active_account_contact(dict(row)):
+        if not row:
+            return jsonify({"code": 404, "msg": "conversation not found"}), 404
+        denied = _guard_contact(dict(row))
+        if denied is not None:
+            return denied
+        if row["account_deleted"] or not is_active_account_contact(dict(row)):
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = _decorate_contact(dict(row))
         messages = [dict(r) for r in c.execute("""SELECT * FROM (
@@ -2151,6 +2203,18 @@ def conversation_detail(cid: int):
         )
         logs = [dict(r) for r in c.execute("""SELECT * FROM dm_reply_logs WHERE contact_id=?
             ORDER BY id DESC LIMIT 30""", (cid,)).fetchall()]
+        reasons = {
+            int(log["outbound_message_id"]): log.get("reason") or ""
+            for log in logs if log.get("outbound_message_id")
+        }
+        for message in messages:
+            if message.get("direction") == "outbound":
+                reason = reasons.get(int(message["id"]), "")
+                if message.get("delivery_status") == "failed" and not reason:
+                    reason = "失败原因未记录（旧版本未保存）"
+                message["delivery_error"] = (
+                    reason if message.get("delivery_status") != "sent" else ""
+                )
     return jsonify({"code": 200, "data": {
         "contact": contact, "messages": messages, "logs": logs,
     }, "msg": None})
@@ -2158,9 +2222,12 @@ def conversation_detail(cid: int):
 
 def mark_conversation_read(cid: int):
     with get_conn() as c:
-        contact = c.execute("SELECT id FROM dm_contacts WHERE id=?", (cid,)).fetchone()
-        if not contact:
-            return jsonify({"code": 404, "data": None, "msg": "conversation not found"}), 404
+        row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
+        if not row:
+            return jsonify({"code": 404, "msg": "conversation not found"}), 404
+        denied = _guard_contact(dict(row))
+        if denied is not None:
+            return denied
         cur = c.execute("""UPDATE messages SET status='read', handled_at=COALESCE(handled_at,?)
             WHERE contact_id=? AND direction='inbound' AND status='new'""", (_now(), cid))
         marked = int(cur.rowcount or 0)
@@ -2313,6 +2380,9 @@ def update_contact(cid: int):
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
             return jsonify({"code": 404, "msg": "contact not found"}), 404
+        denied = _guard_contact(dict(row))
+        if denied is not None:
+            return denied
         merged = dict(row)
         for key in allowed:
             if key in data:
@@ -2348,8 +2418,12 @@ def manual_reply(cid: int):
         if not row:
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = dict(row)
+        denied = _guard_contact(contact)
+        if denied is not None:
+            return denied
         settings = _get_settings(c)
         out_id = _insert_outbound(c, contact, text, "replied", None, auto=False)
+        _log_reply(c, cid, None, out_id, None, "pending", "等待发送", text)
         c.execute("""UPDATE messages SET status='replied',handled_at=? WHERE contact_id=?
             AND direction='inbound' AND status='new'""", (_now(), cid))
         if contact.get("stage") in ("new", "engaged", "qualified"):
@@ -2385,6 +2459,9 @@ def manual_reply_media(cid: int):
         if not row:
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = dict(row)
+        denied = _guard_contact(contact)
+        if denied is not None:
+            return denied
     platform = contact.get("platform")
     if platform == "抖音":
         return jsonify({
@@ -2439,6 +2516,9 @@ def ai_draft(cid: int):
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
+        denied = _guard_contact(dict(row))
+        if denied is not None:
+            return denied
         contact = dict(row)
         last = c.execute("""SELECT content FROM messages m
             WHERE contact_id=? AND direction='inbound' AND """

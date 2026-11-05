@@ -9,12 +9,16 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import requests
 
 from dm_platform_common import account_name, clean_text
-from utils.account_environment import proxy_settings
+from utils.account_http import (
+    FALLBACK_USER_AGENT,
+    account_proxies,
+    account_user_agent,
+)
 
 CHANNELS_ORIGIN = "https://channels.weixin.qq.com"
 CHANNELS_PLATFORM_URL = f"{CHANNELS_ORIGIN}/platform"
@@ -51,12 +55,15 @@ def _load_cookies(path: str | Path) -> list[dict]:
     return [item for item in cookies if isinstance(item, dict) and item.get("name")]
 
 
-def _headers(wxuin: str = "") -> dict:
+def _headers(wxuin: str = "", user_agent: str = "") -> dict:
+    """视频号接口请求头。
+
+    ``user_agent`` 必须来自账号自己的持久化指纹：同一个账号在浏览器里用
+    Linux/Windows/macOS 某个 UA 登录，直连接口如果写死另一个 UA，就等于
+    同一账号出现两种设备指纹，是最容易被风控盯上的模式。
+    """
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": user_agent or FALLBACK_USER_AGENT,
         "Referer": CHANNELS_PLATFORM_URL,
         "Origin": CHANNELS_ORIGIN,
         "Accept": "application/json, text/plain, */*",
@@ -77,18 +84,12 @@ class ChannelsClient:
             raise ChannelsAuthError(
                 f"账号 {account_name(account)} 的 Cookie 文件不存在，请重新扫码登录"
             )
+        # 直连接口必须与浏览器通道使用同一个设备指纹（UA），否则同一个账号
+        # 会以两种设备身份出现在平台侧。
+        self._user_agent = account_user_agent(cookie_file)
         self.session = requests.Session()
-        proxy = proxy_settings(cookie_file)
-        if proxy:
-            # Keep API polling and browser logins on the same egress IP.
-            proxy_url = str(proxy["server"])
-            if proxy.get("username"):
-                parsed = urlparse(proxy_url)
-                credentials = quote(str(proxy["username"]), safe="")
-                if proxy.get("password"):
-                    credentials += ":" + quote(str(proxy["password"]), safe="")
-                proxy_url = parsed._replace(netloc=f"{credentials}@{parsed.netloc}").geturl()
-            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
+        # Keep API polling and browser logins on the same egress IP.
+        self.session.proxies.update(account_proxies(cookie_file))
         for cookie in _load_cookies(cookie_file):
             self.session.cookies.set(
                 str(cookie.get("name")), str(cookie.get("value") or ""),
@@ -101,7 +102,7 @@ class ChannelsClient:
         url = f"{api_base}{path}"
         try:
             response = self.session.post(
-                url, headers=_headers(self._wxuin),
+                url, headers=_headers(self._wxuin, getattr(self, "_user_agent", "")),
                 json=body if body is not None else {},
                 timeout=30,
             )
@@ -177,6 +178,45 @@ class ChannelsClient:
             "response": data,
         }
 
+    def find_post(self, title: str, post_id: str = "") -> dict:
+        """Read one post's current platform stage through Channels' list API."""
+        from uploader.tencent_uploader.main import (
+            extract_tencent_posts, match_tencent_post, tencent_post_state,
+        )
+
+        title = clean_text(title, 300)
+        post_id = clean_text(post_id, 300)
+        data = self._request(
+            "/post/post_list",
+            {"offset": 0, "pageSize": 50, "query": title},
+            CHANNELS_INTERACTION_API_BASE,
+        )
+        posts = extract_tencent_posts(data)
+        selected = next(
+            (item for item in posts if post_id and item.get("post_id") == post_id),
+            None,
+        )
+        if selected is None:
+            selected = match_tencent_post([data], title)
+        if selected is None:
+            return {
+                "verified": False, "found": False, "state": "notfound",
+                "remote_status": "notfound", "post_id": post_id,
+                "verification": "post-list-api",
+            }
+        state = selected.get("state") or tencent_post_state(
+            selected.get("raw_status") or ""
+        )
+        return {
+            "verified": state not in {"unknown", "notfound"},
+            "found": True,
+            "state": state,
+            "remote_status": selected.get("raw_status") or state,
+            "post_id": selected.get("post_id") or post_id,
+            "publish_time": selected.get("publish_time") or "",
+            "verification": "post-list-api",
+        }
+
     def check_alive(self) -> bool:
         """用一次轻量请求判断会话是否还有效。
 
@@ -195,18 +235,25 @@ class ChannelsClient:
         self,
         max_pages: int = HISTORY_MAX_PAGES,
         max_messages: int = HISTORY_MAX_MESSAGES,
+        since_seq: int = 0,
     ) -> list[dict]:
-        """Read the complete private-message history using the page cursor.
+        """Read the private-message history using the page cursor.
 
         Channels returns the next cursor in ``data.cookie``.  Treating one
         response as the complete history silently drops older conversations
         once an account has more than the platform's first page.
+
+        ``since_seq`` enables incremental reads: the platform returns the
+        newest messages first, so as soon as a page contains nothing newer
+        than the watermark we can stop paging instead of walking the whole
+        history on every poll.
         """
         finder_username = self.get_finder_username()
         cursor = ""
         seen_cursors: set[str] = set()
         seen_messages: set[str] = set()
         result: list[dict] = []
+        watermark = int(since_seq or 0)
         for _page in range(max(1, int(max_pages))):
             body = {}
             if cursor:
@@ -223,6 +270,19 @@ class ChannelsClient:
             rows = data.get("msg") or data.get("messages") or data.get("msgList") or []
             if not isinstance(rows, list):
                 break
+            # 增量：整页都旧了就说明后面的页只会更旧，直接停。
+            if watermark > 0 and rows:
+                page_seqs = []
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        page_seqs.append(int(item.get("seq") or 0))
+                    except (TypeError, ValueError):
+                        continue
+                known = [seq for seq in page_seqs if seq > 0]
+                if known and max(known) <= watermark:
+                    break
             added = 0
             for item in rows:
                 if not isinstance(item, dict):
@@ -279,7 +339,7 @@ class ChannelsClient:
             raise ChannelsError("媒体地址格式不正确")
         target_dir = Path(directory)
         target_dir.mkdir(parents=True, exist_ok=True)
-        headers = _headers(self._wxuin)
+        headers = _headers(self._wxuin, getattr(self, "_user_agent", ""))
         headers.pop("Content-Type", None)
         try:
             response = self.session.get(url, headers=headers, timeout=60, stream=True)

@@ -25,6 +25,10 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "name": "小红书",
         "supports_timer": True,
         "supports_draft": False,
+        # 能否在发布后回查平台作品状态（只有回查到 published/success 才算成功）
+        "verification_supported": True,
+        "supports_image_text": True,
+        "supports_remote_manage": True,
         "title_max": 30,
         "tags_max": 10,
         "desc_max": 1000,
@@ -33,6 +37,9 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "name": "视频号",
         "supports_timer": True,
         "supports_draft": True,
+        "verification_supported": True,
+        "supports_image_text": True,
+        "supports_remote_manage": True,
         "title_max": 30,
         "tags_max": 8,
         "desc_max": 1000,
@@ -41,6 +48,9 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "name": "抖音",
         "supports_timer": True,
         "supports_draft": False,
+        "verification_supported": True,
+        "supports_image_text": True,
+        "supports_remote_manage": True,
         "title_max": 55,
         "tags_max": 10,
         "desc_max": 1000,
@@ -49,6 +59,10 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "name": "快手",
         "supports_timer": True,
         "supports_draft": False,
+        # 还没有实现远端作品回查：发布后只能记为"已提交，未验证"
+        "verification_supported": False,
+        "supports_image_text": False,
+        "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
         "desc_max": 1000,
@@ -59,6 +73,9 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         # 所以这个平台实际不支持定时。
         "supports_timer": False,
         "supports_draft": False,
+        "verification_supported": False,
+        "supports_image_text": False,
+        "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
         "desc_max": 1000,
@@ -67,6 +84,9 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "name": "百家号",
         "supports_timer": False,
         "supports_draft": False,
+        "verification_supported": False,
+        "supports_image_text": False,
+        "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
         "desc_max": 1000,
@@ -74,6 +94,11 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
 }
 
 PLATFORM_NAMES: dict[int, str] = {k: v["name"] for k, v in PLATFORM_META.items()}
+
+# 平台是否支持"API 直发"（RPA 只负责传文件，创建作品走平台自己的接口）。
+# 目前只有抖音和小红书能安全回放创建请求；视频号的创建接口与文件上传
+# 强耦合，暂时保持纯 RPA。
+SUPPORTS_API_PUBLISH: frozenset[int] = frozenset({1, 3})
 
 
 def get_platform_meta(platform_type: int) -> dict[str, Any]:
@@ -84,6 +109,9 @@ def get_platform_meta(platform_type: int) -> dict[str, Any]:
             "name": "未知平台",
             "supports_timer": False,
             "supports_draft": False,
+            "verification_supported": False,
+            "supports_image_text": False,
+            "supports_remote_manage": False,
             "title_max": 30,
             "tags_max": 8,
             "desc_max": 1000,
@@ -99,6 +127,31 @@ def supports_timer(platform_type: int) -> bool:
     return bool(get_platform_meta(platform_type)["supports_timer"])
 
 
+def supports_verification(platform_type: int) -> bool:
+    """该平台是否支持发布后回查作品状态。
+
+    不支持回查的平台不能被判定为"发布成功"：只能记为"已提交，未验证"，
+    否则状态机会在 24 小时后把实际已发布的作品判成失败。
+    """
+    return bool(get_platform_meta(platform_type).get("verification_supported"))
+
+
+def supports_image_text(platform_type: int) -> bool:
+    return bool(get_platform_meta(platform_type).get("supports_image_text"))
+
+
+def supports_remote_manage(platform_type: int) -> bool:
+    return bool(get_platform_meta(platform_type).get("supports_remote_manage"))
+
+
+def supports_api_publish(platform_type: int) -> bool:
+    """该平台能否使用"API 直发"（RPA 传文件 + 接口创建作品）。"""
+    try:
+        return int(platform_type) in SUPPORTS_API_PUBLISH
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------- 发布入口
 #
 # 每个函数接收同一套 kwargs：
@@ -110,6 +163,16 @@ def supports_timer(platform_type: int) -> bool:
 
 def _publish_xhs(**kw):
     from myUtils.postVideo import post_video_xhs
+    if kw.get("contentType") == "image-text":
+        from myUtils.postVideo import post_note_xhs
+
+        return post_note_xhs(
+            title=kw["title"], files=kw["files"], tags=kw["tags"],
+            account_file=kw["account_list"], category=kw.get("category"),
+            enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
+            daily_times=kw.get("dailyTimes"), start_days=kw.get("startDays") or 0,
+            desc=kw.get("desc", ""),
+        )
     return post_video_xhs(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
@@ -141,6 +204,16 @@ def _publish_tencent(**kw):
 
 def _publish_douyin(**kw):
     from myUtils.postVideo import post_video_DouYin
+    if kw.get("contentType") == "image-text":
+        from myUtils.postVideo import post_note_DouYin
+
+        return post_note_DouYin(
+            title=kw["title"], files=kw["files"], tags=kw["tags"],
+            account_file=kw["account_list"], category=kw.get("category"),
+            enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
+            daily_times=kw.get("dailyTimes"), start_days=kw.get("startDays") or 0,
+            desc=kw.get("desc", ""),
+        )
     return post_video_DouYin(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
@@ -154,7 +227,7 @@ def _publish_douyin(**kw):
 
 def _publish_kuaishou(**kw):
     from myUtils.postVideo import post_video_ks
-    post_video_ks(
+    return post_video_ks(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], category=kw.get("category"),
         enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
@@ -166,7 +239,7 @@ def _publish_kuaishou(**kw):
 def _publish_weibo(**kw):
     from myUtils.postVideo import post_video_weibo
     from publish_jobs import _ensure_thumbnail
-    post_video_weibo(
+    return post_video_weibo(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], publish_date=0,
         desc=kw.get("desc", ""),
@@ -177,7 +250,7 @@ def _publish_weibo(**kw):
 def _publish_baijiahao(**kw):
     from myUtils.postVideo import post_video_baijiahao
     from publish_jobs import _ensure_thumbnail
-    post_video_baijiahao(
+    return post_video_baijiahao(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], publish_date=0,
         desc=kw.get("desc", ""),

@@ -425,9 +425,33 @@
           show-icon
           title="代理只作用于该账号的登录、巡检和发布会话；留空代理地址表示直连。"
         />
+        <el-divider content-position="left">发布通道</el-divider>
+        <div class="transport-list" v-loading="environmentLoading">
+          <div class="transport-item" v-for="item in transportRows" :key="item.platformType">
+            <div class="transport-head">
+              <span class="transport-name">{{ item.platformType === 1 ? '小红书' : item.platformType === 3 ? '抖音' : `平台 ${item.platformType}` }}</span>
+              <el-tag :type="item.hybridEnabled ? 'success' : 'info'" effect="plain" size="small">
+                {{ item.hybridEnabled ? 'API 直发可用' : '页面自动化' }}
+              </el-tag>
+              <el-tag v-if="item.templateReady" type="success" size="small" effect="dark">
+                模板已就绪
+              </el-tag>
+            </div>
+            <span class="transport-desc">{{ item.description }}</span>
+            <span class="transport-desc" v-if="item.templateReady">
+              模板录制于 {{ item.templateCreatedAt }}，发布时直接调用平台接口创建作品。
+            </span>
+          </div>
+          <el-empty v-if="!transportRows.length" description="暂无发布通道信息" :image-size="60" />
+        </div>
       </el-form>
       <template #footer>
         <el-button @click="environmentVisible = false">取消</el-button>
+        <el-button
+          v-if="transportHasTemplate"
+          :loading="environmentSaving"
+          @click="resetPublishTransport"
+        >清除直发模板</el-button>
         <el-button :loading="environmentSaving" type="primary" @click="saveAccountEnvironment">保存环境</el-button>
       </template>
     </el-dialog>
@@ -660,6 +684,11 @@ const environmentForm = reactive({
   proxyUsername: '',
   proxyPassword: '',
 })
+const transportRows = ref([])
+
+const transportHasTemplate = computed(() =>
+  transportRows.value.some((item) => item.templateReady)
+)
 
 // 表单验证规则
 const rules = {
@@ -904,6 +933,31 @@ const openAccountEnvironment = async (row) => {
     console.error('读取账号环境失败:', error)
   } finally {
     environmentLoading.value = false
+  }
+  await loadPublishTransport(row.id)
+}
+
+const loadPublishTransport = async (accountId) => {
+  try {
+    const res = await accountApi.getPublishTransport(accountId)
+    transportRows.value = Array.isArray(res?.data) ? res.data : []
+  } catch (error) {
+    console.error('读取发布通道状态失败:', error)
+    transportRows.value = []
+  }
+}
+
+const resetPublishTransport = async () => {
+  if (!environmentAccount.value) return
+  environmentSaving.value = true
+  try {
+    await accountApi.clearPublishTransport(environmentAccount.value.id)
+    ElMessage.success('已清除直发模板，下次发布会重新录制')
+    await loadPublishTransport(environmentAccount.value.id)
+  } catch (error) {
+    ElMessage.error('清除直发模板失败')
+  } finally {
+    environmentSaving.value = false
   }
 }
 
@@ -1708,6 +1762,39 @@ onBeforeUnmount(() => {
 }
 
 .account-management {
+  .transport-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .transport-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 6px;
+  }
+
+  .transport-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .transport-name {
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .transport-desc {
+    color: #909399;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
   .direct-login-hint {
     margin: -8px 0 14px 80px;
     color: #909399;

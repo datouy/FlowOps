@@ -8,6 +8,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -16,6 +17,7 @@ from patchright.async_api import async_playwright
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils import browser_timeout
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -121,6 +123,11 @@ def douyin_post_state(candidate: dict) -> str:
         return "review"
     if candidate.get("private") or str(candidate.get("status_value") or "") == "141":
         return "private"
+    if any(marker in value for marker in (
+        "published", "success", "online", "normal", "visible",
+        "已发布", "发布成功", "公开",
+    )) or str(candidate.get("status_value") or "") in {"0", "1", "102"}:
+        return "published"
     return "unknown"
 
 
@@ -166,6 +173,130 @@ def published_video_from_submit(url: str, payload, title: str,
         state = "scheduled" if scheduled else douyin_post_state(candidate)
         return {**candidate, "state": state}
     return None
+
+
+async def query_published_video_in_page(
+    page,
+    title: str,
+    post_id: str = '',
+    deadline: 'browser_timeout.Deadline | None' = None,
+) -> dict:
+    """Read the current creator work status from an already-open page.
+
+    复用浏览器时用这个版本：外部负责准备页面，这里自己挂响应捕获并解析，
+    避免每条作品都重新启动一次 Chromium。
+
+    **必须有总超时**：这个函数跑在账号的浏览器 Profile 锁内部，一旦卡住
+    （最常见的是响应体永远读不完），锁就不会释放，同账号的后续私信发送、
+    发布、登录会全部堵死。页面加载、固定等待、响应解析共用同一份预算。
+    """
+    budget = deadline or browser_timeout.Deadline(label='抖音作品状态回查')
+    captured = []
+
+    def capture(response):
+        if DOUYIN_WORK_LIST_PATH in str(response.url or ''):
+            captured.append(response)
+
+    page.on('response', capture)
+    try:
+        await page.goto(
+            DOUYIN_MANAGE_URL,
+            wait_until='domcontentloaded',
+            timeout=budget.timeout_ms(cap=90000),
+        )
+        budget.check()
+        await asyncio.sleep(min(8, max(budget.remaining, 0)))
+        budget.check()
+        if 'login' in str(page.url or '').lower():
+            raise RuntimeError('抖音登录已失效，请重新扫码登录')
+        payloads = []
+        for response in captured[-40:]:
+            # 响应体读取必须单独设限：请求回来了但响应体不结束，是这条链路上
+            # 最典型的无限等待点。
+            try:
+                payloads.append(await browser_timeout.read_json(
+                    response, timeout=budget.remaining,
+                ))
+            except browser_timeout.PlatformReadTimeout:
+                raise
+            except Exception:
+                continue
+        budget.check()
+        matched = None
+        wanted_id = str(post_id or '').strip()
+        if wanted_id:
+            for payload in payloads:
+                matched = next(
+                    (item for item in extract_douyin_posts(payload)
+                     if item.get('post_id') == wanted_id),
+                    None,
+                )
+                if matched:
+                    matched = {**matched, 'state': douyin_post_state(matched)}
+                    break
+        if matched is None:
+            matched = match_douyin_post(payloads, title)
+        if matched is None:
+            return {
+                'verified': False, 'found': False, 'state': 'notfound',
+                'remote_status': 'notfound', 'post_id': wanted_id,
+                'verification': 'work-list-network',
+            }
+        state = matched.get('state') or 'unknown'
+        return {
+            'verified': state not in {'unknown', 'notfound'},
+            'found': True,
+            'state': state,
+            'remote_status': matched.get('raw_status') or state,
+            'post_id': matched.get('post_id') or wanted_id,
+            'publish_time': matched.get('publish_time') or '',
+            'verification': 'work-list-network',
+        }
+    finally:
+        try:
+            page.remove_listener('response', capture)
+        except Exception:
+            pass
+
+
+async def query_published_video(
+    account_file: str | Path,
+    title: str,
+    post_id: str = '',
+    on_context: Any = None,
+) -> dict:
+    """Read the current creator work status without submitting again.
+
+    与 ``query_published_video_in_page`` 复用同一套解析逻辑，只多一层
+    "自带浏览器"的包装。总超时与响应体超时都在 ``browser_timeout`` 里统一
+    管理——这条路径跑在账号 Profile 锁内部，卡住就是全局卡住。
+
+    ``on_context`` 用于把浏览器上下文交给调用方：调用方超时后可以强杀
+    浏览器进程，让卡住的线程走到 ``finally`` 释放 Profile 锁。
+    """
+    async with async_playwright() as playwright:
+        context = await open_persistent_account_context(
+            playwright,
+            account_file,
+            headless=LOCAL_CHROME_HEADLESS,
+            channel='chromium',
+            args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+        )
+        if on_context is not None:
+            try:
+                on_context(context)
+            except Exception:
+                pass
+        try:
+            context = await set_init_script(context)
+            page = await context.new_page()
+            return await query_published_video_in_page(page, title, post_id)
+        finally:
+            # 关闭浏览器也要有界：浏览器进程僵死时 close() 可能永远不返回，
+            # 清理动作不能变成第二个卡点。
+            await browser_timeout.close_async_resource_async(
+                context, label='关闭抖音创作者后台',
+            )
 
 
 def _desktop_browser_context_options(browser) -> dict:
@@ -1732,6 +1863,68 @@ class DouYinVideo(DouYinBaseUploader):
             except Exception:
                 pass
 
+    async def _verify_direct_publish(self, page: Page, title: str,
+                                     captured_responses: list,
+                                     post_id: str = "") -> dict:
+        """直发之后的回查。
+
+        直发已经拿到了平台的作品 ID，所以即使列表里暂时查不到（平台还在
+        转码/审核，列表还没刷新），也不能判定失败——把作品 ID 记下来交给
+        状态查询线程继续跟踪即可。
+        """
+        post_id = str(post_id or "").strip()
+        payloads = []
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    DOUYIN_WORK_LIST_PATH in url
+                    or any(marker in url for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payloads.append(await response.json())
+                except Exception:
+                    continue
+
+        await collect()
+        matched = None
+        if post_id:
+            for payload in payloads:
+                matched = next(
+                    (item for item in extract_douyin_posts(payload)
+                     if item.get("post_id") == post_id),
+                    None,
+                )
+                if matched:
+                    matched = {**matched, "state": douyin_post_state(matched)}
+                    break
+        if matched is None:
+            matched = match_douyin_post(payloads, title)
+        if matched:
+            state = matched.get("state") or "unknown"
+            return {
+                "verified": state not in {"unknown", "notfound"},
+                "found": True,
+                "state": state,
+                "remote_status": matched.get("raw_status") or state,
+                "post_id": matched.get("post_id") or post_id,
+                "publish_time": matched.get("publish_time") or "",
+                "verification": "hybrid-api",
+                "transport": "hybrid",
+            }
+        # 列表里还没出现：平台还在处理，作品 ID 已经拿到，交给状态查询线程。
+        return {
+            "verified": False,
+            "found": False,
+            "state": "submitted",
+            "remote_status": "submitted",
+            "post_id": post_id,
+            "verification": "hybrid-api",
+            "transport": "hybrid",
+        }
+
     async def _upload_in_context(self, context) -> dict:
         context = await set_init_script(context)
 
@@ -1749,6 +1942,36 @@ class DouYinVideo(DouYinBaseUploader):
                 pass
 
         page.on("response", capture)
+
+        # 混合通道：先挂上录制器（录创建接口 + 收素材 ID），上传完成后尝试直发。
+        from publish_transport import (
+            HybridPublisher, form_signature, hybrid_enabled,
+        )
+
+        hybrid = None
+        if hybrid_enabled(3):
+            hybrid = HybridPublisher(
+                3, self.account_file, self.title, self.desc, self.tags,
+                signature=form_signature(
+                    product_link=self.productLink,
+                    collection=self.collection_name or "",
+                    declaration=self.declaration or "内容由AI生成",
+                    thumbnail=self.thumbnail_landscape_path or "",
+                    scheduled=(
+                        self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED
+                        and self.publish_date != 0
+                    ),
+                    scheduled_at=(
+                        self.publish_date
+                        if (
+                            self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED
+                            and self.publish_date != 0
+                        ) else ""
+                    ),
+                ),
+            )
+            hybrid.attach(page)
+
         await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
@@ -1790,9 +2013,6 @@ class DouYinVideo(DouYinBaseUploader):
                     await asyncio.sleep(0.5)
 
         await asyncio.sleep(1)
-        douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
-        await self.fill_title_and_description(page, self.title, self.desc, self.tags)
-        douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
         while True:
             try:
@@ -1808,6 +2028,43 @@ class DouYinVideo(DouYinBaseUploader):
             except Exception:
                 douyin_logger.debug(_msg("🧍", "小人还在等视频上传完成"))
                 await asyncio.sleep(2)
+
+        # ── 混合通道：文件传完了，先试平台接口直发 ──
+        # 直发的好处是省掉整套表单填写（标题、正文、话题、声明、合集、封面、
+        # 定时、商品链接），这些是页面自动化最脆的部分。
+        #
+        # 只有"表单选项和模板一致"才敢直发：模板里带着上次发布时的这些值，
+        # 这次不一样就用旧模板会把这次的设置丢掉，所以直接回落 RPA。
+        #
+        # 结果不确定（超时、断网）时**绝不能**再点一次发布按钮，否则会重复
+        # 发布；此时只记"已提交，未验证"，交给状态查询线程去平台核对。
+        if hybrid is not None:
+            direct = await hybrid.attempt(page)
+            direct_status = str(direct.get("status") or "")
+            if direct_status == "accepted":
+                douyin_logger.success(
+                    _msg("🥳", f"已通过平台接口直接发布，作品 ID {direct.get('post_id') or '待回查'}")
+                )
+                return await self._verify_direct_publish(
+                    page, self.title, captured_responses,
+                    post_id=str(direct.get("post_id") or ""),
+                )
+            if direct_status == "unknown":
+                douyin_logger.warning(
+                    _msg("⚠️", "平台接口结果不确定，停止重复提交，请到作品管理人工确认")
+                )
+                from publish_transport import submitted_result
+
+                return submitted_result(
+                    3, str(direct.get("error") or direct.get("reason") or ""),
+                )
+            reason = str(direct.get("reason") or direct.get("raw_status") or "")
+            if reason:
+                douyin_logger.info(_msg("🧍", f"直发未启用（{reason}），改用页面发布"))
+
+        douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
+        await self.fill_title_and_description(page, self.title, self.desc, self.tags)
+        douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
         if self.productLink and self.productTitle:
             douyin_logger.info(_msg("🛒", "小人正在设置商品链接"))
@@ -2073,21 +2330,108 @@ class DouYinNote(DouYinBaseUploader):
         context = await set_init_script(context)
 
         upload_success = False
+        result: dict = {
+            "verified": False, "state": "submitted", "remote_status": "submitted",
+            "post_id": "", "verification": "publish-api",
+        }
         try:
             page = await context.new_page()
+            captured_responses = []
+
+            def capture(response):
+                try:
+                    url = str(response.url or "")
+                    if DOUYIN_WORK_LIST_PATH in url or any(
+                        marker in url for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS
+                    ):
+                        captured_responses.append(response)
+                except Exception:
+                    pass
+
+            page.on("response", capture)
             await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
             douyin_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
             await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
 
             await self.upload_note_content(page)
             upload_success = True
+            result = await self._verify_published_note(page, self.title, captured_responses)
         finally:
             if upload_success:
                 await context.storage_state(path=self.account_file)
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
             await context.close()
+        return result
+
+    async def _verify_published_note(self, page: Page, title: str,
+                                     captured_responses: list) -> dict:
+        """回查刚发布的图文作品状态。
+
+        与视频发布共用同一套状态判定：只有回查到 ``published`` 才算成功，
+        审核中/转码中保持进行中，由后续的状态查询线程继续跟踪。
+        """
+        payloads = []
+        submitted_result = None
+
+        async def collect():
+            for response in captured_responses:
+                url = str(getattr(response, "url", "") or "")
+                if not (
+                    DOUYIN_WORK_LIST_PATH in url
+                    or any(marker in url for marker in DOUYIN_PUBLISH_RESPONSE_MARKERS)
+                ):
+                    continue
+                try:
+                    payload = await response.json()
+                except Exception:
+                    continue
+                payloads.append((url, payload))
+
+        await collect()
+        for url, payload in reversed(payloads):
+            direct = published_video_from_submit(url, payload, title)
+            if direct and direct.get("state") != "unknown":
+                return {
+                    "verified": True,
+                    **direct,
+                    "remote_status": direct.get("raw_status") or direct["state"],
+                    "verification": "publish-api",
+                }
+            if direct and submitted_result is None:
+                submitted_result = direct
+
+        try:
+            if page.url.split("?", 1)[0] != DOUYIN_MANAGE_URL:
+                await page.goto(DOUYIN_MANAGE_URL, wait_until="domcontentloaded", timeout=120000)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"打开抖音作品管理失败，继续直接回查：{exc}"))
+        await asyncio.sleep(7)
+        await collect()
+        matched = match_douyin_post([payload for _url, payload in payloads], title)
+        if matched:
+            verified = matched.get("state") != "unknown"
+            return {
+                "verified": verified,
+                **matched,
+                "remote_status": matched.get("raw_status") or matched["state"],
+                "verification": "work-list-network",
+            }
+        if submitted_result:
+            return {
+                "verified": False,
+                **{**submitted_result, "state": "submitted"},
+                "remote_status": "submitted",
+                "verification": "publish-api",
+            }
+        return {
+            "verified": False,
+            "state": "submitted",
+            "remote_status": "submitted",
+            "post_id": "",
+            "verification": "publish-api",
+        }
 
     async def douyin_upload_note(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)

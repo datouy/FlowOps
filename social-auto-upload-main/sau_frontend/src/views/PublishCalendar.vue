@@ -32,7 +32,7 @@
         <div class="day-body">
           <div v-if="byDate[day.date] && byDate[day.date].length" class="event-list">
             <div v-for="ev in byDate[day.date]" :key="ev.job_id + ev.scheduled_at" class="event"
-                 :class="{ done: ev.status === 'success', failed: ev.status === 'failed' }">
+                 :class="{ done: ['success','draft'].includes(ev.status), failed: ['failed','withdrawn'].includes(ev.status) }">
               <div class="ev-time">{{ ev.scheduled_at.slice(11) }}</div>
               <div class="ev-title">{{ ev.title }}</div>
               <div v-if="ev.account" class="ev-account">{{ accountShort(ev.account) }}</div>
@@ -68,7 +68,11 @@ const platformName = t => platformNames[t] || ('类型' + t)
 const platformTag = t => platformTags[t] || 'info'
 
 function statusText(s) {
-  return { pending: '已排期', running: '发布中', success: '已完成', failed: '失败' }[s] || s
+  return {
+    pending: '已排期', scheduled: '已排期', running: '发布中', processing: '平台处理中',
+    success: '已完成', draft: '草稿', failed: '失败', skipped: '已跳过',
+    cancelled: '已取消', withdrawn: '已下架',
+  }[s] || s
 }
 
 function accountShort(acc) {

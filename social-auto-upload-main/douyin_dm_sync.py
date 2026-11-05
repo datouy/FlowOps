@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from flask import Blueprint
 
+import dm_cursor
 import dm_ops
 from dm_media_cache import attach_message_media
 from dm_platform_common import (
@@ -1400,6 +1401,7 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
         "media_downloaded": media_result["downloaded"],
         "media_failed": media_result["failed"],
         "merged_contacts": merged_contacts,
+        "cursor": dm_cursor.cursor_from_items(items),
         "items": ingest.get("items", []),
     }
 
@@ -1441,7 +1443,7 @@ sync_manager = DouyinDmSync(
     settings_table="douyin_dm_sync_settings",
     route_prefix="/dm/sync",
     min_interval=0,
-    default_interval=0,
+    default_interval=120,
     default_max_conversations=100,
     max_conversations=100,
     max_conversations_load=200,
@@ -1451,7 +1453,7 @@ sync_manager = DouyinDmSync(
     prefer_active_accounts=True,
     max_workers=12,
     failure_backoff=300,
-    continuous_gap=0.5,
+    continuous_gap=60,
 )
 sync_manager.register_routes()
 
