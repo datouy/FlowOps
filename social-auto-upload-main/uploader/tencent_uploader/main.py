@@ -59,6 +59,30 @@ def _first_post_value(item: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _nested_post_title(value) -> str:
+    """Read the title fields used by the current Channels post-list payload.
+
+    The response stores the visible title under ``desc.shortTitle`` (a list of
+    objects) and the complete caption under ``desc.description``.  Looking only
+    at top-level text fields makes a successful submission look missing.
+    """
+    if isinstance(value, (str, int)) and str(value).strip():
+        return str(value).strip()
+    if isinstance(value, dict):
+        for key in ("shortTitle", "title", "description", "desc"):
+            if key not in value:
+                continue
+            found = _nested_post_title(value.get(key))
+            if found:
+                return found
+    if isinstance(value, list):
+        for child in value:
+            found = _nested_post_title(child)
+            if found:
+                return found
+    return ""
+
+
 def extract_tencent_posts(payload) -> list[dict]:
     """Normalize post-list response records used for publish verification."""
     posts = []
@@ -68,11 +92,9 @@ def extract_tencent_posts(payload) -> list[dict]:
             item, ("objectId", "postId", "feedId", "exportId", "finderPostId", "id"),
         )
         title = _first_post_value(
-            item, (
-                "title", "postTitle", "objectTitle", "desc", "description",
-                "objectDesc", "content", "feedDesc",
-            ),
-        )
+            item,
+            ("title", "postTitle", "objectTitle", "objectDesc", "content", "feedDesc"),
+        ) or _nested_post_title(item.get("desc"))
         if not post_id or not title:
             continue
         marker = (post_id, title[:160])
@@ -98,6 +120,10 @@ def tencent_post_state(raw_status: str) -> str:
     value = str(raw_status or "").strip().lower()
     if not value:
         return "unknown"
+    # The current post_list response uses numeric status codes.  Status 1 is
+    # the normal published state used by the account's public work list.
+    if value == "1":
+        return "published"
     if any(marker in value for marker in (
         "removed", "withdrawn", "deleted", "offline", "下架", "撤回", "删除", "不可见",
     )):

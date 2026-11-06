@@ -51,6 +51,30 @@ def test_missing_title_match_is_not_publish_success():
     assert match_tencent_post([{"data": {"list": []}}], "目标标题") is None
 
 
+def test_extract_nested_post_list_short_title_and_published_status():
+    payload = {
+        "errCode": 0,
+        "data": {
+            "list": [{
+                "objectId": "export/post-10",
+                "status": 1,
+                "visibleType": 1,
+                "createTime": 1793935823,
+                "desc": {
+                    "shortTitle": [{"shortTitle": "FlowOps核心功能测试"}],
+                    "description": "FlowOps核心功能测试\n#FlowOps #功能测试\n",
+                },
+            }],
+        },
+    }
+
+    matched = match_tencent_post([payload], "FlowOps核心功能测试")
+
+    assert matched is not None
+    assert matched["post_id"] == "export/post-10"
+    assert matched["state"] == "published"
+
+
 def test_note_mode_navigates_to_dedicated_page_when_switch_is_absent():
     note = object.__new__(TencentNote)
 
