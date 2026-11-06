@@ -60,12 +60,38 @@ DOUYIN_AUTH_COOKIE_NAMES = {
     "uid_tt_ss",
 }
 
-# 小红书登录成功后一定会带上 web_session。
+# 小红书创作服务平台登录成功后一定会带上的会话 cookie。
 #
-# 注意：a1 / gid / webId / webBuild 在**未登录**时也会被下发（实测匿名访问
-# creator 登录页就有），把它们当成功标志会 100% 假阳性——窗口刚打开就
-# 直接报"登录成功"。只有 web_session 才代表真正登录。
-XHS_AUTH_COOKIE_NAMES = {
+# 重要：官方登录窗口打开的是**创作服务平台**（creator.xiaohongshu.com），
+# 它和**主站**（www.xiaohongshu.com）是两套独立会话：
+#
+#   * 主站登录     -> web_session / id_token
+#   * 创作平台登录 -> customer-sso-sid / access-token-creator.xiaohongshu.com
+#                     / x-user-id-creator.xiaohongshu.com
+#                     / galaxy_creator_session_id / galaxy.creator.beaker.session.id
+#
+# 之前这里只认 web_session（主站口径），而官方登录窗口做的是创作平台登录，
+# 所以判据永远不成立：用户明明扫码成功，账号却一直不入库，最后登录窗口被
+# 回收时只留下一句 "Target page, context or browser has been closed"。
+#
+# 注意：web_session 也不能当判据——实测**匿名访客**访问主站 explore 就会拿到
+# 一个 web_session（游客态），拿它当"已登录"会 100% 假阳性。
+# a1 / gid / webId / webBuild / xsecappid / ets / loadts / acw_tc /
+# sec_poison_id / websectiga 同理，未登录时也会被下发。
+#
+# 下面这组 cookie 只在创作平台登录成功后才会出现，是当前唯一可靠的信号。
+XHS_CREATOR_AUTH_COOKIE_NAMES = {
+    "access-token-creator.xiaohongshu.com",
+    "galaxy_creator_session_id",
+    "galaxy.creator.beaker.session.id",
+    "x-user-id-creator.xiaohongshu.com",
+    "customer-sso-sid",
+}
+
+# 小红书"已登录"判定用的 cookie 集合（创作平台口径 + 主站口径）。
+XHS_AUTH_COOKIE_NAMES = set(XHS_CREATOR_AUTH_COOKIE_NAMES) | {
+    # 主站会话（主站扫码登录时才有）。注意它单独出现不足以证明登录，
+    # 判定逻辑里还要配合 USER_INFO / 官方接口交叉验证。
     "web_session",
 }
 
@@ -196,6 +222,8 @@ class InteractivePlatformLogin:
         self._last_tencent_probe = 0.0
         # 小红书官方 user 接口返回的登录用户信息（登录成功后缓存）
         self._xhs_user: dict | None = None
+        # 小红书创作平台 localStorage.USER_INFO 里的用户身份（登录成功后缓存）
+        self._xhs_user_info: dict = {}
         self.commands: queue.Queue = queue.Queue(maxsize=256)
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
@@ -804,11 +832,74 @@ class InteractivePlatformLogin:
             return False
 
         if self.platform == "xiaohongshu":
-            # 匿名访客不会有 web_session，但保险起见再验一次官方接口。
-            if self._xhs_user is not None:
-                return True
-            return self._probe_xhs_user(context)
+            return self._xhs_logged_in(context, names, page)
         return True
+
+    def _xhs_logged_in(self, context, names: set[str], page=None) -> bool:
+        """判断小红书是否已真正登录。
+
+        两套会话、两种口径，必须分开处理：
+
+        1. **创作平台会话**（官方登录窗口走的这条路）——
+           ``customer-sso-sid`` / ``access-token-creator`` /
+           ``x-user-id-creator`` / ``galaxy_creator_session_id`` 这组 cookie
+           **只在创作平台登录成功后出现**，是可靠的正面证据。再用页面上的
+           ``localStorage.USER_INFO``（含 userId）做一次交叉确认。
+
+        2. **主站会话**（``web_session``）——**不能单独当判据**：实测匿名访客
+           访问主站 explore 也会拿到一个游客态 web_session，拿它当"已登录"
+           会在窗口刚打开时就误报成功。
+
+        创作平台的 cookie 只有用户真的在创作平台登录过才会有，所以只要这组
+        cookie 在，判据就成立（这正是官方登录窗口走的路径）。
+        """
+        if names & XHS_CREATOR_AUTH_COOKIE_NAMES:
+            # 创作平台会话成立。USER_INFO 有 userId 时把它记下来，
+            # 后面保存账号时用它做身份识别。
+            self._xhs_user_info = self._read_xhs_user_info(page)
+            return True
+        # 只有主站口径的 cookie：必须靠官方接口确认不是游客态。
+        if self._xhs_user is not None:
+            return True
+        return self._probe_xhs_user(context)
+
+    def _read_xhs_user_info(self, page=None) -> dict:
+        """读创作平台的 ``localStorage.USER_INFO``（含 userId / 昵称）。
+
+        创作平台登录成功后会把用户信息写进 localStorage；未登录时它是空的。
+        读不到不影响登录判定，只是拿不到更详细的身份信息。
+        """
+        if page is None:
+            return {}
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            return {}
+        try:
+            raw = evaluate(
+                "() => localStorage.getItem('USER_INFO') || ''"
+            )
+        except Exception:
+            return {}
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        user = payload.get("user")
+        value = user.get("value") if isinstance(user, dict) else None
+        if not isinstance(value, dict):
+            value = payload if isinstance(payload.get("userId"), str) else {}
+        user_id = str(value.get("userId") or "").strip()
+        if not user_id:
+            return {}
+        return {
+            "user_id": user_id,
+            "nickname": str(value.get("nickname") or value.get("userName") or "").strip(),
+        }
 
     def _tencent_channel_selection_pending(self, page) -> bool:
         """识别扫码后的视频号账号选择层，避免在用户选择前保存。

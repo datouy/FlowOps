@@ -376,6 +376,9 @@ def test_xhs_auth_cookie_names_are_platform_specific():
     xhs = InteractivePlatformLogin("s2", "a", None, platform="xiaohongshu")
     assert "sessionid" in douyin._auth_cookie_names
     assert "web_session" in xhs._auth_cookie_names
+    assert "access-token-creator.xiaohongshu.com" in xhs._auth_cookie_names
+    assert "galaxy_creator_session_id" in xhs._auth_cookie_names
+    assert "x-user-id-creator.xiaohongshu.com" in xhs._auth_cookie_names
     assert "sessionid" not in xhs._auth_cookie_names
 
 
@@ -414,6 +417,33 @@ def test_is_logged_in_true_when_web_session_present():
     xhs._xhs_user = {"user_id": "123"}
     ctx = _FakeCookieContext([{"name": "web_session", "value": "sess"}])
     assert xhs._is_logged_in(ctx) is True
+
+
+def test_is_logged_in_true_for_xhs_creator_session_cookie():
+    """创作平台登录不必先获得主站的 web_session。"""
+    xhs = InteractivePlatformLogin("s", "a", None, platform="xiaohongshu")
+    ctx = _FakeCookieContext([
+        {
+            "name": "x-user-id-creator.xiaohongshu.com",
+            "value": "creator-user",
+        },
+        {"name": "customer-sso-sid", "value": "creator-session"},
+    ])
+
+    assert xhs._is_logged_in(ctx) is True
+
+
+def test_xhs_user_info_is_read_from_creator_local_storage():
+    class _Page:
+        def evaluate(self, _script):
+            return '{"user":{"value":{"userId":"607d32","nickname":"大头"}}}'
+
+    xhs = InteractivePlatformLogin("s", "a", None, platform="xiaohongshu")
+
+    assert xhs._read_xhs_user_info(_Page()) == {
+        "user_id": "607d32",
+        "nickname": "大头",
+    }
 
 
 def test_is_logged_in_false_without_any_auth_cookie():
