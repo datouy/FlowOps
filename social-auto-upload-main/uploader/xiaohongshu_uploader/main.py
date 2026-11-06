@@ -81,7 +81,9 @@ def extract_xhs_posts(payload) -> list[dict]:
     posts = []
     seen = set()
     for item in _walk_dicts(payload):
-        post_id = _first_value(item, ("note_id", "noteId", "noteid"))
+        post_id = _first_value(
+            item, ("note_id", "noteId", "noteid", "id"),
+        )
         if not post_id:
             continue
         title = _first_value(
@@ -97,6 +99,7 @@ def extract_xhs_posts(payload) -> list[dict]:
         posts.append({
             "post_id": post_id,
             "title": title,
+            "tab_status": _first_value(item, ("tab_status", "tabStatus")),
             "raw_status": _first_value(
                 item,
                 ("audit_status", "auditStatus", "note_status", "noteStatus",
@@ -120,6 +123,14 @@ def extract_xhs_posts(payload) -> list[dict]:
 
 def xhs_post_state(candidate: dict) -> str:
     value = str(candidate.get("raw_status") or "").strip().lower()
+    # The current note-manager microapp returns ``tab_status`` instead of a
+    # textual audit state. The UI confirms 1 is the "published" tab and 3 is
+    # the "failed" tab.
+    tab_status = str(candidate.get("tab_status") or "").strip().lower()
+    if tab_status == "1":
+        return "published"
+    if tab_status == "3":
+        return "failed"
     if candidate.get("deleted") or any(
         marker in value for marker in ("deleted", "removed", "withdrawn", "下架", "删除")
     ):
@@ -220,6 +231,21 @@ async def query_published_note_in_page(
         budget.check()
         if 'login' in str(page.url or '').lower():
             raise RuntimeError('小红书登录已失效，请重新扫码登录')
+        # The new creator microapp renders only its sidebar at ``creator/notes``
+        # until the note-manager navigation item is opened. Clicking it keeps
+        # this query compatible with both the old page and the current UI.
+        try:
+            manage_entry = page.get_by_text('笔记管理', exact=True).first
+            if await manage_entry.count():
+                await manage_entry.click(
+                    timeout=min(10000, budget.timeout_ms(cap=10000)),
+                )
+                await asyncio.sleep(min(5, max(budget.remaining, 0)))
+                budget.check()
+        except Exception:
+            # Older pages already land directly on the list; navigation is an
+            # enhancement, not a reason to fail an otherwise readable query.
+            pass
         payloads = []
         for response in captured[-40:]:
             # 响应体读取必须单独设限：请求回来了但响应体不结束，是这条链路上

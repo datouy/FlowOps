@@ -78,6 +78,18 @@ async def _xhs_list_in_page(page, title: str, post_id: str) -> dict:
         budget.check()
         if 'login' in str(page.url or '').lower():
             raise RuntimeError('小红书登录已失效，请重新扫码登录')
+        # The creator microapp may render only its sidebar at the legacy URL.
+        # Open the current note-manager route before reading the list response.
+        try:
+            manage_entry = page.get_by_text('笔记管理', exact=True).first
+            if await manage_entry.count():
+                await manage_entry.click(
+                    timeout=min(10000, budget.timeout_ms(cap=10000)),
+                )
+                await asyncio.sleep(min(5, max(budget.remaining, 0)))
+                budget.check()
+        except Exception:
+            pass
         payloads = []
         for response in captured[-40:]:
             # 响应体读取必须单独设限：请求回来了但响应体不结束，是这条链路上

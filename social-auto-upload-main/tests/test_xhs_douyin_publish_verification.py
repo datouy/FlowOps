@@ -37,6 +37,46 @@ def test_xhs_note_is_matched_and_keeps_remote_state():
     assert matched["state"] == "review"
 
 
+def test_xhs_current_note_manager_shape_is_matched_and_published():
+    payload = {
+        "success": True,
+        "code": 0,
+        "data": {
+            "notes": [{
+                "id": "6aed4caa000000002a02abc8",
+                "display_title": "FlowOps核心功能测试",
+                "time": "2026-11-06 11:42",
+                "tab_status": 1,
+                "type": "video",
+            }],
+        },
+    }
+
+    matched = match_xhs_post([payload], "FlowOps核心功能测试")
+
+    assert matched["post_id"] == "6aed4caa000000002a02abc8"
+    assert matched["raw_status"] == ""
+    assert matched["tab_status"] == "1"
+    assert matched["state"] == "published"
+
+
+def test_xhs_current_note_manager_shape_keeps_failed_state():
+    payload = {
+        "data": {
+            "notes": [{
+                "id": "6ad57c47000000000c00e524",
+                "display_title": "测试视频",
+                "tab_status": 3,
+            }],
+        },
+    }
+
+    matched = match_xhs_post([payload], "测试视频")
+
+    assert matched["post_id"] == "6ad57c47000000000c00e524"
+    assert matched["state"] == "failed"
+
+
 def test_xhs_create_response_requires_success_code():
     url = "https://edith.xiaohongshu.com/web_api/sns/v2/note"
     success = published_note_from_submit(
