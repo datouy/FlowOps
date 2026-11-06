@@ -844,7 +844,7 @@ def stats_status() -> dict:
 def monthly_trend(months: int = 6) -> dict:
     """按月汇总发布量、播放、互动，给出统一月度趋势。
 
-    账号矩阵式的月度趋势：每个月一行，包含发布条数、成功条数、播放、点赞、
+    月度趋势：每个月一行，包含发布条数、成功条数、播放、点赞、
     评论、收藏、涨粉，以及环比增长率。
     """
     months = max(1, min(int(months or 6), 24))

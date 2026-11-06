@@ -452,7 +452,7 @@ def interactive_login_stop():
 
 # ---------------------------------------------------------------- 账号服务 v2
 #
-# 账号矩阵式账号模型（详见 docs/账号体系与登录优化.md）：
+# 账号矩阵模型（详见本地设计说明）：
 #   operator（使用者，可用 YUNCE_ACCESS_TOKEN 做本机校验）
 #     └─ account（媒体号）= (平台, 平台侧身份 platform_user_id) 唯一
 #          ├─ credentials     cookiesFile/<name>.json（Playwright storage_state）
@@ -1858,7 +1858,7 @@ def stats_summary():
 
 @app.route('/stats/trend', methods=['GET'])
 def stats_trend():
-    """统一月度趋势（账号矩阵式）：发布量、播放、互动与环比。"""
+"""统一月度趋势：发布量、播放、互动与环比。"""
     months = request.args.get('months', 6)
     try:
         data = stats_reflow.monthly_trend(int(months))

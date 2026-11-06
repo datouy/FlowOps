@@ -25,7 +25,7 @@
 快手        页面  页面  页面  页面
 =========  ====  ====  ====  ====
 
-视频号走 ``channels.weixin.qq.com`` 的正式接口（已确认的接口资料里确认过的
+视频号走 ``channels.weixin.qq.com`` 的正式接口（已确认的
 ``comment/create_comment``、``comment/like_comment``、``comment/del_comment``、
 ``comment/set_top_comment``），带账号指纹 UA 和账号代理，链路最稳。
 
@@ -128,7 +128,7 @@ def platform_type_of(value: Any) -> int:
 class ChannelsCommentAdapter:
     """视频号：走创作者后台正式接口。
 
-    接口路径来自已确认的接口资料里已确认的 ``Shipinhao.*`` 能力面，
+接口路径来自已确认的 ``Shipinhao.*`` 能力面，
     复用 ``ChannelsClient`` 的会话——它已经带上了账号指纹 UA 与账号代理，
     直连接口与浏览器通道因此保持同一个设备身份和同一个出口 IP。
     """

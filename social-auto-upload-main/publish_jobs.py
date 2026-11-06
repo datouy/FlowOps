@@ -206,7 +206,7 @@ def init_db():
             -- 进程重启后用它做远端预查，避免把已经发出去的作品再发一次。
             idempotency_key TEXT DEFAULT '',
             submitted_at DATETIME,
-            -- 可见性（同类产品语义）：public / draft / private。
+-- 可见性（平台语义）：public / draft / private。
             -- 和 publish_stage 分开：draft 是可见性，不是发布阶段。
             visibility TEXT DEFAULT 'public',
             -- 内容形态：video / image-text。
@@ -257,7 +257,7 @@ def init_db():
 
 init_db()
 
-# ---------- 账号级子任务（采用账号矩阵结构的任务模型） ----------
+# ---------- 账号级子任务（账号矩阵任务模型） ----------
 #
 # 旧模型：一个 job = 一批 (素材 × 账号)，全部在一个线程里顺序跑，任何一步抛异常
 # 整批中断；自动重试又是"整个 job 重跑"，会把已经发成功的账号再发一遍（重复发布）。

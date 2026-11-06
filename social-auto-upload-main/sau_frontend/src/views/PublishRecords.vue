@@ -450,7 +450,7 @@ const summary = ref({
   last_fetched_at: null,
   sync: {},
 })
-// 月度趋势与成交漏斗（账号矩阵式统计）。
+      // 月度趋势与成交漏斗。
 const trend = ref({ months: 6, series: [] })
 const funnel = ref({ days: 30, stages: [], inbound_messages: 0, outbound_messages: 0 })
 const completion = ref({ estimated: false, estimated_completion: 0 })
