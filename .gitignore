@@ -70,6 +70,9 @@ deploy/backups/
 deploy/.env.deploy
 deploy/out/
 
+# ---- 本地演示/调试产物（截图、录屏、探针脚本输出，不进仓库）----
+.demo-artifacts/
+
 # ---- keep empty runtime directories ----
 !social-auto-upload-main/cookies/.gitkeep
 !social-auto-upload-main/cookiesFile/.gitkeep
