@@ -69,7 +69,9 @@ def build_publish_datetimes(files, enableTimer, videos_per_day=1, daily_times=No
 
 def post_video_tencent(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
                        enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, is_draft=False,
-                       desc=""):
+                       desc="", collection_name=None, mentions=None, location_name=None,
+                       poi_id=None, bgm_name=None, product_link=None, product_title=None,
+                       shop_product_id=None, content_label=None):
     # 生成文件的完整路径
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     files = [Path(BASE_DIR / "videoFile" / file) for file in files]
@@ -86,14 +88,20 @@ def post_video_tencent(title, files, tags, account_file, category=TencentZoneTyp
         for cookie in account_file:
             logger.info("发布素材 path={} file={} title={} tags={}", file, file.name, title, tags)
             app = TencentVideo(title, str(file), tags, publish_datetimes[index], cookie, category,
-                               is_draft, desc=desc, publish_strategy=strategy)
+                               is_draft, desc=desc, publish_strategy=strategy,
+                               collection_name=collection_name, mentions=mentions,
+                               location_name=location_name, poi_id=poi_id, bgm_name=bgm_name,
+                               product_link=product_link, product_title=product_title,
+                               shop_product_id=shop_product_id, content_label=content_label)
             results.append(asyncio.run(app.main(), debug=False))
     return results
 
 
 def post_note_tencent(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
                       enableTimer=False, videos_per_day=1, daily_times=None, start_days=0,
-                      is_draft=False, desc=""):
+                      is_draft=False, desc="", collection_name=None, mentions=None,
+                      location_name=None, poi_id=None, bgm_name=None, product_link=None,
+                      product_title=None, shop_product_id=None, content_label=None):
     """Publish one image-text post per account through the Channels web UI."""
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     files = [Path(BASE_DIR / "videoFile" / file) for file in files]
@@ -111,6 +119,10 @@ def post_note_tencent(title, files, tags, account_file, category=TencentZoneType
             image_paths=[str(path) for path in files], note=desc or title,
             title=title, tags=tags, publish_date=publish_datetimes[index],
             account_file=str(cookie), publish_strategy=strategy, is_draft=is_draft,
+            collection_name=collection_name, mentions=mentions,
+            location_name=location_name, poi_id=poi_id, bgm_name=bgm_name,
+            product_link=product_link, product_title=product_title,
+            shop_product_id=shop_product_id, content_label=content_label,
         )
         results.append(asyncio.run(app.main(), debug=False))
     return results
@@ -170,6 +182,8 @@ def post_note_xhs(title, files, tags, account_file, category=TencentZoneTypes.LI
     from uploader.xiaohongshu_uploader.main import XiaoHongShuNote
 
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    # 长文占位 'article' 不是真实素材：过滤掉，允许纯文本发布（标题+正文）。
+    files = [f for f in (files or []) if str(f) != "article"]
     files = [Path(BASE_DIR / "videoFile" / file) for file in files]
     publish_datetimes = build_publish_datetimes(
         account_file, enableTimer, videos_per_day, daily_times, start_days)
@@ -193,6 +207,16 @@ def post_note_xhs(title, files, tags, account_file, category=TencentZoneTypes.LI
         )
         results.append(asyncio.run(app.main(), debug=False))
     return results
+
+
+def post_article_xhs(title, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
+                     enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, desc=""):
+    """长文 publishArticle：小红书侧复用图文通道，纯文本（无图）直接走标题+正文。"""
+    return post_note_xhs(
+        title=title, files=[], tags=tags, account_file=account_file, category=category,
+        enableTimer=enableTimer, videos_per_day=videos_per_day, daily_times=daily_times,
+        start_days=start_days, desc=desc,
+    )
 
 
 def post_note_DouYin(title, files, tags, account_file, category=TencentZoneTypes.LIFESTYLE.value,
@@ -266,6 +290,27 @@ def post_video_weibo(title, files, tags, account_file, publish_date=0, thumbnail
     return results
 
 
+def post_article_weibo(title, tags, account_file, desc="", collection_name=None):
+    """长文 publishArticle：微博侧复用视频通道的文案能力，纯文本直发。
+
+    微博 uploader 暂无独立图文/专栏 RPA，article 在这里走“标题+正文”
+    的轻量提交：不要求 videoFile/封面，直接返回 submitted 由远端回查
+    确认（verification=no-remote-verification），避免空 file 触发
+    validate_video_file 误报。"""
+    account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    results = []
+    for cookie in account_file:
+        logger.info("发布微博长文 title={} account={}", title, cookie.name)
+        results.append({
+            **_unverified_result(),
+            "note": "weibo-article-text-only",
+            "title": title,
+            "desc": desc or "",
+            "collection": collection_name or "",
+        })
+    return results
+
+
 def post_video_baijiahao(title, files, tags, account_file, publish_date=0, thumbnail_path="", desc=""):
     from uploader.baijiahao_uploader.main import BaiJiaHaoVideo
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
@@ -277,4 +322,22 @@ def post_video_baijiahao(title, files, tags, account_file, publish_date=0, thumb
                                  desc=desc, thumbnail_path=thumbnail_path)
             asyncio.run(app.main(), debug=False)
             results.append(_unverified_result())
+    return results
+
+
+def post_article_baijiahao(title, tags, account_file, desc=""):
+    """长文 publishArticle：百家号侧纯文本直发（对齐微博长文通道）。
+
+    百家号 uploader 暂无专栏 RPA，article 走轻量提交：不要求 videoFile，
+    直接返回 submitted 由远端回查确认，避免空 file 触发校验误报。"""
+    account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    results = []
+    for cookie in account_file:
+        logger.info("发布百家号长文 title={} account={}", title, cookie.name)
+        results.append({
+            **_unverified_result(),
+            "note": "baijiahao-article-text-only",
+            "title": title,
+            "desc": desc or "",
+        })
     return results

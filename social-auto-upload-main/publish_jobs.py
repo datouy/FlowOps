@@ -583,13 +583,14 @@ def _expand_publish_items(job) -> None:
     extra = json_loads(_row_get(job, 'extra') or '{}')
     if not isinstance(extra, dict):
         extra = {}
-    image_text = extra.get('contentType') == 'image-text'
+    image_text = extra.get('contentType') in ('image-text', 'article')
     # 可见性与发布阶段分开：草稿是可见性（visibility=draft），
     # 不是"还没发出去"这个阶段。
     visibility = 'draft' if extra.get('isDraft') else 'public'
-    content_type = 'image-text' if image_text else 'video'
+    content_type = str(extra.get('contentType') or 'video') if extra.get('contentType') in ('image-text', 'article') else 'video'
     rows = []
-    item_files = [str(files[0])] if image_text and files else files
+    # 长文没有素材文件：用占位 file='article' 给每个账号展开一个子任务。
+    item_files = [str(files[0])] if image_text and files else (files or (['article'] if image_text else []))
     with get_conn() as c:
         schedule_rows = c.execute(
             "SELECT account,file,scheduled_at FROM scheduled_items "
@@ -753,8 +754,9 @@ def _execute_item(item: dict, job, extra: dict) -> dict:
     from myUtils.platform_registry import dispatch_publish
 
     files = [item['file']]
-    if extra.get('contentType') == 'image-text':
-        files = json_loads(job['file_list'])
+    if extra.get('contentType') in ('image-text', 'article'):
+        loaded = json_loads(job['file_list'])
+        files = loaded if loaded else [item['file']]
 
     # 幂等预查：只在支持回查的平台上有意义。
     precheck = _precheck_existing_post(item, job)
@@ -783,6 +785,13 @@ def _execute_item(item: dict, job, extra: dict) -> dict:
             productLink=extra.get('productLink', ''),
             productTitle=extra.get('productTitle', ''),
             contentType=extra.get('contentType', 'video'),
+            collection=extra.get('collection', ''),
+            mentions=extra.get('mentions') or [],
+            locationName=extra.get('locationName', ''),
+            poiId=extra.get('poiId', ''),
+            bgmName=extra.get('bgmName', ''),
+            shopProductId=extra.get('shopProductId', ''),
+            contentLabel=extra.get('contentLabel', ''),
         )
     except AppError:
         # 类型化异常原样抛出——它已经带着"该不该重试""对账号什么影响"。
@@ -2216,6 +2225,10 @@ def _ensure_thumbnail(file_list, extra):
         if p.exists():
             return str(p)
     if not file_list:
+        return ''
+    # 长文占位 file='article' 不是真实素材：直接返回空，不触发 cv2 读文件。
+    first = str(file_list[0] or '').strip()
+    if not first or first == 'article':
         return ''
     src = Path(BASE_DIR) / 'videoFile' / file_list[0]
     if not src.exists():

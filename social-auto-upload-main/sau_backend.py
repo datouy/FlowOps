@@ -54,7 +54,9 @@ from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
 # 平台发布统一走 myUtils.platform_registry，避免这里重复维护平台清单。
 from myUtils.platform_registry import (
     PLATFORM_META,
+    article_platforms,
     platform_name,
+    supports_article,
     supports_image_text,
 )
 
@@ -2525,7 +2527,7 @@ def postVideo():
     thumbnail_path = data.get('thumbnail', '')
     is_draft = data.get('isDraft', False)  # 新增参数：是否保存为草稿
     content_type = str(data.get('contentType') or 'video').strip().lower()
-    if content_type not in ('video', 'image-text'):
+    if content_type not in ('video', 'image-text', 'article'):
         return jsonify({"code": 400, "msg": "不支持的内容类型", "data": None}), 400
     try:
         platform_type = int(type)
@@ -2539,6 +2541,15 @@ def postVideo():
         return jsonify({
             "code": 400,
             "msg": f"图文发布目前仅支持 {supported or '无'}",
+            "data": None,
+        }), 400
+    if content_type == 'article' and not supports_article(platform_type):
+        supported = '、'.join(
+            platform_name(value) for value in article_platforms()
+        )
+        return jsonify({
+            "code": 400,
+            "msg": f"长文发布目前仅支持 {supported or '无'}",
             "data": None,
         }), 400
 
@@ -2558,12 +2569,14 @@ def postVideo():
             "无权向以下账号发布：" + "、".join(out_of_scope)
         )
 
-    if not file_list:
+    if not file_list and content_type != 'article':
         return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
     if not account_list:
         return jsonify({"code": 400, "msg": "账号列表不能为空", "data": None}), 400
     if not title:
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+    if content_type == 'article' and not str(desc or '').strip():
+        return jsonify({"code": 400, "msg": "长文正文(desc)不能为空", "data": None}), 400
 
     # 打印获取到的数据（仅作为示例）
     logger.debug("File List: {}", file_list)
@@ -2583,6 +2596,15 @@ def postVideo():
         'dailyTimes': daily_times, 'startDays': start_days, 'isDraft': is_draft,
         'thumbnail': thumbnail_path, 'productLink': productLink, 'productTitle': productTitle,
         'desc': desc, 'contentType': content_type,
+        # 视频号专属能力（@提及/POI/音乐/小店挂车/合集/标注）：全部可选，
+        # 缺失时各适配器跳过，不阻断主发布流程。
+        'collection': data.get('collection') or data.get('collectionName') or '',
+        'mentions': data.get('mentions') or [],
+        'locationName': data.get('locationName') or data.get('location') or '',
+        'poiId': data.get('poiId') or '',
+        'bgmName': data.get('bgmName') or data.get('music') or '',
+        'shopProductId': data.get('shopProductId') or '',
+        'contentLabel': data.get('contentLabel') or data.get('declaration') or '',
     }
     job_id = enqueue_job(platform_type, title, tags, file_list, account_list, extra,
                          review_required=bool(data.get('reviewRequired')))
@@ -2676,6 +2698,25 @@ def postVideoBatch():
         productLink = data.get('productLink', '')
         productTitle = data.get('productTitle', '')
         is_draft = data.get('isDraft', False)
+        content_type = str(data.get('contentType') or 'video').strip().lower() or 'video'
+        if content_type not in ('video', 'image-text', 'article'):
+            return jsonify({"code": 400, "msg": "不支持的内容类型", "data": None}), 400
+        try:
+            batch_platform = int(type)
+        except (TypeError, ValueError):
+            return jsonify({"code": 400, "msg": "不支持的平台类型", "data": None}), 400
+        if content_type == 'image-text' and not supports_image_text(batch_platform):
+            return jsonify({"code": 400, "msg": "该平台不支持图文发布", "data": None}), 400
+        if content_type == 'article' and not supports_article(batch_platform):
+            return jsonify({"code": 400, "msg": "该平台不支持长文发布", "data": None}), 400
+        if not file_list and content_type != 'article':
+            return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
+        if not account_list:
+            return jsonify({"code": 400, "msg": "账号列表不能为空", "data": None}), 400
+        if not title:
+            return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+        if content_type == 'article' and not str(desc or '').strip():
+            return jsonify({"code": 400, "msg": "长文正文(desc)不能为空", "data": None}), 400
 
         videos_per_day = data.get('videosPerDay')
         daily_times = data.get('dailyTimes')
@@ -2692,6 +2733,14 @@ def postVideoBatch():
             videosPerDay=videos_per_day, dailyTimes=daily_times, startDays=start_days,
             desc=desc, isDraft=is_draft,
             productLink=productLink, productTitle=productTitle,
+            contentType=content_type,
+            collection=data.get('collection') or data.get('collectionName') or '',
+            mentions=data.get('mentions') or [],
+            locationName=data.get('locationName') or data.get('location') or '',
+            poiId=data.get('poiId') or '',
+            bgmName=data.get('bgmName') or data.get('music') or '',
+            shopProductId=data.get('shopProductId') or '',
+            contentLabel=data.get('contentLabel') or data.get('declaration') or '',
         )
     # 返回响应给客户端
     return jsonify(

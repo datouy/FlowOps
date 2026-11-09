@@ -1289,8 +1289,12 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
     async def validate_upload_args(self):
         await self.validate_base_args()
+        # 长文 publishArticle 允许纯文本（无图）：标题+正文即可发布。
         if not self.image_paths:
-            raise ValueError("图文模式下，图片是必须的")
+            if not self.title or not str(self.title).strip():
+                raise ValueError("图文模式下，title 是必须的")
+            self.image_paths = []
+            return
         if not self.title or not str(self.title).strip():
             raise ValueError("图文模式下，title 是必须的")
 
@@ -1303,7 +1307,12 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         self.image_paths = normalized_image_paths
 
     async def upload_note_content(self, page: Page, captured_responses: list) -> dict:
-        xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
+        img_count = len(self.image_paths or [])
+        if img_count:
+            xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运图文，共 {img_count} 张图片"))
+        else:
+            # 长文 publishArticle：纯文本（无图），跳过传图直走标题+正文。
+            xiaohongshu_logger.info(_msg("📝", "长文模式：无图片，跳过上传直填标题正文"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
 
         # 混合通道：先挂录制器（录创建接口 + 收素材 ID）。
@@ -1343,7 +1352,11 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         await upload_input.wait_for(state="attached", timeout=30000)
         xiaohongshu_logger.info(_msg("📤", "小人正在上传图片"))
-        await upload_input.set_input_files(self.image_paths)
+        if self.image_paths:
+            await upload_input.set_input_files(self.image_paths)
+        else:
+            # 长文纯文本：没有可传的图片，直接跳过上传等待。
+            xiaohongshu_logger.info(_msg("📝", "长文模式：跳过图片上传"))
 
         while True:
             try:

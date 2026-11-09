@@ -28,6 +28,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         # 能否在发布后回查平台作品状态（只有回查到 published/success 才算成功）
         "verification_supported": True,
         "supports_image_text": True,
+        "supports_article": True,
         "supports_remote_manage": True,
         "title_max": 30,
         "tags_max": 10,
@@ -39,6 +40,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "supports_draft": True,
         "verification_supported": True,
         "supports_image_text": True,
+        "supports_article": False,
         "supports_remote_manage": True,
         "title_max": 30,
         "tags_max": 8,
@@ -50,6 +52,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "supports_draft": False,
         "verification_supported": True,
         "supports_image_text": True,
+        "supports_article": False,
         "supports_remote_manage": True,
         "title_max": 55,
         "tags_max": 10,
@@ -62,6 +65,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         # 还没有实现远端作品回查：发布后只能记为"已提交，未验证"
         "verification_supported": False,
         "supports_image_text": False,
+        "supports_article": False,
         "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
@@ -75,6 +79,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "supports_draft": False,
         "verification_supported": False,
         "supports_image_text": False,
+        "supports_article": True,
         "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
@@ -86,6 +91,7 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
         "supports_draft": False,
         "verification_supported": False,
         "supports_image_text": False,
+        "supports_article": True,
         "supports_remote_manage": False,
         "title_max": 30,
         "tags_max": 8,
@@ -111,6 +117,7 @@ def get_platform_meta(platform_type: int) -> dict[str, Any]:
             "supports_draft": False,
             "verification_supported": False,
             "supports_image_text": False,
+            "supports_article": False,
             "supports_remote_manage": False,
             "title_max": 30,
             "tags_max": 8,
@@ -140,6 +147,16 @@ def supports_image_text(platform_type: int) -> bool:
     return bool(get_platform_meta(platform_type).get("supports_image_text"))
 
 
+def supports_article(platform_type: int) -> bool:
+    """该平台是否支持长文（publishArticle）体裁（对齐蚁小二三件套）。"""
+    return bool(get_platform_meta(platform_type).get("supports_article"))
+
+
+def article_platforms() -> list[int]:
+    """支持长文的平台列表（给后端校验与前端提示用）。"""
+    return [key for key, meta in PLATFORM_META.items() if meta.get("supports_article")]
+
+
 def supports_remote_manage(platform_type: int) -> bool:
     return bool(get_platform_meta(platform_type).get("supports_remote_manage"))
 
@@ -163,7 +180,7 @@ def supports_api_publish(platform_type: int) -> bool:
 
 def _publish_xhs(**kw):
     from myUtils.postVideo import post_video_xhs
-    if kw.get("contentType") == "image-text":
+    if kw.get("contentType") in ("image-text", "article"):
         from myUtils.postVideo import post_note_xhs
 
         return post_note_xhs(
@@ -191,6 +208,11 @@ def _publish_tencent(**kw):
             enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
             daily_times=kw.get("dailyTimes"), start_days=kw.get("startDays") or 0,
             is_draft=bool(kw.get("isDraft")), desc=kw.get("desc", ""),
+            collection_name=kw.get("collectionName") or kw.get("collection"),
+            mentions=kw.get("mentions"), location_name=kw.get("locationName"),
+            poi_id=kw.get("poiId"), bgm_name=kw.get("bgmName"),
+            product_link=kw.get("productLink", ""), product_title=kw.get("productTitle", ""),
+            shop_product_id=kw.get("shopProductId"), content_label=kw.get("contentLabel"),
         )
     from myUtils.postVideo import post_video_tencent
     return post_video_tencent(
@@ -199,6 +221,11 @@ def _publish_tencent(**kw):
         enableTimer=kw.get("enableTimer"), videos_per_day=kw.get("videosPerDay") or 1,
         daily_times=kw.get("dailyTimes"), start_days=kw.get("startDays") or 0,
         is_draft=bool(kw.get("isDraft")), desc=kw.get("desc", ""),
+        collection_name=kw.get("collectionName") or kw.get("collection"),
+        mentions=kw.get("mentions"), location_name=kw.get("locationName"),
+        poi_id=kw.get("poiId"), bgm_name=kw.get("bgmName"),
+        product_link=kw.get("productLink", ""), product_title=kw.get("productTitle", ""),
+        shop_product_id=kw.get("shopProductId"), content_label=kw.get("contentLabel"),
     )
 
 
@@ -237,8 +264,15 @@ def _publish_kuaishou(**kw):
 
 
 def _publish_weibo(**kw):
-    from myUtils.postVideo import post_video_weibo
     from publish_jobs import _ensure_thumbnail
+    if kw.get("contentType") == "article":
+        from myUtils.postVideo import post_article_weibo
+        return post_article_weibo(
+            title=kw["title"], tags=kw["tags"],
+            account_file=kw["account_list"], desc=kw.get("desc", ""),
+            collection_name=kw.get("collectionName") or kw.get("collection"),
+        )
+    from myUtils.postVideo import post_video_weibo
     return post_video_weibo(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], publish_date=0,
@@ -248,8 +282,14 @@ def _publish_weibo(**kw):
 
 
 def _publish_baijiahao(**kw):
-    from myUtils.postVideo import post_video_baijiahao
     from publish_jobs import _ensure_thumbnail
+    if kw.get("contentType") == "article":
+        from myUtils.postVideo import post_article_baijiahao
+        return post_article_baijiahao(
+            title=kw["title"], tags=kw["tags"],
+            account_file=kw["account_list"], desc=kw.get("desc", ""),
+        )
+    from myUtils.postVideo import post_video_baijiahao
     return post_video_baijiahao(
         title=kw["title"], files=kw["files"], tags=kw["tags"],
         account_file=kw["account_list"], publish_date=0,

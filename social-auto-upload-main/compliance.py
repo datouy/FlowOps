@@ -34,6 +34,7 @@ def check_content(data: dict) -> dict:
     desc = str(data.get("desc") or "").strip()
     tags = data.get("tags") or []
     files = data.get("fileList") or []
+    content_kind = str(data.get("contentType") or "video").strip().lower()
     errors, warnings = [], []
 
     if not title:
@@ -42,7 +43,7 @@ def check_content(data: dict) -> dict:
         errors.append(f"标题 {len(title)} 字，超过{rules['name']}上限 {rules['title_max']} 字")
     if len(desc) > rules.get("desc_max", 1000):
         errors.append(f"正文 {len(desc)} 字，超过上限 {rules['desc_max']} 字")
-    if not files:
+    if not files and content_kind != "article":
         errors.append("没有选择素材")
     if len(tags) > rules["tags_max"]:
         warnings.append(f"话题 {len(tags)} 个，建议不超过 {rules['tags_max']} 个")

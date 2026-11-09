@@ -694,6 +694,14 @@ class TencentBaseUploader(BaseVideoUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         collection_name: str | None = None,
+        mentions: list[str] | None = None,
+        location_name: str | None = None,
+        poi_id: str | None = None,
+        bgm_name: str | None = None,
+        product_link: str | None = None,
+        product_title: str | None = None,
+        shop_product_id: str | None = None,
+        content_label: str | None = None,
     ):
         self.publish_date = publish_date
         self.account_file = _resolve_account_file(account_file)
@@ -701,6 +709,16 @@ class TencentBaseUploader(BaseVideoUploader):
         self.debug = debug
         self.headless = headless
         self.collection_name = collection_name
+        # 视频号专属能力（逆向 Shipinhao.* 对齐）：@提及 / POI 定位 /
+        # 背景音乐 / 小店商品挂车。全部可选，缺失时跳过不阻断主流程。
+        self.mentions = [str(item).strip().lstrip("@") for item in (mentions or []) if str(item).strip()]
+        self.location_name = str(location_name or "").strip()
+        self.poi_id = str(poi_id or "").strip()
+        self.bgm_name = str(bgm_name or "").strip()
+        self.product_link = str(product_link or "").strip()
+        self.product_title = str(product_title or "").strip()
+        self.shop_product_id = str(shop_product_id or "").strip()
+        self.content_label = content_label
         self.local_executable_path = LOCAL_CHROME_PATH
 
     async def validate_base_args(self):
@@ -974,6 +992,173 @@ class TencentBaseUploader(BaseVideoUploader):
             tencent_logger.success(_msg("🥳", f"已选择合集：{self.collection_name}"))
         except Exception as exc:
             tencent_logger.warning(_msg("😵", f"选择合集失败，跳过归集继续发布: {exc}"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    async def apply_mentions(self, page: Page) -> None:
+        """@提及：描述区内输入 @昵称 后从候选列表精确选择。
+
+        逆向 Shipinhao 的 finder XML 是分段 value + at 索引，直接拼纯文本
+        不会生成可点击的提及。这里走页面候选选择，找不到精确匹配就跳过，
+        绝不猜测点第一个（点错人是线上事故）。
+        """
+        if not self.mentions:
+            return
+        try:
+            editor = page.locator("div.input-editor").first
+            if not await editor.count():
+                return
+            for nickname in self.mentions:
+                name = str(nickname or "").strip().lstrip("@")
+                if not name:
+                    continue
+                try:
+                    await editor.click(timeout=5000)
+                    await page.keyboard.type("@" + name)
+                    await page.wait_for_timeout(1200)
+                    candidate = page.locator(
+                        f'[class*="mention"] :text-is("{name}"), '
+                        f'[class*="at-"] :text-is("{name}"), '
+                        f'[role="option"]:has-text("{name}")'
+                    ).first
+                    if await candidate.count():
+                        try:
+                            if await candidate.is_visible():
+                                await candidate.click(timeout=3000)
+                                await page.wait_for_timeout(400)
+                                tencent_logger.success(_msg("🥳", f"已@提及：{name}"))
+                                continue
+                        except Exception:
+                            pass
+                    await page.keyboard.press("Escape")
+                    tencent_logger.warning(_msg("😵", f"未找到@{name}的精确候选，跳过该提及"))
+                except Exception as exc:
+                    tencent_logger.warning(_msg("😵", f"@提及{name}失败，跳过继续发布：{exc}"))
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"@提及流程异常，跳过：{exc}"))
+
+    async def apply_location(self, page: Page) -> None:
+        """POI 定位：按地点名搜索并精确选择（对应 helper_search_location）。"""
+        if not self.location_name and not self.poi_id:
+            return
+        try:
+            entry = page.get_by_text("添加地点", exact=False).first
+            if not await entry.count():
+                entry = page.get_by_text("位置", exact=False).first
+            if not await entry.count():
+                tencent_logger.info(_msg("🧾", "当前页面未发现位置入口，跳过定位"))
+                return
+            await entry.click(timeout=5000)
+            await page.wait_for_timeout(800)
+            search = page.locator('input[placeholder*="搜索地点"], input[placeholder*="搜索位置"]').first
+            if not await search.count():
+                tencent_logger.info(_msg("🧾", "未找到地点搜索框，跳过定位"))
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                return
+            keyword = self.location_name or self.poi_id
+            await search.fill(keyword)
+            await page.wait_for_timeout(1200)
+            option = page.locator(f'[role="option"]:has-text("{keyword}")').first
+            if await option.count():
+                try:
+                    await option.click(timeout=4000)
+                    tencent_logger.success(_msg("🥳", f"已添加地点：{keyword}"))
+                    return
+                except Exception:
+                    pass
+            tencent_logger.warning(_msg("😵", f"未找到地点「{keyword}」的精确匹配，跳过定位"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"设置地点失败，跳过继续发布：{exc}"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    async def apply_bgm(self, page: Page) -> None:
+        """背景音乐：按音乐名搜索并选择（对应 get_bgm_list）。"""
+        if not self.bgm_name:
+            return
+        try:
+            entry = page.get_by_text("添加音乐", exact=False).first
+            if not await entry.count():
+                entry = page.get_by_text("背景音乐", exact=False).first
+            if not await entry.count():
+                tencent_logger.info(_msg("🧾", "当前页面未发现音乐入口，跳过配乐"))
+                return
+            await entry.click(timeout=5000)
+            await page.wait_for_timeout(800)
+            search = page.locator('input[placeholder*="搜索音乐"], input[placeholder*="搜索"]').first
+            if await search.count():
+                await search.fill(self.bgm_name)
+                await page.wait_for_timeout(1200)
+                option = page.locator(f'[role="option"]:has-text("{self.bgm_name}")').first
+                if await option.count():
+                    try:
+                        await option.click(timeout=4000)
+                        tencent_logger.success(_msg("🥳", f"已选择背景音乐：{self.bgm_name}"))
+                        return
+                    except Exception:
+                        pass
+            tencent_logger.warning(_msg("😵", f"未找到音乐「{self.bgm_name}」，跳过配乐"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"设置背景音乐失败，跳过继续发布：{exc}"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    async def apply_shop_product(self, page: Page) -> None:
+        """小店商品挂车：按商品名/链接选择（对应 shop/search_products）。
+
+        有 shop_product_id 或 product_link 时才尝试；找不到精确匹配就跳过，
+        不阻断主发布流程。
+        """
+        keyword = self.shop_product_id or self.product_title or self.product_link
+        if not keyword:
+            return
+        try:
+            entry = page.get_by_text("添加商品", exact=False).first
+            if not await entry.count():
+                entry = page.get_by_text("挂车", exact=False).first
+            if not await entry.count():
+                entry = page.get_by_text("小店", exact=False).first
+            if not await entry.count():
+                tencent_logger.info(_msg("🧾", "当前页面未发现商品入口，跳过挂车"))
+                return
+            await entry.click(timeout=5000)
+            await page.wait_for_timeout(1000)
+            search = page.locator('input[placeholder*="搜索商品"], input[placeholder*="搜索"]').first
+            if await search.count():
+                await search.fill(keyword[:64])
+                await page.wait_for_timeout(1200)
+                option = page.locator(f'[role="option"]:has-text("{keyword[:16]}")').first
+                if await option.count():
+                    try:
+                        await option.click(timeout=4000)
+                        tencent_logger.success(_msg("🥳", f"已挂车商品：{keyword[:32]}"))
+                        return
+                    except Exception:
+                        pass
+            tencent_logger.warning(_msg("😵", f"未找到商品「{keyword[:32]}」，跳过挂车"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"挂车商品失败，跳过继续发布：{exc}"))
             try:
                 await page.keyboard.press("Escape")
             except Exception:
@@ -1283,6 +1468,14 @@ class TencentVideo(TencentBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         collection_name: str | None = None,
+        mentions: list[str] | None = None,
+        location_name: str | None = None,
+        poi_id: str | None = None,
+        bgm_name: str | None = None,
+        product_link: str | None = None,
+        product_title: str | None = None,
+        shop_product_id: str | None = None,
+        content_label: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -1291,6 +1484,14 @@ class TencentVideo(TencentBaseUploader):
             debug=debug,
             headless=headless,
             collection_name=collection_name,
+            mentions=mentions,
+            location_name=location_name,
+            poi_id=poi_id,
+            bgm_name=bgm_name,
+            product_link=product_link,
+            product_title=product_title,
+            shop_product_id=shop_product_id,
+            content_label=content_label,
         )
         self.title = title
         self.file_path = file_path
@@ -1426,6 +1627,7 @@ class TencentVideo(TencentBaseUploader):
         await self.wait_for_realtime_verification(page)
         await self.fill_title_and_tags(page)
         await self.fill_description(page)
+        await self.apply_mentions(page)
         # 合集不在这里选：此时视频还在上传，上传完成后表单会刷新，
         # 上传中选的合集会被重置/不绑定（"日志说选了、后台没加"的根因）。
         # 改到 wait_for_upload_complete 之后再选，见 upload()。
@@ -1450,6 +1652,9 @@ class TencentVideo(TencentBaseUploader):
             await self.wait_for_upload_complete(page)
             # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
             await self.apply_collection(page)
+            await self.apply_location(page)
+            await self.apply_bgm(page)
+            await self.apply_shop_product(page)
             await self.apply_original_statement(page)
             await self.set_thumbnail(page)
 
@@ -1486,6 +1691,15 @@ class TencentNote(TencentBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         is_draft: bool = False,
+        collection_name: str | None = None,
+        mentions: list[str] | None = None,
+        location_name: str | None = None,
+        poi_id: str | None = None,
+        bgm_name: str | None = None,
+        product_link: str | None = None,
+        product_title: str | None = None,
+        shop_product_id: str | None = None,
+        content_label: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -1493,6 +1707,15 @@ class TencentNote(TencentBaseUploader):
             publish_strategy=publish_strategy,
             debug=debug,
             headless=headless,
+            collection_name=collection_name,
+            mentions=mentions,
+            location_name=location_name,
+            poi_id=poi_id,
+            bgm_name=bgm_name,
+            product_link=product_link,
+            product_title=product_title,
+            shop_product_id=shop_product_id,
+            content_label=content_label,
         )
         self.image_paths = image_paths
         self.note = note or ""
@@ -1635,7 +1858,11 @@ class TencentNote(TencentBaseUploader):
     async def prepare_note_for_publish(self, page: Page) -> None:
         await self.fill_note_title_and_tags(page)
         await self.fill_note_body(page)
+        await self.apply_mentions(page)
         await self.apply_collection(page)
+        await self.apply_location(page)
+        await self.apply_bgm(page)
+        await self.apply_shop_product(page)
         await self.apply_original_statement(page)
 
     async def upload_note_content(self, page: Page) -> None:
