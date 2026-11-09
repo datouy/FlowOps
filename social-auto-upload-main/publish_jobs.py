@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
 from conf import BASE_DIR
+import job_events
 import verify_codes
 from db_utils import connect, record_schema_version
 from utils.credential_crypto import credential_exists
@@ -247,6 +248,9 @@ def init_db():
             ON jobs(status)''')
         c.execute('''CREATE INDEX IF NOT EXISTS idx_publish_items_job
             ON publish_items(job_id, status)''')
+        # 任务事件流：把一次发布的每一步落成可回放的时间轴。
+        # 建表放在这里是为了跟主库同一个文件——事件和任务数据同生共死。
+        job_events.ensure_schema(c)
         _ensure_columns(c, 'publish_records', (('result', "TEXT DEFAULT ''"),))
         _ensure_columns(c, 'publish_items', (
             ('remote_id', "TEXT DEFAULT ''"), ('remote_status', "TEXT DEFAULT ''"),
@@ -311,6 +315,10 @@ ITEM_TERMINAL = (
     ITEM_SUBMITTED,
 )
 MAX_ITEM_ATTEMPTS = 2
+
+#: 任务事件保留天数。事件表是流水账，必须有清理策略，
+#: 否则时间轴查询会越来越慢。
+EVENT_RETENTION_DAYS = 30
 
 STAGE_UPLOAD = 'upload'
 STAGE_PUSH = 'push'
@@ -1039,6 +1047,17 @@ def _record_tracking_result(item: dict, result: dict) -> None:
     )
     updated = get_job_item(int(item['job_id']), int(item['id'])) or item
     _sync_scheduled_item(updated, item_status, error)
+    # 阶段变化落到事件流：这就是"卡在哪一步"的时间轴来源。
+    job_events.record(
+        int(item.get('job_id') or 0),
+        stage or job_events.STAGE_PUSH,
+        error or f"作品状态更新为 {state}",
+        item_id=int(item.get('id') or 0),
+        account_id=int(item.get('account_id') or 0),
+        level=job_events.LEVEL_ERROR if item_status == ITEM_FAILED else job_events.LEVEL_INFO,
+        code=error_kind,
+        payload={"state": state, "stageStatus": stage_status, "status": item_status},
+    )
 
 
 def run_tracking_once(now: datetime | None = None) -> list[dict]:
@@ -1092,6 +1111,13 @@ def run_tracking_once(now: datetime | None = None) -> list[dict]:
                 message = str(result.get('error'))[:500] or result.get('error')
                 kind = classify_publish_error(message)
                 attempts = int(item.get('check_attempts') or 0) + 1
+                job_events.record(
+                    job_id, job_events.STAGE_PUSH, f"作品状态复查失败：{message}",
+                    item_id=int(item.get('id') or 0),
+                    account_id=int(item.get('account_id') or 0),
+                    level=job_events.LEVEL_ERROR, code=kind,
+                    payload={"checkAttempt": attempts},
+                )
                 if kind == KIND_LOGIN_EXPIRED:
                     _mark_account_expired(str(item.get('cookie') or ''), message)
                     if item.get('status') == ITEM_SUCCESS:
@@ -1826,6 +1852,11 @@ def _run_job(job_id):
 
     expired_accounts: set[int] = set()
     first_error = ''
+    job_events.mark_job_start(job_id)
+    job_events.record(
+        job_id, job_events.STAGE_JOB, f"任务开始执行，共 {len(account_list)} 个账号",
+        payload={"type": type, "title": title, "fileCount": len(file_list)},
+    )
     try:
         for item in _pending_items(job_id):
             item_id = int(item['id'])
@@ -1888,6 +1919,12 @@ def _run_job(job_id):
                     ).rowcount
                 if not claimed_item:
                     continue
+                job_events.record(
+                    job_id, job_events.STAGE_UPLOAD,
+                    f"开始发布《{title}》到账号 {item['account_name']}",
+                    item_id=item_id, account_id=account_id,
+                    payload={"attempt": attempts, "file": str(item.get('file') or '')},
+                )
                 try:
                     # 发布前节流：账号令牌桶 + 平台并发信号量。
                     #
@@ -1900,11 +1937,25 @@ def _run_job(job_id):
                         _update_item(item_id, submitted_at=now)
                         result = _execute_item(item, job, extra) or {}
                         _record_publish_result(item, result)
+                        job_events.record(
+                            job_id, job_events.STAGE_SUCCESS,
+                            f"《{title}》已提交到平台，等待回查",
+                            item_id=item_id, account_id=account_id,
+                            payload={
+                                "remoteId": str(result.get('remote_id') or result.get('remoteId') or ''),
+                                "state": str(result.get('state') or ''),
+                            },
+                        )
                 except TimeoutError as exc:
                     # 触发速率上限：不是失败，是"太慢了"。回 pending 等下一轮，
                     # 不消耗失败次数。
                     message = str(exc)[:500]
                     logger.warning("账号 {} 触发发布速率上限: {}", item['account_name'], message)
+                    job_events.record(
+                        job_id, job_events.STAGE_THROTTLED, message,
+                        item_id=item_id, account_id=account_id,
+                        level=job_events.LEVEL_WARN, code=KIND_RATE_LIMITED,
+                    )
                     _update_item(item_id, status=ITEM_PENDING, error=message, error_kind=KIND_RATE_LIMITED)
                 except Exception as exc:
                     message = str(exc)[:500] or exc.__class__.__name__
@@ -1912,6 +1963,10 @@ def _run_job(job_id):
                     first_error = first_error or message
                     traceback.print_exc()
                     effect = _error_account_effect(exc)
+                    job_events.record_error(
+                        job_id, exc, item_id=item_id, account_id=account_id,
+                        payload={"attempt": attempts, "kind": kind},
+                    )
                     if effect == ACCOUNT_EXPIRE:
                         expired_accounts.add(account_id)
                         _mark_account_expired(cookie, message)
@@ -1948,6 +2003,7 @@ def _run_job(job_id):
 
     _finalize_job(job_id, rec_id, job, first_error)
     _finalize_replacement(job_id, extra)
+    job_events.clear_job_start(job_id)
 
 
 def _finalize_job(
@@ -2457,6 +2513,14 @@ def start_patrol(interval_hours=12):
         while True:
             try:
                 run_patrol_once()
+            except Exception:
+                traceback.print_exc()
+            # 顺带清理过期事件：事件表是流水账，会一直涨。
+            # 挂在巡检循环里是合适的——每天一次，量足够小。
+            try:
+                removed = job_events.prune(keep_days=EVENT_RETENTION_DAYS)
+                if removed:
+                    logger.info("已清理 {} 条过期任务事件", removed)
             except Exception:
                 traceback.print_exc()
             time.sleep(interval_hours * 3600)

@@ -610,6 +610,42 @@ def api_v2_credentials_migrate():
     return jsonify({"code": 200, "msg": None, "data": result}), 200
 
 
+@app.route('/api/v2/jobs/<int:job_id>/timeline', methods=['GET'])
+def api_v2_job_timeline(job_id: int):
+    """任务时间轴：这次发布到底发生了什么，按时间正序。
+
+    比"任务状态=failed"有用得多——能看到卡在哪一步、试了几次、每次的
+    报错是什么、中间等了多久。
+    """
+    import job_events
+
+    try:
+        limit = int(request.args.get('limit', 500))
+    except (TypeError, ValueError):
+        limit = 500
+    item_id = request.args.get('itemId', type=int)
+    try:
+        events = job_events.timeline(job_id=job_id, item_id=item_id, limit=limit)
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"读取任务时间轴失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": {"jobId": job_id, "events": events}}), 200
+
+
+@app.route('/api/v2/jobs/<int:job_id>/summary', methods=['GET'])
+def api_v2_job_summary(job_id: int):
+    """任务聚合视图：各阶段耗时、失败次数、错误分布。
+
+    这是"一眼看出卡在哪"的那个接口，不用逐条读时间轴。
+    """
+    import job_events
+
+    try:
+        data = job_events.job_summary(job_id)
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"读取任务摘要失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
 @app.route('/api/v2/publish/rate-limit', methods=['GET'])
 def api_v2_publish_rate_limit():
     """发布限流状态：速率上限、平台并发、夜间降速与各账号令牌余量。"""
