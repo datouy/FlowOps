@@ -195,6 +195,44 @@ def health():
     return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
 
 
+@app.route('/health/ready', methods=['GET'])
+def health_ready():
+    """就绪探针：依赖真的能用才返回 200，否则 503。
+
+    与 ``/health`` 的分工：``/health`` 回答"进程活着吗"（重启判断用，必须
+    永远轻量），``/health/ready`` 回答"现在能不能真的干活"——4 个库能否拿到
+    写锁、磁盘还有多少、后台任务有没有死、账号还剩几个可用、数据回流停了
+    几天。Docker healthcheck、Nginx upstream 和运维面板都应该看这个。
+    """
+    import health_probe
+    result = health_probe.readiness()
+    return jsonify({
+        "code": 200 if result["ready"] else 503,
+        "msg": None if result["ready"] else "服务未就绪",
+        "data": result,
+    }), (200 if result["ready"] else 503)
+
+
+@app.route('/api/v2/runtime/status', methods=['GET'])
+def api_v2_runtime_status():
+    """后台任务运行状态：谁还活着、谁被重启过、谁心跳停了。"""
+    import runtime_guard
+    return jsonify({"code": 200, "msg": None, "data": runtime_guard.status()}), 200
+
+
+@app.route('/api/v2/system/health', methods=['GET'])
+def api_v2_system_health():
+    """给前端用的健康快照。
+
+    和 ``/health/ready`` 的区别：那个用状态码表达就绪（Docker/Nginx 要的是
+    状态码），这个**永远返回 200**、就绪与否放在 ``data.ready`` 里——否则前端
+    的响应拦截器会把 503 当成"接口报错"弹一个红条，而用户其实只是想知道
+    "现在有没有问题"。
+    """
+    import health_probe
+    return jsonify({"code": 200, "msg": None, "data": health_probe.readiness()}), 200
+
+
 @app.route('/auth/check', methods=['GET'])
 def auth_check():
     """Authenticated lightweight probe used by the browser access gate."""
@@ -3025,19 +3063,93 @@ def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
             logger.debug("清理队列: {}", queue_id)
 
 import publish_jobs
+import runtime_guard
 
-publish_jobs.start_publish_runtime()
-start_patrol()
-stats_reflow.start_stats_loop(24)
-douyin_dm_sync.start_background()
-xiaohongshu_dm_sync.start_background()
-channels_dm_sync.start_background()
-try:
+
+def _restart_comment_sync() -> None:
+    """评论同步是可选模块（导入失败不影响主流程），重启也要延迟导入。"""
     import comment_sync
+    comment_sync.restart_comment_loop()
 
-    comment_sync.start_comment_loop()
-except Exception:
-    logger.exception("评论自动同步启动失败")
+
+# ---------------------------------------------------------------- 后台任务登记
+#
+# 这些线程以前是"起了就不管"：循环体有 try/except 兜着，但**线程本身**退出
+# （逃出 try 的异常、Event 被永久清除、死锁）时没有任何人知道。界面照旧显示
+# "自动同步运行中"，实际可能几天没干活——后台型产品最贵的静默故障。
+#
+# 交给 runtime_guard 看门狗：线程死/心跳停 → 自动重启（指数退避、有上限），
+# 状态通过 /api/v2/runtime/status 与 /health/ready 暴露出来。
+def _background_disabled() -> bool:
+    """只起 Web、不跑任何后台任务。
+
+    线上出问题时的第一动作往往是"先把自动动作停下来，别继续往平台上打"，
+    但又必须保留界面能把状态看清楚。也给冒烟测试和只读部署用。
+    """
+    raw = str(os.environ.get("FLOWOPS_DISABLE_BACKGROUND", "0")).strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _start_background_tasks() -> None:
+    if _background_disabled():
+        logger.warning(
+            "FLOWOPS_DISABLE_BACKGROUND=1：本次只启动 Web，"
+            "发布调度/私信同步/数据回流均不会自动运行"
+        )
+        return
+
+    runtime_guard.register(
+        "publish-scheduler", description="发布调度扫描（本地定时触发器）",
+        interval=20, launcher=publish_jobs.restart_publish_runtime,
+    )
+    runtime_guard.register(
+        "publish-tracker", description="发布后状态追踪与回填",
+        interval=60, launcher=publish_jobs.restart_publish_runtime,
+    )
+    runtime_guard.register(
+        "account-patrol", description="账号登录态巡检",
+        interval=12 * 3600, launcher=publish_jobs.restart_patrol,
+    )
+    runtime_guard.register(
+        "stats-reflow", description="作品数据回流",
+        interval=24 * 3600, launcher=stats_reflow.restart_stats_loop,
+    )
+    runtime_guard.register(
+        "comment-sync", description="评论自动同步",
+        interval=900, launcher=_restart_comment_sync,
+    )
+    # 私信同步的循环在"没到点"时最多只等 5-10 秒就回到循环顶部打心跳，所以
+    # 心跳很密；interval 设大是为了容忍单轮 run_sync 扫多个账号花掉的时间。
+    for dm_module, dm_label in (
+        (douyin_dm_sync, "抖音"),
+        (xiaohongshu_dm_sync, "小红书"),
+        (channels_dm_sync, "视频号"),
+    ):
+        runtime_guard.register(
+            f"{dm_module.sync_manager.key}-dm-sync",
+            description=f"{dm_label}私信同步",
+            interval=600,
+            launcher=dm_module.restart_background,
+        )
+
+    publish_jobs.start_publish_runtime()
+    start_patrol()
+    stats_reflow.start_stats_loop(24)
+    douyin_dm_sync.start_background()
+    xiaohongshu_dm_sync.start_background()
+    channels_dm_sync.start_background()
+    try:
+        import comment_sync
+
+        comment_sync.start_comment_loop()
+    except Exception:
+        logger.exception("评论自动同步启动失败")
+
+    # 所有后台任务都起来之后再开看门狗，避免启动阶段的正常空窗被判成卡死。
+    runtime_guard.start_watchdog()
+
+
+_start_background_tasks()
 
 
 def _dm_storage_maintenance():
