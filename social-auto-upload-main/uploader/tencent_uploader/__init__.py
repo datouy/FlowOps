@@ -15,6 +15,7 @@ from uploader.tencent_uploader.main import get_tencent_cookie
 from uploader.tencent_uploader.main import tencent_cookie_gen
 from uploader.tencent_uploader.main import tencent_setup
 from uploader.tencent_uploader.main import weixin_setup
+from uploader.tencent_uploader.shop_auth import TencentShopAuthSession
 
 __all__ = [
     "TENCENT_PUBLISH_STRATEGY_IMMEDIATE",
@@ -22,6 +23,7 @@ __all__ = [
     "TencentBaseUploader",
     "TencentNote",
     "TencentVideo",
+    "TencentShopAuthSession",
     "cookie_auth",
     "format_str_for_short_title",
     "get_tencent_cookie",

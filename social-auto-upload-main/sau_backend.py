@@ -201,6 +201,72 @@ def auth_check():
     return jsonify({"code": 200, "msg": None, "data": {"authenticated": True}}), 200
 
 
+# ---------------------------------------------------------------- 本地发现
+#
+# 对齐蚁小二 createServer：网页端/扩展先探 /client-id 发现本地客户端，
+# 再投递 rpa-video / rpa-image 任务。这里给最小闭环：固定 client-id +
+# 本地投递入口，全部走现有发布队列，不另起通道。
+@app.route('/client-id', methods=['GET'])
+def local_client_id():
+    """本地发现探针：网页端/扩展用它确认本地客户端在线。"""
+    import hashlib
+    try:
+        node = uuid.getnode()
+        basis = f"flowops-{node:012x}"
+    except Exception:
+        basis = "flowops-local"
+    device_id = hashlib.sha256(str(basis).encode("utf-8")).hexdigest()[:32]
+    return jsonify({"code": 200, "msg": None, "data": {"clientId": device_id}}), 200
+
+
+@app.route('/local/publish', methods=['POST'])
+def local_publish():
+    """本地投递：网页端/扩展把 rpa-video / rpa-image 任务直接丢给本地队列。"""
+    from myUtils.platform_registry import dispatch_publish
+    data = request.get_json(force=True) or {}
+    task_type = str(data.get("task") or data.get("taskType") or "rpa-video").strip()
+    if task_type not in ("rpa-video", "rpa-image", "publish"):
+        return jsonify({"code": 400, "msg": "不支持的本地任务类型", "data": None}), 400
+    files = data.get("fileList") or ([data.get("file")] if data.get("file") else [])
+    if not files:
+        return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
+    try:
+        dispatch_publish(
+            data.get("type"),
+            title=data.get("title", "本地投递"), files=files,
+            tags=data.get("tags") or [], account_list=data.get("accountList") or [],
+            category=data.get("category"), enableTimer=data.get("enableTimer"),
+            videosPerDay=data.get("videosPerDay"), dailyTimes=data.get("dailyTimes"),
+            startDays=data.get("startDays", 0), desc=data.get("desc", ""),
+            isDraft=bool(data.get("isDraft")),
+            productLink=data.get("productLink", ""), productTitle=data.get("productTitle", ""),
+            contentType=str(data.get("contentType") or "video").strip().lower() or "video",
+            collection=data.get("collection") or data.get("collectionName") or "",
+            mentions=data.get("mentions") or [],
+            locationName=data.get("locationName") or data.get("location") or "",
+            poiId=data.get("poiId") or "", bgmName=data.get("bgmName") or data.get("music") or "",
+            shopProductId=data.get("shopProductId") or "",
+            contentLabel=data.get("contentLabel") or data.get("declaration") or "",
+        )
+    except Exception as exc:
+        return jsonify({"code": 400, "msg": str(exc)[:200], "data": None}), 400
+    return jsonify({"code": 200, "msg": None, "data": {"accepted": True, "task": task_type}}), 200
+
+
+@app.route('/api/v2/tencent/shop-auth/start', methods=['POST'])
+def tencent_shop_auth_start():
+    """视频号小店独立授权：开一次性扫码会话（不对接发布会话）。"""
+    from uploader.tencent_uploader.shop_auth import TencentShopAuthSession
+    data = request.get_json(force=True) or {}
+    account_file = str(data.get("accountFile") or data.get("cookie") or "").strip()
+    if not account_file:
+        return jsonify({"code": 400, "msg": "accountFile 不能为空", "data": None}), 400
+    session = TencentShopAuthSession(account_file)
+    result = asyncio.run(session.run(headless=True))
+    code = 200 if result.get("success") else 202
+    return jsonify({"code": code, "msg": None, "data": result}), code
+
+
 # ---------------------------------------------------------------- 登录账号槽位
 #
 # "登录账号选择"：先用平台定位到 type，再列出该平台已有账号，让前端在
