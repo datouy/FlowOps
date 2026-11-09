@@ -20,7 +20,30 @@ MAIN_DB = Path(BASE_DIR / "db" / "database.db")
 COOKIE_DIR = Path(BASE_DIR / "cookiesFile")
 DOUYIN_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 
-_send_lock = threading.Lock()
+_send_locks: dict[str, threading.Lock] = {}
+_send_locks_guard = threading.Lock()
+
+
+def _send_lock_for(account) -> threading.Lock:
+    """取该账号的发送锁：**同账号串行、跨账号并行**。
+
+    以前这里是一把全局 ``threading.Lock``——所有账号的私信回复排成一队。
+    每条回复都要"起浏览器 → 开会话 → 输入 → 点击 → 等 2.5 秒确认 → 关浏览器"，
+    十几秒起步；三个平台、十个账号同时有客户来信时，最后一个账号的客户要等
+    好几分钟才收到回复。
+
+    而平台侧真正在意的是"**同一个账号**不要并发操作"：不同账号本来就是不同的
+    人、不同的设备、不同的出口 IP，串起来没有风控收益，只有延迟。所以锁的
+    粒度降到账号。
+    """
+    payload = account or {}
+    key = str(payload.get("id") or payload.get("cookie_path") or payload.get("filePath") or "")
+    with _send_locks_guard:
+        lock = _send_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _send_locks[key] = lock
+        return lock
 
 
 def _account_by_type(account_type: int, account_name: str):
@@ -320,7 +343,7 @@ def send_douyin_media(account_name: str, author: str,
     if not account:
         raise RuntimeError("未找到可用的抖音登录账号，请先在账号管理中登录")
 
-    with _send_lock:
+    with _send_lock_for(account):
         with sync_playwright() as playwright:
             context = open_persistent_account_context_sync(
                 playwright,
@@ -445,7 +468,7 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
     if not account:
         raise RuntimeError("未找到可用的抖音登录账号，请先在账号管理中登录")
 
-    with _send_lock:
+    with _send_lock_for(account):
         with sync_playwright() as playwright:
             context = open_persistent_account_context_sync(
                 playwright,
