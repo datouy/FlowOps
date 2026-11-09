@@ -792,6 +792,15 @@ def run_stats_reflow_once() -> dict:
             platform_result['saved'] += saved
             platform_result['history'] += saved
 
+        # 每天留一份累计快照，周报才能算"本期增量"而不是终身累计。
+        try:
+            import daily_metrics
+
+            result['snapshots'] = daily_metrics.snapshot()
+        except Exception as exc:  # 快照失败不影响回流主流程
+            logger.warning("写每日指标快照失败: {}", exc)
+            result['snapshots'] = 0
+
         result['finished_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
         _set_state(running=False, finished_at=result['finished_at'], last_result=result, error=None)
         return result

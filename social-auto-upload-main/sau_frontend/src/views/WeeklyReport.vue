@@ -9,10 +9,31 @@
       :closable="false"
       style="margin-bottom: 14px;"
     />
+    <el-alert
+      v-else-if="!report.hasBaseline"
+      title="本期增量暂不可用"
+      description="缺少上一期的历史快照，累计值不能当作本期增量使用。下方「累计」数据仅为参考。"
+      type="warning"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
+    <el-alert
+      v-else-if="report.coverage && report.coverage.daysWithData < report.coverage.days"
+      :title="`数据覆盖 ${report.coverage.daysWithData}/${report.coverage.days} 天`"
+      :description="`缺少 ${report.coverage.missingDays.length} 天的快照，未回流的日子增量按 0 计，不是「没涨」。`"
+      type="info"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
     <div class="page-head">
       <div>
         <h2>运营周报</h2>
-        <p class="sub">自动汇总发布任务、内容数据和表现最好的作品，可复制或导出 CSV。</p>
+        <p class="sub">
+          主口径为「本期增量」（本期涨了多少）；累计值单独标注，仅作参考。
+          <template v-if="report.snapshotAt">数据快照时间：{{ report.snapshotAt }}</template>
+        </p>
       </div>
       <div>
         <el-select v-model="days" style="width:120px" @change="load">
@@ -26,10 +47,47 @@
 
     <div class="metric-grid">
       <div class="metric"><span>发布任务</span><strong>{{ report.jobs }}</strong><small>成功 {{ report.success }} / 失败 {{ report.failed }}</small></div>
-      <div class="metric"><span>总播放</span><strong>{{ formatNum(report.totals.plays) }}</strong><small>{{ days }} 天累计</small></div>
-      <div class="metric"><span>总点赞</span><strong>{{ formatNum(report.totals.likes) }}</strong><small>互动 {{ interactionRate }}%</small></div>
-      <div class="metric"><span>总评论</span><strong>{{ formatNum(report.totals.comments) }}</strong><small>内容 {{ report.top_contents.length }} 条</small></div>
+      <div class="metric" :class="{ muted: !report.hasBaseline }">
+        <span>本期新增播放</span>
+        <strong>{{ report.hasBaseline ? formatNum(report.totals.delta.plays) : '—' }}</strong>
+        <small>{{ report.hasBaseline ? `近 ${days} 天真实增量` : '缺少基线快照' }}</small>
+      </div>
+      <div class="metric" :class="{ muted: !report.hasBaseline }">
+        <span>本期新增点赞</span>
+        <strong>{{ report.hasBaseline ? formatNum(report.totals.delta.likes) : '—' }}</strong>
+        <small>互动 {{ interactionRate }}%</small>
+      </div>
+      <div class="metric"><span>累计播放（参考）</span><strong>{{ formatNum(report.totals.cumulative.plays) }}</strong><small>累计点赞 {{ formatNum(report.totals.cumulative.likes) }}</small></div>
     </div>
+
+    <el-card shadow="never" style="margin-bottom:16px">
+      <template #header>
+        <div class="card-head">
+          <span>每日播放趋势</span>
+          <el-radio-group v-model="trendMetric" size="small">
+            <el-radio-button value="plays">播放</el-radio-button>
+            <el-radio-button value="likes">点赞</el-radio-button>
+            <el-radio-button value="comments">评论</el-radio-button>
+          </el-radio-group>
+        </div>
+      </template>
+      <div v-if="!trendPoints.length" class="empty-hint">
+        还没有每日快照。数据回流后会每天自动留一份快照，届时这里会显示趋势曲线。
+      </div>
+      <svg v-else class="trend" :viewBox="`0 0 ${trendWidth} ${trendHeight}`" preserveAspectRatio="none">
+        <polyline :points="trendLine" fill="none" stroke="#409eff" stroke-width="2" />
+        <circle
+          v-for="(p, i) in trendPoints" :key="i"
+          :cx="p.x" :cy="p.y" r="3" fill="#409eff"
+        >
+          <title>{{ p.label }}：{{ formatNum(p.value) }}{{ p.hasSnapshot ? '' : '（无快照）' }}</title>
+        </circle>
+      </svg>
+      <div v-if="trendPoints.length" class="trend-axis">
+        <span>{{ trendPoints[0].date }}</span>
+        <span>{{ trendPoints[trendPoints.length - 1].date }}</span>
+      </div>
+    </el-card>
 
     <el-row :gutter="16">
       <el-col :xs="24" :lg="11">
@@ -38,14 +96,18 @@
           <el-table :data="report.platforms" size="small" stripe>
             <el-table-column prop="name" label="平台" width="90" />
             <el-table-column prop="contents" label="作品" width="70" />
-            <el-table-column label="播放" min-width="90"><template #default="s">{{ formatNum(s.row.plays) }}</template></el-table-column>
-            <el-table-column label="点赞" min-width="80"><template #default="s">{{ formatNum(s.row.likes) }}</template></el-table-column>
+            <el-table-column label="新增播放" min-width="90">
+              <template #default="s">{{ s.row.hasBaseline === false ? '—' : formatNum(s.row.delta.plays) }}</template>
+            </el-table-column>
+            <el-table-column label="累计播放" min-width="90">
+              <template #default="s">{{ formatNum(s.row.cumulative.plays) }}</template>
+            </el-table-column>
           </el-table>
         </el-card>
       </el-col>
       <el-col :xs="24" :lg="13">
         <el-card shadow="never">
-          <template #header><span>表现最好的内容</span></template>
+          <template #header><span>表现最好的内容（累计）</span></template>
           <el-table :data="report.top_contents" size="small">
             <el-table-column prop="title" label="标题" min-width="180" show-overflow-tooltip />
             <el-table-column prop="platform" label="平台" width="86" />
@@ -74,13 +136,49 @@ const accountStore = useAccountStore()
 const hasNoAccounts = computed(() => !accountStore.accounts.length)
 const days = ref(7)
 const loading = ref(false)
-const report = ref({ jobs: 0, success: 0, failed: 0, totals: { plays: 0, likes: 0, comments: 0 }, platforms: [], top_contents: [], text: '' })
+const emptyTotals = {
+  delta: { plays: 0, likes: 0, comments: 0, collects: 0, shares: 0, followers: 0 },
+  cumulative: { plays: 0, likes: 0, comments: 0, collects: 0, shares: 0, followers: 0 },
+  publishedScope: { contents: 0, plays: 0, likes: 0, comments: 0 },
+}
+const report = ref({
+  jobs: 0, success: 0, failed: 0,
+  totals: emptyTotals,
+  scope: '', hasBaseline: false, snapshotAt: '',
+  coverage: { days: 0, daysWithData: 0, missingDays: [], coverage: 0 },
+  platforms: [], top_contents: [], text: '',
+})
 
 const interactionRate = computed(() => {
-  const p = Number(report.value.totals.plays || 0)
+  const delta = report.value.totals?.delta || {}
+  const p = Number(delta.plays || 0)
   if (!p) return '0.0'
-  return (((Number(report.value.totals.likes) + Number(report.value.totals.comments)) / p) * 100).toFixed(1)
+  return (((Number(delta.likes || 0) + Number(delta.comments || 0)) / p) * 100).toFixed(1)
 })
+
+// ---- 每日趋势（内联 SVG，不引第三方图表库）----
+const trendMetric = ref('plays')
+const trendWidth = 720
+const trendHeight = 160
+const series = ref([])
+
+const trendPoints = computed(() => {
+  const rows = series.value || []
+  if (!rows.length) return []
+  const values = rows.map(r => Number(r[trendMetric.value] || 0))
+  const max = Math.max(...values, 1)
+  const step = rows.length > 1 ? trendWidth / (rows.length - 1) : 0
+  return rows.map((r, i) => ({
+    x: Number((i * step).toFixed(2)),
+    y: Number((trendHeight - (values[i] / max) * (trendHeight - 20) - 10).toFixed(2)),
+    value: values[i],
+    date: r.date,
+    label: r[trendMetric.value],
+    hasSnapshot: r.hasSnapshot !== false,
+  }))
+})
+
+const trendLine = computed(() => trendPoints.value.map(p => `${p.x},${p.y}`).join(' '))
 
 function formatNum(n) {
   const v = Number(n || 0)
@@ -93,9 +191,19 @@ async function load() {
   loading.value = true
   try {
     const r = await http.get('/report/weekly', { days: days.value })
-    report.value = r.data
+    const data = r.data || {}
+    // 老结构兜底，避免接口未升级时前端崩掉。
+    data.totals = data.totals?.delta ? data.totals : { ...emptyTotals, delta: data.totals || emptyTotals.delta }
+    report.value = { ...report.value, ...data }
   } catch (e) { ElMessage.error('周报加载失败') }
   finally { loading.value = false }
+  // 趋势单独拉：它来自 daily_metrics，和周报口径无关，失败不影响主流程。
+  try {
+    const s = await http.get('/api/v2/stats/daily', { days: days.value })
+    series.value = s.data?.series?.series || []
+  } catch (e) {
+    series.value = []
+  }
 }
 
 async function copyText() {
@@ -104,8 +212,22 @@ async function copyText() {
 }
 
 function exportCsv() {
-  const rows = [['指标', '数值'], ['发布任务', report.value.jobs], ['成功', report.value.success], ['失败', report.value.failed],
-    ['播放', report.value.totals.plays], ['点赞', report.value.totals.likes], ['评论', report.value.totals.comments]]
+  const t = report.value.totals
+  const rows = [
+    ['指标', '数值', '口径'],
+    ['发布任务', report.value.jobs, '窗口内'],
+    ['成功', report.value.success, '窗口内'],
+    ['失败', report.value.failed, '窗口内'],
+    ['新增播放', report.value.hasBaseline ? t.delta.plays : '', '本期增量'],
+    ['新增点赞', report.value.hasBaseline ? t.delta.likes : '', '本期增量'],
+    ['新增评论', report.value.hasBaseline ? t.delta.comments : '', '本期增量'],
+    ['累计播放', t.cumulative.plays, '终身累计（参考）'],
+    ['累计点赞', t.cumulative.likes, '终身累计（参考）'],
+    ['本期发布内容数', t.publishedScope.contents, '本期发布口径'],
+    ['本期发布内容累计播放', t.publishedScope.plays, '本期发布口径'],
+    ['快照覆盖天数', report.value.coverage.daysWithData, `共 ${report.value.coverage.days} 天`],
+    ['快照时间', report.value.snapshotAt, ''],
+  ]
   const csv = '\ufeff' + rows.map(r => r.join(',')).join('\n')
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
   const a = document.createElement('a')
@@ -131,9 +253,13 @@ onMounted(async () => {
 .sub { color: #909399; font-size: 13px; margin: 0; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
 .metric { background: #fff; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+.metric.muted { opacity: 0.6; }
 .metric span { color: #606266; font-size: 13px; }
 .metric strong { font-size: 26px; }
 .metric small { color: #909399; font-size: 12px; }
 .card-head { display: flex; justify-content: space-between; align-items: center; }
+.trend { width: 100%; height: 160px; }
+.trend-axis { display: flex; justify-content: space-between; color: #909399; font-size: 12px; margin-top: 4px; }
+.empty-hint { color: #909399; font-size: 13px; padding: 24px 0; text-align: center; }
 @media (max-width: 900px) { .metric-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>

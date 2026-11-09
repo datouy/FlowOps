@@ -658,6 +658,33 @@ def api_v2_publish_rate_limit():
     return jsonify({"code": 200, "msg": None, "data": data}), 200
 
 
+@app.route('/api/v2/stats/daily', methods=['GET'])
+def api_v2_stats_daily():
+    """每日指标时序 + 窗口增量 + 快照覆盖情况。
+
+    三个口径分开给，前端自己挑着展示：
+
+    * ``series``——每天一行的累计值与相对前一天的增量；
+    * ``delta``——最近 N 天的**真实增量**（窗口末快照 − 窗口前快照）；
+    * ``coverage``——有多少天有快照。缺数据时别让 0 冒充真实值。
+    """
+    import daily_metrics
+
+    try:
+        days = int(request.args.get('days', 30))
+    except (TypeError, ValueError):
+        days = 30
+    try:
+        data = {
+            "series": daily_metrics.series(days),
+            "delta": daily_metrics.window_delta(days),
+            "coverage": daily_metrics.coverage(days),
+        }
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"读取每日指标失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
 @app.route('/api/v2/accounts/<int:account_id>/check', methods=['POST'])
 async def api_v2_account_check(account_id: int):
     """单账号健康检查：立刻回写 status / lastCheckAt / failReason。

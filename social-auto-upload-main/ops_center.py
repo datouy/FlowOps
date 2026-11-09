@@ -6,15 +6,18 @@ import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 
 from conf import BASE_DIR
 import ai_content
+import daily_metrics
 import ops_schema
 import publish_jobs
 import stats_reflow
 from db_utils import connect, record_schema_version
+from myUtils.platform_registry import PLATFORM_NAMES
 
 bp = Blueprint("ops_center", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
@@ -31,7 +34,7 @@ INTENT_WORDS = {
     "high": ["价格", "多少钱", "报价", "费用", "报名", "行程", "几天", "优惠", "怎么去", "联系", "微信", "电话"],
     "medium": ["好玩", "值得", "推荐", "攻略", "住宿", "吃", "门票", "孩子", "老人"],
 }
-NAMES = {1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "微博", 6: "百家号"}
+NAMES = PLATFORM_NAMES
 PLATFORM_URLS = {
     "抖音": "https://creator.douyin.com/creator-micro/home",
     "快手": "https://cp.kuaishou.com/",
@@ -303,6 +306,26 @@ def open_capture():
     return jsonify({"code": 200, "data": {"url": url, "opened": opened}, "msg": "请在浏览器中打开评论/私信页，复制内容后使用批量导入"})
 
 def weekly_report(days: int = 7) -> dict:
+    """生成运营周报。
+
+    **口径说明（这里以前是错的）**：
+
+    旧实现直接 ``SUM(content_stats.plays)`` 全表，然后把结果标成"近 N 天"。
+    但 ``content_stats`` 是 UPSERT，每条内容只保留**最新快照**——那个 SUM
+    是**终身累计**，不是周期值。报"本周播放 12 万"而真实增量只有 3000，
+    是会毁掉信任的数字。
+
+    现在分两个口径，都明确标出来：
+
+    * ``delta`` —— **窗口增量**（本周真实涨了多少）。来自
+      ``daily_metrics`` 的快照差值。这是周报的主口径。
+    * ``cumulative`` —— 截至目前的累计值。只作参考，不冒充周期值。
+    * ``publishedScope`` —— 本周**发布**的内容累计表现（"新内容表现如何"，
+      与"本周涨了多少"是两个问题，不能混用）。
+
+    没有基线快照时（比如刚上线还没攒够历史），增量不可信——这时
+    ``hasBaseline=False``，周报会明说数据不完整，而不是报一个 0 冒充真值。
+    """
     days = max(1, min(int(days or 7), 90))
     since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with publish_jobs.get_conn() as c:
@@ -321,33 +344,159 @@ def weekly_report(days: int = 7) -> dict:
     rows = stats_reflow.filter_current_account_rows(rows, accounts)
     success = sum(1 for r in records if r["status"] == "success")
     failed = sum(1 for r in records if r["status"] == "failed")
-    platform = {}
-    for r in rows:
-        p = platform.setdefault(int(r["platform"] or 0), {"contents": 0, "plays": 0, "likes": 0, "comments": 0})
-        p["contents"] += 1
+
+    # ---- 口径一：窗口增量（主口径）----
+    try:
+        delta = daily_metrics.window_delta(days)
+    except Exception:
+        delta = {"days": days, "hasBaseline": False, "snapshotAt": "",
+                 "scope": daily_metrics.SCOPE_CONTENT_PUBLISHED, "platforms": [],
+                 "missingBaseline": []}
+
+    # ---- 口径二：本窗口发布内容的累计表现（参考）----
+    published_scope: dict[int, dict[str, Any]] = {}
+    published_keys: set[str] = set()
+    for record in records:
+        if str(record.get("status") or "") != "success":
+            continue
+        published_keys.add(str(record.get("title") or "").strip())
+    for row in rows:
+        title = str(row.get("title") or "").strip()
+        if not title or title not in published_keys:
+            continue
+        pid = int(row.get("platform") or 0)
+        bucket = published_scope.setdefault(pid, {
+            "contents": 0, "plays": 0, "likes": 0, "comments": 0,
+        })
+        bucket["contents"] += 1
         for k in ("plays", "likes", "comments"):
-            p[k] += int(r[k] or 0)
-    totals = {"plays": sum(v["plays"] for v in platform.values()),
-              "likes": sum(v["likes"] for v in platform.values()),
-              "comments": sum(v["comments"] for v in platform.values())}
+            bucket[k] += int(row[k] or 0)
+
+    # 合并两个口径，供前端展示。
+    platform: dict[int, dict[str, Any]] = {}
+    for entry in delta.get("platforms") or []:
+        pid = int(entry.get("platform") or 0)
+        bucket = platform.setdefault(pid, {
+            "delta": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "cumulative": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "publishedScope": {"contents": 0, "plays": 0, "likes": 0, "comments": 0},
+            "contents": 0,
+            "hasBaseline": bool(entry.get("hasBaseline", True)),
+        })
+        for metric in ("plays", "likes", "comments", "collects", "shares", "followers"):
+            bucket["delta"][metric] += int(entry.get(metric) or 0)
+        for metric in ("plays", "likes", "comments", "collects", "shares", "followers"):
+            bucket["cumulative"][metric] += int(entry.get("cumulative", {}).get(metric) or 0)
+        bucket["contents"] += int(entry.get("contents") or 0)
+    for pid, value in published_scope.items():
+        bucket = platform.setdefault(pid, {
+            "delta": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "cumulative": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "publishedScope": {"contents": 0, "plays": 0, "likes": 0, "comments": 0},
+            "contents": 0,
+            "hasBaseline": False,
+        })
+        bucket["publishedScope"] = value
+
+    # 增量总额只统计有基线的平台——缺基线的平台增量是 0，
+    # 把它们的 0 混进来会让"总额"看起来像"这部分真的没涨"。
+    delta_platforms = [
+        v for v in platform.values() if v.get("hasBaseline", True)
+    ]
+    totals = {
+        "delta": {
+            metric: sum(v["delta"][metric] for v in delta_platforms)
+            for metric in ("plays", "likes", "comments", "collects", "shares", "followers")
+        },
+        "cumulative": {
+            metric: sum(v["cumulative"][metric] for v in platform.values())
+            for metric in ("plays", "likes", "comments", "collects", "shares", "followers")
+        },
+        "publishedScope": {
+            metric: sum(v["publishedScope"][metric] for v in platform.values())
+            for metric in ("contents", "plays", "likes", "comments")
+        },
+    }
+
     top = [{"title": r["title"], "platform": NAMES.get(int(r["platform"] or 0), ""),
             "plays": r["plays"], "likes": r["likes"]} for r in rows[:5]]
+
+    has_baseline = bool(delta.get("hasBaseline"))
     lines = [
         f"近 {days} 天运营周报",
         f"发布任务：{len(jobs)} 个；成功 {success} 个；失败 {failed} 个",
-        f"内容数据：播放 {totals['plays']}；点赞 {totals['likes']}；评论 {totals['comments']}",
     ]
+    if has_baseline:
+        lines.append(
+            f"本期新增：播放 {totals['delta']['plays']}；"
+            f"点赞 {totals['delta']['likes']}；评论 {totals['delta']['comments']}"
+        )
+        lines.append(
+            f"累计数据（截至 {delta.get('snapshotAt') or '最新'}）："
+            f"播放 {totals['cumulative']['plays']}；点赞 {totals['cumulative']['likes']}"
+        )
+    else:
+        # 没有基线快照就说清楚，而不是报 0 冒充真值。
+        lines.append(
+            "本期新增数据暂不可用：缺少上一期的历史快照，"
+            "累计值不能当作本期增量使用。"
+        )
+        lines.append(
+            f"累计数据（仅供参考）：播放 {totals['cumulative']['plays']}；"
+            f"点赞 {totals['cumulative']['likes']}"
+        )
     for pid, v in platform.items():
-        lines.append(f"{NAMES.get(pid, '未知平台')}：{v['contents']} 条，播放 {v['plays']}，点赞 {v['likes']}")
+        name = NAMES.get(pid, "未知平台")
+        # 按平台自己的基线状态判断——有的平台有基线，有的没有，
+        # 不能因为一个平台缺数据就把另一个平台的增量也抹掉。
+        if v.get("hasBaseline", has_baseline):
+            lines.append(
+                f"{name}：本期新增播放 {v['delta']['plays']}，"
+                f"点赞 {v['delta']['likes']}，评论 {v['delta']['comments']}"
+            )
+        else:
+            lines.append(
+                f"{name}：本期新增不可用（缺少基线快照）；"
+                f"累计播放 {v['cumulative']['plays']}，"
+                f"点赞 {v['cumulative']['likes']}"
+            )
     if top:
-        lines.append("表现最好的内容：")
+        lines.append("表现最好的内容（累计）：")
         for i, item in enumerate(top, 1):
             lines.append(f"{i}. {item['platform']}《{item['title']}》播放 {item['plays']}，点赞 {item['likes']}")
     else:
         lines.append("本周还没有回流内容数据，请先同步平台数据。")
-    return {"days": days, "totals": totals, "jobs": len(jobs), "success": success, "failed": failed,
-            "platforms": [dict(platform=pid, name=NAMES.get(pid, "未知"), **v) for pid, v in platform.items()],
-            "top_contents": top, "text": "\n".join(lines)}
+
+    try:
+        coverage = daily_metrics.coverage(days)
+    except Exception:
+        coverage = {"days": days, "daysWithData": 0, "missingDays": [], "coverage": 0}
+
+    return {
+        "days": days,
+        "totals": totals,
+        "jobs": len(jobs),
+        "success": success,
+        "failed": failed,
+        # 口径标记：前端据此决定怎么展示。
+        "scope": delta.get("scope"),
+        "hasBaseline": has_baseline,
+        "snapshotAt": delta.get("snapshotAt") or "",
+        "coverage": coverage,
+        "platforms": [
+            dict(
+                platform=pid,
+                name=NAMES.get(pid, "未知"),
+                delta=v["delta"],
+                cumulative=v["cumulative"],
+                publishedScope=v["publishedScope"],
+                contents=v["contents"],
+            )
+            for pid, v in platform.items()
+        ],
+        "top_contents": top,
+        "text": "\n".join(lines),
+    }
 
 
 
