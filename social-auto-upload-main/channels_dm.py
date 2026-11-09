@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import requests
 
 from dm_platform_common import account_name, clean_text
+from utils.credential_crypto import credential_exists
 from utils.account_http import (
     FALLBACK_USER_AGENT,
     account_proxies,
@@ -80,7 +81,7 @@ class ChannelsClient:
         self._finder_username = ""
         self._wxuin = ""
         cookie_file = str(account.get("cookie_path") or "")
-        if not cookie_file or not Path(cookie_file).is_file():
+        if not cookie_file or not credential_exists(cookie_file):
             raise ChannelsAuthError(
                 f"账号 {account_name(account)} 的 Cookie 文件不存在，请重新扫码登录"
             )

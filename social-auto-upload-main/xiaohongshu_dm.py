@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from utils.credential_crypto import credential_exists
 from dm_platform_common import account_name, clean_text, normalize_timestamp
 from utils.account_browser import open_persistent_account_context_sync
 
@@ -244,7 +245,7 @@ class XhsClient:
 
     def _start(self):
         cookie_file = str(self.account.get("cookie_path") or "")
-        if not cookie_file or not Path(cookie_file).is_file():
+        if not cookie_file or not credential_exists(cookie_file):
             raise XhsAuthError(
                 f"账号 {account_name(self.account)} 的 Cookie 文件不存在，请重新登录"
             )

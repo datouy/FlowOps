@@ -23,6 +23,7 @@ from typing import Any
 from loguru import logger
 
 from conf import BASE_DIR
+from utils.credential_crypto import resolve_credential_path
 
 # 各平台创作者中心的评论管理页。
 COMMENT_PAGES: dict[int, str] = {
@@ -273,9 +274,11 @@ def _account_rows(platform_type: int) -> list[dict]:
     result = []
     for row in rows:
         cookie_path = cookie_dir / Path(str(row.get("filePath") or "")).name
-        if not cookie_path.is_file() or cookie_path.stat().st_size <= 2:
+        # 凭据可能是明文也可能是密文，两种都要认。
+        resolved = resolve_credential_path(cookie_path)
+        if resolved is None or resolved.stat().st_size <= 2:
             continue
-        row["cookie_path"] = str(cookie_path)
+        row["cookie_path"] = str(resolved)
         result.append(row)
     return result
 

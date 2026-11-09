@@ -1,3 +1,5 @@
+from utils.credential_crypto import materialize_storage_state
+from utils.account_browser import save_account_storage_state
 # -*- coding: utf-8 -*-
 """YouTube uploader (browser automation via YouTube Studio).
 
@@ -52,7 +54,7 @@ async def cookie_auth(account_file) -> bool:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True, channel="chrome")
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await browser.new_context(storage_state=materialize_storage_state(account_file) or account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(STUDIO_URL, wait_until="domcontentloaded")
@@ -85,7 +87,7 @@ async def youtube_cookie_gen(account_file, headless: bool = False):
                 break
             await asyncio.sleep(1)
         if ok:
-            await context.storage_state(path=account_file)
+            await save_account_storage_state(context, account_file)
             youtube_logger.success(_msg("✅", f"YouTube 登录态已保存: {account_file}"))
         else:
             youtube_logger.error(_msg("😵", "等待登录超时，未保存登录态"))
@@ -202,7 +204,7 @@ class YouTubeVideo(BaseVideoUploader):
             headless=self.headless, channel="chrome",
             proxy={"server": YT_PROXY} if YT_PROXY else None,
         )
-        context = await browser.new_context(storage_state=self.account_file)
+        context = await browser.new_context(storage_state=materialize_storage_state(self.account_file) or self.account_file)
         context = await set_init_script(context)
         page = await context.new_page()
         page.set_default_timeout(60000)
@@ -322,7 +324,7 @@ class YouTubeVideo(BaseVideoUploader):
 
         # 刷新 cookie
         try:
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
         except Exception:
             pass
         await page.wait_for_timeout(2000)

@@ -1,3 +1,5 @@
+from utils.credential_crypto import materialize_storage_state
+from utils.account_browser import save_account_storage_state
 # -*- coding: utf-8 -*-
 import re
 from datetime import datetime
@@ -15,7 +17,7 @@ from conf import LOCAL_CHROME_HEADLESS
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
         browser = await playwright.firefox.launch(headless=LOCAL_CHROME_HEADLESS)
-        context = await browser.new_context(storage_state=account_file)
+        context = await browser.new_context(storage_state=materialize_storage_state(account_file) or account_file)
         context = await set_init_script(context)
         # 创建一个新的页面
         page = await context.new_page()
@@ -66,7 +68,7 @@ async def get_tiktok_cookie(account_file):
         await page.goto("https://www.tiktok.com/login?lang=en")
         await page.pause()
         # 点击调试器的继续，保存cookie
-        await context.storage_state(path=account_file)
+        await save_account_storage_state(context, account_file)
 
 
 class TiktokVideo(object):
@@ -143,7 +145,7 @@ class TiktokVideo(object):
 
     async def upload(self, playwright: Playwright) -> None:
         browser = await playwright.firefox.launch(headless=self.headless)
-        context = await browser.new_context(storage_state=f"{self.account_file}")
+        context = await browser.new_context(storage_state=materialize_storage_state(self.account_file) or self.account_file)
         context = await set_init_script(context)
         page = await context.new_page()
 
@@ -177,7 +179,7 @@ class TiktokVideo(object):
 
         await self.click_publish(page)
 
-        await context.storage_state(path=f"{self.account_file}")  # save cookie
+        await save_account_storage_state(context, self.account_file)  # save cookie
         tiktok_logger.info('  [-] update cookie！')
         await asyncio.sleep(2)  # close delay for look the video status
         # close all

@@ -24,6 +24,7 @@ from flask import Blueprint
 import dm_cursor
 import dm_ops
 from dm_media_cache import attach_message_media
+from utils.credential_crypto import credential_exists
 from dm_platform_common import (
     BaseDmSync, SyncError, account_name, public_account,
 )
@@ -889,7 +890,7 @@ async def _ensure_douyin_playwright():
 
 async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
     cookie_path = Path(str(account.get("cookie_path") or ""))
-    if not cookie_path.is_file():
+    if not credential_exists(cookie_path):
         raise SyncError("抖音 Cookie 文件不存在，请重新登录账号")
     key = "|".join((
         str(account.get("id") or 0), _account_name(account), str(cookie_path.resolve()),

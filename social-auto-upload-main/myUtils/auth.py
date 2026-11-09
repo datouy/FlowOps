@@ -22,29 +22,25 @@ async def _persist_storage_state(context, account_file) -> bool:
 
     WeChat can rotate cookies while the account is being checked. Closing the
     temporary context without saving those changes leaves the next probe with
-    an increasingly stale session. ``storage_state`` writes directly to its
-    target, so write to a sibling temporary file first and replace atomically.
-    A persistence failure must never turn a valid account into an invalid one.
+    an increasingly stale session.
+
+    The state is written **encrypted** (``secrets/<name>.enc``) — a plaintext
+    cookie file is equivalent to handing over the account.  A persistence
+    failure must never turn a valid account into an invalid one, so this
+    returns False and the caller keeps the previous credential.
     """
+    from utils.account_browser import save_account_storage_state
+
     path = Path(account_file)
-    temp_name = ""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        os.close(fd)
-        await context.storage_state(path=temp_name)
-        os.replace(temp_name, path)
-        temp_name = ""
-        return True
+        saved = await save_account_storage_state(context, path)
+        if not saved:
+            tencent_logger.warning("[+] 保存刷新后的视频号 Cookie 失败")
+        return saved
     except Exception as exc:
         tencent_logger.warning("[+] 保存刷新后的视频号 Cookie 失败: {}", exc)
         return False
-    finally:
-        if temp_name:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
 
 
 @asynccontextmanager

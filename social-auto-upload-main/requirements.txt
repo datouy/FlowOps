@@ -4,6 +4,9 @@ flask-cors>=6,<7
 loguru>=0.7,<0.8
 numpy>=1.26
 opencv-python-headless>=4.10
+# 凭据加密（AES-256-GCM）。没有它就不能落盘加密凭据，
+# 后端启动时会拒绝创建新的凭据文件。
+cryptography>=42,<51
 # 上游不同适配器仍分别 import patchright/playwright，统一驱动前两者都需保留。
 patchright>=1.64,<2
 playwright>=1.52,<2

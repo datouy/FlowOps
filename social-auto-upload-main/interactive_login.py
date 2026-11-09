@@ -47,6 +47,7 @@ from utils.account_environment import (
     load_environment,
     save_environment,
 )
+from utils.credential_crypto import credential_exists
 
 
 DOUYIN_AUTH_COOKIE_NAMES = {
@@ -321,10 +322,49 @@ class InteractivePlatformLogin:
             return self.frame, self.frame_version
 
     @staticmethod
-    def _storage_identity(storage_path: Path) -> str:
+    def _save_storage_state(context, cookie_path: Path) -> bool:
+        """把登录态加密保存（同步 Playwright）。
+
+        ``interactive_login`` 用的是 ``sync_playwright``，异步版
+        ``save_account_storage_state`` 用不了，这里同步落一份等价实现。
+        """
+        from utils import credential_crypto
+
         try:
-            payload = json.loads(storage_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+            state = context.storage_state()
+        except Exception as exc:
+            logger.warning("读取登录态失败（{}）: {}", cookie_path.name, exc)
+            return False
+        if not isinstance(state, dict):
+            logger.warning("登录态格式异常，未保存: {}", cookie_path.name)
+            return False
+        try:
+            credential_crypto.write_storage_state(cookie_path, state)
+        except Exception as exc:
+            logger.warning("加密保存凭据失败（{}）: {}", cookie_path.name, exc)
+            return False
+        legacy = Path(cookie_path)
+        if legacy != credential_crypto.secret_path(cookie_path) and legacy.is_file():
+            try:
+                legacy.unlink()
+            except OSError as exc:
+                logger.debug("删除旧明文凭据失败: {}", exc)
+        return True
+
+    @staticmethod
+    def _storage_identity(storage_path: Path) -> str:
+        """从 storage_state 里取视频号频道标识（``finder_username``）。
+
+        凭据可能是密文，也可能是迁移前的老明文——两条路径都要认。
+        """
+        try:
+            from utils import credential_crypto
+
+            payload = credential_crypto.read_storage_state(storage_path)
+        except Exception as exc:
+            logger.warning("读取账号凭据失败（{}）: {}", storage_path.name, exc)
+            return ""
+        if not isinstance(payload, dict):
             return ""
         for origin in payload.get("origins", []):
             for item in origin.get("localStorage", []):
@@ -363,7 +403,8 @@ class InteractivePlatformLogin:
         cookie_name = f"{uuid.uuid4().hex}.json"
         cookie_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
-        context.storage_state(path=str(cookie_path))
+        # 登录态加密落盘：明文 cookie 文件等同于账号密码。
+        self._save_storage_state(context, cookie_path)
         if self.fingerprint and self.platform != "tencent":
             save_fingerprint(cookie_path, self.fingerprint)
 
@@ -1159,7 +1200,7 @@ class InteractivePlatformLogin:
                         Path(BASE_DIR / "cookiesFile" / f".login-{self.session_id}.json")
                     )
                 environment_cookie = Path(self._environment_cookie)
-                if self.seed_storage and not environment_cookie.is_file():
+                if self.seed_storage and not credential_exists(environment_cookie):
                     environment_cookie = Path(self.seed_storage)
                 if not self.seed_storage:
                     save_environment(environment_cookie, {

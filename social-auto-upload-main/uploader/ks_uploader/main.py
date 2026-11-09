@@ -21,7 +21,10 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import kuaishou_logger
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 
 KUAISHOU_UPLOAD_URL = "https://cp.kuaishou.com/article/publish/video"
 KUAISHOU_MANAGE_URL = "https://cp.kuaishou.com/article/manage/video?status=2&from=publish"
@@ -324,7 +327,7 @@ async def get_ks_cookie(
 
             for _ in range(max_checks):
                 if page.url.startswith(KUAISHOU_UPLOAD_URL) or await _is_ks_login_page_gone(page):
-                    await context.storage_state(path=account_file)
+                    await save_account_storage_state(context, account_file)
                     result = _build_login_result(
                         True, "success", "快手扫码登录成功", account_file,
                         qrcode_info, page.url,
@@ -741,7 +744,7 @@ class KSVideo(KSBaseUploader):
             upload_success = True
         finally:
             if upload_success:
-                await context.storage_state(path=self.account_file)
+                await save_account_storage_state(context, self.account_file)
                 kuaishou_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
             await context.close()
@@ -901,7 +904,7 @@ class KSNote(KSBaseUploader):
             upload_success = True
         finally:
             if upload_success:
-                await context.storage_state(path=self.account_file)
+                await save_account_storage_state(context, self.account_file)
                 kuaishou_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
             await context.close()

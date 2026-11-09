@@ -9,12 +9,15 @@ fingerprint and proxy keep the same account on the same device and egress.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
+
+from loguru import logger
 
 from utils import browser_timeout
 from utils.account_environment import (
@@ -429,3 +432,80 @@ def open_persistent_account_context_sync(playwright, cookie_path: str | Path, **
     manager = persistent_account_context_sync(playwright, cookie_path, **kwargs)
     context = manager.__enter__()
     return _PersistentSyncHandle(context, manager)
+
+
+# --------------------------------------------------------------------------
+# 凭据落盘（加密）
+#
+# 所有平台登录成功后都会执行 ``await context.storage_state(path=...)``。
+# 那个调用写的是**明文 JSON**——里面是完整 cookie，等同于账号密码。
+# 这里统一收口成"先取明文 dict → 加密 → 写 secrets/*.enc"，
+# 平台代码只调用 ``save_account_storage_state(context, path)``。
+
+async def save_account_storage_state(context, cookie_path: str | Path) -> bool:
+    """把浏览器当前的登录态加密保存。
+
+    返回 ``True`` 表示密文已落盘；``False`` 表示保存失败（调用方应保留
+    原有凭据，不要把账号标记成失效）。
+
+    老明文文件在密文写成功后会被删除——明文留在盘上等于没加密。
+    """
+    from utils import credential_crypto
+
+    target = Path(cookie_path)
+    state = await _read_storage_state(context)
+    if not isinstance(state, dict):
+        logger.warning("浏览器登录态格式异常，未保存: {}", target.name)
+        return False
+    try:
+        credential_crypto.write_storage_state(target, state)
+    except Exception as exc:
+        logger.warning("加密保存凭据失败（{}）: {}", target.name, exc)
+        return False
+    # 密文已落盘，删除可能残留的老明文。
+    legacy = target
+    if legacy != credential_crypto.secret_path(target) and legacy.is_file():
+        try:
+            legacy.unlink()
+        except OSError as exc:
+            logger.debug("删除旧明文凭据失败（{}）: {}", legacy.name, exc)
+    return True
+
+
+async def _read_storage_state(context) -> dict[str, Any] | None:
+    """从浏览器上下文取登录态。
+
+    Playwright 的 ``storage_state()`` 既可以"不传 path 直接返回 dict"，也可
+    以"传 path 写到文件"。两种形态都出现过（不同版本的适配器、不同版本的
+    Playwright/patchright），所以这里两种都试：优先无参调用，失败再用临时
+    文件兜底。
+    """
+    try:
+        state = await context.storage_state()
+        if isinstance(state, dict):
+            return state
+    except TypeError:
+        # 只接受 path 关键字的实现：改走临时文件。
+        pass
+    except Exception as exc:
+        logger.warning("读取浏览器登录态失败: {}", exc)
+        return None
+
+    import tempfile
+
+    temp_name = ""
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix="flowops-state-", suffix=".json")
+        os.close(fd)
+        await context.storage_state(path=temp_name)
+        payload = json.loads(Path(temp_name).read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception as exc:
+        logger.warning("读取浏览器登录态失败: {}", exc)
+        return None
+    finally:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass

@@ -34,6 +34,7 @@ import access_scope
 import comment_ops
 from app_logging import logger, setup_request_logging
 from utils.keep_awake import hold_system_awake
+from utils.credential_crypto import resolve_credential_path
 from utils.account_environment import (
     _all_proxy_bindings,
     assign_pool_proxy,
@@ -348,13 +349,14 @@ def interactive_login_start():
             ).fetchone()
         cookie_name = str(cookie_row["filePath"] or "") if cookie_row else ""
         seed_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
-        if not cookie_name or not seed_path.is_file():
+        resolved_seed = resolve_credential_path(seed_path) if cookie_name else None
+        if not cookie_name or resolved_seed is None:
             return jsonify({
                 "code": 400,
                 "msg": "该账号的 Cookie 文件不存在，请先重新扫码登录一次",
                 "data": None,
             }), 400
-        seed_storage = str(seed_path)
+        seed_storage = str(resolved_seed)
     # 覆盖登录前先确认这个账号确实属于当前平台，否则会把抖音账号行写进小红书。
     if account_id is not None:
         row = _account_row(account_id)
@@ -569,6 +571,43 @@ def api_v2_account_credentials(account_id: int):
             "storageKeys": sorted(set(storage_keys))[:200],
         },
     }), 200
+
+
+# ---------------------------------------------------------------- 凭据加密
+#
+# 凭据明文落盘等同于把账号密码写在盘上。这里提供查看状态与批量迁移的
+# 管理接口：迁移是不可逆的（明文被删），所以默认 dry-run，必须显式
+# 传 confirm=true 才会真正执行。
+
+@app.route('/api/v2/credentials/status', methods=['GET'])
+def api_v2_credentials_status():
+    """凭据加密状态：有多少已加密、多少还是明文、主密钥来自哪里。"""
+    from utils import credential_crypto
+
+    try:
+        health = credential_crypto.credential_health()
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"读取凭据状态失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": health}), 200
+
+
+@app.route('/api/v2/credentials/migrate', methods=['POST'])
+def api_v2_credentials_migrate():
+    """把明文凭据批量迁移成密文。
+
+    默认 ``dry_run=true``：只报告"哪些文件会被迁、哪些被跳过"，不落盘不
+    删除。真正执行要传 ``confirm=true``——因为迁移会**删除原明文文件**，
+    不可逆。
+    """
+    from utils import credential_crypto
+
+    payload = request.get_json(silent=True) or {}
+    confirm = bool(payload.get("confirm"))
+    try:
+        result = credential_crypto.migrate_legacy_cookies(dry_run=not confirm)
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"凭据迁移失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": result}), 200
 
 
 @app.route('/api/v2/accounts/<int:account_id>/check', methods=['POST'])
@@ -1858,7 +1897,7 @@ def stats_summary():
 
 @app.route('/stats/trend', methods=['GET'])
 def stats_trend():
-"""统一月度趋势：发布量、播放、互动与环比。"""
+    """统一月度趋势：发布量、播放、互动与环比。"""
     months = request.args.get('months', 6)
     try:
         data = stats_reflow.monthly_trend(int(months))
@@ -1947,7 +1986,8 @@ def _comment_account(account_name: str, platform: str = ""):
         raise ValueError(f"存在多个同名账号“{target}”，请先重命名再操作评论")
     row = matched[0]
     cookie = base / "cookiesFile" / Path(str(row.get("filePath") or "")).name
-    row["cookie_path"] = str(cookie) if cookie.is_file() else ""
+    resolved_cookie = resolve_credential_path(cookie)
+    row["cookie_path"] = str(resolved_cookie) if resolved_cookie else ""
     return row
 
 

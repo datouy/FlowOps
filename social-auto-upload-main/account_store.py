@@ -146,6 +146,37 @@ AUTH_SESSION_FIELDS = (
 )
 
 _COOKIE_FILE_RE = re.compile(r"^[0-9a-f]{32}\.json$")
+# 凭据文件：迁移前是明文 ``<32hex>.json``，迁移后是密文 ``<32hex>.enc``。
+# 两种都要认——账号表里记的是逻辑名（.json），密文是同一名字换后缀。
+_CREDENTIAL_FILE_RE = re.compile(r"^[0-9a-f]{32}\.(json|enc)$")
+
+
+def _logical_cookie_name(name: str) -> str:
+    """密文文件名 → 账号表里记录的逻辑名。"""
+    text = str(name or "")
+    if text.endswith(".enc"):
+        return text[:- len(".enc")] + ".json"
+    return text
+
+
+def credential_file(cookies_dir: Path, cookie_name: str) -> Path | None:
+    """凭据的实际落盘路径（优先密文，其次明文）。
+
+    账号表里记的是逻辑名（``<32hex>.json``）。迁移后磁盘上是
+    ``<32hex>.enc``，所以判断"凭据在不在"必须同时看两个路径，否则迁移
+    过的账号会被误报成"凭据丢失"。
+    """
+    name = str(cookie_name or "").strip()
+    if not name:
+        return None
+    encrypted = cookies_dir / _logical_cookie_name(name).replace(".json", ".enc")
+    if encrypted.is_file():
+        return encrypted
+    legacy = cookies_dir / name
+    if legacy.is_file():
+        return legacy
+    # 都没落盘时返回逻辑路径，调用方用它判断"应该存在但丢了"。
+    return legacy
 
 
 def now_text() -> str:
@@ -189,21 +220,17 @@ def platform_type_of(platform: str | int | None) -> int | None:
 
 
 def read_storage_state(path: str | Path) -> dict[str, Any] | None:
-    """读取 Playwright storage_state；兼容"裸 cookie 列表"的老文件。"""
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if isinstance(payload, list):
-        return {"cookies": payload, "origins": []}
-    if isinstance(payload, dict):
-        cookies = payload.get("cookies")
-        origins = payload.get("origins")
-        return {
-            "cookies": cookies if isinstance(cookies, list) else [],
-            "origins": origins if isinstance(origins, list) else [],
-        }
-    return None
+    """读取 Playwright storage_state。
+
+    优先读加密凭据（``secrets/<name>.enc``）；没有密文时回落老明文 JSON
+    （迁移前的文件）。兼容"裸 cookie 列表"的老格式。
+
+    解密失败会抛 ``ValueError``——那说明主密钥丢了或密文被篡改，必须让
+    调用方知道，不能静默当成"没登录"。
+    """
+    from utils import credential_crypto
+
+    return credential_crypto.read_storage_state(path)
 
 
 def _iter_storage_items(state: dict[str, Any]) -> Iterable[tuple[str, str]]:
@@ -368,7 +395,7 @@ class AccountStore:
         pid = data.get("type")
         meta = platform_meta(pid)
         cookie_name = str(data.get("filePath") or "")
-        cookie_path = self.cookies_dir / cookie_name if cookie_name else None
+        cookie_path = credential_file(self.cookies_dir, cookie_name) if cookie_name else None
         size = 0
         mtime = ""
         session_group = ""
@@ -532,7 +559,7 @@ class AccountStore:
         identity = _normalize_identity(identity)
         now = now_text()
         cookie_size = 0
-        cookie_path = self.cookies_dir / cookie_name if cookie_name else None
+        cookie_path = credential_file(self.cookies_dir, cookie_name) if cookie_name else None
         if cookie_path and cookie_path.is_file():
             try:
                 cookie_size = int(cookie_path.stat().st_size)
@@ -739,7 +766,12 @@ class AccountStore:
         return {"filled": filled, "conflicts": conflicts}
 
     def orphan_cookies(self) -> list[Path]:
-        """返回没有被任何账号引用的 Cookie 文件（只看 <32hex>.json）。"""
+        """返回没有被任何账号引用的凭据文件。
+
+        凭据可能是明文（迁移前 ``<32hex>.json``）也可能是密文
+        （``<32hex>.enc``）——两种都要认，否则清理会把正在用的密文当成
+        垃圾删掉，或者把明文残留漏在盘上。
+        """
         self.ensure_schema()
         try:
             with db_connect(self.db_path) as conn:
@@ -752,11 +784,19 @@ class AccountStore:
             return []
         if not self.cookies_dir.is_dir():
             return []
-        return [
-            path
-            for path in sorted(self.cookies_dir.iterdir())
-            if path.is_file() and _COOKIE_FILE_RE.match(path.name) and path.name not in used
-        ]
+        orphans = []
+        for path in sorted(self.cookies_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if not _CREDENTIAL_FILE_RE.match(name):
+                continue
+            # 账号表里记的是逻辑名（.json）；密文是同一个名字换后缀。
+            logical = _logical_cookie_name(name)
+            if logical in used:
+                continue
+            orphans.append(path)
+        return orphans
 
     def prune_orphans(self, dry_run: bool = True) -> dict[str, Any]:
         orphans = self.orphan_cookies()
@@ -773,14 +813,30 @@ class AccountStore:
         }
 
     def _remove_cookie(self, cookie_name: str) -> bool:
-        if not cookie_name or not _COOKIE_FILE_RE.match(cookie_name):
+        """删除一个凭据文件（明文 + 密文一起清）。"""
+        if not cookie_name:
             return False
-        path = self.cookies_dir / cookie_name
+        logical = _logical_cookie_name(cookie_name)
+        if not _CREDENTIAL_FILE_RE.match(cookie_name) and not _CREDENTIAL_FILE_RE.match(logical):
+            return False
+        removed = False
+        for name in {cookie_name, logical}:
+            path = self.cookies_dir / name
+            try:
+                if path.exists():
+                    path.unlink()
+                    removed = True
+            except OSError:
+                continue
+        # 账号的持久 profile 与指纹也要一起清，否则删了账号还留着
+        # 一个能复现登录态的浏览器目录。
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            return False
-        return True
+            from utils.account_environment import remove_environment
+
+            remove_environment(self.cookies_dir / logical)
+        except Exception:
+            pass
+        return removed
 
     def stats(self) -> dict[str, Any]:
         self.ensure_schema()

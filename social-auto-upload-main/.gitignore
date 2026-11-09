@@ -184,6 +184,11 @@ node_modules/
 # database
 db/database.db
 
+# 凭据主密钥（DPAPI 保护或本机降级文件）。
+# 绝对不能进仓库：拿到它就能解密 cookiesFile/ 下的全部账号凭据。
+db/.master_key
+db/.master_key.dpapi
+
 # 临时文件夹
 cookiesFile
 uploadFile

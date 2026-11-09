@@ -25,7 +25,10 @@ from patchright.async_api import Page, Playwright, TimeoutError as PWTimeoutErro
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import weibo_logger
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 from utils.login_qrcode import build_login_qrcode_path, remove_qrcode_file
 
 
@@ -210,7 +213,7 @@ async def weibo_cookie_gen(account_file, qrcode_callback=None, poll_interval: in
 
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
+                await save_account_storage_state(context, account_file)
                 weibo_logger.success(_msg("🥳", f"cookie 已保存: {account_file}"))
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
@@ -372,7 +375,7 @@ class WeiBoVideo(BaseVideoUploader):
             await self._submit_publish(publish_page)
 
             # 保存 cookie
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             weibo_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()

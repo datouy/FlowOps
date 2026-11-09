@@ -23,7 +23,10 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import xiaohongshu_logger
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 
 XHS_DEFAULT_CREATOR_BASE_URL = "https://creator.xiaohongshu.com"
 XHS_CREATOR_BASE_URL_ENV = "SAU_XHS_CREATOR_BASE_URL"
@@ -566,7 +569,7 @@ async def xiaohongshu_cookie_gen(
             for _ in range(max_checks):
                 if await _is_xhs_login_completed(page):
                     await asyncio.sleep(2)
-                    await context.storage_state(path=account_file)
+                    await save_account_storage_state(context, account_file)
                     result = _build_login_result(
                         True, "success", "小红书扫码登录成功", account_file,
                         qrcode_info, page.url,
@@ -1242,7 +1245,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         try:
             page = await context.new_page()
             result = await self.upload_video_content(page)
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
             return result
         finally:
@@ -1445,7 +1448,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
             page.on("response", capture)
             result = await self.upload_note_content(page, captured_responses)
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
             return result
         finally:

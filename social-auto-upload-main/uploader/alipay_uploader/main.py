@@ -1,3 +1,5 @@
+from utils.credential_crypto import materialize_storage_state
+from utils.account_browser import save_account_storage_state
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -187,7 +189,7 @@ async def alipay_cookie_gen(account_file, qrcode_callback=None, poll_interval: i
 
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
+                await save_account_storage_state(context, account_file)
                 # 登录结束，轻量确认 cookie 文件里有点东西
                 try:
                     _d = _json.load(open(account_file))
@@ -226,7 +228,7 @@ async def cookie_auth(account_file):
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await browser.new_context(storage_state=materialize_storage_state(account_file) or account_file)
             page = await context.new_page()
             await page.goto(ALIPAY_LIFE_ACCOUNT_URL, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
@@ -673,7 +675,7 @@ class AlipayVideo(BaseVideoUploader):
         alipay_logger.info(_msg("🥳", "上传前检查通过"))
 
         browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        context = await browser.new_context(storage_state=materialize_storage_state(self.account_file) or self.account_file)
         await context.grant_permissions(["geolocation"])
         # 注意：不能用 set_init_script(stealth) —— 会阻止支付宝内容创作平台(qiankun 微应用)渲染
 
@@ -691,7 +693,7 @@ class AlipayVideo(BaseVideoUploader):
             await self.wait_for_upload_complete(page)
             await self.submit_publish(page)
 
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             alipay_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()

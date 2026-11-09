@@ -455,11 +455,19 @@ def assign_pool_proxy(
 
 
 def _read_storage_state(cookie_path: str | Path) -> dict[str, Any]:
+    """读取 storage_state（优先密文，回落老明文）。
+
+    解密失败返回空 dict——这里用于"把登录态播种进持久 profile"，失败时
+    宁可不播种，也不能把异常抛到浏览器启动流程里。
+    """
+    from utils import credential_crypto
+
     try:
-        payload = json.loads(Path(cookie_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+        state = credential_crypto.read_storage_state(cookie_path)
+    except Exception as exc:
+        logger.warning("读取凭据失败（{}）: {}", Path(cookie_path).name, exc)
         return {}
-    return payload if isinstance(payload, dict) else {}
+    return state if isinstance(state, dict) else {}
 
 
 def _local_storage_script(state: dict[str, Any]) -> str:

@@ -10,7 +10,10 @@ from loguru import logger
 
 from myUtils.auth import check_cookie
 from utils.base_social_media import set_init_script
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 import uuid
 from pathlib import Path
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
@@ -530,7 +533,7 @@ async def get_tencent_cookie(id, status_queue, account_id=None):
                 status_queue.put("500")
                 return False
 
-            await context.storage_state(path=cookie_path)
+            await save_account_storage_state(context, cookie_path)
 
         # 校验 Cookie；偶发失败重试一次，避免把"其实成功了"判成失败
         valid = False
@@ -613,7 +616,7 @@ async def get_ks_cookie(id, status_queue, account_id=None):
             )
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)
             logger.info("快手登录页面跳转成功")
-            await context.storage_state(path=cookie_path)
+            await save_account_storage_state(context, cookie_path)
             logged_in = True
         except asyncio.TimeoutError:
             logger.warning("快手登录页面跳转超时")
@@ -724,7 +727,7 @@ async def xiaohongshu_cookie_gen(id, status_queue, account_id=None):
                 raise RuntimeError("小红书创作服务平台登录态未建立，请重新扫码")
 
             logger.debug("登录凭证文件名: {}", cookie_name)
-            await context.storage_state(path=cookie_path)
+            await save_account_storage_state(context, cookie_path)
 
             saved = save_login_account(1, cookie_name, id, account_id)
             logger.info("小红书账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))

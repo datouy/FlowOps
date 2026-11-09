@@ -51,6 +51,7 @@ from typing import Any
 
 from loguru import logger
 
+from utils.credential_crypto import credential_exists
 from utils import browser_timeout
 
 # ---------------------------------------------------------------- 动作定义
@@ -356,7 +357,7 @@ class DomCommentAdapter:
 
         validate_comment(comment, action)
         cookie_path = str(self.account.get("cookie_path") or "")
-        if not cookie_path or not Path(cookie_path).is_file():
+        if not cookie_path or not credential_exists(cookie_path):
             raise CommentActionError(
                 "账号的 Cookie 文件不存在，请重新扫码登录后再操作评论"
             )

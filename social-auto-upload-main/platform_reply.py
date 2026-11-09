@@ -13,6 +13,7 @@ from loguru import logger
 
 from conf import BASE_DIR
 from db_utils import connect
+from utils.credential_crypto import credential_exists, resolve_credential_path
 from utils.account_browser import open_persistent_account_context_sync
 
 MAIN_DB = Path(BASE_DIR / "db" / "database.db")
@@ -33,8 +34,10 @@ def _account_by_type(account_type: int, account_name: str):
     available = []
     for row in rows:
         cookie = COOKIE_DIR / Path(str(row.get("filePath") or "")).name
-        if cookie.is_file() and cookie.stat().st_size > 2:
-            row["cookie_path"] = cookie
+        # 凭据可能是明文也可能是密文，两种都要认。
+        resolved = resolve_credential_path(cookie)
+        if resolved is not None and resolved.stat().st_size > 2:
+            row["cookie_path"] = resolved
             available.append(row)
     target = str(account_name or "").strip()
     if target:

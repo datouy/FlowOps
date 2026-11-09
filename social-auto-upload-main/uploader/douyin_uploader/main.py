@@ -24,7 +24,10 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import douyin_logger
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 import verify_codes
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
@@ -973,7 +976,7 @@ async def douyin_form_cookie_gen(
                 poll_count += 1
                 if await _is_douyin_login_completed(page):
                     await asyncio.sleep(2)
-                    await context.storage_state(path=account_file)
+                    await save_account_storage_state(context, account_file)
                     result = _build_login_result(
                         True,
                         "success",
@@ -1092,7 +1095,7 @@ async def douyin_cookie_gen(
             )
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
+                await save_account_storage_state(context, account_file)
                 # 登录已通过"发布视频"确认成功、storage_state 刚从已登录浏览器抓下来，
                 # 不再用 flaky 的浏览器重检（那正是导致成功被误判为失败的老 bug）。
                 # 只轻量确认文件里有 sessionid。
@@ -2197,7 +2200,7 @@ class DouYinVideo(DouYinBaseUploader):
             _msg("🥳", f"作品已回查：{result['state']}，ID {result['post_id']}")
         )
 
-        await context.storage_state(path=self.account_file)
+        await save_account_storage_state(context, self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
         await asyncio.sleep(2)
         return result
@@ -2358,7 +2361,7 @@ class DouYinNote(DouYinBaseUploader):
             result = await self._verify_published_note(page, self.title, captured_responses)
         finally:
             if upload_success:
-                await context.storage_state(path=self.account_file)
+                await save_account_storage_state(context, self.account_file)
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
             await context.close()

@@ -10,6 +10,7 @@ from loguru import logger
 from conf import BASE_DIR
 import verify_codes
 from db_utils import connect, record_schema_version
+from utils.credential_crypto import credential_exists
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
 _lock = threading.Lock()
@@ -1313,7 +1314,7 @@ def _platform_account_for_item(item: dict) -> tuple[dict, dict]:
     if platform_type not in (1, 2, 3):
         raise ValueError("该平台暂不支持作品管理")
     cookie_path = Path(BASE_DIR / 'cookiesFile' / cookie)
-    if not cookie_path.is_file():
+    if not credential_exists(cookie_path):
         raise ValueError("作品所属账号的凭据文件不存在，请重新登录")
     return account, {
         "id": int(account['id']),

@@ -22,7 +22,10 @@ from utils.account_fingerprint import (
     legacy_linux_fingerprint,
 )
 from utils.base_social_media import set_init_script
-from utils.account_browser import open_persistent_account_context
+from utils.account_browser import (
+    open_persistent_account_context,
+    save_account_storage_state,
+)
 from utils.account_environment import (
     account_id_for_cookie,
 )
@@ -612,7 +615,7 @@ async def tencent_cookie_gen(
             )
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
+                await save_account_storage_state(context, account_file)
         except Exception as exc:
             result = _build_login_result(
                 False,
@@ -1452,7 +1455,7 @@ class TencentVideo(TencentBaseUploader):
             await self.set_short_title(page, self.title, self.short_title)
             self.publish_result = await self.submit_publish(page)
 
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
             return self.publish_result
         finally:
@@ -1658,7 +1661,7 @@ class TencentNote(TencentBaseUploader):
 
             self.publish_result = await self.submit_publish(page)
 
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
             return self.publish_result
         finally:

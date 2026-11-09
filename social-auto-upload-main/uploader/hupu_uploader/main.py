@@ -27,6 +27,7 @@ from playwright.async_api import BrowserContext, Page, Playwright, async_playwri
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import hupu_logger
+from utils.account_browser import save_account_storage_state
 
 
 HUPU_HOME_URL = "https://www.hupu.com/"
@@ -174,7 +175,7 @@ async def hupu_cookie_gen(account_file, qrcode_callback=None, poll_interval: int
                 if "www.hupu.com" not in page.url:
                     await page.goto(HUPU_HOME_URL, timeout=30000, wait_until="domcontentloaded")
                     await page.wait_for_timeout(3000)
-                await context.storage_state(path=account_file)
+                await save_account_storage_state(context, account_file)
                 hupu_logger.success(_msg("🥳", f"cookie 已保存: {account_file}"))
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
@@ -375,7 +376,7 @@ class HuPuVideo(BaseVideoUploader):
             await self._submit_publish(page)
 
             # 保存 cookie
-            await context.storage_state(path=self.account_file)
+            await save_account_storage_state(context, self.account_file)
             hupu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()

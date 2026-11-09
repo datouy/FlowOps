@@ -213,7 +213,13 @@ Copy-Item social-auto-upload-main\.env.example social-auto-upload-main\.env
 notepad social-auto-upload-main\.env
 ```
 
-`.env` 已被 `.gitignore` 排除，不会进入仓库。异常通知可在同一文件中配置：
+`.env` 已被 `.gitignore` 排除，不会进入仓库。**请务必设置凭据加密主密钥**（不设置会用系统凭据库兜底，但换机器后无法解密已保存的账号凭据）：
+
+```text
+FLOWOPS_SECRET_KEY=一串足够长的随机口令
+```
+
+异常通知可在同一文件中配置：
 
 ```text
 OPS_WEBHOOK_URL=你的企业微信/飞书机器人地址
@@ -282,7 +288,12 @@ FlowOps/
 - 后端和前端默认只监听 `127.0.0.1`，同局域网设备无法直接打开工作台。确需远程访问时，必须在 `.env` 中同时设置 `YUNCE_HOST`、`YUNCE_ALLOW_REMOTE=1` 和 `YUNCE_ACCESS_TOKEN`；缺少令牌时后端会拒绝启动。前端请求会自动携带 `X-YunCe-Token`。
 - 设置访问令牌后，在浏览器控制台执行 `localStorage.setItem('yunce_access_token', '你的令牌')` 即可让前端携带令牌；不要把令牌写进 `VITE_*` 变量，否则会被打包进前端代码。
 - `.env`、数据库、Cookie、日志、上传素材、虚拟环境和前端构建产物均不进入仓库。
-- `cookiesFile/` 中的登录凭证仍是明文 JSON，请勿复制、提交或通过网盘共享；工作台默认仅限本机访问正是为了避免这些凭证被同网段设备滥用。
+- **账号登录态加密存储**：`cookiesFile/` 下的 Playwright `storage_state` 用 **AES-256-GCM** 加密落盘（文件后缀 `.enc`），不再有明文 cookie 文件。密文与账号绑定（AAD），跨账号搬运、篡改、用错主密钥都会被直接拒绝。
+  - 主密钥来源优先级：`FLOWOPS_SECRET_KEY` 环境变量 → 系统凭据库（Windows DPAPI / macOS Keychain / Linux keyring）→ 本机降级文件 `db/.master_key`。
+  - **生产环境请设置 `FLOWOPS_SECRET_KEY`**：换机器、重装系统或清理 `db/` 目录后，降级密钥会丢，已保存的凭据将无法解密，只能重新扫码登录。
+  - 迁移老凭据：`POST /api/v2/credentials/migrate`（默认 dry-run，只报告不改动；加 `confirm: true` 才真正执行并删除明文）。查看状态：`GET /api/v2/credentials/status`。
+- `cookiesFile/` 中的登录凭证仍是加密 JSON，请勿复制、提交或通过网盘共享；工作台默认仅限本机访问正是为了避免这些凭证被同网段设备滥用。
+- 日志与接口响应里的 cookie 值统一脱敏（`sessionid` / `SESSDATA` / `BDUSS` 等敏感项完全遮蔽）。
 - 数据库首次启动会自动建表；账号登录态请在本机重新扫码生成。
 - 请仅操作自己拥有或获授权的账号。
 - 本项目通过浏览器自动化模拟人工操作，平台没有面向个人开放的统一发布或私信 API。请遵守各平台用户协议，控制发布和回复频率。
