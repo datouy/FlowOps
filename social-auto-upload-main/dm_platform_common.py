@@ -19,6 +19,7 @@ from loguru import logger
 from conf import BASE_DIR
 import dm_cursor
 import dm_ops
+import runtime_guard
 from db_utils import apply_migrations, connect
 
 ACCOUNT_DB = Path(BASE_DIR) / "db" / "database.db"
@@ -1137,6 +1138,9 @@ class BaseDmSync:
 
     def _background_loop(self) -> None:
         while True:
+            # 心跳只表示"这个循环还活着"：关闭自动同步、没有账号、平台没新消息
+            # 都算正常活着；只有循环卡住或线程死了才该被看门狗抓出来。
+            runtime_guard.beat(self.guard_name)
             try:
                 settings = self.load_settings()
                 if not settings.get("enabled"):
@@ -1167,14 +1171,27 @@ class BaseDmSync:
                     if result.get("no_accounts") and self.no_accounts_is_normal():
                         # 没配置账号是正常状态，别每 30 秒重试一次
                         gap = max(gap, self.no_accounts_backoff)
+                # 业务结果单独记：同步失败 != 线程故障，连续失败要能在
+                # /health/ready 与私信中心的同步状态里看到。
+                runtime_guard.beat(
+                    self.guard_name,
+                    ok=bool(result.get("ok")),
+                    error=str(result.get("error") or ""),
+                )
                 with self._state_lock:
                     self._next_run_at = time.time() + gap
             except Exception as exc:
+                runtime_guard.beat(self.guard_name, ok=False, error=str(exc))
                 self.log.exception("background loop error: {}", exc)
                 with self._state_lock:
                     self._next_run_at = time.time() + self.failure_backoff
                 self._wake_event.wait(30)
                 self._wake_event.clear()
+
+    @property
+    def guard_name(self) -> str:
+        """看门狗里用的任务名（与线程名保持一致，便于对照日志）。"""
+        return f"{self.key}-dm-sync"
 
     def start_background(self) -> None:
         with self._state_lock:
@@ -1188,3 +1205,15 @@ class BaseDmSync:
             daemon=True,
         )
         thread.start()
+
+    def restart_background(self) -> None:
+        """线程死掉后重新拉起同步循环（看门狗用）。
+
+        ``start_background`` 是幂等的，线程没了它也不会重建；重启必须先把
+        ``_worker_started`` 打回 False。游标和已入库的消息都在库里，重启不会
+        重新拉一遍历史——去重靠 ``external_message_id``。
+        """
+        with self._state_lock:
+            self._worker_started = False
+        self.log.warning("重新拉起 {} 私信同步线程", self.key)
+        self.start_background()

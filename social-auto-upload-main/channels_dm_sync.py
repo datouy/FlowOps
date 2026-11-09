@@ -496,6 +496,11 @@ def start_background():
     sync_manager.start_background()
 
 
+def restart_background():
+    """线程死掉后重新拉起视频号私信同步（看门狗用）。"""
+    sync_manager.restart_background()
+
+
 def _status_payload() -> dict:
     return sync_manager.status_payload()
 

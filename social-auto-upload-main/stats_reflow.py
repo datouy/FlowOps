@@ -16,6 +16,7 @@ from typing import Any
 from loguru import logger
 from patchright.async_api import async_playwright
 
+import runtime_guard
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
 from utils.account_browser import open_persistent_account_context
@@ -833,14 +834,26 @@ def start_stats_loop(interval_hours: int = 24):
         _stats_started = True
 
     def _loop():
+        runtime_guard.beat('stats-reflow')
         while True:
             try:
                 run_stats_reflow_once()
-            except Exception:
+                runtime_guard.beat('stats-reflow')
+            except Exception as exc:
+                runtime_guard.beat('stats-reflow', ok=False, error=str(exc))
                 traceback.print_exc()
             time.sleep(max(1, interval_hours) * 3600)
 
     threading.Thread(target=_loop, daemon=True).start()
+
+
+def restart_stats_loop(interval_hours: int = 24) -> None:
+    """线程死掉后重新拉起数据回流（看门狗用）。"""
+    global _stats_started
+    with _lock:
+        _stats_started = False
+    logger.warning("重新拉起数据回流线程")
+    start_stats_loop(interval_hours)
 
 
 def stats_status() -> dict:

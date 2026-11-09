@@ -22,6 +22,7 @@ from typing import Any
 
 from loguru import logger
 
+import runtime_guard
 from conf import BASE_DIR
 from utils.credential_crypto import resolve_credential_path
 
@@ -386,14 +387,41 @@ def comment_status() -> dict:
 
 # ---------------------------------------------------------------- 后台线程
 
+_comment_loop_started = False
+_comment_loop_guard = threading.Lock()
+
+
 def start_comment_loop(interval_seconds: int = DEFAULT_INTERVAL) -> None:
-    """启动评论自动同步的后台线程。"""
+    """启动评论自动同步的后台线程（幂等）。
+
+    注意：这个方法以前**没有**幂等保护，被调用两次就会跑两个同步线程——
+    两个线程同时拉同一批评论，重复入库、互相抢游标。看门狗重启线程之后
+    这个隐患会从"潜在"变成"必然"，所以顺手补上。
+    """
+    global _comment_loop_started
+    with _comment_loop_guard:
+        if _comment_loop_started:
+            return
+        _comment_loop_started = True
+
     def _loop():
+        runtime_guard.beat('comment-sync')
         while True:
             try:
                 run_comment_sync_once()
-            except Exception:
+                runtime_guard.beat('comment-sync')
+            except Exception as exc:
+                runtime_guard.beat('comment-sync', ok=False, error=str(exc))
                 logger.exception("评论自动同步异常")
             time.sleep(max(60, int(interval_seconds or DEFAULT_INTERVAL)))
 
     threading.Thread(target=_loop, name="comment-sync", daemon=True).start()
+
+
+def restart_comment_loop(interval_seconds: int = DEFAULT_INTERVAL) -> None:
+    """线程死掉后重新拉起评论同步（看门狗用）。"""
+    global _comment_loop_started
+    with _comment_loop_guard:
+        _comment_loop_started = False
+    logger.warning("重新拉起评论同步线程")
+    start_comment_loop(interval_seconds)
