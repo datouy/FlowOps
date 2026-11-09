@@ -9,6 +9,8 @@ from pathlib import Path
 from loguru import logger
 from conf import BASE_DIR
 import job_events
+import publish_preflight
+import runtime_guard
 import verify_codes
 from db_utils import connect, record_schema_version
 from utils.credential_crypto import credential_exists
@@ -450,6 +452,9 @@ KIND_FILE_MISSING = 'file_missing'
 KIND_NETWORK = 'network'
 # 触发发布速率上限：不是失败，是"太慢了"。这类子任务不消耗失败次数。
 KIND_RATE_LIMITED = 'rate_limited'
+# 发布前预检未通过：素材/凭据/代理/指纹/合规这类**输入不合法**，
+# 不是平台的问题。跳过而不算失败——重试也还是同样的脏输入。
+KIND_PRECHECK = 'precheck_failed'
 # 平台没有发布后回查能力，结果只能停在"已提交，未验证"。
 KIND_UNVERIFIED = 'unverified'
 KIND_UNKNOWN = 'unknown'
@@ -1915,6 +1920,49 @@ def _run_job(job_id):
                 )
                 continue
 
+            # 发布前预检：把"注定失败"的子任务挡在浏览器动作之前。
+            #
+            # 素材被删、凭据文件坏掉、代理地址少写 scheme、文案含违规词——这些
+            # 都不是"平台不稳定"，而是**输入不合法**。放它们进去只会白烧一次
+            # 账号动作（起浏览器 / 校验登录态 / 进上传页），还会把"失败率"这个
+            # 指标污染成噪音：真正该关注的是平台拒绝，不是我们自己的脏数据。
+            #
+            # 预检不过 → 跳过，不消耗 attempts、不动账号健康状态、不发账号动作。
+            preflight = {"ok": True, "blockers": [], "warnings": [], "errors": []}
+            if publish_preflight.preflight_enabled():
+                try:
+                    preflight = publish_preflight.preflight_publish(job, item)
+                except Exception as exc:
+                    # 预检自己出错绝不能挡住发布——降级为放行。
+                    logger.warning("发布预检异常，放行子任务 {}：{}", item_id, exc)
+                    preflight = {"ok": True, "blockers": [], "warnings": [], "errors": []}
+            if preflight.get("blockers"):
+                reason = publish_preflight.summarize(preflight)
+                _update_item(
+                    item_id, status=ITEM_SKIPPED, error_kind=KIND_PRECHECK,
+                    error=reason, finished_at=now,
+                )
+                job_events.record(
+                    job_id, job_events.STAGE_SKIPPED,
+                    f"发布前预检未通过，已跳过：{reason}",
+                    payload={
+                        "itemId": item_id,
+                        "account": item['account_name'],
+                        "codes": preflight.get("errors") or [],
+                    },
+                )
+                logger.warning(
+                    "子任务 {} 预检未通过（{}）：{}",
+                    item_id, ",".join(preflight.get("errors") or []), reason,
+                )
+                continue
+            for warning in (preflight.get("warnings") or [])[:3]:
+                job_events.record(
+                    job_id, job_events.STAGE_JOB,
+                    f"预检提示：{warning.get('message') or ''}",
+                    payload={"itemId": item_id, "code": warning.get("code")},
+                )
+
             with _account_lock(account_id):
                 attempts = int(item['attempts'] or 0) + 1
                 with get_conn() as c:
@@ -2493,10 +2541,13 @@ def start_publish_runtime(
 
     if start_scheduler:
         def _schedule_loop():
+            runtime_guard.beat('publish-scheduler')
             while True:
                 try:
                     run_schedule_once()
-                except Exception:
+                    runtime_guard.beat('publish-scheduler')
+                except Exception as exc:
+                    runtime_guard.beat('publish-scheduler', ok=False, error=str(exc))
                     traceback.print_exc()
                 time.sleep(max(5, int(schedule_interval_seconds)))
 
@@ -2504,14 +2555,32 @@ def start_publish_runtime(
 
     if start_tracker:
         def _tracking_loop():
+            runtime_guard.beat('publish-tracker')
             while True:
                 try:
                     run_tracking_once()
-                except Exception:
+                    runtime_guard.beat('publish-tracker')
+                except Exception as exc:
+                    runtime_guard.beat('publish-tracker', ok=False, error=str(exc))
                     traceback.print_exc()
                 time.sleep(max(15, int(tracking_interval_seconds)))
 
         threading.Thread(target=_tracking_loop, daemon=True, name='publish-tracker').start()
+
+
+def restart_publish_runtime(schedule_interval_seconds: int = 30,
+                            tracking_interval_seconds: int = 60) -> None:
+    """线程死掉后重新拉起调度/追踪（看门狗用）。
+
+    ``start_publish_runtime`` 是幂等的——幂等在这里是缺点：线程没了它也不
+    会重建。所以重启必须先把 ``_started`` 标志打回 False。
+    """
+    global _scheduler_started, _tracker_started
+    with _lock:
+        _scheduler_started = False
+        _tracker_started = False
+    logger.warning("重新拉起发布调度/追踪线程")
+    start_publish_runtime(schedule_interval_seconds, tracking_interval_seconds)
 
 # ---------- account patrol ----------
 _patrol_started = False
@@ -2523,10 +2592,13 @@ def start_patrol(interval_hours=12):
             return
         _patrol_started = True
     def _loop():
+        runtime_guard.beat('account-patrol')
         while True:
             try:
                 run_patrol_once()
-            except Exception:
+                runtime_guard.beat('account-patrol')
+            except Exception as exc:
+                runtime_guard.beat('account-patrol', ok=False, error=str(exc))
                 traceback.print_exc()
             # 顺带清理过期事件：事件表是流水账，会一直涨。
             # 挂在巡检循环里是合适的——每天一次，量足够小。
@@ -2538,6 +2610,15 @@ def start_patrol(interval_hours=12):
                 traceback.print_exc()
             time.sleep(interval_hours * 3600)
     threading.Thread(target=_loop, daemon=True).start()
+
+
+def restart_patrol(interval_hours: int = 12) -> None:
+    """线程死掉后重新拉起账号巡检（看门狗用）。"""
+    global _patrol_started
+    with _lock:
+        _patrol_started = False
+    logger.warning("重新拉起账号巡检线程")
+    start_patrol(interval_hours)
 
 def run_patrol_once():
     import asyncio

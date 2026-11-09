@@ -318,3 +318,82 @@ def fingerprint_init_script(fingerprint: dict[str, Any] | None) -> str:
   try {{ localStorage.setItem('_finger_print_device_id', {json.dumps(str(profile.get('device_id')), ensure_ascii=False)}); }} catch (_) {{}}
 }})();
 """
+
+
+# ---------------------------------------------------------------- 一致性自检
+#
+# 伪造/复用的指纹最容易在"同一份数据自相矛盾"上露馅，而且这种矛盾**不需要
+# 启动浏览器**就能查出来：UA 说 Chrome 132、UA-CH 的 brands 说 131；platform
+# 写 Win32 但 UA 是 Macintosh；屏幕 1920x1080 但 availHeight 比 height 还大。
+# 平台侧任何一次高熵取值都会把这些矛盾拿走，所以发布前先自己查一遍。
+
+_UA_PLATFORM_HINTS = (
+    ("windows", ("Windows NT",)),
+    ("macos", ("Macintosh", "Mac OS X")),
+    ("linux", ("X11; Linux", "Linux x86_64")),
+)
+
+
+def user_agent_major(user_agent: str) -> str:
+    """从 UA 里取 Chrome 主版本号，取不到返回空串。"""
+    match = re.search(r"Chrome/(\d+)", str(user_agent or ""))
+    return match.group(1) if match else ""
+
+
+def fingerprint_consistency(profile: dict[str, Any] | None) -> list[str]:
+    """返回指纹内部不一致的描述列表（空列表 = 自洽）。
+
+    只做静态比对，不发请求、不起浏览器，可以在预检里随便调。
+    """
+    if not isinstance(profile, dict) or not profile:
+        return ["指纹为空"]
+    problems: list[str] = []
+    ua = str(profile.get("user_agent") or "")
+    if not ua:
+        return ["指纹里没有 user_agent"]
+
+    major = user_agent_major(ua)
+    if not major:
+        problems.append("UA 里没有 Chrome 版本号")
+
+    data = profile.get("user_agent_data")
+    if isinstance(data, dict):
+        brands = data.get("brands") or []
+        for brand in brands:
+            if not isinstance(brand, dict):
+                continue
+            name = str(brand.get("brand") or "")
+            version = str(brand.get("version") or "")
+            if name == "Google Chrome" and major and version and version != major:
+                problems.append(
+                    f"UA 声明 Chrome {major}，UA-CH brands 声明 {version}"
+                )
+        full = data.get("fullVersionList") or []
+        if isinstance(full, list) and full:
+            first = full[0] if isinstance(full[0], dict) else {}
+            if not first.get("brand"):
+                problems.append("UA-CH fullVersionList 结构异常")
+    else:
+        problems.append("指纹里没有 user_agent_data（高熵取值会直接暴露缺失）")
+
+    platform_key = str(profile.get("platform") or "").strip().lower()
+    if platform_key:
+        hints = dict(_UA_PLATFORM_HINTS).get(platform_key) or ()
+        if hints and not any(hint in ua for hint in hints):
+            problems.append(f"platform={platform_key} 与 UA 里的系统标识不一致")
+
+    screen = profile.get("screen") or {}
+    height = int(screen.get("height") or 0)
+    avail = int(screen.get("avail_height") or 0)
+    if height and avail and avail > height:
+        problems.append(f"屏幕可用高度 {avail} 大于总高度 {height}")
+
+    viewport = profile.get("viewport") or {}
+    vw = int(viewport.get("width") or 0)
+    if vw and screen.get("width") and vw > int(screen["width"]):
+        problems.append("视口宽度大于屏幕宽度")
+
+    languages = profile.get("languages")
+    if not languages:
+        problems.append("指纹里没有 languages")
+    return problems
