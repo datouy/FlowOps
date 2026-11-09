@@ -832,6 +832,9 @@ class TencentBaseUploader(BaseVideoUploader):
         # 轮询各 frame 的 input[type=file]，表单真正挂载后立即继续。
 
     async def upload_video_file(self, page: Page, file_path: str) -> None:
+        # 对齐蚁小二 shipinghaoRun：wujie 微前端把编辑器藏在 shadowRoot 里，
+        # frame 遍历扫不到；先 JS 穿透 shadow 取到 input 句柄直接注入，
+        # 失败再走 CDP DOM.setFileInputFiles 兜底，最后才回落常规 locator。
         async def find_file_input():
             for fr in page.frames:  # 主 frame + 所有 iframe（视频号编辑器可能在 iframe 内）
                 try:
@@ -840,7 +843,69 @@ class TencentBaseUploader(BaseVideoUploader):
                         return fi.first
                 except Exception:
                     continue
+            # wujie 微前端：编辑器藏在 shadowRoot 里，frame 遍历扫不到。
+            # 用 JS 穿透 shadowRoot 直接拿 input 句柄（对齐蚁小二 shipinghaoRun）。
+            try:
+                handle = await page.evaluate_handle(
+                    """() => {
+                        const walk = (root) => {
+                            if (!root || !root.querySelectorAll) return null;
+                            const inputs = root.querySelectorAll('input[type="file"]');
+                            for (const el of inputs) { if (el) return el; }
+                            const all = root.querySelectorAll('*');
+                            for (const el of all) {
+                                if (el.shadowRoot) {
+                                    const hit = walk(el.shadowRoot);
+                                    if (hit) return hit;
+                                }
+                            }
+                            return null;
+                        };
+                        return walk(document);
+                    }"""
+                )
+                try:
+                    element = handle.as_element()
+                except Exception:
+                    element = None
+                if element is not None:
+                    return element
+                try:
+                    await handle.dispose()
+                except Exception:
+                    pass
+            except Exception:
+                pass
             return None
+
+        async def cdp_inject_files() -> bool:
+            """CDP 兜底：DOM.getDocument + DOM.querySelector 穿透 shadow 注入文件。"""
+            try:
+                session = page.context.new_cdp_session(page)
+                if inspect.isawaitable(session):
+                    session = await session
+                doc = session.send("DOM.getDocument", {"depth": -1, "pierce": True})
+                if inspect.isawaitable(doc):
+                    doc = await doc
+                root = (doc or {}).get("root", {})
+                query = session.send(
+                    "DOM.querySelector",
+                    {"nodeId": root.get("nodeId"), "selector": 'input[type="file"]'},
+                )
+                if inspect.isawaitable(query):
+                    query = await query
+                node_id = (query or {}).get("nodeId")
+                if not node_id:
+                    return False
+                res = session.send(
+                    "DOM.setFileInputFiles", {"files": [str(file_path)], "nodeId": node_id}
+                )
+                if inspect.isawaitable(res):
+                    await res
+                return True
+            except Exception as exc:
+                tencent_logger.debug(_msg("🧾", f"CDP 文件注入兜底失败（继续走常规通道）: {exc}"))
+                return False
 
         fi = await find_file_input()
         clicked_publish = False
@@ -868,6 +933,11 @@ class TencentBaseUploader(BaseVideoUploader):
             if fi is None:
                 await asyncio.sleep(1)
         if fi is None:
+            # 蚁小二兜底顺序：JS 句柄 → 主进程 CDP DOM.setFileInputFiles → 常规报错。
+            # shadow 内的 input 用 locator 点不中时，直接走 CDP 按 nodeId 注入文件。
+            if await cdp_inject_files():
+                tencent_logger.success(_msg("🥳", "已通过 CDP 兜底注入视频文件（shadow 穿透）"))
+                return
             # 留现场：这个错误的可能原因太多（没登录 / 落到首页 / iframe 没加载完 /
             # 平台改版），只看错误字符串没法区分，截图能一眼看出是哪种。
             try:
@@ -881,7 +951,14 @@ class TencentBaseUploader(BaseVideoUploader):
             except Exception:
                 pass
             raise RuntimeError("未找到视频号文件上传框")
-        await fi.set_input_files(file_path)
+        try:
+            await fi.set_input_files(file_path)
+        except Exception:
+            # ElementHandle / locator 差异：直接注入失败时再走一次 CDP 兜底。
+            if await cdp_inject_files():
+                tencent_logger.success(_msg("🥳", "已通过 CDP 兜底注入视频文件（set_input_files 失败后）"))
+                return
+            raise
 
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
         # 视频号「短标题」即界面上要求填写的“标题”（那个大编辑区其实是“视频描述”）。
@@ -1768,6 +1845,75 @@ class TencentNote(TencentBaseUploader):
             raise RuntimeError("视频号 cookie 已失效，请重新扫码登录后再发布图文")
 
     async def upload_note_images(self, page: Page) -> None:
+        # 图文同样走 wujie shadow 穿透：先 frame，再 shadow 句柄，最后 CDP 兜底。
+        async def shadow_image_handle():
+            try:
+                handle = await page.evaluate_handle(
+                    """() => {
+                        const walk = (root) => {
+                            if (!root || !root.querySelectorAll) return null;
+                            const pref = root.querySelector('input[type="file"][accept*="image"]');
+                            if (pref) return pref;
+                            const any = root.querySelector('input[type="file"]');
+                            if (any) return any;
+                            const all = root.querySelectorAll('*');
+                            for (const el of all) {
+                                if (el.shadowRoot) {
+                                    const hit = walk(el.shadowRoot);
+                                    if (hit) return hit;
+                                }
+                            }
+                            return null;
+                        };
+                        return walk(document);
+                    }"""
+                )
+                try:
+                    element = handle.as_element()
+                except Exception:
+                    element = None
+                if element is not None:
+                    return element
+                try:
+                    await handle.dispose()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return None
+
+        async def cdp_inject_images() -> bool:
+            try:
+                import inspect as _inspect
+                session = page.context.new_cdp_session(page)
+                if _inspect.isawaitable(session):
+                    session = await session
+                doc = session.send("DOM.getDocument", {"depth": -1, "pierce": True})
+                if _inspect.isawaitable(doc):
+                    doc = await doc
+                root = (doc or {}).get("root", {})
+                for selector in ('input[type="file"][accept*="image"]', 'input[type="file"]'):
+                    query = session.send(
+                        "DOM.querySelector",
+                        {"nodeId": root.get("nodeId"), "selector": selector},
+                    )
+                    if _inspect.isawaitable(query):
+                        query = await query
+                    node_id = (query or {}).get("nodeId")
+                    if not node_id:
+                        continue
+                    res = session.send(
+                        "DOM.setFileInputFiles",
+                        {"files": [str(p) for p in self.image_paths], "nodeId": node_id},
+                    )
+                    if _inspect.isawaitable(res):
+                        await res
+                    return True
+                return False
+            except Exception as exc:
+                tencent_logger.debug(_msg("🧾", f"图文 CDP 注入兜底失败: {exc}"))
+                return False
+
         file_input = None
         for _ in range(45):
             for frame in page.frames:
@@ -1781,8 +1927,19 @@ class TencentNote(TencentBaseUploader):
                     continue
             if file_input is not None:
                 break
+            # frame 扫不到时试一次 shadow 句柄（wujie 微前端）。
+            try:
+                shadow_el = await shadow_image_handle()
+            except Exception:
+                shadow_el = None
+            if shadow_el is not None:
+                file_input = shadow_el
+                break
             await asyncio.sleep(1)
         if file_input is None:
+            if await cdp_inject_images():
+                tencent_logger.success(_msg("🥳", "已通过 CDP 兜底注入图文图片（shadow 穿透）"))
+                return
             raise RuntimeError("未找到视频号图文图片上传框，请检查页面是否改版")
         try:
             await file_input.set_input_files(self.image_paths)
