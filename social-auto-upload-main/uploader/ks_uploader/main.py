@@ -21,6 +21,7 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import kuaishou_logger
+from utils.errors import AuthExpiredError, ResourceMissingError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -398,9 +399,9 @@ class KSBaseUploader(BaseVideoUploader):
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成快手登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成快手登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成快手登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成快手登录: {self.account_file}")
 
         if self.publish_strategy is None:
             self.publish_strategy = (

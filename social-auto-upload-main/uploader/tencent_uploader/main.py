@@ -22,6 +22,7 @@ from utils.account_fingerprint import (
     legacy_linux_fingerprint,
 )
 from utils.base_social_media import set_init_script
+from utils.errors import AuthExpiredError, ResourceMissingError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -704,9 +705,9 @@ class TencentBaseUploader(BaseVideoUploader):
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成视频号登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成视频号登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成视频号登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成视频号登录: {self.account_file}")
         if self.publish_strategy not in {TENCENT_PUBLISH_STRATEGY_IMMEDIATE, TENCENT_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
 
@@ -780,15 +781,18 @@ class TencentBaseUploader(BaseVideoUploader):
         # cookie 失效时前端 JS 会跳转到登录页, 提前发现并报明确的错误
         try:
             await page.wait_for_url("**/login.html**", timeout=8000)
-            raise RuntimeError("视频号 cookie 已失效（被跳转到登录页），请重新扫码登录后再发布")
+            raise AuthExpiredError("视频号 cookie 已失效（被跳转到登录页），请重新扫码登录后再发布")
         except TimeoutError:
             pass  # 8 秒内未跳转, 正常
-        except RuntimeError:
+        except AuthExpiredError:
+            # 类型化异常必须原样抛出——下面那个 ``except Exception: pass``
+            # 会把它静默吞掉，登录失效就被当成了"没跳转"，然后继续发布，
+            # 结果是拿一个失效的会话在平台上反复操作。
             raise
         except Exception:
             pass
         if any("open.weixin.qq.com/connect/qrconnect" in fr.url for fr in page.frames):
-            raise RuntimeError("视频号 cookie 已失效（被跳转到登录页），请重新扫码登录后再发布")
+            raise AuthExpiredError("视频号 cookie 已失效（被跳转到登录页），请重新扫码登录后再发布")
         # 视频号页面长期保持轮询/长连接，networkidle 往往等满超时才返回。
         # 上传表单是否就绪由 upload_video_file 轮询 input[type=file] 判断。
         # 注意：get_by_text("发表视频") 会命中一个隐藏的说明 <p>（不可点）；

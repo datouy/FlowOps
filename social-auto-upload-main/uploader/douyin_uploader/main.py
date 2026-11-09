@@ -24,6 +24,7 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import douyin_logger
+from utils.errors import AuthExpiredError, ResourceMissingError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -211,7 +212,11 @@ async def query_published_video_in_page(
         await asyncio.sleep(min(8, max(budget.remaining, 0)))
         budget.check()
         if 'login' in str(page.url or '').lower():
-            raise RuntimeError('抖音登录已失效，请重新扫码登录')
+            # 登录失效是**类型化异常**：调用方据此立刻把账号标记为失效并
+            # 跳过该账号剩余任务，绝不重试——重试只会让平台更确信这个号在
+            # 撞风控。不带类型的裸 RuntimeError 只能靠文案猜，平台一改
+            # 文案就漏判。
+            raise AuthExpiredError('抖音登录已失效，请重新扫码登录')
         payloads = []
         for response in captured[-40:]:
             # 响应体读取必须单独设限：请求回来了但响应体不结束，是这条链路上
@@ -1151,9 +1156,9 @@ class DouYinBaseUploader(BaseVideoUploader):
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成抖音登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成抖音登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成抖音登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成抖音登录: {self.account_file}")
         if self.publish_strategy not in {DOUYIN_PUBLISH_STRATEGY_IMMEDIATE, DOUYIN_PUBLISH_STRATEGY_SCHEDULED}:
             raise ValueError(f"不支持的发布策略: {self.publish_strategy}")
 

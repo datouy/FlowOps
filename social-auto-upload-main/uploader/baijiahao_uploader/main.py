@@ -20,6 +20,7 @@ from patchright.async_api import Page, Playwright, TimeoutError as PWTimeoutErro
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import baijiahao_logger
+from utils.errors import AuthExpiredError, ResourceMissingError, RiskControlError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -265,9 +266,9 @@ class BaiJiaHaoVideo(BaseVideoUploader):
 
     async def validate_upload_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成百家号登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成百家号登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成百家号登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成百家号登录: {self.account_file}")
         if not self.title or not str(self.title).strip():
             raise ValueError("视频标题不能为空")
         if not self.thumbnail_path:
@@ -590,7 +591,9 @@ class BaiJiaHaoVideo(BaseVideoUploader):
                 return
             # 检查是否出现百度安全验证
             if await page.locator('text="百度安全验证"').count():
-                raise RuntimeError("出现百度安全验证，需人工处理")
+                # 风控是类型化异常：不重试（再发一次只会把风控等级推高），
+                # 但要**降速**而不是判死账号。
+                raise RiskControlError("出现百度安全验证，需人工处理")
             # 检查是否有错误提示阻止发布
             error_toast = page.locator('.cheetah-message-error, .cheetah-message-warning').first
             if await error_toast.count() and await error_toast.is_visible():

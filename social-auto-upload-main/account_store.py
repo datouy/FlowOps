@@ -646,6 +646,29 @@ class AccountStore:
             logger.warning("更新账号 {} 状态失败: {}", account_id, exc)
             return False
 
+    def mark_throttled(self, account_id: int, reason: str = "") -> bool:
+        """记录一次风控，但**不改账号健康状态**。
+
+        风控和登录失效是两回事。登录失效是"这个号登不进去了"（状态该置
+        失效）；风控是"这个号现在动作太密"（号还好好的，只是要降速）。
+
+        所以这里只写失败原因，``status`` 保持原样——否则一次风控就会把
+        账号误杀出发布队列。
+        """
+        self.ensure_schema()
+        try:
+            with db_connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE user_info SET fail_reason=?, updated_at=? WHERE id=?",
+                    (f"触发平台风控，已降速：{(reason or '')[:200]}"[:240],
+                     now_text(), int(account_id)),
+                )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.warning("记录账号 {} 风控状态失败: {}", account_id, exc)
+            return False
+
     def mark_checked(
         self,
         account_id: int,

@@ -11,6 +11,26 @@ from conf import BASE_DIR
 import verify_codes
 from db_utils import connect, record_schema_version
 from utils.credential_crypto import credential_exists
+from utils.errors import (
+    ACCOUNT_EXPIRE,
+    ACCOUNT_THROTTLE,
+    AppError,
+    AuthExpiredError,
+    ResourceMissingError,
+    RiskControlError,
+    TransientError,
+    account_effect as _error_account_effect,
+    backoff_seconds,
+    describe as describe_error,
+    error_code_for,
+    is_retryable,
+)
+from utils.rate_limit import (
+    publish_guard,
+    set_throttle,
+    throttle_reason,
+    throttle_seconds_left,
+)
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
 _lock = threading.Lock()
@@ -420,6 +440,8 @@ KIND_RISK_CONTROL = 'risk_control'
 KIND_ACCOUNT_EXPIRED = 'account_expired'
 KIND_FILE_MISSING = 'file_missing'
 KIND_NETWORK = 'network'
+# 触发发布速率上限：不是失败，是"太慢了"。这类子任务不消耗失败次数。
+KIND_RATE_LIMITED = 'rate_limited'
 # 平台没有发布后回查能力，结果只能停在"已提交，未验证"。
 KIND_UNVERIFIED = 'unverified'
 KIND_UNKNOWN = 'unknown'
@@ -447,13 +469,36 @@ def _account_lock(account_id) -> threading.Lock:
 
 
 def classify_publish_error(text: str) -> str:
-    """把发布异常翻译成可决策的错误类型（用于跳过/重试/告警）。"""
+    """把发布异常翻译成可决策的错误类型（用于跳过/重试/告警）。
+
+    **这是过渡期的兼容层**：老代码抛的是裸 ``Exception``，只能靠中文
+    关键词猜。新代码应该直接抛 ``utils.errors`` 里的类型异常——那里
+    类型在抛出点就确定了，不受平台文案变化影响。
+
+    关键词表保留是为了让**未改造的**适配器也能被正确归因。
+    """
     message = str(text or '')
     for kind, keywords in _ERROR_RULES:
         for keyword in keywords:
             if keyword in message:
                 return kind
     return KIND_UNKNOWN
+
+
+def classify_exception(exc: BaseException) -> str:
+    """按**异常类型**归因，优先于字符串匹配。
+
+    类型化异常（``AuthExpiredError`` 等）直接给出确定的错误码；裸异常
+    才会回落到关键词匹配。
+    """
+    if isinstance(exc, AppError):
+        return exc.code
+    return classify_publish_error(str(exc))
+
+
+def exception_is_retryable(exc: BaseException) -> bool:
+    """该不该重试——看类型，不看文案。"""
+    return is_retryable(exc)
 
 
 def _load_accounts(cookies) -> dict:
@@ -656,6 +701,41 @@ def _mark_account_expired(cookie: str, reason: str) -> None:
         logger.exception("回写账号失效状态失败: {}", cookie)
 
 
+#: 被风控的账号在多久之内不再参与发布（秒）。
+THROTTLE_COOLDOWN = 1800
+
+
+def _throttle_account(cookie: str, reason: str) -> None:
+    """被平台风控的账号要**降速**，而不是判死。
+
+    风控和登录失效是两回事：登录失效是"这个号登不进去了"，风控是"这个号
+    现在动作太密"。把风控当成失效去标记，账号会被无谓地踢出发布队列；
+    什么都不做，又会继续撞风控直到真的封。
+
+    这里做两件事：
+    1. 记一条失败原因，让运维在账号列表里看到"被风控"；
+    2. 账号状态保持不变（还可能是有效的），但发布侧会对它降速。
+    """
+    try:
+        from account_store import get_store
+
+        accounts = _load_accounts([cookie])
+        account = accounts.get(str(cookie))
+        if not account:
+            return
+        store = get_store(BASE_DIR)
+        account_id = int(account['id'])
+        # 账号本身不算失效——只写风控原因，健康状态保持不变。
+        store.mark_throttled(account_id, reason)
+        set_throttle(account_id, THROTTLE_COOLDOWN, reason)
+        logger.warning(
+            "账号 {} 触发平台风控，{} 秒内降速: {}",
+            cookie, THROTTLE_COOLDOWN, (reason or '')[:200],
+        )
+    except Exception:
+        logger.exception("回写账号风控状态失败: {}", cookie)
+
+
 def _execute_item(item: dict, job, extra: dict) -> dict:
     """执行单条子任务：一次只发一个素材到一个账号。
 
@@ -673,28 +753,37 @@ def _execute_item(item: dict, job, extra: dict) -> dict:
     if precheck is not None:
         return precheck
 
-    result = dispatch_publish(
-        int(job['type']),
-        title=job['title'],
-        files=files,
-        tags=json_loads(job['tags']),
-        account_list=[item['cookie']],
-        category=extra.get('category'),
-        # Local scheduling already decided *when* this item runs.  At this
-        # point the platform must publish immediately; asking the platform to
-        # schedule as well would create a second scheduler and leave the item
-        # in ``scheduled`` for an unknown period.
-        enableTimer=False,
-        videosPerDay=extra.get('videosPerDay'),
-        dailyTimes=extra.get('dailyTimes'),
-        startDays=extra.get('startDays', 0),
-        desc=extra.get('desc', ''),
-        isDraft=extra.get('isDraft', False),
-        thumbnail=extra.get('thumbnail', ''),
-        productLink=extra.get('productLink', ''),
-        productTitle=extra.get('productTitle', ''),
-        contentType=extra.get('contentType', 'video'),
-    )
+    try:
+        result = dispatch_publish(
+            int(job['type']),
+            title=job['title'],
+            files=files,
+            tags=json_loads(job['tags']),
+            account_list=[item['cookie']],
+            category=extra.get('category'),
+            # Local scheduling already decided *when* this item runs.  At this
+            # point the platform must publish immediately; asking the platform to
+            # schedule as well would create a second scheduler and leave the item
+            # in ``scheduled`` for an unknown period.
+            enableTimer=False,
+            videosPerDay=extra.get('videosPerDay'),
+            dailyTimes=extra.get('dailyTimes'),
+            startDays=extra.get('startDays', 0),
+            desc=extra.get('desc', ''),
+            isDraft=extra.get('isDraft', False),
+            thumbnail=extra.get('thumbnail', ''),
+            productLink=extra.get('productLink', ''),
+            productTitle=extra.get('productTitle', ''),
+            contentType=extra.get('contentType', 'video'),
+        )
+    except AppError:
+        # 类型化异常原样抛出——它已经带着"该不该重试""对账号什么影响"。
+        raise
+    except Exception as exc:
+        # 未改造的适配器抛的还是裸异常（多数是网络类）。在这里归一化成
+        # ``TransientError``，让它能被正确重试——而不是靠关键词猜。
+        raise _as_transient(exc) from exc
+
     # The Tencent adapters return one structured verification result per
     # account. A publish item is already scoped to one account, so persist that
     # result instead of treating the one-element list as a mapping.
@@ -702,6 +791,25 @@ def _execute_item(item: dict, job, extra: dict) -> dict:
         return result[0] if result else {}
     return result or {}
 
+
+def _as_transient(exc: BaseException) -> Exception:
+    """把裸异常归一化成带类型的异常。
+
+    网络类（超时、连接失败）归为 ``TransientError``（可重试）；其余归为
+    平台拒绝（不可重试）。分类仍用关键词，但这是**兜底**：类型化异常
+    在抛出点就定了类型，走不到这里。
+    """
+    message = str(exc)[:500] or exc.__class__.__name__
+    kind = classify_publish_error(message)
+    if kind == KIND_NETWORK:
+        return TransientError(message)
+    if kind == KIND_LOGIN_EXPIRED:
+        return AuthExpiredError(message)
+    if kind == KIND_RISK_CONTROL:
+        return RiskControlError(message)
+    if kind == KIND_FILE_MISSING:
+        return ResourceMissingError(message)
+    return TransientError(message)
 
 def _precheck_existing_post(item: dict, job) -> dict | None:
     """远端预查：平台上已经有这篇作品时，直接返回成功结果。
@@ -1752,6 +1860,21 @@ def _run_job(job_id):
                 logger.warning("账号 {} 未通过健康门禁，跳过发布: {}", item['account_name'], account.get('fail_reason'))
                 continue
 
+            # 风控降速期：账号没失效，但暂时不该再操作。
+            # 跳过（而不是失败）——降速期结束后这些素材还能正常发。
+            throttled_for = throttle_seconds_left(account_id)
+            if throttled_for > 0:
+                _update_item(
+                    item_id, status=ITEM_SKIPPED, error_kind=KIND_RISK_CONTROL,
+                    error=f"账号处于风控降速期，还需等待 {throttled_for} 秒",
+                    finished_at=now,
+                )
+                logger.warning(
+                    "账号 {} 处于风控降速期（{} 秒），跳过发布: {}",
+                    item['account_name'], throttled_for, throttle_reason(account_id)[:120],
+                )
+                continue
+
             with _account_lock(account_id):
                 attempts = int(item['attempts'] or 0) + 1
                 with get_conn() as c:
@@ -1766,28 +1889,53 @@ def _run_job(job_id):
                 if not claimed_item:
                     continue
                 try:
-                    # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
-                    # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
-                    # 后者不会被自动重发。
-                    _update_item(item_id, submitted_at=now)
-                    result = _execute_item(item, job, extra) or {}
-                    _record_publish_result(item, result)
+                    # 发布前节流：账号令牌桶 + 平台并发信号量。
+                    #
+                    # 顺序是"先令牌、再信号量"：反过来的话任务会占着并发
+                    # 额度干等令牌，把平台并发浪费在什么都没干的任务上。
+                    with publish_guard(account_id, type):
+                        # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
+                        # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
+                        # 后者不会被自动重发。
+                        _update_item(item_id, submitted_at=now)
+                        result = _execute_item(item, job, extra) or {}
+                        _record_publish_result(item, result)
+                except TimeoutError as exc:
+                    # 触发速率上限：不是失败，是"太慢了"。回 pending 等下一轮，
+                    # 不消耗失败次数。
+                    message = str(exc)[:500]
+                    logger.warning("账号 {} 触发发布速率上限: {}", item['account_name'], message)
+                    _update_item(item_id, status=ITEM_PENDING, error=message, error_kind=KIND_RATE_LIMITED)
                 except Exception as exc:
                     message = str(exc)[:500] or exc.__class__.__name__
-                    kind = classify_publish_error(message)
+                    kind = classify_exception(exc)
                     first_error = first_error or message
                     traceback.print_exc()
-                    if kind == KIND_LOGIN_EXPIRED:
+                    effect = _error_account_effect(exc)
+                    if effect == ACCOUNT_EXPIRE:
                         expired_accounts.add(account_id)
                         _mark_account_expired(cookie, message)
                         _update_item(
                             item_id, status=ITEM_FAILED, error=message, error_kind=kind,
                             finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                         )
-                    elif attempts < MAX_ITEM_ATTEMPTS and kind not in (
-                        KIND_FILE_MISSING, KIND_ACCOUNT_EXPIRED
-                    ):
-                        # 留待本轮重试（状态回 pending，不动 finished_at）
+                    elif effect == ACCOUNT_THROTTLE:
+                        # 被风控：不重试，账号降速，并跳过该账号剩余素材——
+                        # 继续发只会把风控等级越推越高。
+                        expired_accounts.add(account_id)
+                        _throttle_account(cookie, message)
+                        _update_item(
+                            item_id, status=ITEM_FAILED, error=message, error_kind=kind,
+                            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                        )
+                    elif attempts < MAX_ITEM_ATTEMPTS and exception_is_retryable(exc):
+                        # 值得重试：退避后留待本轮重试（状态回 pending，不动 finished_at）
+                        delay = backoff_seconds(exc, attempts)
+                        logger.info(
+                            "子任务 {} 第 {} 次尝试失败（{}），{} 秒后重试: {}",
+                            item_id, attempts, kind, delay, message,
+                        )
+                        time.sleep(min(delay, 30.0))
                         _update_item(item_id, status=ITEM_PENDING, error=message, error_kind=kind)
                     else:
                         _update_item(

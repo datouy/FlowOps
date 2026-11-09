@@ -610,6 +610,18 @@ def api_v2_credentials_migrate():
     return jsonify({"code": 200, "msg": None, "data": result}), 200
 
 
+@app.route('/api/v2/publish/rate-limit', methods=['GET'])
+def api_v2_publish_rate_limit():
+    """发布限流状态：速率上限、平台并发、夜间降速与各账号令牌余量。"""
+    from utils import rate_limit
+
+    try:
+        data = rate_limit.status()
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": f"读取限流状态失败：{exc}", "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
 @app.route('/api/v2/accounts/<int:account_id>/check', methods=['POST'])
 async def api_v2_account_check(account_id: int):
     """单账号健康检查：立刻回写 status / lastCheckAt / failReason。

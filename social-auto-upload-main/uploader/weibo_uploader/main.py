@@ -25,6 +25,7 @@ from patchright.async_api import Page, Playwright, TimeoutError as PWTimeoutErro
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.log import weibo_logger
+from utils.errors import AuthExpiredError, ResourceMissingError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -311,9 +312,9 @@ class WeiBoVideo(BaseVideoUploader):
 
     async def validate_upload_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成微博登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成微博登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成微博登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成微博登录: {self.account_file}")
         if not self.title or not str(self.title).strip():
             raise ValueError("视频标题不能为空")
         if not self.thumbnail_path:

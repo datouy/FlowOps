@@ -23,6 +23,7 @@ from utils.login_qrcode import print_terminal_qrcode
 from utils.login_qrcode import remove_qrcode_file
 from utils.login_qrcode import save_data_url_image
 from utils.log import xiaohongshu_logger
+from utils.errors import AuthExpiredError, ResourceMissingError
 from utils.account_browser import (
     open_persistent_account_context,
     save_account_storage_state,
@@ -233,7 +234,7 @@ async def query_published_note_in_page(
         await asyncio.sleep(min(8, max(budget.remaining, 0)))
         budget.check()
         if 'login' in str(page.url or '').lower():
-            raise RuntimeError('小红书登录已失效，请重新扫码登录')
+            raise AuthExpiredError('小红书登录已失效，请重新扫码登录')
         # The new creator microapp renders only its sidebar at ``creator/notes``
         # until the note-manager navigation item is opened. Clicking it keeps
         # this query compatible with both the old page and the current UI.
@@ -625,9 +626,9 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
-            raise RuntimeError(f"cookie文件不存在，请先完成小红书登录: {self.account_file}")
+            raise ResourceMissingError(f"cookie文件不存在，请先完成小红书登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
-            raise RuntimeError(f"cookie文件已失效，请先完成小红书登录: {self.account_file}")
+            raise AuthExpiredError(f"cookie文件已失效，请先完成小红书登录: {self.account_file}")
 
         if self.publish_strategy not in {
             XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
