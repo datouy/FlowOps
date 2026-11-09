@@ -460,22 +460,49 @@ def required_media_keys(template: dict) -> set[str]:
 
 # ---------------------------------------------------------------- 回放
 
+# 小红书重签说明（对齐蚁小二 qianming 签名服务思路，但走本地页面重签）：
+# x-s / x-t / x-s-common / x-t-common 都是一次性的，录制时直接丢弃，
+# 回放时在页面上下文里调 `window._webmsxyw(url, bodyText)` 现算。
+# 该函数在不同版本的创作平台上可能是同步也可能是 Promise，这里统一 await；
+# 拿不到签名函数时直接按无签名发，让平台明确拒绝后回落 RPA（绝不重试直发）。
 _REPLAY_SCRIPT = """
 async ({url, method, headers, bodyText, sign}) => {
   try {
     const finalHeaders = Object.assign({}, headers || {});
     if (sign) {
+      let signed = null;
       try {
-        if (typeof window._webmsxyw === 'function') {
-          const signed = window._webmsxyw(url, bodyText);
-          if (signed) {
-            const xs = signed['X-s'] || signed['x-s'];
-            const xt = signed['X-t'] || signed['x-t'];
-            if (xs) finalHeaders['x-s'] = xs;
-            if (xt) finalHeaders['x-t'] = xt;
-          }
+        const signer = window._webmsxyw || window.__xhsSigner || window._xyw;
+        if (typeof signer === 'function') {
+          signed = await signer(url, bodyText);
+        } else if (signer && typeof signer.sign === 'function') {
+          signed = await signer.sign(url, bodyText);
         }
-      } catch (e) { /* 签名失败就按原样发，交给平台判定 */ }
+      } catch (e) { signed = null; }
+      if (signed && typeof signed === 'object') {
+        const pick = (obj, names) => {
+          for (const name of names) {
+            if (obj[name] !== undefined && obj[name] !== null && String(obj[name])) {
+              return String(obj[name]);
+            }
+          }
+          return '';
+        };
+        const xs = pick(signed, ['X-s', 'x-s', 'X-S', 'xs']);
+        const xt = pick(signed, ['X-t', 'x-t', 'X-T', 'xt']);
+        const xsCommon = pick(signed, ['X-s-common', 'x-s-common']);
+        const xtCommon = pick(signed, ['X-t-common', 'x-t-common']);
+        if (xs) finalHeaders['x-s'] = xs;
+        if (xt) finalHeaders['x-t'] = xt;
+        if (xsCommon) finalHeaders['x-s-common'] = xsCommon;
+        if (xtCommon) finalHeaders['x-t-common'] = xtCommon;
+        finalHeaders['x-sign-missing'] = '';
+        if (!xs || !xt) {
+          return {ok: true, status: 0, payload: null, signMissing: true};
+        }
+      } else {
+        return {ok: true, status: 0, payload: null, signMissing: true};
+      }
     }
     const response = await fetch(url, {
       method: method || 'POST',
@@ -530,8 +557,19 @@ async def replay_publish(page, template: dict, body: Any, platform_type: int) ->
             "payload": {},
             "error": message or "接口回放失败",
         }
+    if outcome.get("signMissing"):
+        # 页面里拿不到 _webmsxyw（版本切换/页面还没加载完）：签名算不出来，
+        # 此时按“未尝试直发”回落 RPA，而不是按 unknown 停手（unknown 会记
+        # “已提交未验证”，而这里根本还没发出去）。
+        return {
+            "status": "not_attempted",
+            "payload": {},
+            "reason": "页面签名函数不可用，已回落页面发布",
+        }
     status = int(outcome.get("status") or 0)
     payload = outcome.get("payload")
+    # 小红书签名过期时服务端回 HTTP 401/403 + code != 0：明确拒绝，回落 RPA
+    # 重走一次页面流程即可拿到新签名，不删除模板（模板本身不含签名）。
     verdict = interpret_response(platform_type, payload, status)
     return {"status": verdict["status"], "payload": payload, **verdict}
 
