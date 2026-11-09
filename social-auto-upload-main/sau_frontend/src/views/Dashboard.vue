@@ -82,6 +82,9 @@
         </el-col>
       </el-row>
 
+      <!-- 运行状态：稳定性问题的特点是"悄悄坏掉"，所以放在首屏 -->
+      <SystemHealthCard />
+
       <!-- 快捷操作区域 -->
       <div class="quick-actions">
         <h2>快捷操作</h2>
@@ -169,6 +172,7 @@ import {
 import { materialApi } from '@/api/material'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
+import SystemHealthCard from '@/components/SystemHealthCard.vue'
 
 const router = useRouter()
 const accountStore = useAccountStore()
