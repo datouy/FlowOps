@@ -23,10 +23,10 @@ from utils.account_environment import proxy_settings
 from utils.account_fingerprint import load_fingerprint
 
 # 没有指纹文件时的兜底 UA。用 Linux Chrome，与历史上账号登录时的默认指纹
-# 保持一致（旧账号就是用这个 UA 登录的）。
+# 保持一致（旧账号就是用这个 UA 登录的）。P0-2：默认 156 与运行期 Chromium 对齐。
 FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 )
 
 

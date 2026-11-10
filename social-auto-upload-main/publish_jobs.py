@@ -19,6 +19,7 @@ from utils.errors import (
     ACCOUNT_THROTTLE,
     AppError,
     AuthExpiredError,
+    FingerprintMismatchError,
     ResourceMissingError,
     RiskControlError,
     TransientError,
@@ -2024,7 +2025,22 @@ def _run_job(job_id):
                         job_id, exc, item_id=item_id, account_id=account_id,
                         payload={"attempt": attempts, "kind": kind},
                     )
-                    if effect == ACCOUNT_EXPIRE:
+                    # P0-2 fail-closed 熔断：指纹自检失败 → 该账号本次不执行。
+                    if isinstance(exc, FingerprintMismatchError):
+                        expired_accounts.add(account_id)
+                        try:
+                            from account_store import get_store as _fp_store
+                            _fp_store(BASE_DIR).mark_status(
+                                int(account_id), 0,
+                                f"fingerprint_unavailable：{message}"[:240])
+                        except Exception:
+                            pass
+                        _update_item(
+                            item_id, status=ITEM_FAILED, error=message,
+                            error_kind="fingerprint_unavailable",
+                            finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                        )
+                    elif effect == ACCOUNT_EXPIRE:
                         expired_accounts.add(account_id)
                         _mark_account_expired(cookie, message)
                         _update_item(

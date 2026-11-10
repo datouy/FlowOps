@@ -1194,7 +1194,7 @@ class InteractivePlatformLogin:
         context = None
         try:
             with sync_playwright() as playwright:
-                version = "131"
+                version = "156"
                 if not self._environment_cookie:
                     self._environment_cookie = str(
                         Path(BASE_DIR / "cookiesFile" / f".login-{self.session_id}.json")

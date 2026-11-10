@@ -27,6 +27,41 @@ SELFCHECK_SCRIPT = r"""
       };
     }
   } catch (_) {}
+  let canvasHash = "";
+  try {
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 50;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 200, 50);
+    ctx.fillStyle = '#069'; ctx.font = '16px Arial';
+    ctx.fillText('yunce-probe-云策', 10, 30);
+    canvasHash = c.toDataURL().slice(-64);
+  } catch (_) {}
+  let audioHash = "";
+  try {
+    const AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    audioHash = AC ? "available" : "missing";
+  } catch (_) { audioHash = "error"; }
+  let fontProbe = [];
+  try {
+    const base = document.createElement('canvas').getContext('2d');
+    base.font = '16px monospace';
+    const w0 = base.measureText('mmmmmmmmmm').width;
+    for (const f of ['Arial', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK']) {
+      base.font = `16px "${f}", monospace`;
+      const w = base.measureText('mmmmmmmmmm').width;
+      fontProbe.push({font: f, diff: Math.abs(w - w0) > 0.01});
+    }
+  } catch (_) {}
+  let webdriverDesc = "";
+  try {
+    const d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+    webdriverDesc = d ? (typeof d.get === 'function' ? 'getter' : 'value:' + String(d.value)) : 'absent';
+  } catch (_) { webdriverDesc = 'error'; }
+  let webdriverInProto = false;
+  try { webdriverInProto = 'webdriver' in Navigator.prototype; } catch (_) {}
+  let tz = "";
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (_) {}
   return {
     ua: navigator.userAgent,
     platform: navigator.platform,
@@ -35,11 +70,17 @@ SELFCHECK_SCRIPT = r"""
     lang: navigator.language,
     langs: (navigator.languages ? Array.from(navigator.languages) : []),
     webdriver: navigator.webdriver,
+    webdriverDesc: webdriverDesc,
+    webdriverInProto: webdriverInProto,
     sw: screen.width,
     sh: screen.height,
     sah: screen.availHeight,
     cd: screen.colorDepth,
+    tz: tz,
     uadb: uadb,
+    canvasHash: canvasHash,
+    audioHash: audioHash,
+    fontProbe: fontProbe,
   };
 })()
 """
@@ -63,15 +104,23 @@ def compare(result: dict, fingerprint: dict):
     soft = []
     fp = fingerprint or {}
 
+    # 1. webdriver 必须删掉：值为 True 或原型上仍存在属性都算暴露
     if result.get("webdriver") is True:
         hard.append("navigator.webdriver=true（自动化特征未隐藏）")
+    if result.get("webdriverInProto") is True:
+        hard.append("Navigator.prototype 仍存在 webdriver 属性（删除未生效）")
+    desc = str(result.get("webdriverDesc") or "")
+    if desc.startswith("value:"):
+        hard.append("navigator.webdriver 可被直接读取（应为 undefined/不可枚举）")
 
+    # 2. platform
     platform_name = str(fp.get("platform_name") or "")
     if platform_name:
         actual_platform = str(result.get("platform") or "")
         if actual_platform and actual_platform != platform_name:
             hard.append("navigator.platform=" + repr(actual_platform) + "，期望 " + repr(platform_name))
 
+    # 3-4. 硬件并发 / 内存
     hc = fp.get("hardware_concurrency")
     if hc is not None and result.get("hc") is not None and int(result["hc"]) != int(hc):
         hard.append("hardwareConcurrency=" + str(result["hc"]) + "，期望 " + str(hc))
@@ -80,6 +129,7 @@ def compare(result: dict, fingerprint: dict):
     if dm is not None and result.get("dm") is not None and int(result["dm"]) != int(dm):
         hard.append("deviceMemory=" + str(result["dm"]) + "，期望 " + str(dm))
 
+    # 5. 语言
     langs = fp.get("languages") or []
     if langs:
         first = str(langs[0])
@@ -90,13 +140,22 @@ def compare(result: dict, fingerprint: dict):
         elif actual_langs and first not in actual_langs:
             hard.append("navigator.languages=" + repr(actual_langs) + "，缺少 " + repr(first))
 
+    # 6-8. 屏幕三件套 + 色深
     screen = fp.get("screen") or {}
     for key, expected in (("sw", "width"), ("sh", "height"), ("sah", "avail_height")):
         want = int(screen.get(expected) or 0)
         got = result.get(key)
         if want and got is not None and int(got) != want:
             hard.append("screen." + expected + "=" + str(got) + "，期望 " + str(want))
+    if result.get("cd") is not None and int(result.get("cd") or 0) != 24:
+        hard.append("screen.colorDepth=" + str(result.get("cd")) + "，期望 24")
 
+    # 9. 时区必须与指纹一致（默认 Asia/Shanghai）
+    tz = str(result.get("tz") or "")
+    if tz and tz != "Asia/Shanghai":
+        hard.append("时区=" + repr(tz) + "，期望 'Asia/Shanghai'")
+
+    # 10. UA 主版本
     major = str(fp.get("chrome_major") or _chrome_major(str(fp.get("user_agent") or "")))
     ua = str(result.get("ua") or "")
     if major and major not in ua:
@@ -106,6 +165,7 @@ def compare(result: dict, fingerprint: dict):
     if hints and ua and not any(hint in ua for hint in hints):
         hard.append("userAgent 与 platform=" + platform_key + " 不匹配")
 
+    # 11. UA-CH 主版本必须与 UA 对齐（fail-closed：不对齐直接硬失败）
     uadb = result.get("uadb")
     data = fp.get("user_agent_data") or {}
     if isinstance(uadb, dict) and isinstance(data, dict):
@@ -121,7 +181,7 @@ def compare(result: dict, fingerprint: dict):
         if chrome_ver:
             got = actual_brands.get("Google Chrome") or actual_brands.get("Chromium")
             if got and got != chrome_ver:
-                soft.append("UA-CH Chrome 版本 " + got + "，期望 " + chrome_ver)
+                hard.append("UA-CH Chrome 版本 " + got + "，期望 " + chrome_ver)
 
     return hard, soft
 

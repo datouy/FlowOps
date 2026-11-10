@@ -185,7 +185,7 @@ def account_fingerprint(
     *,
     account_id: int | None = None,
     seed: str = "",
-    browser_version: str = "131",
+    browser_version: str = "156",
 ) -> dict[str, Any]:
     """Return the account's stable fingerprint, creating it only once."""
     resolved = Path(cookie_path).expanduser().resolve()
@@ -238,6 +238,8 @@ def _prepare(
         "--no-sandbox",
         "--disable-blink-features=AutomationControlled",
         "--lang=zh-CN",
+        "--disable-features=WebRtcHideLocalIpsWithMdns",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
     for value in args or []:
         if value not in launch_args:
@@ -267,7 +269,7 @@ async def persistent_account_context(
     *,
     account_id: int | None = None,
     seed: str = "",
-    browser_version: str = "131",
+    browser_version: str = "156",
     headless: bool = True,
     channel: str = "chromium",
     executable_path: str = "",
@@ -350,7 +352,7 @@ def persistent_account_context_sync(
     *,
     account_id: int | None = None,
     seed: str = "",
-    browser_version: str = "131",
+    browser_version: str = "156",
     headless: bool = True,
     channel: str = "chromium",
     executable_path: str = "",

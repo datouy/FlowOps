@@ -310,7 +310,7 @@ async def query_published_video(
 def _desktop_browser_context_options(browser) -> dict:
     """Build a normal desktop browser profile instead of Playwright's headless UA."""
     version = str(getattr(browser, "version", "") or "")
-    major = version.split(".", 1)[0] if version else "131"
+    major = version.split(".", 1)[0] if version else "156"
     return {
         "user_agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "

@@ -20,6 +20,19 @@ from typing import Any
 
 
 FINGERPRINT_DIR_NAME = ".fingerprints"
+# P0-2：UA 主版本必须与 Playwright Chromium 对齐。
+# 实测本机 chromium-1248 对应 156；不再写死 131，允许环境覆盖，
+# 新建指纹默认取运行期版本，老指纹保持不动（换 UA 等于换设备）。
+def chromium_major_default() -> str:
+    for env in ("FLOWOPS_CHROME_MAJOR", "FLOWOPS_BROWSER_MAJOR"):
+        try:
+            v = str(__import__("os").environ.get(env) or "").strip().split(".", 1)[0]
+            if v.isdigit():
+                return v
+        except Exception:
+            pass
+    return "156"
+_CHROME_MAJOR_DEFAULT = chromium_major_default()
 _UA_PROFILES = (
     (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,7 +50,7 @@ _UA_PROFILES = (
         "linux",
     ),
 )
-_CHROME_MAJORS = (130, 131, 132, 133)
+_CHROME_MAJORS = (154, 155, 156, 157)
 _PLATFORM_NAMES = {
     "windows": "Win32",
     "macos": "MacIntel",
@@ -54,9 +67,9 @@ def _digest_int(value: str) -> int:
     return int(hashlib.sha256(value.encode("utf-8")).hexdigest()[:12], 16)
 
 
-def legacy_linux_fingerprint(browser_version: str = "131") -> dict[str, Any]:
+def legacy_linux_fingerprint(browser_version: str = _CHROME_MAJOR_DEFAULT) -> dict[str, Any]:
     """Fingerprint used by builds before account-level fingerprints existed."""
-    major = str(browser_version or "131").split(".", 1)[0]
+    major = str(browser_version or _CHROME_MAJOR_DEFAULT).split(".", 1)[0]
     return _normalize_fingerprint({
         "version": 1,
         "id": "legacy-linux",
@@ -73,21 +86,15 @@ def legacy_linux_fingerprint(browser_version: str = "131") -> dict[str, Any]:
     }, "legacy-linux")
 
 
-def new_fingerprint(seed: str, browser_version: str = "131") -> dict[str, Any]:
+def new_fingerprint(seed: str, browser_version: str = _CHROME_MAJOR_DEFAULT) -> dict[str, Any]:
     """Create a deterministic profile for one account login environment."""
-    # Seed controls the UA platform and major version. Keeping the viewport
-    # fixed preserves the remote-login coordinate mapping in the web client.
+    # P0-2：UA 主版本必须与 Chromium 对齐 —— 不再随机挑 major，
+    # 统一取 browser_version 的主版本，避免 UA 132 / 内核 131 的穿帮。
+    # Seed 只决定 platform（windows/macos/linux），不决定版本。
     numeric = re.search(r"(\d+)$", seed)
     number = int(numeric.group(1)) if numeric else _digest_int(seed)
     template, platform = _UA_PROFILES[number % len(_UA_PROFILES)]
-    if platform == "linux":
-        major = str(browser_version or "131").split(".", 1)[0]
-    else:
-        current = int(str(browser_version or "131").split(".", 1)[0])
-        allowed = [value for value in _CHROME_MAJORS if value <= current + 1]
-        if not allowed:
-            allowed = list(_CHROME_MAJORS[:1])
-        major = str(allowed[number // len(_UA_PROFILES) % len(allowed)])
+    major = str(str(browser_version or _CHROME_MAJOR_DEFAULT).split(".", 1)[0] or _CHROME_MAJOR_DEFAULT)
     return _normalize_fingerprint({
         "version": 1,
         "id": hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20],
@@ -118,7 +125,7 @@ def _normalize_fingerprint(
     payload.setdefault("screen", screen)
     payload.setdefault("languages", ["zh-CN", "zh", "en"])
     ua_match = re.search(r"Chrome/(\d+)", str(payload.get("user_agent") or ""))
-    chrome_major = ua_match.group(1) if ua_match else "131"
+    chrome_major = ua_match.group(1) if ua_match else _CHROME_MAJOR_DEFAULT
     payload.setdefault("chrome_major", chrome_major)
     payload.setdefault(
         "user_agent_data",
@@ -241,7 +248,7 @@ def fingerprint_for_storage(cookie_path: str | Path) -> dict[str, Any] | None:
             break
     if stored_device_id:
         if fingerprint is None:
-            fingerprint = legacy_linux_fingerprint("131")
+            fingerprint = legacy_linux_fingerprint(_CHROME_MAJOR_DEFAULT)
         fingerprint = _normalize_fingerprint(fingerprint)
         fingerprint["device_id"] = stored_device_id
         return fingerprint
@@ -252,9 +259,15 @@ def fingerprint_for_storage(cookie_path: str | Path) -> dict[str, Any] | None:
 
 
 def fingerprint_init_script(fingerprint: dict[str, Any] | None) -> str:
-    """Install stable device, screen and WebGL signals before site scripts."""
+    """Install stable device, screen and WebGL signals before site scripts.
+
+    P0-2 加固版：canvas/audio/font 低位噪声（seed= device_id，确定性、
+    只动不透明像素、导出走副本），webdriver 删除（不是置 false），
+    Function.prototype.toString 透传避免“一探即知”。
+    """
     profile = _normalize_fingerprint(fingerprint or {})
     screen = profile.get("screen") or _SCREEN_PROFILES[0]
+    device_id = str(profile.get("device_id") or "yunce")
     values = {
         "platform": profile.get("platform_name"),
         "hardwareConcurrency": profile.get("hardware_concurrency"),
@@ -265,20 +278,33 @@ def fingerprint_init_script(fingerprint: dict[str, Any] | None) -> str:
     return f"""
 (() => {{
   const values = {json.dumps(values, ensure_ascii=False)};
+  const seedStr = {json.dumps(device_id, ensure_ascii=False)};
+  let seed = 0;
+  for (let i = 0; i < seedStr.length; i++) {{ seed = (seed * 31 + seedStr.charCodeAt(i)) >>> 0; }}
+  const rand = () => {{ seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }};
   const define = (target, key, value) => {{
     try {{ Object.defineProperty(target, key, {{get: () => value, configurable: true}}); }} catch (_) {{}}
+  }};
+  const hideFn = (fn) => {{
+    try {{
+      const src = Function.prototype.toString.call(fn);
+      fn.toString = () => src;
+    }} catch (_) {{}}
+    return fn;
   }};
   define(Navigator.prototype, 'platform', values.platform);
   define(Navigator.prototype, 'hardwareConcurrency', values.hardwareConcurrency);
   define(Navigator.prototype, 'deviceMemory', values.deviceMemory);
   define(Navigator.prototype, 'languages', values.languages);
   define(Navigator.prototype, 'language', values.languages[0]);
-  define(Navigator.prototype, 'webdriver', false);
+  try {{ delete Navigator.prototype.webdriver; }} catch (_) {{}}
+  try {{ delete navigator.webdriver; }} catch (_) {{}}
+  define(Navigator.prototype, 'webdriver', undefined);
   if (values.userAgentData) {{
     const data = values.userAgentData;
     define(Navigator.prototype, 'userAgentData', {{
       ...data,
-      getHighEntropyValues: async (hints) => {{
+      getHighEntropyValues: hideFn(async (hints) => {{
         const result = {{
           brands: data.brands,
           mobile: false,
@@ -291,7 +317,7 @@ def fingerprint_init_script(fingerprint: dict[str, Any] | None) -> str:
           wow64: data.wow64,
         }};
         return Object.fromEntries((hints || []).filter(k => k in result).map(k => [k, result[k]]));
-      }},
+      }}),
       toJSON: () => ({{brands: data.brands, mobile: false, platform: data.platform}}),
     }});
   }}
@@ -307,14 +333,98 @@ def fingerprint_init_script(fingerprint: dict[str, Any] | None) -> str:
   const patchGl = (proto) => {{
     if (!proto) return;
     const original = proto.getParameter;
-    proto.getParameter = function(parameter) {{
+    const patched = function(parameter) {{
       if (parameter === 37445) return {json.dumps(str(profile.get('webgl_vendor')), ensure_ascii=False)};
       if (parameter === 37446) return {json.dumps(str(profile.get('webgl_renderer')), ensure_ascii=False)};
       return original.call(this, parameter);
     }};
+    hideFn(patched);
+    proto.getParameter = patched;
   }};
   patchGl(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
   patchGl(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  // canvas 低位噪声：只动不透明像素最低位，肉眼不可见、哈希稳定偏移
+  try {{
+    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    const patchedGet = function(sx, sy, sw, sh, ...rest) {{
+      const img = origGetImageData.call(this, sx, sy, sw, sh, ...rest);
+      try {{
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {{
+          if (d[i + 3] === 0) continue;
+          const n = Math.floor(rand() * 3) - 1;
+          d[i] = Math.max(0, Math.min(255, d[i] + n));
+        }}
+      }} catch (_) {{}}
+      return img;
+    }};
+    hideFn(patchedGet);
+    CanvasRenderingContext2D.prototype.getImageData = patchedGet;
+  }} catch (_) {{}}
+  // audio：OfflineAudioContext 1e-8 级扰动
+  try {{
+    const OrigAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (OrigAC && !OrigAC.__yuncePatched) {{
+      const Patched = function(...args) {{
+        const ctx = new OrigAC(...args);
+        try {{
+          const origStart = ctx.startRendering.bind(ctx);
+          ctx.startRendering = () => origStart().then((buf) => {{
+            try {{
+              const ch = buf.getChannelData(0);
+              for (let i = 0; i < Math.min(ch.length, 4096); i += 997) ch[i] += (rand() - 0.5) * 1e-7;
+            }} catch (_) {{}}
+            return buf;
+          }});
+        }} catch (_) {{}}
+        return ctx;
+      }};
+      Patched.prototype = OrigAC.prototype;
+      window.OfflineAudioContext = Patched;
+      window.OfflineAudioContext.__yuncePatched = true;
+    }}
+  }} catch (_) {{}}
+  // font：measureText 系数抖动
+  try {{
+    const origMeasure = CanvasRenderingContext2D.prototype.measureText;
+    const patchedMeasure = function(text) {{
+      const m = origMeasure.call(this, text);
+      try {{
+        const jitter = 1 + (rand() - 0.5) * 0.0004;
+        Object.defineProperty(m, 'width', {{ value: m.width * jitter, configurable: true }});
+      }} catch (_) {{}}
+      return m;
+    }};
+    hideFn(patchedMeasure);
+    CanvasRenderingContext2D.prototype.measureText = patchedMeasure;
+  }} catch (_) {{}}
+  // WebRTC fail-closed：只允许 relay（经代理），禁止 host/srflx 直连透真实 IP；
+  // enumerateDevices 隐藏 device label，避免硬件指纹直读。
+  try {{
+    const OrigRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if (OrigRTC && !OrigRTC.__yuncePatched) {{
+      const PatchedRTC = function(...args) {{
+        let cfg = args[0] || {{}};
+        cfg = Object.assign({{}}, cfg, {{ iceTransportPolicy: 'relay' }});
+        if (!cfg.iceServers || !cfg.iceServers.length) {{
+          cfg.iceServers = [{{ urls: 'stun:127.0.0.1:19302' }}];
+        }}
+        return new OrigRTC(cfg);
+      }};
+      PatchedRTC.prototype = OrigRTC.prototype;
+      PatchedRTC.__yuncePatched = true;
+      try {{ window.RTCPeerConnection = PatchedRTC; }} catch (_) {{}}
+      try {{ window.webkitRTCPeerConnection = PatchedRTC; }} catch (_) {{}}
+    }}
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+      const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      const patchedEnum = hideFn(async () => {{
+        const list = await origEnum();
+        return list.map((d) => ({{ kind: d.kind, deviceId: '', groupId: '' }}));
+      }});
+      try {{ Object.defineProperty(navigator.mediaDevices, 'enumerateDevices', {{ value: patchedEnum, configurable: true }}); }} catch (_) {{}}
+    }}
+  }} catch (_) {{}}
   try {{ localStorage.setItem('_finger_print_device_id', {json.dumps(str(profile.get('device_id')), ensure_ascii=False)}); }} catch (_) {{}}
 }})();
 """

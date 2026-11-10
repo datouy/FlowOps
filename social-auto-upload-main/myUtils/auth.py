@@ -69,7 +69,7 @@ async def browser_session(
     # before account fingerprints existed.  Preserve that identity when a
     # legacy credential is first opened in the persistent profile.
     if interactive_ua and not fingerprint_for_storage(account_file):
-        save_fingerprint(account_file, legacy_linux_fingerprint("131"))
+        save_fingerprint(account_file, legacy_linux_fingerprint())
     async with async_playwright() as playwright:
         async with persistent_account_context(
             playwright,

@@ -214,7 +214,7 @@ def bind_tencent_channel_environment(
     identity: str,
     *,
     login_session_id: str = "",
-    browser_version: str = "131",
+    browser_version: str = "156",
     proxy: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create a durable per-Channels environment after one WeChat login.

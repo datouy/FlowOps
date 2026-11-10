@@ -197,7 +197,7 @@ def _resolve_account_file(account_file: str | Path) -> str:
 def _fingerprint_for_account(account_file: str | Path) -> dict:
     fingerprint = fingerprint_for_storage(account_file)
     if fingerprint is None:
-        fingerprint = legacy_linux_fingerprint("131")
+        fingerprint = legacy_linux_fingerprint()
     return fingerprint
 
 
