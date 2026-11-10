@@ -931,19 +931,29 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
         await page.wait_for_timeout(700 if quick else 1500)
         if await _page_is_login(page):
             raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-        if not await page.locator(".semi-list-item").count():
-            try:
-                await page.wait_for_selector(".semi-list-item", timeout=12000)
-            except PlaywrightTimeoutError:
-                if await _page_is_login(page):
-                    raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-                body = ""
+        # P0-4：走远端适配包有序候选，本地回退；全失败自动打 Drift 包
+        try:
+            import selector_adapters as _ad
+            await _ad.wait_first_visible_async(page, "douyin", 12000)
+        except Exception as _ad_exc:
+            from utils.errors import SelectorDriftError as _Drift
+            if isinstance(_ad_exc, _Drift):
+                raise SyncError(str(_ad_exc)[:300]) from _ad_exc
+            if await page.locator(".semi-list-item").count():
+                pass
+            else:
                 try:
-                    body = await page.locator("body").inner_text(timeout=5000)
-                except Exception:
-                    pass
-                if not any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
-                    raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败")
+                    await page.wait_for_selector(".semi-list-item", timeout=12000)
+                except PlaywrightTimeoutError:
+                    if await _page_is_login(page):
+                        raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+                    body = ""
+                    try:
+                        body = await page.locator("body").inner_text(timeout=5000)
+                    except Exception:
+                        pass
+                    if not any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
+                        raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败")
         await page.wait_for_timeout(300 if quick else 1200)
         if await _page_is_login(page):
             raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")

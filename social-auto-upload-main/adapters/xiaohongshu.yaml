@@ -1,0 +1,7 @@
+# xiaohongshu 私信列表适配包（P0-4）
+- selector: ".conversation-item"
+  assert: visible
+  timeout: 12000
+- selector: "[class*='conversation']"
+  assert: attached
+  timeout: 8000

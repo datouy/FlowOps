@@ -1,0 +1,7 @@
+# channels 私信列表适配包（P0-4）
+- selector: "[class*='chat-item']"
+  assert: visible
+  timeout: 12000
+- selector: ".chat-list-item"
+  assert: attached
+  timeout: 8000

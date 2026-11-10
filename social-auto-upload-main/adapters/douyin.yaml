@@ -1,0 +1,11 @@
+# douyin 私信列表适配包（P0-4）
+# 有序候选：按可靠度排序，runtime 按顺序尝试
+- selector: ".semi-list-item"
+  assert: visible
+  timeout: 12000
+- selector: "[class*='list-item']"
+  assert: attached
+  timeout: 8000
+- selector: "[data-flowops-dm-target]"
+  assert: visible
+  timeout: 5000
