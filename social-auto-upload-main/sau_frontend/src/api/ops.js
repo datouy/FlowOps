@@ -1,0 +1,30 @@
+import { http } from '@/utils/request'
+
+// P0/P1 台面统一 API：执行层 / 串行 / 指纹 / 适配 / 审计 / 内容中台 / 驾驶舱 / 日历 / ROI / 开放
+export const opsApi = {
+  executors: () => http.get('/api/v2/executors'),
+  serialStatus: () => http.get('/api/v2/serial/status'),
+  fingerprintProbe: (params) => http.get('/api/v2/fingerprint/probe', params),
+  selectorsGet: (platform) => http.get(`/api/v2/selectors/${platform}`),
+  selectorsRefresh: () => http.post('/api/v2/selectors/refresh', {}),
+  selectorsDrift: (payload) => http.post('/api/v2/selectors/drift', payload),
+  rbacStatus: () => http.get('/api/v2/rbac/status'),
+  auditLogs: (limit = 200) => http.get('/api/v2/audit/logs', { limit }),
+  migrationsRun: (dryRun = true) => http.post('/api/v2/migrations/run', { dryRun }),
+  contents: () => http.get('/api/v2/contents'),
+  contentCreate: (payload) => http.post('/api/v2/contents', payload),
+  variants: (cid) => http.get(`/api/v2/contents/${cid}/variants`),
+  variantSave: (cid, payload) => http.post(`/api/v2/contents/${cid}/variants`, payload),
+  contentSubmit: (cid, payload) => http.post(`/api/v2/contents/${cid}/submit`, payload),
+  cockpit: () => http.get('/api/v2/dashboard/cockpit'),
+  scheduleMove: (payload) => http.post('/api/v2/schedule/move', payload),
+  scheduleWeek: () => http.get('/schedule/week'),
+  scheduleSuggest: () => http.get('/schedule/suggest'),
+  roiSummary: () => http.get('/api/v2/roi/summary'),
+  roiCampaignCreate: (payload) => http.post('/api/v2/roi/campaigns', payload),
+  roiDealClose: (payload) => http.post('/api/v2/roi/deals', payload),
+  roiExport: (format = 'csv') => `/api/v2/roi/export?format=${format}`,
+  roiPush: () => http.post('/api/v2/roi/push', {}),
+  webhooksSubscribe: (payload) => http.post('/api/v2/webhooks/subscribe', payload),
+  webhooksEmit: (payload) => http.post('/api/v2/webhooks/emit', payload),
+}

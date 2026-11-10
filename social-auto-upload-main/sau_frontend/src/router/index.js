@@ -13,6 +13,8 @@ import Todo from '../views/Todo.vue'
 import ContentPack from '../views/ContentPack.vue'
 import Review from '../views/Review.vue'
 import WeeklyReport from '../views/WeeklyReport.vue'
+import Roi from '../views/Roi.vue'
+import OpsConsole from '../views/OpsConsole.vue'
 
 const routes = [
   {
@@ -79,6 +81,16 @@ const routes = [
     path: '/publish-calendar',
     name: 'PublishCalendar',
     component: PublishCalendar
+  },
+  {
+    path: '/roi',
+    name: 'Roi',
+    component: Roi
+  },
+  {
+    path: '/ops',
+    name: 'OpsConsole',
+    component: OpsConsole
   },
   {
     path: '/about',

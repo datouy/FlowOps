@@ -21,6 +21,7 @@ def _week_schedule():
     if rows:
         for r in rows:
             items.append({
+                'id': r['id'],
                 'job_id': r['job_id'],
                 'title': r['title'],
                 'type': r['type'],

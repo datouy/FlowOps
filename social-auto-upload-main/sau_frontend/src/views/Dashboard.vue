@@ -85,6 +85,47 @@
       <!-- 运行状态：稳定性问题的特点是"悄悄坏掉"，所以放在首屏 -->
       <SystemHealthCard />
 
+      <!-- P1-2 运营驾驶舱四象限 + 日历上首屏 -->
+      <el-row :gutter="20" style="margin-bottom:20px">
+        <el-col :span="6">
+          <el-card class="stat-card" style="height:auto">
+            <div class="stat-label">今日待办</div>
+            <div class="stat-value">{{ cockpit.todos?.length || 0 }}</div>
+            <div class="stat-detail">pending/uncertain/processing 前20</div>
+          </el-card>
+        </el-col>
+        <el-col :span="6">
+          <el-card class="stat-card" style="height:auto">
+            <div class="stat-label">成功率</div>
+            <div class="stat-value">{{ cockpit.successRate ?? '-' }}%</div>
+            <div class="stat-detail">全部 jobs 成功占比</div>
+          </el-card>
+        </el-col>
+        <el-col :span="6">
+          <el-card class="stat-card" style="height:auto">
+            <div class="stat-label">账号健康</div>
+            <div class="stat-value">{{ cockpit.health?.ready ? '就绪' : '异常' }}</div>
+            <div class="stat-detail">{{ (cockpit.health?.blockers || []).join(',') || '无阻塞项' }}</div>
+          </el-card>
+        </el-col>
+        <el-col :span="6">
+          <el-card class="stat-card" style="height:auto">
+            <div class="stat-label">昨日对比(7天窗口)</div>
+            <div class="stat-value">{{ weekDeltaText }}</div>
+            <div class="stat-detail">快照: {{ cockpit.weekDelta?.snapshotAt || '无' }}</div>
+          </el-card>
+        </el-col>
+      </el-row>
+
+      <el-card shadow="never" style="margin-bottom:20px" v-if="cockpit.calendar?.length">
+        <template #header><span>本周日历（首屏）</span><el-button text @click="navigateTo('/publish-calendar')">去日历拖拽排期</el-button></template>
+        <el-table :data="cockpit.calendar.slice(0, 8)" size="small">
+          <el-table-column prop="scheduled_at" label="计划时间" width="170" />
+          <el-table-column prop="account" label="账号" width="140" />
+          <el-table-column prop="status" label="状态" width="100" />
+        </el-table>
+      </el-card>
+
       <!-- 快捷操作区域 -->
       <div class="quick-actions">
         <h2>快捷操作</h2>
@@ -172,12 +213,20 @@ import {
 import { materialApi } from '@/api/material'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
+import { opsApi } from '@/api/ops'
 import SystemHealthCard from '@/components/SystemHealthCard.vue'
 
 const router = useRouter()
 const accountStore = useAccountStore()
 const appStore = useAppStore()
 const loading = ref(false)
+const cockpit = ref({ todos: [], byStatus: [], byPlatform: [], weekDelta: {}, successRate: 0, health: {}, calendar: [] })
+const weekDeltaText = computed(() => {
+  const plats = cockpit.value.weekDelta?.platforms || []
+  let plays = 0
+  for (const p of plats) plays += Number(p.plays || 0)
+  return plays ? `+${plays}播放` : '暂无增量'
+})
 
 // 账号统计数据 - 从真实数据计算
 const accountStats = computed(() => {
@@ -249,14 +298,18 @@ const fetchDashboardData = async () => {
   loading.value = true
   try {
     // 并行获取账号和素材数据
-    const [accountRes, materialRes] = await Promise.allSettled([
+    const [accountRes, materialRes, cockpitRes] = await Promise.allSettled([
       accountStore.loadAccounts(true),
-      materialApi.getAllMaterials()
+      materialApi.getAllMaterials(),
+      opsApi.cockpit(),
     ])
 
     if (accountRes.status === 'rejected') console.error('获取账号数据失败:', accountRes.reason)
     if (materialRes.status === 'fulfilled' && materialRes.value.code === 200) {
       appStore.setMaterials(materialRes.value.data)
+    }
+    if (cockpitRes.status === 'fulfilled' && cockpitRes.value?.code === 200) {
+      cockpit.value = { ...cockpit.value, ...cockpitRes.value.data }
     }
   } catch (error) {
     console.error('获取仪表盘数据失败:', error)

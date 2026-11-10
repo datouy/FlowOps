@@ -10,7 +10,9 @@
       </div>
     </div>
     <el-alert type="info" :closable="false" style="margin-bottom:14px"
-      title="显示已排期的定时发布任务（在发布中心开启「定时发布」后自动出现在这里）。当天格子显示计划时间与内容标题。" />
+      title="显示已排期的定时发布任务（在发布中心开启「定时发布」后自动出现在这里）。拖拽卡片到其他日期即可改期，撞车会自动告警。" />
+    <el-alert v-if="moveConflict" type="warning" :closable="false" style="margin-bottom:14px"
+      :title="'改期撞车：' + moveConflict" />
     <el-card v-if="suggest.platforms.length" shadow="never" style="margin-bottom:14px">
       <template #header><span>智能排期建议</span></template>
       <div class="suggest-grid">
@@ -24,7 +26,8 @@
         :title="'检测到 ' + suggest.conflicts.length + ' 个时间点存在多条任务撞车，请调整排期'" />
     </el-card>
     <div class="week-grid">
-      <div v-for="day in weekDays" :key="day.date" class="day-cell" :class="{ today: day.isToday }">
+      <div v-for="day in weekDays" :key="day.date" class="day-cell" :class="{ today: day.isToday }"
+        @dragover.prevent @drop="onDrop(day.date)">
         <div class="day-title">
           <span class="day-name">{{ day.name }}</span>
           <span class="day-date">{{ day.date.slice(5) }}</span>
@@ -32,6 +35,7 @@
         <div class="day-body">
           <div v-if="byDate[day.date] && byDate[day.date].length" class="event-list">
             <div v-for="ev in byDate[day.date]" :key="ev.job_id + ev.scheduled_at" class="event"
+                 draggable="true" @dragstart="onDrag(ev)"
                  :class="{ done: ['success','draft'].includes(ev.status), failed: ['failed','withdrawn'].includes(ev.status) }">
               <div class="ev-time">{{ ev.scheduled_at.slice(11) }}</div>
               <div class="ev-title">{{ ev.title }}</div>
@@ -55,8 +59,10 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { http } from '@/utils/request'
+import { opsApi } from '@/api/ops'
 
 const loading = ref(false)
+const movingId = ref(null)
 const scheduledItems = ref([])
 const suggest = ref({ platforms: [], conflicts: [] })
 const weekOffset = ref(0)
@@ -117,11 +123,39 @@ const byDate = computed(() => {
 async function loadAll() {
   loading.value = true
   try {
-    const [r, s] = await Promise.all([http.get('/schedule/week'), http.get('/schedule/suggest')])
+    const [r, s] = await Promise.all([opsApi.scheduleWeek(), opsApi.scheduleSuggest()])
     scheduledItems.value = r.data
     suggest.value = s.data
   } catch(e) { console.error(e) }
   finally { loading.value = false }
+}
+
+// P1-3 拖拽改期 + 撞车校验
+const dragEv = ref(null)
+const moveConflict = ref('')
+function onDrag(ev) { dragEv.value = ev }
+async function onDrop(date) {
+  if (!dragEv.value) return
+  const ev = dragEv.value
+  dragEv.value = null
+  const sid = ev.id
+  if (!sid) { ElMessage.warning('该任务暂无排期ID，仅支持已展开的定时任务拖拽'); return }
+  const timePart = String(ev.scheduled_at || '10:00').slice(11) || '10:00'
+  const newAt = `${date} ${timePart}`
+  if (newAt === ev.scheduled_at) return
+  movingId.value = sid
+  try {
+    const r = await opsApi.scheduleMove({ scheduledId: sid, scheduledAt: newAt })
+    if (r.data?.conflict) {
+      moveConflict.value = `${newAt} 有 ${r.data.conflicts?.length || 2} 条任务撞车，建议换个时段`
+      ElMessage.warning(moveConflict.value)
+    } else {
+      moveConflict.value = ''
+      ElMessage.success(`已改期到 ${newAt}`)
+    }
+    await loadAll()
+  } catch (e) { console.error(e) }
+  finally { movingId.value = null }
 }
 
 onMounted(() => {

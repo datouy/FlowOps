@@ -129,6 +129,8 @@ import schedule_suggest
 schedule_suggest.register(app)
 import material_ops
 material_ops.register(app)
+import p0p1_ops
+p0p1_ops.register(app)
 
 # 默认只允许本机前端跨域，避免任意站点在浏览器里调用本机接口
 CORS(

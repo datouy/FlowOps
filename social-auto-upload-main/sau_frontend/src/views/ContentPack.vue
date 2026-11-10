@@ -80,6 +80,10 @@
               </el-form>
             </el-tab-pane>
           </el-tabs>
+          <div v-if="items.length" style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+            <el-button type="primary" :loading="submitting" @click="submitAll">一次提交产N个任务（内容中台）</el-button>
+            <span style="font-size:12px;color:#909399">内容一等对象→各平台变体→每平台一个 job，后端 /jobs/&lt;id&gt;/items 已有</span>
+          </div>
           <el-empty v-else description="生成后会在这里按平台分栏展示" :image-size="80" />
         </el-card>
       </el-col>
@@ -91,9 +95,12 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { http } from '@/utils/request'
+import { opsApi } from '@/api/ops'
 import { API_BASE, withToken } from '@/config'
+import { useAccountStore } from '@/stores/account'
 
 const router = useRouter()
+const accountStore = useAccountStore()
 const industries = ['通用', '餐饮美食', '美妆个护', '教育培训', '健身运动', '本地生活', '电商零售', '房产家居', '旅行社', '其他']
 const form = ref({
   industry: '通用',
@@ -207,6 +214,39 @@ async function copyItem(item) {
 function publishItem(item) {
   syncTags(item)
   router.push({ path: '/publish-center', query: { title: item.title, body: item.body, tags: (item.tags || []).join(','), platform: item.platform } })
+}
+
+// P1-1 多平台 composer：内容一等对象 → 变体 → 一次提交产 N 个 job
+const submitting = ref(false)
+const PLAT_KEY = { '抖音': 'douyin', '小红书': 'xiaohongshu', '视频号': 'channels', '快手': 'kuaishou', '微博': 'weibo', '百家号': 'baijiahao' }
+async function submitAll() {
+  if (!items.value.length) return
+  submitting.value = true
+  try {
+    await accountStore.loadAccounts(true).catch(() => {})
+    const title0 = items.value[0]?.title || form.value.topic || form.value.business_name || '内容中台投放'
+    const cc = await opsApi.contentCreate({ title: title0, body: items.value[0]?.body || '', files: sourceFile.value ? [sourceFile.value] : [] })
+    const cid = cc.data?.id
+    if (!cid) throw new Error('创建内容失败')
+    for (const it of items.value) {
+      syncTags(it)
+      const key = PLAT_KEY[it.platform] || it.platform
+      await opsApi.variantSave(cid, { platform: key, title: it.title, body: [it.body, '', (it.tags || []).map(t => '#' + t).join(' ')].join('\n') })
+    }
+    // 按平台中文名匹配账号 filePath，一平台无账号则跳过该平台
+    const accounts = {}
+    for (const it of items.value) {
+      const key = PLAT_KEY[it.platform] || it.platform
+      const accs = accountStore.accounts.filter(a => a.platform === it.platform).map(a => a.filePath || a.id)
+      if (accs.length) accounts[key] = accs
+    }
+    const r = await opsApi.contentSubmit(cid, { accounts })
+    const jobs = r.data?.jobs || []
+    if (!jobs.length) { ElMessage.warning('各平台均无可用账号，已保存内容与变体，请先登录账号'); return }
+    ElMessage.success(`已一次提交产出 ${jobs.length} 个任务：` + jobs.map(j => `${j.platform}#${j.jobId}`).join('、'))
+    router.push({ path: '/publish-records' })
+  } catch (e) { console.error(e) }
+  finally { submitting.value = false }
 }
 
 onMounted(loadMaterials)

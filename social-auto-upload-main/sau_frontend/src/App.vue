@@ -64,6 +64,14 @@
             <el-icon><Calendar /></el-icon>
             <span>发布日历</span>
           </el-menu-item>
+          <el-menu-item index="/roi">
+            <el-icon><DataLine /></el-icon>
+            <span>线索ROI</span>
+          </el-menu-item>
+          <el-menu-item index="/ops">
+            <el-icon><DataAnalysis /></el-icon>
+            <span>运维台面</span>
+          </el-menu-item>
           <el-menu-item index="/about">
             <el-icon><DataAnalysis /></el-icon>
             <span>关于</span>
