@@ -2087,22 +2087,27 @@ def _run_job(job_id):
                     #
                     # 顺序是"先令牌、再信号量"：反过来的话任务会占着并发
                     # 额度干等令牌，把平台并发浪费在什么都没干的任务上。
-                    with publish_guard(account_id, type):
-                        # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
-                        # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
-                        # 后者不会被自动重发。
-                        _update_item(item_id, submitted_at=now)
-                        result = _execute_item(item, job, extra) or {}
-                        _record_publish_result(item, result)
-                        job_events.record(
-                            job_id, job_events.STAGE_SUCCESS,
-                            f"《{title}》已提交到平台，等待回查",
-                            item_id=item_id, account_id=account_id,
-                            payload={
-                                "remoteId": str(result.get('remote_id') or result.get('remoteId') or ''),
-                                "state": str(result.get('state') or ''),
-                            },
-                        )
+                    # P0-3：外层再套同账号全局串行 + 人类节律（publish/DM/评论统一入口）。
+                    from utils.account_serial import account_serial as _serial
+                    _acct_key = str(cookie or account_id or "unknown")
+                    with _serial(f"account:{_acct_key}", timeout=600):
+                        heartbeat_job(int(job_id))
+                        with publish_guard(account_id, type):
+                            # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
+                            # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
+                            # 后者不会被自动重发。
+                            _update_item(item_id, submitted_at=now)
+                            result = _execute_item(item, job, extra) or {}
+                            _record_publish_result(item, result)
+                            job_events.record(
+                                job_id, job_events.STAGE_SUCCESS,
+                                f"《{title}》已提交到平台，等待回查",
+                                item_id=item_id, account_id=account_id,
+                                payload={
+                                    "remoteId": str(result.get('remote_id') or result.get('remoteId') or ''),
+                                    "state": str(result.get('state') or ''),
+                                },
+                            )
                 except TimeoutError as exc:
                     # 触发速率上限：不是失败，是"太慢了"。回 pending 等下一轮，
                     # 不消耗失败次数。

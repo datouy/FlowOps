@@ -495,35 +495,49 @@ def run_comment_action(
             f"{PLATFORM_NAMES.get(platform_type, '该平台')}暂不支持「{action}」操作"
         )
 
-    with _lock:
-        if isinstance(adapter, ChannelsCommentAdapter):
-            client = adapter._client()
-            try:
-                if action == ACTION_REPLY:
-                    return adapter.reply(client, comment, str(text).strip())
-                if action == ACTION_LIKE:
-                    return adapter.like(client, comment, True)
-                if action == ACTION_UNLIKE:
-                    return adapter.like(client, comment, False)
-                if action == ACTION_DELETE:
-                    return adapter.delete(client, comment)
-                if action == ACTION_PIN:
-                    return adapter.pin(client, comment, True)
-                return adapter.pin(client, comment, False)
-            finally:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
+    # P0-3：评论腿同样走同账号全局串行 + 人类节律（publish/DM/评论统一入口）。
+    try:
+        from utils.account_serial import account_serial as _serial
+        _acct_key = str(account.get("id") or account.get("cookie_path") or account.get("cookie") or "unknown")
+        _serial_ctx = _serial(f"account:{_acct_key}", timeout=600)
+    except Exception:
+        _serial_ctx = None
+    if _serial_ctx is None:
+        return _run_comment_action_inner(adapter, account, action, comment, text)
+    with _serial_ctx:
+        return _run_comment_action_inner(adapter, account, action, comment, text)
+
+
+def _run_comment_action_inner(adapter, account: dict, action: str, comment: dict, text: str = "") -> dict:
+    if isinstance(adapter, ChannelsCommentAdapter):
+        client = adapter._client()
         try:
-            return adapter._call(action, comment, str(text or "").strip())
-        except CommentActionError:
-            raise
-        except Exception as exc:
-            logger.warning("评论操作失败（{} / {}）: {}", action, platform_type, exc)
-            raise CommentActionError(f"评论操作失败：{str(exc)[:200]}") from exc
+            if action == ACTION_REPLY:
+                return adapter.reply(client, comment, str(text).strip())
+            if action == ACTION_LIKE:
+                return adapter.like(client, comment, True)
+            if action == ACTION_UNLIKE:
+                return adapter.like(client, comment, False)
+            if action == ACTION_DELETE:
+                return adapter.delete(client, comment)
+            if action == ACTION_PIN:
+                return adapter.pin(client, comment, True)
+            return adapter.pin(client, comment, False)
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+    try:
+        return adapter._call(action, comment, str(text or "").strip())
+    except CommentActionError:
+        raise
+    except Exception as exc:
+        from loguru import logger as _lg
+        _lg.warning("评论操作失败（{}）: {}", action, exc)
+        raise CommentActionError(f"评论操作失败：{str(exc)[:200]}") from exc
 
 
 # ---------------------------------------------------------------- 能力查询

@@ -1423,6 +1423,22 @@ def _prepare_auto_reply(c, contact: dict, inbound: dict, settings: dict,
 
 
 def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
+    # P0-3：私信发送同样走同账号全局串行 + 人类节律，与发布腿统一入口。
+    # key 统一为 account:<账号标识>，与 publish_jobs/comment_ops 同一命名空间，
+    # 否则三条腿各玩各的，串行等于没做。
+    try:
+        from utils.account_serial import account_serial as _serial
+        _acct = str(payload.get("account") or payload.get("cookie") or "unknown")
+        _serial_ctx = _serial(f"account:{_acct}", timeout=600)
+    except Exception:
+        _serial_ctx = None
+    if _serial_ctx is None:
+        return _deliver_outbound_inner(out_id, payload, settings)
+    with _serial_ctx:
+        return _deliver_outbound_inner(out_id, payload, settings)
+
+
+def _deliver_outbound_inner(out_id: int, payload: dict, settings: dict) -> dict:
     platform = _clean(payload.get("platform"), 40)
     nickname = _clean(payload.get("nickname"), 80)
     external_user_id = _clean(payload.get("external_user_id"), 300)
