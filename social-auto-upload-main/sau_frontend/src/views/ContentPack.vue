@@ -231,7 +231,9 @@ async function submitAll() {
     for (const it of items.value) {
       syncTags(it)
       const key = PLAT_KEY[it.platform] || it.platform
-      await opsApi.variantSave(cid, { platform: key, title: it.title, body: [it.body, '', (it.tags || []).map(t => '#' + t).join(' ')].join('\n') })
+      // tags 独立传，后端单独落库并在 enqueue_job 时作为平台话题标签下发；
+      // 不再拼进 body（拼进 body 会让话题丢失，发布出去没有标签）。
+      await opsApi.variantSave(cid, { platform: key, title: it.title, body: it.body || '', tags: it.tags || [] })
     }
     // 按平台中文名匹配账号 filePath，一平台无账号则跳过该平台
     const accounts = {}

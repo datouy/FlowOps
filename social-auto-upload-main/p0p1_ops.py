@@ -9,6 +9,29 @@ from pathlib import Path
 from flask import jsonify, request
 
 
+def _ensure_variant_tags(conn) -> None:
+    """content_variants 表补 tags 列。
+
+    002 迁移建的 content_variants 没有 tags 列，话题被前端拼进 body 里、后端
+    enqueue_job 收空 tags——发布出去平台侧没有话题标签。老库用 ALTER 幂等补齐，
+    不破坏已有数据。
+    """
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(content_variants)").fetchall()}
+    if "tags" not in cols:
+        conn.execute("ALTER TABLE content_variants ADD COLUMN tags TEXT DEFAULT ''")
+
+
+def _infer_content_type(files: list) -> str:
+    """根据素材扩展名推断内容类型：全视频 → video，否则 → image-text。"""
+    video_ext = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".flv", ".webm")
+    names = [str(f).lower() for f in files or []]
+    if names and all(name.endswith(video_ext) for name in names):
+        return "video"
+    if names:
+        return "image-text"
+    return "video"
+
+
 def register(app):
     # ---------- P0-1 执行层 ----------
     @app.route('/api/v2/executors', methods=['GET'])
@@ -185,12 +208,19 @@ def register(app):
         platform = str(payload.get("platform") or "").strip()
         if not platform:
             return jsonify({"code": 400, "msg": "缺少 platform", "data": None}), 400
+        tags = payload.get("tags") or []
+        if isinstance(tags, str):
+            tags = [item.strip() for item in tags.split(",") if item.strip()]
         with connect(db, timeout=15) as c:
-            c.execute("""INSERT INTO content_variants (content_id, platform, title, body, status)
-                VALUES (?,?,?,?,?) ON CONFLICT(content_id, platform) DO UPDATE SET
-                title=excluded.title, body=excluded.body""",
+            _ensure_variant_tags(c)
+            c.execute("""INSERT INTO content_variants
+                (content_id, platform, title, body, tags, status)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(content_id, platform) DO UPDATE SET
+                title=excluded.title, body=excluded.body, tags=excluded.tags""",
                       (cid, platform, str(payload.get("title") or ""),
-                       str(payload.get("body") or ""), "draft"))
+                       str(payload.get("body") or ""),
+                       json.dumps(tags, ensure_ascii=False), "draft"))
         return jsonify({"code": 200, "msg": None, "data": {"ok": True}}), 200
 
     @app.route('/api/v2/contents/<int:cid>/submit', methods=['POST'])
@@ -205,12 +235,14 @@ def register(app):
         payload = request.get_json(silent=True) or {}
         account_map = payload.get("accounts") or {}
         with connect(db, timeout=15) as c:
+            _ensure_variant_tags(c)
             content = c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone()
             variants = [dict(r) for r in c.execute(
                 "SELECT * FROM content_variants WHERE content_id=?", (cid,)).fetchall()]
         if not content:
             return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
         files = json.loads(str(dict(content).get("files") or "[]") or "[]") if isinstance(dict(content).get("files"), str) else (dict(content).get("files") or [])
+        content_type = _infer_content_type(files)
         job_ids = []
         type_map = {"douyin": 3, "xiaohongshu": 1, "channels": 2, "tencent": 2,
                     "kuaishou": 4, "weibo": 5, "baijiahao": 6}
@@ -220,10 +252,19 @@ def register(app):
             accounts = account_map.get(plat) or account_map.get(str(ptype)) or []
             if not accounts:
                 continue
+            tags = v.get("tags") or []
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except ValueError:
+                    tags = [item.strip() for item in tags.split(",") if item.strip()]
+            if not isinstance(tags, list):
+                tags = []
             jid = publish_jobs.enqueue_job(
                 ptype, str(v.get("title") or dict(content).get("title") or ""),
-                [], files if isinstance(files, list) else [], accounts,
-                {"desc": str(v.get("body") or "")}, review_required=False)
+                tags, files if isinstance(files, list) else [], accounts,
+                {"desc": str(v.get("body") or ""), "contentType": content_type},
+                review_required=False)
             job_ids.append({"platform": plat, "jobId": jid})
         return jsonify({"code": 200, "msg": None, "data": {"jobs": job_ids}}), 200
 
