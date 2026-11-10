@@ -284,7 +284,10 @@ def test_xhs_status_read_times_out_on_hanging_response_body(monkeypatch):
     monkeypatch.setattr(browser_timeout, "read_timeout", lambda *a, **k: 0.3)
 
     page = _FakePage(
-        responses=[_HangingResponse()],
+        # 必须用能命中 XHS_LIST_RESPONSE_MARKERS 的 url，否则 capture 不会
+        # 记录这个响应，read_json 根本不会被调用，测试就退化成了靠 budget
+        # 0.3 秒边界"碰巧"通过/失败的 flaky 竞态。
+        responses=[_HangingResponse(url="https://creator.xiaohongshu.com/api/galaxy/creator/note")],
         url="https://creator.xiaohongshu.com/creator/notes",
     )
 
