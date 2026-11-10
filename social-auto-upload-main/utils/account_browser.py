@@ -208,6 +208,35 @@ def account_fingerprint(
         return fingerprint
 
 
+# launch_persistent_context 的 browser 级参数；其余都是 context 级，可透传
+# 给共享实例的 new_context。
+_BROWSER_KEYS = frozenset({"headless", "args", "executable_path", "channel"})
+
+
+def _shared_storage_state(cookie_path: str | Path) -> dict[str, Any] | None:
+    """读账号登录态（解密 storage_state）。读不到/解密失败返回 None。
+
+    解密失败降级为 None，而不是抛异常——上游共享分支会因此退回 persistent
+    模式，让原有的播种/报错逻辑按老路径走，行为不变。
+    """
+    try:
+        from utils import credential_crypto
+        state = credential_crypto.read_storage_state(cookie_path)
+        return state if isinstance(state, dict) else None
+    except Exception:
+        return None
+
+
+def _use_shared(options: dict[str, Any]) -> bool:
+    """是否走共享单实例：headless 且开关开。
+
+    登录需要可见窗口（headless=False），仍走 persistent 独立进程——共享实例
+    始终 headless，避免一个可见窗口把所有账号的上下文都拖成可见。
+    """
+    from utils import shared_browser
+    return bool(options.get("headless")) and shared_browser.shared_enabled()
+
+
 def _prepare(
     cookie_path: str | Path,
     *,
@@ -291,6 +320,37 @@ async def persistent_account_context(
         fingerprint=fingerprint,
     )
     context = None
+    if _use_shared(options):
+        # 共享单实例模式：一个 Chromium 进程承载多个账号的 context。
+        # 登录态直接来自 storage_state（权威），不走 persistent profile。
+        from utils import shared_browser
+
+        context_opts = {k: v for k, v in options.items() if k not in _BROWSER_KEYS}
+        proxy = context_opts.pop("proxy", None)
+        context = await shared_browser.account_context(
+            playwright,
+            cookie_path=resolved,
+            storage_state=_shared_storage_state(resolved),
+            proxy=proxy,
+            fingerprint_options=context_opts,
+            init_script=fingerprint_init_script(fingerprint),
+            headless=bool(options.get("headless")),
+            args=list(options.get("args") or []),
+            executable_path=str(options.get("executable_path") or ""),
+            channel=str(options.get("channel") or ""),
+        )
+        try:
+            from runtime_config import FINGERPRINT_FAIL_CLOSED
+            if FINGERPRINT_FAIL_CLOSED:
+                from utils.fingerprint_selfcheck import assert_fingerprint
+                await assert_fingerprint(context, fingerprint)
+            yield context
+        finally:
+            await browser_timeout.close_async_resource_async(
+                context, label="关闭共享账号上下文",
+            )
+        return
+
     from utils.browser_pool import browser_slot
     async with _ProfileGuard(profile):
         with browser_slot():
@@ -376,6 +436,32 @@ def persistent_account_context_sync(
         fingerprint=fingerprint,
     )
     context = None
+    if _use_shared(options):
+        from utils import shared_browser
+
+        context_opts = {k: v for k, v in options.items() if k not in _BROWSER_KEYS}
+        proxy = context_opts.pop("proxy", None)
+        context = shared_browser.account_context_sync(
+            playwright,
+            storage_state=_shared_storage_state(resolved),
+            proxy=proxy,
+            fingerprint_options=context_opts,
+            init_script=fingerprint_init_script(fingerprint),
+            headless=bool(options.get("headless")),
+            args=list(options.get("args") or []),
+            executable_path=str(options.get("executable_path") or ""),
+            channel=str(options.get("channel") or ""),
+        )
+        try:
+            from runtime_config import FINGERPRINT_FAIL_CLOSED
+            if FINGERPRINT_FAIL_CLOSED:
+                from utils.fingerprint_selfcheck import assert_fingerprint_sync
+                assert_fingerprint_sync(context, fingerprint)
+            yield context
+        finally:
+            browser_timeout.close_async_resource(context, label="关闭共享账号上下文")
+        return
+
     from utils.browser_pool import browser_slot as _browser_slot
     with _ProfileGuard(profile):
         with _browser_slot():
