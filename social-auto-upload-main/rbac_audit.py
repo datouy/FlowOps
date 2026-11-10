@@ -77,13 +77,32 @@ def list_audit(limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+MIGRATION_TABLE = "file_migrations"
+
+
+def _ensure_migration_table(conn) -> None:
+    """迁移登记表。
+
+    注意：**不能复用** ``db_utils`` 建的那张 ``schema_migrations``。那张表是
+    ``(scope, version)`` 语义（按模块版本号推进），这里是文件名语义；两者同名，
+    ``CREATE TABLE IF NOT EXISTS`` 会静默跳过建表，紧接着
+    ``SELECT name FROM schema_migrations`` 直接报 ``no such column: name``——
+    只要库是已有的（一定是，各个模块启动时都会调 ``apply_migrations``），
+    这个方法就永远跑不起来。
+    """
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} ("
+        "name TEXT PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    )
+
+
 def run_migrations(dry_run: bool = False) -> list[dict]:
-    """执行 migrations/*.sql，文件名 00X_*.sql 排序；记录到 schema_migrations。"""
+    """执行 migrations/*.sql，文件名 00X_*.sql 排序；记录到 file_migrations。"""
     MIGRATION_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(MIGRATION_DIR.glob("*.sql"))
     with get_conn() as c:
-        c.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
-        applied = {r["name"] for r in c.execute("SELECT name FROM schema_migrations").fetchall()}
+        _ensure_migration_table(c)
+        applied = {r["name"] for r in c.execute(f"SELECT name FROM {MIGRATION_TABLE}").fetchall()}
     results = []
     for f in files:
         if f.name in applied:
@@ -95,7 +114,8 @@ def run_migrations(dry_run: bool = False) -> list[dict]:
             continue
         with get_conn() as c:
             c.executescript(sql)
-            c.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (f.name,))
+            _ensure_migration_table(c)
+            c.execute(f"INSERT OR IGNORE INTO {MIGRATION_TABLE} (name) VALUES (?)", (f.name,))
         results.append({"name": f.name, "status": "applied"})
     return results
 
