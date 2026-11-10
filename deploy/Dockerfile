@@ -74,9 +74,10 @@ COPY --from=web /web/dist/vite.svg /app/assets/vite.svg
 
 EXPOSE 5409
 
-# /health 不校验令牌，专门给健康检查用
+# /health 不校验令牌，专门给健康检查用；/health/ready 做就绪判定（P0-5）
+# Docker HEALTHCHECK 看 ready：依赖坏了容器判 unhealthy，Nginx upstream 配合 max_fails 踢掉
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
-  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5409/health',timeout=4)" || exit 1
+  CMD python -c "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5409/health/ready',timeout=4).getcode()==200 else 1)" || exit 1
 
 # 单进程：内存队列、发布 worker、巡检线程、SSE 都在进程内，别改成多 worker
 # db/database.db 的 user_info / file_records 只有 createTable.py 会建，

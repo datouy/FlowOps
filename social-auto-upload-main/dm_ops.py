@@ -1064,7 +1064,15 @@ def _upsert_contact(c, item: dict, content: str, intent: str, segment: str, ts: 
              _clean(source_content, 500), fields["contact_info"], fields["traveler_count"],
              fields["origin"], fields["travel_date"], fields["company_name"], fields["budget"],
              ts, ts, ts if direction == "inbound" else None, ts, ts))
-        return cur.lastrowid
+        _new_id = int(cur.lastrowid)
+        # P1-5 事件：新线索落库即推 lead.created（签名推送，订阅者无则空转）
+        try:
+            import event_bus
+            event_bus.emit("lead.created", {"contactId": _new_id, "platform": platform,
+                                            "account": account, "intent": intent, "stage": stage})
+        except Exception:
+            pass
+        return _new_id
 
     new_segment = segment if segment != "unknown" else row["segment"]
     if item.get("segment") in SEGMENTS and item.get("segment") != "unknown":

@@ -100,6 +100,12 @@ schedule_ops.register(app)
 import publish_jobs
 publish_jobs.backfill_scheduled_items()
 publish_jobs.recover_pending_jobs()
+try:
+    import rbac_audit
+    rbac_audit.init_rbac()
+    rbac_audit.run_migrations()
+except Exception:
+    pass
 import stats_reflow
 import ai_content
 import ai_pack_jobs

@@ -2336,6 +2336,25 @@ def _finalize_job(
             )
         except Exception:
             pass
+    # P1-5 事件推送：job.success 签名推送（订阅者无则空转）
+    try:
+        if status in ('success', 'partial_success', 'submitted'):
+            import event_bus
+            event_bus.emit("job.success", {"jobId": int(job_id), "status": status,
+                                           "ok": int(ok), "failed": int(bad)})
+    except Exception:
+        pass
+    # P0-5 审计：任务终态落 audit_logs（失败也记）
+    try:
+        import rbac_audit
+        rbac_audit.init_rbac()
+        with rbac_audit.get_conn() as _c:
+            _c.execute("INSERT INTO audit_logs (user, action, target, detail, ok) VALUES (?,?,?,?,?)",
+                       ("system", "job.finalize", str(job_id),
+                        f"{status} ok={ok} bad={bad} skip={skipped}"[:500],
+                        1 if status in ('success', 'submitted') else 0))
+    except Exception:
+        pass
 
 
 def _finalize_existing_job(job_id: int) -> None:
