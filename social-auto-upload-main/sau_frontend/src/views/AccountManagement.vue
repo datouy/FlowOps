@@ -425,6 +425,17 @@
           show-icon
           title="代理只作用于该账号的登录、巡检和发布会话；留空代理地址表示直连。"
         />
+        <el-form-item label="出口 IP">
+          <span v-if="egressForm.ip" class="egress-ip">{{ egressForm.ip }}</span>
+          <span v-else class="egress-muted">尚未验证</span>
+          <el-button
+            size="small"
+            style="margin-left: 12px"
+            :loading="egressVerifying"
+            @click="verifyProxyEgress"
+          >验证出口</el-button>
+          <span v-if="egressForm.error" class="egress-error" :title="egressForm.error">（验证失败）</span>
+        </el-form-item>
         <el-divider content-position="left">发布通道</el-divider>
         <div class="transport-list" v-loading="environmentLoading">
           <div class="transport-item" v-for="item in transportRows" :key="item.platformType">
@@ -685,6 +696,8 @@ const environmentForm = reactive({
   proxyPassword: '',
 })
 const transportRows = ref([])
+const egressVerifying = ref(false)
+const egressForm = reactive({ ip: '', error: '' })
 
 const transportHasTemplate = computed(() =>
   transportRows.value.some((item) => item.templateReady)
@@ -935,6 +948,7 @@ const openAccountEnvironment = async (row) => {
     environmentLoading.value = false
   }
   await loadPublishTransport(row.id)
+  await loadProxyEgress(row.id)
 }
 
 const loadPublishTransport = async (accountId) => {
@@ -944,6 +958,38 @@ const loadPublishTransport = async (accountId) => {
   } catch (error) {
     console.error('读取发布通道状态失败:', error)
     transportRows.value = []
+  }
+}
+
+const loadProxyEgress = async (accountId) => {
+  try {
+    const res = await accountApi.getProxyEgress(accountId)
+    const data = res?.data || {}
+    egressForm.ip = data.ip || ''
+    egressForm.error = data.error || ''
+  } catch (error) {
+    egressForm.ip = ''
+    egressForm.error = ''
+  }
+}
+
+const verifyProxyEgress = async () => {
+  if (!environmentAccount.value || egressVerifying.value) return
+  egressVerifying.value = true
+  try {
+    const res = await accountApi.verifyProxyEgress(environmentAccount.value.id)
+    const data = res?.data || {}
+    egressForm.ip = data.ip || ''
+    egressForm.error = data.error || ''
+    if (data.ip) {
+      ElMessage.success('出口 IP：' + data.ip)
+    } else {
+      ElMessage.warning(data.error || '未能获取出口 IP')
+    }
+  } catch (error) {
+    ElMessage.error(error?.message || '验证出口失败')
+  } finally {
+    egressVerifying.value = false
   }
 }
 

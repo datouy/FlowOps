@@ -205,10 +205,12 @@ def check_proxy(cookie: str, base: Path | None = None) -> list[dict]:
     proxy = (env or {}).get("proxy") or {}
     server = str(proxy.get("server") or "").strip()
     if not server:
+        from runtime_config import REQUIRE_PROXY
+        severity = BLOCKING if REQUIRE_PROXY else WARNING
         issues.append(_issue(
-            "proxy_absent", WARNING,
+            "proxy_absent", severity,
             "该账号没有绑定独立出口，发布将使用本机 IP",
-            "多账号共用本机出口容易被判定为账号矩阵；建议在代理池里分配",
+            "多账号共用本机出口容易被判定为账号矩阵；请在代理池里分配独立出口",
         ))
         return issues
     if not server.lower().startswith(PROXY_SCHEMES):

@@ -1007,6 +1007,44 @@ def _account_count() -> int:
         return 0
 
 
+@app.route('/api/v2/accounts/<int:account_id>/proxy/verify', methods=['POST'])
+def api_v2_account_proxy_verify(account_id: int):
+    """探测该账号代理的真实出口 IP 并落盘，便于运营确认没有回落直连。"""
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None or not item["cookie"].get("name"):
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str(item["cookie"].get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
+    from utils.account_environment import load_environment
+    from utils.proxy_egress import detect_egress_ip, record_egress
+    proxy = (load_environment(cookie_path) or {}).get("proxy") or {}
+    ip, err = detect_egress_ip(proxy)
+    record_egress(cookie_path, ip, err)
+    return jsonify({"code": 200, "msg": None, "data": {"ip": ip, "error": err}}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/proxy/egress', methods=['GET'])
+def api_v2_account_proxy_egress(account_id: int):
+    """读取该账号最近一次出口验证结果。"""
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None or not item["cookie"].get("name"):
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str(item["cookie"].get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
+    from utils.proxy_egress import egress_status
+    return jsonify({"code": 200, "msg": None, "data": egress_status(cookie_path)}), 200
+
+
 @app.route('/api/v2/accounts/prune-cookies', methods=['POST'])
 def api_v2_prune_cookies():
     """清理没有被任何账号引用的 Cookie 文件；默认 dry-run。"""

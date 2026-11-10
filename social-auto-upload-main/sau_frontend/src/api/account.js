@@ -45,6 +45,16 @@ export const accountApi = {
     return http.post(`/api/v2/accounts/${id}/check`)
   },
 
+  // 验证该账号代理的真实出口 IP 并落盘
+  verifyProxyEgress(id) {
+    return http.post(`/api/v2/accounts/${id}/proxy/verify`)
+  },
+
+  // 读取该账号最近一次出口验证结果
+  getProxyEgress(id) {
+    return http.get(`/api/v2/accounts/${id}/proxy/egress`)
+  },
+
   // 凭据脱敏预览（只回 Cookie 名称/域名与 localStorage 键名，不回值）
   getAccountCredentials(id) {
     return http.get(`/api/v2/accounts/${id}/credentials`)

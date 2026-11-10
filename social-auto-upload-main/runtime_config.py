@@ -120,6 +120,10 @@ CORS_ORIGINS = _split_csv(_env_text("YUNCE_CORS_ORIGINS")) or list(DEFAULT_ORIGI
 PUBLIC_PATHS = frozenset({"/health", "/favicon.ico", "/vite.svg"})
 PUBLIC_PREFIXES = ("/assets/",)
 
+# 发布执行期强制要求每个账号绑定独立代理出口。关闭时"无代理"只是提醒，
+# 开启后多账号环境下没有代理会被发布预检拦下（fail-closed）。
+REQUIRE_PROXY = _as_bool(_env_text("FLOWOPS_REQUIRE_PROXY"))
+
 # 账号浏览器启动后做一次动态指纹自检，关键字段不一致就拒绝执行账号动作。
 # 默认关闭：实测部分 Chromium 构建里 navigator.platform / hardwareConcurrency /
 # screen 的注入并不稳定，默认硬拦会误伤正常账号。确认注入生效后再用
