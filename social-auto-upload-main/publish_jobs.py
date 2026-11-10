@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # 发布任务队列 + 发布记录 + 账号巡检
+import os
 import threading
 import time
 import traceback
@@ -48,6 +49,79 @@ def _ensure_columns(c, table: str, columns: tuple[tuple[str, str], ...]) -> None
     for name, ddl in columns:
         if name not in existing:
             c.execute(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}')
+            existing.add(name)
+
+
+# ---------------------------------------------------------------- Executor 租约
+#
+# P0-1：控制面与执行面分离的第一步 —— jobs 表持有租约字段，
+# worker 用“租约抢占 + 心跳续期”代替内存 Queue 的“拿走即拥有”。
+# 单机 SQLite 够用，不引入 Redis/Celery。
+EXECUTOR_ID = f"worker-{os.getpid()}"
+EXECUTOR_LEASE_SECONDS = int(os.environ.get("FLOWOPS_EXECUTOR_LEASE", "120") or 120)
+
+
+def claim_job(job_id: int) -> bool:
+    """原子抢占 pending/过期租约任务。成功返回 True。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as c:
+        _ensure_columns(c, 'jobs', (
+            ('executor_id', "TEXT DEFAULT ''"),
+            ('lease_until', "DATETIME"),
+            ('heartbeat_at', "DATETIME"),
+        ))
+        row = c.execute(
+            "SELECT status, lease_until FROM jobs WHERE id=?", (int(job_id),)
+        ).fetchone()
+        if not row:
+            return False
+        status = str(row['status'] or '')
+        lease = str(row['lease_until'] or '')
+        expired = True
+        if lease:
+            try:
+                expired = lease <= now
+            except Exception:
+                expired = True
+        if status == 'pending' or (status == 'running' and expired):
+            c.execute(
+                "UPDATE jobs SET status='running', executor_id=?, "
+                "lease_until=datetime(CURRENT_TIMESTAMP, ?), "
+                "heartbeat_at=CURRENT_TIMESTAMP WHERE id=?",
+                (EXECUTOR_ID, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
+            )
+            return True
+        return False
+
+
+def heartbeat_job(job_id: int) -> None:
+    """执行中续期，防止被其他 worker 抢走。"""
+    try:
+        with get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET heartbeat_at=CURRENT_TIMESTAMP, "
+                "lease_until=datetime(CURRENT_TIMESTAMP, ?) "
+                "WHERE id=? AND executor_id=?",
+                (f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id), EXECUTOR_ID),
+            )
+    except Exception:
+        pass
+
+
+def release_stale_leases() -> int:
+    """回收过期租约回 pending。返回回收数。"""
+    with get_conn() as c:
+        _ensure_columns(c, 'jobs', (
+            ('executor_id', "TEXT DEFAULT ''"),
+            ('lease_until', "DATETIME"),
+            ('heartbeat_at', "DATETIME"),
+        ))
+        cur = c.execute(
+            "UPDATE jobs SET status='pending', executor_id='', lease_until=NULL "
+            "WHERE status='running' AND lease_until IS NOT NULL "
+            "AND lease_until < CURRENT_TIMESTAMP"
+        )
+        return int(cur.rowcount or 0)
 
 
 def _reconcile_historical_item_stages(c) -> None:
@@ -165,6 +239,9 @@ def init_db():
             progress TEXT DEFAULT '',
             result TEXT DEFAULT '',
             retry_count INTEGER DEFAULT 0,
+            executor_id TEXT DEFAULT '',
+            lease_until DATETIME,
+            heartbeat_at DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
         )''')
@@ -1805,6 +1882,14 @@ def _worker(worker_id):
     while True:
         job_id = _q.get()
         try:
+            # P0-1 租约抢占：重复队列项/过期租约由 claim_job 仲裁
+            try:
+                if not claim_job(int(job_id)):
+                    logger.info("任务 {} 已被其它执行器领取，跳过", job_id)
+                    continue
+            except Exception:
+                pass
+            heartbeat_job(int(job_id))
             _run_job(job_id)
         except Exception as e:
             try:
@@ -1821,8 +1906,10 @@ def _run_job(job_id):
     与旧实现的区别（也是"重复发布"bug 的修复点）：
     * 每条子任务独立记状态，一个账号失败不会中断其它账号；
     * 自动重试只针对失败/未跑的子任务，已成功的不会重发；
-    * 发布前检查账号健康度，失效账号直接 skip 并写明原因；
-    * 异常按类型归因，登录失效立刻把账号标为异常并跳过该账号剩余子任务。
+    * 发布前做账号健康门禁，失效账号直接 skip 并写明原因；
+    * 异常按类型归因，登录失效立刻把账号标为异常并跳过该账号剩余子任务；
+    * P0-1 租约：worker 已通过 claim_job 持有租约，这里只做归属校验，
+      执行中每条 item 前 heartbeat 续期，防止长任务被误回收。
     """
     from myUtils.platform_registry import platform_name
 
@@ -1834,17 +1921,29 @@ def _run_job(job_id):
         logger.info("任务 {} 状态为 {}，跳过执行", job_id, job['status'])
         return
 
-    # A due schedule can be discovered by both restart recovery and the
-    # scheduler during startup.  Claim the job atomically so duplicate queue
-    # entries cannot publish the same items twice.
-    with get_conn() as c:
-        claimed = c.execute(
-            "UPDATE jobs SET status='running' WHERE id=? AND status='pending'",
-            (int(job_id),),
-        ).rowcount
-    if not claimed:
-        logger.info("任务 {} 已被其它 worker 领取或已结束，跳过重复队列项", job_id)
+    # P0-1 租约归属校验：只有持有者才能执行，防止重复队列项二次执行。
+    try:
+        owner = str((job['executor_id'] if 'executor_id' in job.keys() else '') or '')
+    except Exception:
+        owner = ''
+    if owner and owner != EXECUTOR_ID:
+        logger.info("任务 {} 已被执行器 {} 持有，跳过", job_id, owner)
         return
+    if not owner:
+        # 兼容老 worker 直投：尝试抢占，抢不到就跳过。
+        try:
+            if not claim_job(int(job_id)):
+                logger.info("任务 {} 已被其它 worker 领取或已结束，跳过重复队列项", job_id)
+                return
+        except Exception:
+            with get_conn() as c:
+                claimed = c.execute(
+                    "UPDATE jobs SET status='running' WHERE id=? AND status='pending'",
+                    (int(job_id),),
+                ).rowcount
+            if not claimed:
+                logger.info("任务 {} 已被其它 worker 领取或已结束，跳过重复队列项", job_id)
+                return
 
     type = job['type']
     title = job['title']
@@ -2540,6 +2639,51 @@ def reject_job(job_id):
 
 _scheduler_started = False
 _tracker_started = False
+_lease_reclaimer_started = False
+
+
+def _start_lease_reclaimer(interval_seconds: int = 30) -> None:
+    """P0-1 租约回收后台线程：过期 running → pending，重启/崩溃 0 卡死。"""
+    global _lease_reclaimer_started
+    with _lock:
+        if _lease_reclaimer_started:
+            return
+        _lease_reclaimer_started = True
+
+    def _loop():
+        runtime_guard.beat('executor-lease-reclaimer')
+        while True:
+            try:
+                n = int(release_stale_leases() or 0)
+                if n:
+                    logger.info("租约回收：{} 个过期任务回 pending", n)
+                    _start_workers()
+                    # 回 pending 的任务需要重新入队，否则只躺库里没人跑
+                    try:
+                        with get_conn() as c:
+                            rows = c.execute(
+                                "SELECT id FROM jobs WHERE status='pending' ORDER BY id DESC LIMIT 50"
+                            ).fetchall()
+                        for r in rows:
+                            try:
+                                _q.put_nowait(int(r['id']))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                runtime_guard.beat('executor-lease-reclaimer')
+            except Exception as exc:
+                runtime_guard.beat('executor-lease-reclaimer', ok=False, error=str(exc))
+            time.sleep(max(10, int(interval_seconds)))
+
+    threading.Thread(target=_loop, daemon=True, name='executor-lease-reclaimer').start()
+
+
+def restart_lease_reclaimer(interval_seconds: int = 30) -> None:
+    global _lease_reclaimer_started
+    with _lock:
+        _lease_reclaimer_started = False
+    _start_lease_reclaimer(interval_seconds)
 
 
 def start_publish_runtime(
@@ -2549,6 +2693,7 @@ def start_publish_runtime(
     """Start the local schedule scanner and post-submit status tracker."""
     global _scheduler_started, _tracker_started
     _start_workers()
+    _start_lease_reclaimer()
     with _lock:
         start_scheduler = not _scheduler_started
         start_tracker = not _tracker_started

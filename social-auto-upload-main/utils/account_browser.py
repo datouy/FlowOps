@@ -291,31 +291,33 @@ async def persistent_account_context(
         fingerprint=fingerprint,
     )
     context = None
+    from utils.browser_pool import browser_slot
     async with _ProfileGuard(profile):
-        try:
-            context = await playwright.chromium.launch_persistent_context(
-                str(profile), **options,
-            )
-            register_context_profile(context, profile)
-            await hydrate_context_async(context, resolved, account_id)
-            await context.add_init_script(script=fingerprint_init_script(fingerprint))
-            from runtime_config import FINGERPRINT_FAIL_CLOSED
-            if FINGERPRINT_FAIL_CLOSED:
-                from utils.fingerprint_selfcheck import assert_fingerprint
-                await assert_fingerprint(context, fingerprint)
-            yield context
-        finally:
-            if context is not None:
-                # 关闭浏览器必须有界。
-                #
-                # 这段清理在 ``_ProfileGuard`` 的作用域内：如果 ``close()``
-                # 永远不返回（浏览器进程僵死时很常见），Guard 就永远不会退出，
-                # Profile 锁也就永远不释放——同账号的私信发送、发布、登录
-                # 全部堵死。清理动作不能变成第二个卡点。
-                await browser_timeout.close_async_resource_async(
-                    context, label="关闭账号浏览器",
+        with browser_slot():
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    str(profile), **options,
                 )
-            unregister_context_profile(context)
+                register_context_profile(context, profile)
+                await hydrate_context_async(context, resolved, account_id)
+                await context.add_init_script(script=fingerprint_init_script(fingerprint))
+                from runtime_config import FINGERPRINT_FAIL_CLOSED
+                if FINGERPRINT_FAIL_CLOSED:
+                    from utils.fingerprint_selfcheck import assert_fingerprint
+                    await assert_fingerprint(context, fingerprint)
+                yield context
+            finally:
+                if context is not None:
+                    # 关闭浏览器必须有界。
+                    #
+                    # 这段清理在 ``_ProfileGuard`` 的作用域内：如果 ``close()``
+                    # 永远不返回（浏览器进程僵死时很常见），Guard 就永远不会退出，
+                    # Profile 锁也就永远不释放——同账号的私信发送、发布、登录
+                    # 全部堵死。清理动作不能变成第二个卡点。
+                    await browser_timeout.close_async_resource_async(
+                        context, label="关闭账号浏览器",
+                    )
+                unregister_context_profile(context)
 
 
 @asynccontextmanager
@@ -374,26 +376,28 @@ def persistent_account_context_sync(
         fingerprint=fingerprint,
     )
     context = None
+    from utils.browser_pool import browser_slot as _browser_slot
     with _ProfileGuard(profile):
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile), **options,
-            )
-            register_context_profile(context, profile)
-            hydrate_context(context, resolved, account_id)
-            context.add_init_script(script=fingerprint_init_script(fingerprint))
-            from runtime_config import FINGERPRINT_FAIL_CLOSED
-            if FINGERPRINT_FAIL_CLOSED:
-                from utils.fingerprint_selfcheck import assert_fingerprint_sync
-                assert_fingerprint_sync(context, fingerprint)
-            yield context
-        finally:
-            if context is not None:
-                # 同异步版本：关闭动作必须有界，否则 Profile 锁释放不了。
-                browser_timeout.close_async_resource(
-                    context, label="关闭账号浏览器",
+        with _browser_slot():
+            try:
+                context = playwright.chromium.launch_persistent_context(
+                    str(profile), **options,
                 )
-            unregister_context_profile(context)
+                register_context_profile(context, profile)
+                hydrate_context(context, resolved, account_id)
+                context.add_init_script(script=fingerprint_init_script(fingerprint))
+                from runtime_config import FINGERPRINT_FAIL_CLOSED
+                if FINGERPRINT_FAIL_CLOSED:
+                    from utils.fingerprint_selfcheck import assert_fingerprint_sync
+                    assert_fingerprint_sync(context, fingerprint)
+                yield context
+            finally:
+                if context is not None:
+                    # 同异步版本：关闭动作必须有界，否则 Profile 锁释放不了。
+                    browser_timeout.close_async_resource(
+                        context, label="关闭账号浏览器",
+                    )
+                unregister_context_profile(context)
 
 
 class _PersistentAsyncHandle:
