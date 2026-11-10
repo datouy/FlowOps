@@ -142,6 +142,19 @@ class UnknownPlatformError(AppError):
     account_effect = ACCOUNT_NONE
 
 
+class FingerprintMismatchError(AppError):
+    """浏览器实际暴露的指纹与账号记录的指纹不一致。
+
+    这属于"伪造/复用的指纹没打上去"：账号会被平台当成一台新设备，轻则
+    登录态失效，重则直接触发环境风控。fail-closed 语义下必须拒绝执行，
+    而不是带着矛盾的指纹继续发账号动作。
+    """
+
+    code = "fingerprint_mismatch"
+    retryable = False
+    account_effect = ACCOUNT_NONE
+
+
 # ---------------------------------------------------------------- 工具
 
 #: 错误码 → 异常类。新写的异常在这里登记。
@@ -153,6 +166,7 @@ ERROR_CODES: dict[str, type[AppError]] = {
     SelectorDriftError.code: SelectorDriftError,
     ResourceMissingError.code: ResourceMissingError,
     UnknownPlatformError.code: UnknownPlatformError,
+    FingerprintMismatchError.code: FingerprintMismatchError,
 }
 
 

@@ -297,6 +297,10 @@ async def persistent_account_context(
             register_context_profile(context, profile)
             await hydrate_context_async(context, resolved, account_id)
             await context.add_init_script(script=fingerprint_init_script(fingerprint))
+            from runtime_config import FINGERPRINT_FAIL_CLOSED
+            if FINGERPRINT_FAIL_CLOSED:
+                from utils.fingerprint_selfcheck import assert_fingerprint
+                await assert_fingerprint(context, fingerprint)
             yield context
         finally:
             if context is not None:
@@ -376,6 +380,10 @@ def persistent_account_context_sync(
             register_context_profile(context, profile)
             hydrate_context(context, resolved, account_id)
             context.add_init_script(script=fingerprint_init_script(fingerprint))
+            from runtime_config import FINGERPRINT_FAIL_CLOSED
+            if FINGERPRINT_FAIL_CLOSED:
+                from utils.fingerprint_selfcheck import assert_fingerprint_sync
+                assert_fingerprint_sync(context, fingerprint)
             yield context
         finally:
             if context is not None:
