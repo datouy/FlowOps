@@ -577,6 +577,30 @@ def _platform_catalog() -> list:
     ]
 
 
+def _account_error_kind(item: dict) -> str:
+    """把账号失效原因收敛成稳定的 errorKind，供前端按图标/文案分类展示。"""
+    cookie = item.get("cookie") or {}
+    if not cookie.get("exists"):
+        return "cookie_missing"
+    name = str(cookie.get("name") or "")
+    if name:
+        try:
+            state = read_storage_state(Path(BASE_DIR / "cookiesFile" / name))
+            if state is None:
+                return "cookie_unreadable"
+        except Exception:
+            return "credential_undecryptable"
+    status = int(item.get("status") or 0)
+    if status == 1:
+        return "ok"
+    reason = str(item.get("failReason") or "")
+    if "风控" in reason:
+        return "throttled"
+    if "失效" in reason or "登录" in reason:
+        return "expired"
+    return "expired" if status == 0 else "ok"
+
+
 @app.route('/api/v2/accounts', methods=['GET'])
 def api_v2_accounts():
     """结构化账号列表：平台元数据 + 身份 + 健康度 + 凭据状态 + 汇总。"""
@@ -586,6 +610,8 @@ def api_v2_accounts():
     # 多人协作：只返回令牌范围内的账号。汇总数字也按过滤后的集合统计，
     # 否则运营能看到"全公司 30 个号"这种范围外的元信息。
     accounts = access_scope.filter_accounts(store.list(pid))
+    for item in accounts:
+        item["errorKind"] = _account_error_kind(item)
     return jsonify({
         "code": 200,
         "msg": None,
@@ -818,6 +844,7 @@ async def api_v2_account_check(account_id: int):
                 "status": fresh["status"],
                 "statusText": fresh["statusText"],
                 "reason": fresh["failReason"],
+                "errorKind": _account_error_kind(fresh),
             },
         }), 200
     flags = await check_cookies_concurrently(
@@ -835,6 +862,7 @@ async def api_v2_account_check(account_id: int):
             "status": fresh["status"],
             "statusText": fresh["statusText"],
             "reason": fresh["failReason"],
+            "errorKind": _account_error_kind(fresh),
         },
     }), 200
 
@@ -1005,6 +1033,58 @@ def _account_count() -> int:
         return int(row[0] or 0) if row else 0
     except Exception:
         return 0
+
+
+@app.route('/api/v2/accounts/check-all', methods=['POST'])
+async def api_v2_accounts_check_all():
+    """批量健康检查：逐个跑 cookie 校验并回写状态，返回汇总。"""
+    store = get_store(BASE_DIR)
+    accounts = access_scope.filter_accounts(store.list())
+    results = []
+    ok = 0
+    bad = 0
+    for item in accounts:
+        aid = int(item["id"])
+        if not item["cookie"]["exists"]:
+            store.mark_status(aid, 0, "凭据文件缺失，请重新扫码授权")
+            bad += 1
+            fresh = store.get(aid) or item
+            results.append({
+                "id": aid,
+                "name": item["name"],
+                "alive": False,
+                "status": fresh["status"],
+                "statusText": fresh["statusText"],
+                "reason": fresh["failReason"],
+                "errorKind": _account_error_kind(fresh),
+            })
+            continue
+        flags = await check_cookies_concurrently(
+            [(item["platform"]["type"], item["cookie"]["name"])], max_concurrent=1
+        )
+        alive = bool(flags.get(0, False))
+        store.mark_checked(
+            aid, alive, "" if alive else "登录态失效，请重新授权"
+        )
+        if alive:
+            ok += 1
+        else:
+            bad += 1
+        fresh = store.get(aid) or item
+        results.append({
+            "id": aid,
+            "name": item["name"],
+            "alive": alive,
+            "status": fresh["status"],
+            "statusText": fresh["statusText"],
+            "reason": fresh["failReason"],
+            "errorKind": _account_error_kind(fresh),
+        })
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {"ok": ok, "bad": bad, "total": len(results), "accounts": results},
+    }), 200
 
 
 @app.route('/api/v2/accounts/<int:account_id>/proxy/verify', methods=['POST'])

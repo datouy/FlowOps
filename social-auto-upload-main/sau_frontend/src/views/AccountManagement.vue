@@ -28,6 +28,7 @@
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
                 </el-button>
+                <el-button :loading="checkingAll" @click="checkAllAccounts">批量检查</el-button>
               </div>
             </div>
 
@@ -574,6 +575,7 @@ onMounted(() => {
 
 // 单账号复检：走 /api/v2/accounts/<id>/check，回写状态/最后校验时间/失效原因
 const checkingAccountId = ref(null)
+const checkingAll = ref(false)
 
 // 同一次扫码保存出来的多个频道共享会话：计数 >1 才提示"共用登录"
 const sharedSessionGroups = computed(() => {
@@ -990,6 +992,22 @@ const verifyProxyEgress = async () => {
     ElMessage.error(error?.message || '验证出口失败')
   } finally {
     egressVerifying.value = false
+  }
+}
+
+const checkAllAccounts = async () => {
+  if (checkingAll.value) return
+  checkingAll.value = true
+  try {
+    const res = await accountApi.checkAllAccounts()
+    const data = res?.data || {}
+    ElMessage.success('批量检查完成：正常 ' + (data.ok || 0) + ' / 异常 ' + (data.bad || 0))
+    await accountStore.loadHealth()
+    await fetchAccountsQuick()
+  } catch (error) {
+    ElMessage.error(error?.message || '批量检查失败')
+  } finally {
+    checkingAll.value = false
   }
 }
 

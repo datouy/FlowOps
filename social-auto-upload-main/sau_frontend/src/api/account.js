@@ -45,6 +45,11 @@ export const accountApi = {
     return http.post(`/api/v2/accounts/${id}/check`)
   },
 
+  // 批量健康检查（逐个校验并回写状态，返回汇总）
+  checkAllAccounts() {
+    return http.post('/api/v2/accounts/check-all')
+  },
+
   // 验证该账号代理的真实出口 IP 并落盘
   verifyProxyEgress(id) {
     return http.post(`/api/v2/accounts/${id}/proxy/verify`)
