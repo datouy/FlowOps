@@ -220,3 +220,185 @@ def wait_first_visible_sync(page, platform: str, default_timeout: int = 12000) -
     pack = drift_pack(platform, url, tried, dom, shot)
     path = save_drift_pack(pack, shot if isinstance(shot, (bytes, bytearray)) else None)
     raise SelectorDriftError(f"选择器全部失效({platform})，诊断包已导出：{path}")
+
+
+# ---------------------------------------------------------------- 发布步骤
+#
+# 上面的 ``candidates`` 只覆盖**私信列表**。发布侧的选择器此前仍硬编码在
+# uploader/*/main.py 里——平台改版一次，发布就得改代码发版。这里把发布流程
+# 的**关键锚点**也外置成候选表：上传入口 / 发布按钮 / 登录态标志 / 成功标志。
+# 这些是"改版最高发、失败最致命"的点；标题、话题这类有 text/placeholder 兜底
+# 的，暂不纳入。
+
+PUBLISH_DIR = ADAPTER_DIR / "publish"
+
+PUBLISH_BUILTIN: dict[str, dict[str, list[dict]]] = {
+    "tencent": {
+        "publish_button": [
+            {"selector": 'button.weui-desktop-btn:has-text("发表视频")', "assert": "visible", "timeout": 30000},
+            {"selector": 'button:has-text("发表")', "assert": "visible", "timeout": 15000},
+        ],
+        "login_marker": [
+            {"selector": 'div:has-text("发表视频")', "assert": "visible"},
+            {"selector": 'button:has-text("发表")', "assert": "visible"},
+            {"selector": 'button:has-text("保存草稿")', "assert": "visible"},
+        ],
+        "qrcode_marker": [
+            {"selector": "div.login-qrcode-wrap", "assert": "visible"},
+            {"selector": "div.qrcode-wrap", "assert": "visible"},
+            {"selector": "img.qrcode", "assert": "visible"},
+            {"selector": 'span:has-text("微信扫码登录 视频号助手")', "assert": "visible"},
+        ],
+    },
+    "baijiahao": {
+        "publish_button": [
+            {"selector": '[data-testid="publish-btn"]', "assert": "visible", "timeout": 15000},
+            {"selector": 'button:text-is("发布")', "assert": "visible", "timeout": 15000},
+            {"selector": 'button:has-text("发布")', "assert": "visible", "timeout": 15000},
+        ],
+    },
+    "kuaishou": {
+        "upload_entry": [
+            {"selector": "button[class^='_upload-btn']", "assert": "visible", "timeout": 15000},
+        ],
+        "publish_confirm": [
+            {"selector": "div.ant-modal-confirm-centered button.ant-btn-primary", "assert": "visible", "timeout": 8000},
+        ],
+    },
+    "weibo": {
+        "upload_entry": [
+            {"selector": 'button:has-text("上传视频")', "assert": "visible", "timeout": 15000},
+        ],
+    },
+    "douyin": {
+        "upload_entry": [
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+        ],
+    },
+    "xiaohongshu": {
+        "upload_entry": [
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+            {"selector": "input.upload-input", "assert": "attached", "timeout": 15000},
+        ],
+    },
+}
+
+
+def publish_candidates(platform: str, step: str) -> list[dict]:
+    """发布流程某一步骤的有序候选。远端 yaml 优先，内置兜底。"""
+    key = str(platform or "").strip().lower()
+    st = str(step or "").strip().lower()
+    path = PUBLISH_DIR / f"{key}.{st}.yaml"
+    if path.is_file():
+        try:
+            parsed = _parse_simple_yaml(path.read_text(encoding="utf-8"))
+            if parsed:
+                return parsed
+        except OSError:
+            pass
+    return [dict(item) for item in PUBLISH_BUILTIN.get(key, {}).get(st, [])]
+
+
+def _collect_drift(page, platform: str, tried: list[str]) -> str:
+    """全失败时打包诊断信息，返回落盘路径。"""
+    url, dom = "", ""
+    shot = None
+    try:
+        url = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        dom = str(page.content())[:60000]
+    except Exception:
+        pass
+    try:
+        shot = page.screenshot(full_page=False)
+    except Exception:
+        shot = None
+    pack = drift_pack(platform, url, tried, dom, shot)
+    return save_drift_pack(pack, shot if isinstance(shot, (bytes, bytearray)) else None)
+
+
+async def wait_publish_step_async(page, platform: str, step: str,
+                                 default_timeout: int = 15000) -> str:
+    """等发布流程某一步骤的第一个候选出现，返回命中 selector；全失败抛 Drift。"""
+    from utils.errors import SelectorDriftError
+    tried: list[str] = []
+    for cand in publish_candidates(platform, step):
+        sel = str(cand.get("selector") or "")
+        if not sel:
+            continue
+        tried.append(sel)
+        try:
+            await page.wait_for_selector(sel, timeout=int(cand.get("timeout") or default_timeout))
+            return sel
+        except Exception:
+            continue
+    path = await _async_collect_drift(page, platform, tried)
+    raise SelectorDriftError(f"发布步骤 {step}({platform}) 选择器全部失效，诊断包已导出：{path}")
+
+
+async def _async_collect_drift(page, platform: str, tried: list[str]) -> str:
+    url, dom = "", ""
+    shot = None
+    try:
+        url = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        dom = str(await page.content())[:60000]
+    except Exception:
+        pass
+    try:
+        shot = await page.screenshot(full_page=False)
+    except Exception:
+        shot = None
+    pack = drift_pack(platform, url, tried, dom, shot)
+    return save_drift_pack(pack, shot if isinstance(shot, (bytes, bytearray)) else None)
+
+
+async def publish_step_any_visible(page, platform: str, step: str) -> bool:
+    """立即判断某一步骤的任一候选当前是否**存在且可见**（用于登录态判定）。"""
+    for cand in publish_candidates(platform, step):
+        sel = str(cand.get("selector") or "")
+        if not sel:
+            continue
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_publish_step_sync(page, platform: str, step: str,
+                           default_timeout: int = 15000) -> str:
+    from utils.errors import SelectorDriftError
+    tried: list[str] = []
+    for cand in publish_candidates(platform, step):
+        sel = str(cand.get("selector") or "")
+        if not sel:
+            continue
+        tried.append(sel)
+        try:
+            page.wait_for_selector(sel, timeout=int(cand.get("timeout") or default_timeout))
+            return sel
+        except Exception:
+            continue
+    path = _collect_drift(page, platform, tried)
+    raise SelectorDriftError(f"发布步骤 {step}({platform}) 选择器全部失效，诊断包已导出：{path}")
+
+
+def publish_step_any_visible_sync(page, platform: str, step: str) -> bool:
+    for cand in publish_candidates(platform, step):
+        sel = str(cand.get("selector") or "")
+        if not sel:
+            continue
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    return False

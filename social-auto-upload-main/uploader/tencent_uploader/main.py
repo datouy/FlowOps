@@ -428,6 +428,20 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
 
 
 async def _is_tencent_login_completed(page: Page) -> bool:
+    # 登录态判定走远端适配包（P0-4）：平台改版后推 yaml 即可，不用发版。
+    # 适配包不可用时回退到下面的硬编码，向后兼容。
+    try:
+        import selector_adapters as _ad
+        if await _ad.publish_step_any_visible(page, "tencent", "login_marker"):
+            return True
+        if not (page.url.startswith(TENCENT_UPLOAD_URL) or page.url.startswith(TENCENT_MANAGE_URL)):
+            return False
+        if await _ad.publish_step_any_visible(page, "tencent", "qrcode_marker"):
+            return False
+        return True
+    except Exception:
+        pass
+
     publish_markers = [
         page.locator('div:has-text("发表视频")').first,
         page.locator('button:has-text("发表")').first,

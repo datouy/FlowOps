@@ -572,12 +572,18 @@ class BaiJiaHaoVideo(BaseVideoUploader):
             await page.wait_for_timeout(1000)
 
         # 百家号发布按钮有 data-testid="publish-btn"
-        publish_btn = page.locator('[data-testid="publish-btn"]').first
-        if not await publish_btn.count():
-            publish_btn = page.locator('button:text-is("发布")').first
-        if not await publish_btn.count():
-            publish_btn = page.locator('button:has-text("发布")').last
-        await publish_btn.wait_for(state="visible", timeout=15000)
+        # 发布按钮走远端适配包（P0-4）：改版后推 yaml 即可，不用发版。
+        try:
+            import selector_adapters as _ad
+            sel = await _ad.wait_publish_step_async(page, "baijiahao", "publish_button", 15000)
+            publish_btn = page.locator(sel).first
+        except Exception:
+            publish_btn = page.locator('[data-testid="publish-btn"]').first
+            if not await publish_btn.count():
+                publish_btn = page.locator('button:text-is("发布")').first
+            if not await publish_btn.count():
+                publish_btn = page.locator('button:has-text("发布")').last
+            await publish_btn.wait_for(state="visible", timeout=15000)
         await publish_btn.click(force=True)
         baijiahao_logger.info(_msg("🏃", "已点击发布按钮"))
 
