@@ -21,6 +21,7 @@ import dm_cursor
 import dm_ops
 import runtime_guard
 from db_utils import apply_migrations, connect
+from utils.credential_crypto import resolve_credential_path
 
 ACCOUNT_DB = Path(BASE_DIR) / "db" / "database.db"
 COOKIE_DIR = Path(BASE_DIR) / "cookiesFile"
@@ -144,13 +145,26 @@ def parse_account_ids(value: Any) -> list[int]:
 
 
 def cookie_path(value: Any) -> Path | None:
+    """账号表里记的逻辑凭据名 → 磁盘上实际存在的文件。
+
+    登录态迁移成密文后，磁盘上是 ``<32hex>.enc``，账号表里还是
+    ``<32hex>.json``。这里必须走 ``resolve_credential_path``（密文优先），
+    直接 ``Path("x.json").is_file()`` 会把正常账号判成"Cookie 文件不存在"，
+    抖音/小红书/视频号同步全部报 cookie_missing。
+    """
     name = str(value or "").strip()
     if not name:
         return None
     path = COOKIE_DIR / Path(name).name
-    if path.is_file() and path.stat().st_size > 2:
-        return path
-    return None
+    resolved = resolve_credential_path(path)
+    if resolved is None:
+        return None
+    try:
+        if resolved.stat().st_size <= 2:
+            return None
+    except OSError:
+        return None
+    return resolved
 
 
 def account_rows(account_type: int) -> list[dict]:
@@ -191,6 +205,22 @@ def public_account(account: dict | None) -> dict | None:
     }
 
 
+def _dm_account_alive(account: dict | None) -> bool:
+    """私信同步口径的存活判断：只有 status == 0 才算失效。
+
+    status 缺失（老数据）或 -1（验证中）都视为存活，避免巡检抖动时
+    同步目标来回跳。与 stats_reflow._is_alive_account 保持一致。
+    """
+    if not account:
+        return False
+    if account.get("status") is None:
+        return True
+    try:
+        return int(account.get("status")) != 0
+    except (TypeError, ValueError):
+        return True
+
+
 def resolve_accounts(accounts: list[dict], selected_ids: list[int]) -> list[dict]:
     if selected_ids:
         selected = [
@@ -200,7 +230,8 @@ def resolve_accounts(accounts: list[dict], selected_ids: list[int]) -> list[dict
         selected = [item for item in accounts if item.get("cookie_path")]
         if not selected:
             selected = list(accounts)
-    return selected
+    # 失效账号全局隐藏：即使被显式选中也不再同步。
+    return [item for item in selected if _dm_account_alive(item)]
 
 
 def validate_account_ids(accounts: list[dict], selected_ids: list[int]) -> list[int]:
@@ -539,6 +570,32 @@ class BaseDmSync:
                 migrations,
             )
             self._ensure_health_table(conn)
+            # 建表兜底：迁移只在 version > 已记录版本时才跑。
+            # 一旦库被换掉、恢复过备份或表被误删，版本号还在、表却没了，
+            # 迁移就永远跳过——之后所有读写都是 "no such table"。
+            # 所以这里无条件跑一次幂等的 CREATE TABLE IF NOT EXISTS，
+            # 缺什么补什么，不缺就什么都不做。
+            self._ensure_settings_table(conn)
+
+    def _ensure_settings_table(self, conn: sqlite3.Connection) -> None:
+        """幂等补齐设置表（表被删/换库后自愈）。
+
+        ``_create_schema`` 里除了建表还会写默认行、跑平台特有的初始化，
+        这里只做"表在不在"这一层，保证不会因为版本号对不上而缺表。
+        """
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (self.settings_table,),
+        ).fetchone()
+        if row is not None:
+            return
+        self.log.warning("设置表 {} 缺失，重新创建", self.settings_table)
+        # 平台特有的初始化会读 dm_meta（dm_ops 的基础表）。
+        # 换库/恢复备份时那张表可能也没了，先把它补回来，
+        # 否则建表过程自己先炸在 "no such table: dm_meta" 上。
+        conn.execute("""CREATE TABLE IF NOT EXISTS dm_meta (
+            key TEXT PRIMARY KEY, value TEXT DEFAULT '')""")
+        self._create_schema(conn)
 
     def load_settings(self) -> dict:
         with dm_ops.get_conn() as conn:
@@ -640,6 +697,8 @@ class BaseDmSync:
                     selected = active
             if not selected:
                 selected = list(accounts)
+        # 失效账号全局隐藏：即使被显式选中也不再同步。
+        selected = [item for item in selected if _dm_account_alive(item)]
         result = []
         for item in selected:
             prepared = dict(item)
@@ -792,10 +851,19 @@ class BaseDmSync:
         result = self.run_sync("manual", wait_seconds=60)
         if not result.get("ok"):
             status = 409 if result.get("busy") else 400
+            # 错误原因不能是空串——前端会直接把它显示给用户，
+            # 兜底成"同步失败"等于什么都没说。
+            message = str(result.get("error") or "").strip()
+            if not message:
+                message = (
+                    "本轮没有账号被执行（分级调度已推迟），稍后会自动重试"
+                    if result.get("skipped_all")
+                    else "同步未完成，请稍后重试"
+                )
             return jsonify({
                 "code": status,
                 "data": result,
-                "msg": result.get("error") or "同步失败",
+                "msg": message,
             }), status
         return jsonify({"code": 200, "data": result, "msg": "同步完成"})
 
@@ -1068,6 +1136,14 @@ class BaseDmSync:
                 last_error=error_summary,
                 last_skip_reasons=json.dumps(skip_reasons, ensure_ascii=False),
             )
+            # 所有账号都被分级调度跳过（还没轮到执行）时，
+            # account_results 是空的——这不是失败，只是本轮没轮上。
+            # 之前 ok = bool(succeeded) 会把它判成失败，
+            # 后端又因为 error 是空串而回一句"同步失败"，
+            # 用户看到的就是"抖音：同步失败"，实际上什么都没坏。
+            skipped_all = not account_results
+            if skipped_all:
+                error_summary = ""
             self.log.info(
                 "trigger={} quick={} accounts={}/{} scanned={} imported={} duplicates={} "
                 "skipped={} ready={} duration={}ms",
@@ -1076,8 +1152,10 @@ class BaseDmSync:
                 duration_ms,
             )
             return {
-                "ok": bool(succeeded),
+                "ok": bool(succeeded) or skipped_all,
                 "partial": bool(failed and succeeded),
+                "skipped_all": skipped_all,
+                "skipped_cold": int(self._skipped_cold),
                 "trigger": trigger,
                 "quick": trigger in self.quick_triggers,
                 "parallel_workers": min(self.max_workers, max(1, len(selected_accounts))),

@@ -1139,6 +1139,7 @@ async function runPlatformSync() {
     const data = res.data || {}
     const summary = `扫描 ${data.scanned || 0}，新增 ${data.imported || 0}，重复 ${data.duplicates || 0}`
     if (data.partial) ElMessage.warning(`部分账号同步失败：${summary}。${data.error || ''}`)
+    else if (data.skipped_all) ElMessage.info(`${platform}本轮未轮到执行（分级调度已推迟），稍后会自动重试`)
     else ElMessage.success(`${platform}同步完成：${summary}`)
     await Promise.all([loadSyncStatus(), loadConversations(), loadAnalytics(), loadLeads()])
     if (currentContact.value?.id) await loadConversation(currentContact.value.id)
@@ -1167,6 +1168,7 @@ async function runAllPlatformSync() {
     const succeeded = results.filter(item => item.ok)
     const failed = results.filter(item => !item.ok)
     const partial = succeeded.filter(item => item.data.partial)
+    const deferred = succeeded.filter(item => item.data.skipped_all)
     const scanned = succeeded.reduce((sum, item) => sum + Number(item.data.scanned || 0), 0)
     const imported = succeeded.reduce((sum, item) => sum + Number(item.data.imported || 0), 0)
     const duplicates = succeeded.reduce((sum, item) => sum + Number(item.data.duplicates || 0), 0)
@@ -1180,6 +1182,10 @@ async function runAllPlatformSync() {
         ...partial.map(item => `${item.platform}：部分账号失败`),
       ].join('；')
       ElMessage.warning(`全平台同步完成 ${succeeded.length} 个平台；${details}。扫描 ${scanned}，新增 ${imported}，重复 ${duplicates}`)
+    } else if (deferred.length) {
+      // 分级调度推迟不是失败：提示"稍后自动重试"而不是报错。
+      const names = deferred.map(item => item.platform).join('、')
+      ElMessage.info(`${names}本轮未轮到执行（分级调度已推迟），稍后会自动重试。扫描 ${scanned}，新增 ${imported}，重复 ${duplicates}`)
     } else {
       ElMessage.success(`全部平台同步完成：扫描 ${scanned}，新增 ${imported}，重复 ${duplicates}`)
     }

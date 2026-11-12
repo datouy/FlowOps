@@ -185,3 +185,70 @@ def test_status_payload_no_hint_when_accounts_exist(sync_app):
 
     assert payload["no_accounts"] is False
     assert payload["last_error_is_account_hint"] is False
+
+
+def test_run_sync_when_all_accounts_skipped_is_not_a_failure(sync_app, monkeypatch):
+    """回归：分级调度把账号全部推迟时，不能报"同步失败"。
+
+    之前 ``ok = bool(succeeded)`` 在 ``account_results`` 为空时判成失败，
+    后端又因为 error 是空串而回一句"同步失败"，
+    用户看到的就是"抖音：同步失败"——实际上什么都没坏。
+    """
+    manager, client = sync_app
+    monkeypatch.setattr(
+        "dm_cursor.is_due", lambda _platform, _key: False,
+    )
+
+    response = client.post("/dm/fake/run")
+    assert response.status_code == 200, response.get_json()
+    data = response.get_json()["data"]
+    assert data["ok"] is True
+    assert data["skipped_all"] is True
+    assert data["error"] == ""
+
+
+def test_run_view_never_returns_blank_error_message(sync_app, monkeypatch):
+    """错误提示不能是空串——空串会被前端兜底成没信息量的"同步失败"。"""
+    manager, client = sync_app
+    monkeypatch.setattr(
+        manager, "run_sync",
+        lambda *a, **k: {"ok": False, "error": "", "skipped_all": True},
+    )
+
+    response = client.post("/dm/fake/run")
+    assert response.status_code == 400
+    msg = response.get_json()["msg"]
+    assert msg.strip()
+    assert "同步失败" not in msg
+
+
+def test_init_db_recreates_missing_settings_table(sync_app, tmp_path):
+    """回归：设置表被删/换库后必须能自愈。
+
+    迁移只在 version > 已记录版本时才跑。一旦 ``schema_migrations`` 里
+    记了版本号、但表本身没了（换库、恢复备份、误删），迁移就永远跳过，
+    之后所有读写都是 "no such table"——抖音/小红书/视频号同步集体失败。
+    """
+    manager, _ = sync_app
+    with dm_ops.get_conn() as conn:
+        conn.execute("DROP TABLE fake_dm_sync_settings")
+        conn.commit()
+
+    # 表确实没了
+    with dm_ops.get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='fake_dm_sync_settings'"
+        ).fetchone()
+    assert row is None
+
+    manager.init_db()
+
+    with dm_ops.get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='fake_dm_sync_settings'"
+        ).fetchone()
+    assert row is not None, "设置表缺失后 init_db 没能重新创建"
+    # 重新创建后读取必须正常（默认 max_conversations 来自构造参数）
+    assert manager.load_settings()["max_conversations"] == 20
