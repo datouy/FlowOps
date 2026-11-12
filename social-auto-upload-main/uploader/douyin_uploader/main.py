@@ -2170,10 +2170,31 @@ class DouYinVideo(DouYinBaseUploader):
                     sms_request_id = None
                     sms_get_code_clicked = False
 
-                # ── 正常发布流程 ──
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click(force=True)
+                # ── 正常发布流程（优先走适配包，改版只改 yaml）──
+                try:
+                    import selector_adapters as _ad
+                    _hit = None
+                    for _cand in _ad.publish_candidates("douyin", "publish_button"):
+                        try:
+                            _sel = str((_cand or {}).get("selector") or "")
+                            if not _sel:
+                                continue
+                            _loc = page.locator(_sel).first
+                            if await _loc.count() and await _loc.is_visible():
+                                _hit = _loc
+                                break
+                        except Exception:
+                            continue
+                    if _hit is not None:
+                        await _hit.click(force=True)
+                    else:
+                        publish_button = page.get_by_role("button", name="发布", exact=True)
+                        if await publish_button.count():
+                            await publish_button.click(force=True)
+                except Exception:
+                    publish_button = page.get_by_role("button", name="发布", exact=True)
+                    if await publish_button.count():
+                        await publish_button.click(force=True)
                 await page.wait_for_url(
                     "https://creator.douyin.com/creator-micro/content/manage**",
                     timeout=3000,
@@ -2309,9 +2330,30 @@ class DouYinNote(DouYinBaseUploader):
 
         while True:
             try:
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click()
+                try:
+                    import selector_adapters as _ad2
+                    _hit2 = None
+                    for _cand in _ad2.publish_candidates("douyin", "publish_button"):
+                        try:
+                            _sel = str((_cand or {}).get("selector") or "")
+                            if not _sel:
+                                continue
+                            _loc = page.locator(_sel).first
+                            if await _loc.count() and await _loc.is_visible():
+                                _hit2 = _loc
+                                break
+                        except Exception:
+                            continue
+                    if _hit2 is not None:
+                        await _hit2.click()
+                    else:
+                        publish_button = page.get_by_role("button", name="发布", exact=True)
+                        if await publish_button.count():
+                            await publish_button.click()
+                except Exception:
+                    publish_button = page.get_by_role("button", name="发布", exact=True)
+                    if await publish_button.count():
+                        await publish_button.click()
                 await page.wait_for_url(
                     "**/creator-micro/content/manage?enter_from=publish**",
                     timeout=3000,

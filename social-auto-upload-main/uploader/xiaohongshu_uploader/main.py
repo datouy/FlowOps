@@ -1194,10 +1194,48 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         while time.monotonic() < deadline:
             try:
                 if not clicked or (not captured_responses and time.monotonic() - clicked_at > 20):
-                    if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                        await page.locator('button:has-text("定时发布")').click()
-                    else:
-                        await page.locator('button:has-text("发布")').click()
+                    try:
+                        import selector_adapters as _ad
+                        _cands = _ad.publish_candidates(
+                            "xiaohongshu",
+                            "publish_button" if self.publish_strategy != XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "publish_button",
+                        )
+                        _hit = None
+                        _want = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+                        for _cand in _cands:
+                            try:
+                                _sel = str((_cand or {}).get("selector") or "")
+                                if not _sel or _want not in _sel:
+                                    continue
+                                _loc = page.locator(_sel).first
+                                if await _loc.count() and await _loc.is_visible():
+                                    _hit = _loc
+                                    break
+                            except Exception:
+                                continue
+                        if _hit is None:
+                            for _cand in _cands:
+                                try:
+                                    _sel = str((_cand or {}).get("selector") or "")
+                                    if not _sel:
+                                        continue
+                                    _loc = page.locator(_sel).first
+                                    if await _loc.count() and await _loc.is_visible():
+                                        _hit = _loc
+                                        break
+                                except Exception:
+                                    continue
+                        if _hit is not None:
+                            await _hit.click()
+                        elif self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
+                            await page.locator('button:has-text("定时发布")').click()
+                        else:
+                            await page.locator('button:has-text("发布")').click()
+                    except Exception:
+                        if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
+                            await page.locator('button:has-text("定时发布")').click()
+                        else:
+                            await page.locator('button:has-text("发布")').click()
                     clicked = True
                     clicked_at = time.monotonic()
                 await page.wait_for_url(
@@ -1403,10 +1441,45 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
 
         while True:
             try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
+                try:
+                    import selector_adapters as _ad3
+                    _cands3 = _ad3.publish_candidates("xiaohongshu", "publish_button")
+                    _want3 = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+                    _hit3 = None
+                    for _cand in _cands3:
+                        try:
+                            _sel = str((_cand or {}).get("selector") or "")
+                            if not _sel or _want3 not in _sel:
+                                continue
+                            _loc = page.locator(_sel).first
+                            if await _loc.count() and await _loc.is_visible():
+                                _hit3 = _loc
+                                break
+                        except Exception:
+                            continue
+                    if _hit3 is None:
+                        for _cand in _cands3:
+                            try:
+                                _sel = str((_cand or {}).get("selector") or "")
+                                if not _sel:
+                                    continue
+                                _loc = page.locator(_sel).first
+                                if await _loc.count() and await _loc.is_visible():
+                                    _hit3 = _loc
+                                    break
+                            except Exception:
+                                continue
+                    if _hit3 is not None:
+                        await _hit3.click()
+                    elif self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
+                        await page.locator('button:has-text("定时发布")').click()
+                    else:
+                        await page.locator('button:has-text("发布")').click()
+                except Exception:
+                    if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
+                        await page.locator('button:has-text("定时发布")').click()
+                    else:
+                        await page.locator('button:has-text("发布")').click()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000

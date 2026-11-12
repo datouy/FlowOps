@@ -93,6 +93,17 @@ async def cookie_auth_douyin(account_file):
         await page.goto("https://creator.douyin.com/creator-micro/content/upload")
         try:
             await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=5000)
+            # 三平台收拢：先走适配包判登录态，文本兜底。改版只改 yaml。
+            try:
+                import selector_adapters as _ad
+                if await _ad.publish_step_any_visible(page, "douyin", "qrcode_marker"):
+                    douyin_logger.error("[+] cookie 失效，需要扫码登录")
+                    return False
+                if await _ad.publish_step_any_visible(page, "douyin", "login_marker"):
+                    douyin_logger.success("[+]  cookie 有效")
+                    return True
+            except Exception:
+                pass
             # 2024.06.17 抖音创作者中心改版
             # 判断
             # 等待“扫码登录”元素出现，超时 5 秒（如果 5 秒没出现，说明 cookie 有效）
@@ -125,6 +136,18 @@ async def cookie_auth_tencent(account_file):
                 "https://channels.weixin.qq.com/platform/post/create",
                 wait_until="domcontentloaded",
             )
+            # 三平台收拢：适配包先判（发表/草稿=已登录，扫码框=失效），旧逻辑兜底。
+            try:
+                import selector_adapters as _ad
+                if await _ad.publish_step_any_visible(page, "tencent", "qrcode_marker"):
+                    tencent_logger.error("[+] cookie 失效（页面出现扫码登录框）")
+                    return False
+                if await _ad.publish_step_any_visible(page, "tencent", "login_marker"):
+                    await _persist_storage_state(_context, account_file)
+                    tencent_logger.success("[+] cookie 有效")
+                    return True
+            except Exception:
+                pass
             # cookie 失效时页面会先停在 post/create，随后由前端 JS 跳转到登录页；
             # 必须等跳转完成再判断。旧版用「微信小店」标题判断，视频号改版后
             # 首页也带该标题，会把刚扫好的有效 cookie 误判为失效。
@@ -170,6 +193,17 @@ async def cookie_auth_xhs(account_file):
         except Exception:
             xiaohongshu_logger.error("[+] 等待5秒 cookie 失效")
             return False
+        # 三平台收拢：适配包先判（扫码框=失效，发布按钮=有效），旧文本兜底。
+        try:
+            import selector_adapters as _ad
+            if await _ad.publish_step_any_visible(page, "xiaohongshu", "qrcode_marker"):
+                xiaohongshu_logger.error("[+] cookie 失效（出现登录框）")
+                return False
+            if await _ad.publish_step_any_visible(page, "xiaohongshu", "login_marker"):
+                xiaohongshu_logger.success("[+] cookie 有效")
+                return True
+        except Exception:
+            pass
         # 2024.06.17 抖音创作者中心改版
         if await page.get_by_text('手机号登录').count() or await page.get_by_text('扫码登录').count():
             xiaohongshu_logger.error("[+] 等待5秒 cookie 失效")

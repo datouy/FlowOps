@@ -234,9 +234,15 @@ PUBLISH_DIR = ADAPTER_DIR / "publish"
 
 PUBLISH_BUILTIN: dict[str, dict[str, list[dict]]] = {
     "tencent": {
+        "upload_entry": [
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+            {"selector": 'button:has-text("发表视频")', "assert": "visible", "timeout": 15000},
+        ],
         "publish_button": [
             {"selector": 'button.weui-desktop-btn:has-text("发表视频")', "assert": "visible", "timeout": 30000},
+            {"selector": 'div.form-btns button:has-text("发表")', "assert": "visible", "timeout": 15000},
             {"selector": 'button:has-text("发表")', "assert": "visible", "timeout": 15000},
+            {"selector": 'button:has-text("保存草稿")', "assert": "visible", "timeout": 15000},
         ],
         "login_marker": [
             {"selector": 'div:has-text("发表视频")', "assert": "visible"},
@@ -248,6 +254,11 @@ PUBLISH_BUILTIN: dict[str, dict[str, list[dict]]] = {
             {"selector": "div.qrcode-wrap", "assert": "visible"},
             {"selector": "img.qrcode", "assert": "visible"},
             {"selector": 'span:has-text("微信扫码登录 视频号助手")', "assert": "visible"},
+        ],
+        "success_marker": [
+            {"selector": ':has-text("发表成功")', "assert": "visible"},
+            {"selector": ':has-text("发布成功")', "assert": "visible"},
+            {"selector": ':has-text("已发表")', "assert": "visible"},
         ],
     },
     "baijiahao": {
@@ -272,13 +283,49 @@ PUBLISH_BUILTIN: dict[str, dict[str, list[dict]]] = {
     },
     "douyin": {
         "upload_entry": [
+            {"selector": "div[class^='container'] input[type='file']", "assert": "attached", "timeout": 15000},
+            {"selector": "div[class^='container'] input.upload-input", "assert": "attached", "timeout": 15000},
+            {"selector": 'div.progress-div [class^="upload-btn-input"]', "assert": "attached", "timeout": 15000},
             {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+        ],
+        "publish_button": [
+            {"selector": 'button:has-text("发布")', "assert": "visible", "timeout": 15000},
+        ],
+        "login_marker": [
+            {"selector": 'div:has-text("发布视频")', "assert": "visible"},
+            {"selector": 'button:has-text("发布")', "assert": "visible"},
+        ],
+        "qrcode_marker": [
+            {"selector": ':has-text("扫码登录")', "assert": "visible"},
+            {"selector": 'input[placeholder="请输入手机号"]', "assert": "visible"},
+        ],
+        "success_marker": [
+            {"selector": ':has-text("发布成功")', "assert": "visible"},
+            {"selector": ':has-text("已发布")', "assert": "visible"},
         ],
     },
     "xiaohongshu": {
         "upload_entry": [
-            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+            {"selector": "div[class^='upload-content'] input[class='upload-input']", "assert": "attached", "timeout": 15000},
             {"selector": "input.upload-input", "assert": "attached", "timeout": 15000},
+            {"selector": 'input[type="file"][accept*="image"]', "assert": "attached", "timeout": 15000},
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+        ],
+        "publish_button": [
+            {"selector": 'button:has-text("发布")', "assert": "visible", "timeout": 15000},
+            {"selector": 'button:has-text("定时发布")', "assert": "visible", "timeout": 15000},
+        ],
+        "login_marker": [
+            {"selector": 'div:has-text("发布笔记")', "assert": "visible"},
+            {"selector": 'button:has-text("发布")', "assert": "visible"},
+        ],
+        "qrcode_marker": [
+            {"selector": 'div[class*="login-box"]', "assert": "visible"},
+            {"selector": ':has-text("扫码登录")', "assert": "visible"},
+            {"selector": ':has-text("手机号登录")', "assert": "visible"},
+        ],
+        "success_marker": [
+            {"selector": ':has-text("发布成功")', "assert": "visible"},
         ],
     },
 }

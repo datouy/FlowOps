@@ -1464,7 +1464,31 @@ class TencentBaseUploader(BaseVideoUploader):
                 await page.evaluate("""() => document.querySelectorAll('.mask, .changeAccount-dialog, .common-dialog').forEach(e => e.remove())""")
             except Exception:
                 pass
-            candidate = page.get_by_role("button", name="发表", exact=True).first if not is_draft else page.get_by_role("button", name="保存草稿").first
+            # 三平台收拢：优先走 selector_adapters 发布候选（远端 yaml 可覆盖），
+            # get_by_role 仅作兜底，平台改版不再改代码发版。
+            candidate = None
+            try:
+                import selector_adapters as _ad
+                for _cand in _ad.publish_candidates("tencent", "publish_button"):
+                    try:
+                        _sel = str((_cand or {}).get("selector") or "")
+                        if not _sel:
+                            continue
+                        # 草稿模式只点“保存草稿”，正式模式只点“发表”，避免误触。
+                        if is_draft and "保存草稿" not in _sel:
+                            continue
+                        if not is_draft and "保存草稿" in _sel:
+                            continue
+                        _loc = page.locator(_sel).first
+                        if await _loc.count() and await _loc.is_visible():
+                            candidate = _loc
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                candidate = None
+            if candidate is None:
+                candidate = page.get_by_role("button", name="发表", exact=True).first if not is_draft else page.get_by_role("button", name="保存草稿").first
             try:
                 if await candidate.count() and await candidate.is_visible():
                     publish_btn = candidate
