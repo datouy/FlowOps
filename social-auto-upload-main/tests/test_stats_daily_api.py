@@ -23,11 +23,14 @@ def client(tmp_path, monkeypatch):
     be = pytest.importorskip("sau_backend")
     import daily_metrics
     import runtime_config
+    import stats_reflow
 
     monkeypatch.setattr(runtime_config, "ACCESS_TOKEN", "")
     monkeypatch.setattr(runtime_config, "TOKENS_FILE", "")
     monkeypatch.setattr(be, "BASE_DIR", tmp_path, raising=True)
     monkeypatch.setattr(daily_metrics, "DB", tmp_path / "metrics.db")
+    # 测试库里没有真实账号：不过滤快照，保持旧口径可测。
+    monkeypatch.setattr(stats_reflow, "_account_rows", lambda: [])
     with daily_metrics.get_conn() as c:
         daily_metrics.ensure_schema(c)
         c.commit()

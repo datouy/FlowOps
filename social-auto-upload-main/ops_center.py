@@ -388,6 +388,8 @@ def weekly_report(days: int = 7) -> dict:
         for metric in ("plays", "likes", "comments", "collects", "shares", "followers"):
             bucket["cumulative"][metric] += int(entry.get("cumulative", {}).get(metric) or 0)
         bucket["contents"] += int(entry.get("contents") or 0)
+        bucket["inWindowDelta"] = dict(entry.get("inWindowDelta") or {})
+        bucket["inWindowHasBaseline"] = bool(entry.get("inWindowHasBaseline", False))
     for pid, value in published_scope.items():
         bucket = platform.setdefault(pid, {
             "delta": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
@@ -395,8 +397,40 @@ def weekly_report(days: int = 7) -> dict:
             "publishedScope": {"contents": 0, "plays": 0, "likes": 0, "comments": 0},
             "contents": 0,
             "hasBaseline": False,
+            "inWindowDelta": {},
+            "inWindowHasBaseline": False,
         })
         bucket["publishedScope"] = value
+
+    # 没有快照覆盖的平台（比如账号刚加进来、还没回流过），
+    # 快照里的累计是 0，但 ``content_stats`` 里其实有真实数据。
+    # 直接用 content_stats 补上累计值——否则"累计播放"整列都是 0，
+    # 用户看到的就是一张"什么都没有"的表。
+    stats_cumulative: dict[int, dict[str, int]] = {}
+    for row in rows:
+        pid = int(row.get("platform") or 0)
+        bucket = stats_cumulative.setdefault(
+            pid, {"plays": 0, "likes": 0, "comments": 0, "contents": 0},
+        )
+        bucket["contents"] += 1
+        for k in ("plays", "likes", "comments"):
+            bucket[k] += int(row.get(k) or 0)
+    for pid, value in stats_cumulative.items():
+        bucket = platform.setdefault(pid, {
+            "delta": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "cumulative": {"plays": 0, "likes": 0, "comments": 0, "collects": 0, "shares": 0, "followers": 0},
+            "publishedScope": {"contents": 0, "plays": 0, "likes": 0, "comments": 0},
+            "contents": 0,
+            "hasBaseline": False,
+            "inWindowDelta": {},
+            "inWindowHasBaseline": False,
+        })
+        # 快照更准（它是回流当时的数），只在快照缺失时用 content_stats 兜底。
+        for k in ("plays", "likes", "comments"):
+            if not bucket["cumulative"][k] and value[k]:
+                bucket["cumulative"][k] = value[k]
+        if not bucket["contents"]:
+            bucket["contents"] = value["contents"]
 
     # 增量总额只统计有基线的平台——缺基线的平台增量是 0，
     # 把它们的 0 混进来会让"总额"看起来像"这部分真的没涨"。
@@ -422,6 +456,8 @@ def weekly_report(days: int = 7) -> dict:
             "plays": r["plays"], "likes": r["likes"]} for r in rows[:5]]
 
     has_baseline = bool(delta.get("hasBaseline"))
+    in_window = delta.get("inWindow") or {}
+    in_window_has_baseline = bool(in_window.get("hasBaseline"))
     lines = [
         f"近 {days} 天运营周报",
         f"发布任务：{len(jobs)} 个；成功 {success} 个；失败 {failed} 个",
@@ -430,6 +466,19 @@ def weekly_report(days: int = 7) -> dict:
         lines.append(
             f"本期新增：播放 {totals['delta']['plays']}；"
             f"点赞 {totals['delta']['likes']}；评论 {totals['delta']['comments']}"
+        )
+        lines.append(
+            f"累计数据（截至 {delta.get('snapshotAt') or '最新'}）："
+            f"播放 {totals['cumulative']['plays']}；点赞 {totals['cumulative']['likes']}"
+        )
+    elif in_window_has_baseline:
+        # 主口径缺基线，但窗口内有两份快照——仍然能给出真实增量，
+        # 只是覆盖的天数比整窗口短。说清楚覆盖范围，别让人误以为是整周。
+        lines.append(
+            f"本期新增（快照覆盖 {in_window.get('from')} 至 {in_window.get('to')}）："
+            f"播放 {in_window.get('plays') or 0}；"
+            f"点赞 {in_window.get('likes') or 0}；"
+            f"评论 {in_window.get('comments') or 0}"
         )
         lines.append(
             f"累计数据（截至 {delta.get('snapshotAt') or '最新'}）："
@@ -482,6 +531,10 @@ def weekly_report(days: int = 7) -> dict:
         "scope": delta.get("scope"),
         "hasBaseline": has_baseline,
         "snapshotAt": delta.get("snapshotAt") or "",
+        # 快照是哪一天的、数据有多旧——用户得知道这张表基于哪天的数据。
+        "snapshotDate": delta.get("snapshotDate") or "",
+        "staleDays": int(delta.get("staleDays") or 0),
+        "inWindow": in_window,
         "coverage": coverage,
         "platforms": [
             dict(
@@ -491,6 +544,11 @@ def weekly_report(days: int = 7) -> dict:
                 cumulative=v["cumulative"],
                 publishedScope=v["publishedScope"],
                 contents=v["contents"],
+                # 前端要按平台粒度显示"—"而不是 0：缺基线的平台增量是未知的。
+                hasBaseline=v.get("hasBaseline", False),
+                # 窗口内增量：主口径缺基线时的兜底，按平台也给一份。
+                inWindowDelta=v.get("inWindowDelta") or {},
+                inWindowHasBaseline=v.get("inWindowHasBaseline", False),
             )
             for pid, v in platform.items()
         ],

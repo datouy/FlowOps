@@ -32,9 +32,10 @@ def report_env(tmp_path, monkeypatch):
     monkeypatch.setattr(ops_center.publish_jobs, "DB", db_path)
     monkeypatch.setattr(stats_reflow, "DB", db_path)
     monkeypatch.setattr(stats_reflow, "MAIN_DB", tmp_path / "main.db")
-    monkeypatch.setattr(stats_reflow, "_account_rows", lambda: [{
-        "id": 1, "type": 3, "userName": "acc1", "filePath": "acc1", "status": 1,
-    }])
+    monkeypatch.setattr(stats_reflow, "_account_rows", lambda: [
+        {"id": 1, "type": 3, "userName": "acc1", "filePath": "acc1", "status": 1},
+        {"id": 2, "type": 4, "userName": "acc1", "filePath": "acc1_k", "status": 1},
+    ])
 
     with daily_metrics.get_conn() as c:
         daily_metrics.ensure_schema(c)
@@ -180,6 +181,47 @@ def test_weekly_report_separates_published_scope(report_env):
     assert scope["plays"] == 500
     # 增量口径仍然是 100，不被 publishedScope 污染。
     assert report["totals"]["delta"]["plays"] == 100
+
+
+def test_weekly_report_platforms_not_empty_without_today_snapshot(report_env):
+    """回归：今天没回流时，"平台表现"不能是空表。
+
+    以前窗口增量死等"今天的快照"，早上一打开周报，平台表整块空白。
+    """
+    _write_snapshot(_day(1), plays=777)
+
+    report = ops_center.weekly_report(7)
+    assert report["platforms"], "平台表现不能是空表"
+    assert report["platforms"][0]["name"] == "抖音"
+    assert report["platforms"][0]["cumulative"]["plays"] == 777
+    assert report["snapshotDate"] == _day(1)
+    assert report["staleDays"] == 1
+
+
+def test_weekly_report_platform_cumulative_falls_back_to_content_stats(report_env):
+    """快照没覆盖到的平台，累计值用 content_stats 兜底，不显示 0。"""
+    _write_snapshot(_day(1), plays=100, platform=3, account="acc1")
+    with daily_metrics.get_conn() as c:
+        _insert_content(c, title="内容B", platform=4, account="acc1",
+                        plays=555, likes=11, comments=3, key="k2")
+        c.commit()
+
+    report = ops_center.weekly_report(7)
+    by_pid = {p["platform"]: p for p in report["platforms"]}
+    assert 4 in by_pid, "有数据的平台必须出现在平台表现里"
+    assert by_pid[4]["cumulative"]["plays"] == 555
+
+
+def test_weekly_report_uses_in_window_delta_when_baseline_missing(report_env):
+    """主口径缺基线时，周报文字用窗口内首末快照的增量，并说清覆盖范围。"""
+    _write_snapshot(_day(3), plays=100)
+    _write_snapshot(_day(1), plays=400)
+
+    report = ops_center.weekly_report(7)
+    assert report["hasBaseline"] is False
+    assert report["inWindow"]["hasBaseline"] is True
+    assert "本期新增" in report["text"]
+    assert "300" in report["text"]
 
 
 def test_weekly_report_includes_coverage(report_env):

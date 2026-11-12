@@ -153,6 +153,43 @@ def test_snapshot_is_idempotent_same_day(metrics_db):
 
 # ---------------------------------------------------------------- 窗口增量
 
+def test_window_delta_uses_latest_snapshot_not_only_today(metrics_db):
+    """今天没回流时，也要用最近一份快照，不能返回空平台列表。
+
+    回归：以前窗口增量死等"今天的快照"，早上一打开周报，
+    "平台表现"整张表是空的。
+    """
+    _write_snapshot(_day(1), plays=100)
+    delta = daily_metrics.window_delta(7)
+    assert delta["platforms"], "没有今天的快照时，平台列表不能为空"
+    assert delta["snapshotDate"] == _day(1)
+    assert delta["staleDays"] == 1
+    assert delta["platforms"][0]["cumulativePlays"] == 100
+
+
+def test_window_delta_in_window_fallback(metrics_db):
+    """主口径缺基线时，用窗口内首末快照差值兜底，并说清覆盖范围。"""
+    _write_snapshot(_day(3), plays=100)
+    _write_snapshot(_day(1), plays=300)
+
+    delta = daily_metrics.window_delta(7)
+    # 窗口外没有基线 → 主口径不可信。
+    assert delta["hasBaseline"] is False
+    # 但窗口内有两份快照 → 次要口径可用。
+    assert delta["inWindow"]["hasBaseline"] is True
+    assert delta["inWindow"]["from"] == _day(3)
+    assert delta["inWindow"]["to"] == _day(1)
+    assert delta["inWindow"]["plays"] == 200
+
+
+def test_window_delta_empty_when_no_snapshot_at_all(metrics_db):
+    """一条快照都没有时，如实返回空并标记没有基线。"""
+    delta = daily_metrics.window_delta(7)
+    assert delta["platforms"] == []
+    assert delta["hasBaseline"] is False
+    assert delta["snapshotDate"] == ""
+
+
 def test_window_delta_is_increment_not_cumulative(metrics_db):
     """窗口增量 = 末快照 − 基线快照，不是终身累计。"""
     _write_snapshot(_day(8), plays=100)

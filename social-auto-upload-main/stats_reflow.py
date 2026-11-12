@@ -20,6 +20,7 @@ import runtime_guard
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
 from utils.account_browser import open_persistent_account_context
+from utils.credential_crypto import credential_exists, resolve_credential_path
 from db_utils import connect, record_schema_version
 
 DB = Path(BASE_DIR / 'db' / 'publish_jobs.db')
@@ -118,13 +119,13 @@ def _account_rows():
 
 def _account_cookie(account: dict | None, platform: int) -> Path | None:
     if account and account.get('filePath'):
-        path = COOKIE_DIR / str(account['filePath'])
-        if path.exists():
+        path = resolve_credential_path(COOKIE_DIR / str(account['filePath']))
+        if path:
             return path
     for row in _account_rows():
         if int(row.get('type') or 0) == int(platform):
-            path = COOKIE_DIR / str(row.get('filePath') or '')
-            if path.exists():
+            path = resolve_credential_path(COOKIE_DIR / str(row.get('filePath') or ''))
+            if path:
                 return path
     return None
 
@@ -144,11 +145,29 @@ def _account_identifiers(account: dict) -> set[str]:
     }
 
 
+def _is_alive_account(account: dict | None) -> bool:
+    """失效账号是否视为有效。
+
+    只有 ``status == 0（异常/登录失效）`` 才算失效，需要全局隐藏。
+    ``status`` 缺失（老测试数据）或 ``-1（验证中）`` 都视为有效，
+    避免校验抖动时数据来回跳。
+    """
+    if not account:
+        return False
+    if account.get('status') is None:
+        return True
+    try:
+        return int(account.get('status')) != 0
+    except (TypeError, ValueError):
+        return True
+
+
 def _current_account_keys(account_rows: list[dict] | None = None) -> set[tuple[int, str]]:
     rows = _account_rows() if account_rows is None else account_rows
     return {
         (int(row.get('type') or 0), identifier)
         for row in rows
+        if _is_alive_account(row)
         for identifier in _account_identifiers(row)
     }
 
@@ -173,6 +192,8 @@ def _record_accounts(
         if raw:
             entries.append(raw)
     rows = _account_rows() if account_rows is None else account_rows
+    # 失效账号全局隐藏：只认存活账号，已失效的不再匹配。
+    rows = [r for r in rows if _is_alive_account(r)]
     record_platform = int(record.get('type') or 0)
     if record_platform:
         rows = [row for row in rows if int(row.get('type') or 0) == record_platform]
@@ -725,11 +746,14 @@ def run_stats_reflow_once() -> dict:
             ).fetchall()]
 
         # 即使还没有发布记录，也先回流账号下的历史作品，让看板立即可用。
+        # 失效账号不再回流：Cookie 已失效，抓到的数据也是错的，还会污染看板。
         sources = {}
         for account in _account_rows():
+            if not _is_alive_account(account):
+                continue
             platform = int(account.get('type') or 0)
             cookie = COOKIE_DIR / str(account.get('filePath') or '')
-            if platform in FETCHERS and cookie.exists():
+            if platform in FETCHERS and credential_exists(cookie):
                 sources[(platform, int(account['id']))] = account
 
         record_sources = []

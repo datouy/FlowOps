@@ -10,9 +10,18 @@
       style="margin-bottom: 14px;"
     />
     <el-alert
-      v-else-if="!report.hasBaseline"
+      v-else-if="!deltaAvailable"
       title="本期增量暂不可用"
       description="缺少上一期的历史快照，累计值不能当作本期增量使用。下方「累计」数据仅为参考。"
+      type="warning"
+      show-icon
+      :closable="false"
+      style="margin-bottom: 14px;"
+    />
+    <el-alert
+      v-else-if="!report.hasBaseline"
+      title="本期增量按快照覆盖区间计算"
+      :description="`缺少窗口外的基线快照，增量取快照覆盖区间 ${report.inWindow.from} 至 ${report.inWindow.to} 的差值，不足整 ${days} 天。`"
       type="warning"
       show-icon
       :closable="false"
@@ -32,7 +41,12 @@
         <h2>运营周报</h2>
         <p class="sub">
           主口径为「本期增量」（本期涨了多少）；累计值单独标注，仅作参考。
-          <template v-if="report.snapshotAt">数据快照时间：{{ report.snapshotAt }}</template>
+          <template v-if="report.snapshotAt">
+            数据快照时间：{{ report.snapshotAt }}<template v-if="report.snapshotDate">（{{ report.snapshotDate }}）</template>
+          </template>
+          <template v-if="report.staleDays > 0">
+            <span class="stale">· 距今 {{ report.staleDays }} 天未回流</span>
+          </template>
         </p>
       </div>
       <div>
@@ -47,14 +61,14 @@
 
     <div class="metric-grid">
       <div class="metric"><span>发布任务</span><strong>{{ report.jobs }}</strong><small>成功 {{ report.success }} / 失败 {{ report.failed }}</small></div>
-      <div class="metric" :class="{ muted: !report.hasBaseline }">
+      <div class="metric" :class="{ muted: !deltaAvailable }">
         <span>本期新增播放</span>
-        <strong>{{ report.hasBaseline ? formatNum(report.totals.delta.plays) : '—' }}</strong>
-        <small>{{ report.hasBaseline ? `近 ${days} 天真实增量` : '缺少基线快照' }}</small>
+        <strong>{{ deltaAvailable ? formatNum(deltaPlays) : '—' }}</strong>
+        <small>{{ deltaHint }}</small>
       </div>
-      <div class="metric" :class="{ muted: !report.hasBaseline }">
+      <div class="metric" :class="{ muted: !deltaAvailable }">
         <span>本期新增点赞</span>
-        <strong>{{ report.hasBaseline ? formatNum(report.totals.delta.likes) : '—' }}</strong>
+        <strong>{{ deltaAvailable ? formatNum(deltaLikes) : '—' }}</strong>
         <small>互动 {{ interactionRate }}%</small>
       </div>
       <div class="metric"><span>累计播放（参考）</span><strong>{{ formatNum(report.totals.cumulative.plays) }}</strong><small>累计点赞 {{ formatNum(report.totals.cumulative.likes) }}</small></div>
@@ -93,16 +107,24 @@
       <el-col :xs="24" :lg="11">
         <el-card shadow="never">
           <template #header><span>平台表现</span></template>
-          <el-table :data="report.platforms" size="small" stripe>
+          <el-table :data="report.platforms" size="small" stripe empty-text="还没有平台数据，同步平台数据后这里会显示各平台表现">
             <el-table-column prop="name" label="平台" width="90" />
             <el-table-column prop="contents" label="作品" width="70" />
             <el-table-column label="新增播放" min-width="90">
-              <template #default="s">{{ s.row.hasBaseline === false ? '—' : formatNum(s.row.delta.plays) }}</template>
+              <template #default="s">
+                <template v-if="s.row.hasBaseline !== false">{{ formatNum(s.row.delta.plays) }}</template>
+                <template v-else-if="s.row.inWindowHasBaseline">{{ formatNum(s.row.inWindowDelta.plays) }}</template>
+                <template v-else>—</template>
+              </template>
             </el-table-column>
             <el-table-column label="累计播放" min-width="90">
               <template #default="s">{{ formatNum(s.row.cumulative.plays) }}</template>
             </el-table-column>
           </el-table>
+          <p v-if="report.inWindow && report.inWindow.hasBaseline" class="table-note">
+            注：本期缺少窗口外的基线快照，「新增播放」按快照覆盖区间
+            {{ report.inWindow.from }} 至 {{ report.inWindow.to }} 计算。
+          </p>
         </el-card>
       </el-col>
       <el-col :xs="24" :lg="13">
@@ -145,15 +167,46 @@ const report = ref({
   jobs: 0, success: 0, failed: 0,
   totals: emptyTotals,
   scope: '', hasBaseline: false, snapshotAt: '',
+  snapshotDate: '', staleDays: 0,
+  inWindow: { from: '', to: '', hasBaseline: false, plays: 0, likes: 0, comments: 0 },
   coverage: { days: 0, daysWithData: 0, missingDays: [], coverage: 0 },
   platforms: [], top_contents: [], text: '',
 })
 
 const interactionRate = computed(() => {
-  const delta = report.value.totals?.delta || {}
-  const p = Number(delta.plays || 0)
+  const p = Number(deltaPlays.value || 0)
   if (!p) return '0.0'
-  return (((Number(delta.likes || 0) + Number(delta.comments || 0)) / p) * 100).toFixed(1)
+  const likes = Number(deltaLikes.value || 0)
+  const comments = report.value.hasBaseline
+    ? Number(report.value.totals?.delta?.comments || 0)
+    : Number(report.value.inWindow?.comments || 0)
+  return (((likes + comments) / p) * 100).toFixed(1)
+})
+
+// ---- 增量口径 ----
+// 主口径是整窗口增量；主口径缺基线时，退到"窗口内首末快照差值"——
+// 它覆盖的天数短一些，但仍是真实增量。两者都拿不到才显示"—"。
+const deltaAvailable = computed(() => {
+  if (report.value.hasBaseline) return true
+  return !!report.value.inWindow?.hasBaseline
+})
+
+const deltaPlays = computed(() => {
+  if (report.value.hasBaseline) return Number(report.value.totals?.delta?.plays || 0)
+  return Number(report.value.inWindow?.plays || 0)
+})
+
+const deltaLikes = computed(() => {
+  if (report.value.hasBaseline) return Number(report.value.totals?.delta?.likes || 0)
+  return Number(report.value.inWindow?.likes || 0)
+})
+
+const deltaHint = computed(() => {
+  if (report.value.hasBaseline) return `近 ${days.value} 天真实增量`
+  if (report.value.inWindow?.hasBaseline) {
+    return `快照覆盖 ${report.value.inWindow.from} 至 ${report.value.inWindow.to}`
+  }
+  return '缺少基线快照'
 })
 
 // ---- 每日趋势（内联 SVG，不引第三方图表库）----
@@ -218,14 +271,15 @@ function exportCsv() {
     ['发布任务', report.value.jobs, '窗口内'],
     ['成功', report.value.success, '窗口内'],
     ['失败', report.value.failed, '窗口内'],
-    ['新增播放', report.value.hasBaseline ? t.delta.plays : '', '本期增量'],
-    ['新增点赞', report.value.hasBaseline ? t.delta.likes : '', '本期增量'],
-    ['新增评论', report.value.hasBaseline ? t.delta.comments : '', '本期增量'],
+    ['新增播放', deltaAvailable.value ? deltaPlays.value : '', '本期增量'],
+    ['新增点赞', deltaAvailable.value ? deltaLikes.value : '', '本期增量'],
+    ['新增评论', deltaAvailable.value ? (report.value.hasBaseline ? t.delta.comments : report.value.inWindow.comments) : '', '本期增量'],
     ['累计播放', t.cumulative.plays, '终身累计（参考）'],
     ['累计点赞', t.cumulative.likes, '终身累计（参考）'],
     ['本期发布内容数', t.publishedScope.contents, '本期发布口径'],
     ['本期发布内容累计播放', t.publishedScope.plays, '本期发布口径'],
     ['快照覆盖天数', report.value.coverage.daysWithData, `共 ${report.value.coverage.days} 天`],
+    ['快照日期', report.value.snapshotDate, ''],
     ['快照时间', report.value.snapshotAt, ''],
   ]
   const csv = '\ufeff' + rows.map(r => r.join(',')).join('\n')
@@ -251,6 +305,7 @@ onMounted(async () => {
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
 .page-head h2 { margin: 0 0 6px; }
 .sub { color: #909399; font-size: 13px; margin: 0; }
+.stale { color: #e6a23c; margin-left: 6px; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
 .metric { background: #fff; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
 .metric.muted { opacity: 0.6; }
@@ -261,5 +316,6 @@ onMounted(async () => {
 .trend { width: 100%; height: 160px; }
 .trend-axis { display: flex; justify-content: space-between; color: #909399; font-size: 12px; margin-top: 4px; }
 .empty-hint { color: #909399; font-size: 13px; padding: 24px 0; text-align: center; }
+.table-note { color: #909399; font-size: 12px; margin: 8px 0 0; line-height: 1.6; }
 @media (max-width: 900px) { .metric-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>

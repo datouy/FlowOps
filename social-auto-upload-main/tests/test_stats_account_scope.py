@@ -58,3 +58,35 @@ def test_filter_jobs_hides_removed_account_lists_and_schedule_entries():
     ]
 
     assert [row["id"] for row in filter_current_account_jobs(jobs, ACCOUNTS)] == [1]
+
+
+def test_expired_accounts_are_hidden_everywhere():
+    """失效账号（status=0）的数据要全局隐藏：周报/发布记录/统计都不展示。"""
+    accounts = ACCOUNTS + [
+        {
+            "id": 7,
+            "type": 3,
+            "userName": "已失效号",
+            "filePath": "douyin_expired.json",
+            "status": 0,
+        },
+    ]
+    # 发布记录：失效账号的不展示
+    records = [
+        {"id": 1, "type": 3, "accounts": "douyin_current.json"},
+        {"id": 2, "type": 3, "accounts": "douyin_expired.json"},
+    ]
+    assert [r["id"] for r in filter_current_account_records(records, accounts)] == [1]
+    # 内容统计：失效账号的不展示
+    rows = [
+        {"id": 1, "platform": 3, "account": "龙脊"},
+        {"id": 2, "platform": 3, "account": "已失效号"},
+        {"id": 3, "platform": 3, "account": "douyin_expired.json"},
+    ]
+    assert [r["id"] for r in filter_current_account_rows(rows, accounts)] == [1]
+    # 任务队列：失效账号的不展示
+    jobs = [
+        {"id": 1, "type": 3, "account_list": '["douyin_current.json"]'},
+        {"id": 2, "type": 3, "account_list": '["douyin_expired.json"]'},
+    ]
+    assert [j["id"] for j in filter_current_account_jobs(jobs, accounts)] == [1]

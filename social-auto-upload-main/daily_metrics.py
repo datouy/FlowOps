@@ -215,7 +215,7 @@ def _rows_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
     try:
         with get_conn() as c:
             ensure_schema(c)
-            return [dict(r) for r in c.execute(
+            rows = [dict(r) for r in c.execute(
                 "SELECT * FROM daily_metrics WHERE stat_date>=? AND stat_date<=? "
                 "ORDER BY stat_date, platform, account",
                 (start_date, end_date),
@@ -223,6 +223,18 @@ def _rows_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("读取每日指标失败: {}", exc)
         return []
+    # 失效账号全局隐藏：历史快照里还留着它们当天的累计值，
+    # 周报增量/趋势/覆盖率读取时必须按存活账号再过滤一次，
+    # 否则账号失效后数字还在。
+    try:
+        import stats_reflow
+
+        accounts = stats_reflow._account_rows()
+        if accounts:
+            rows = stats_reflow.filter_current_account_rows(rows, accounts)
+    except Exception:
+        pass
+    return rows
 
 
 def series(days: int = 30) -> dict[str, Any]:
@@ -292,23 +304,65 @@ def window_delta(days: int = 7) -> dict[str, Any]:
 
     返回里带 ``hasBaseline`` 与 ``snapshotAt``——没有基线时增量不可信，
     调用方（周报）应该把这一点显示出来，而不是报一个看起来很确定的 0。
+
+    **当前快照不是"今天"**：快照只在数据回流时写，一天没回流就没有今天的行。
+    如果死等"今天的快照"，那么每天早上打开周报都会看到一张空表——
+    这是之前"平台表现"整块空白的原因。所以这里取**窗口内最近的一份快照**
+    （``<= 今天``）作为当前值，并把它是哪一天标出来（``snapshotDate``、
+    ``staleDays``），让调用方知道数据有多旧。
+
+    另外提供 ``inWindow``：窗口内**首末两份快照**的差值。它不需要
+    窗口外的基线，在快照刚铺开、还没攒够历史时仍然可用——但它覆盖的
+    天数比整窗口短，所以单独放一个字段，不和主口径混用。
     """
     days = max(1, min(int(days or 7), 365))
     end = datetime.now()
     end_date = end.strftime("%Y-%m-%d")
+    window_start_date = (end - timedelta(days=days)).strftime("%Y-%m-%d")
     # 基线取窗口开始前一天（或更早）的最后一份快照。
     baseline_date = (end - timedelta(days=days)).strftime("%Y-%m-%d")
 
     all_rows = _rows_between(
         (end - timedelta(days=days * 2)).strftime("%Y-%m-%d"), end_date,
     )
-    current_rows = [r for r in all_rows if str(r.get("stat_date") or "") == end_date]
-    baseline_rows = [r for r in all_rows if str(r.get("stat_date") or "") <= baseline_date]
+
+    # ---- 当前快照：窗口内最近的一份，而不是"必须恰好是今天" ----
+    dates = sorted({str(r.get("stat_date") or "") for r in all_rows})
+    current_date = dates[-1] if dates else ""
+    current_rows = [r for r in all_rows if str(r.get("stat_date") or "") == current_date]
+    if not current_date:
+        return {
+            "days": days,
+            "hasBaseline": False,
+            "snapshotAt": "",
+            "snapshotDate": "",
+            "staleDays": 0,
+            "scope": SCOPE_CONTENT_PUBLISHED,
+            "missingBaseline": [],
+            "inWindow": {"from": "", "to": "", "hasBaseline": False},
+            "platforms": [],
+        }
+
+    stale_days = (end - datetime.strptime(current_date, "%Y-%m-%d")).days
+    # 基线必须严格早于当前快照，否则"当前减自己"会得到一个假的 0。
+    baseline_cutoff = min(
+        baseline_date,
+        (datetime.strptime(current_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"),
+    )
+    baseline_rows = [r for r in all_rows if str(r.get("stat_date") or "") <= baseline_cutoff]
+    baseline = _baseline_for(baseline_rows, baseline_cutoff)
+
+    # ---- 窗口内首末快照（次要口径，用来兜住"还没攒够历史"的阶段）----
+    window_dates = [d for d in dates if d >= window_start_date and d <= current_date]
+    in_window_from = window_dates[0] if len(window_dates) > 1 else ""
+    in_window_rows = {
+        (int(r.get("platform") or 0), str(r.get("account") or "")): r
+        for r in all_rows if str(r.get("stat_date") or "") == in_window_from
+    } if in_window_from else {}
 
     current: dict[tuple[int, str], dict[str, Any]] = {}
     for row in current_rows:
         current[(int(row.get("platform") or 0), str(row.get("account") or ""))] = row
-    baseline = _baseline_for(baseline_rows, baseline_date)
 
     platforms: dict[int, dict[str, Any]] = {}
     snapshot_at = ""
@@ -323,6 +377,8 @@ def window_delta(days: int = 7) -> dict[str, Any]:
             "published": 0, "cumulativePlays": 0,
             "cumulative": {metric: 0 for metric in METRICS},
             "hasBaseline": True,
+            "inWindowDelta": {metric: 0 for metric in METRICS},
+            "inWindowHasBaseline": True,
         })
         # 累计值与基线无关——即使没有基线也要如实给出来。
         bucket["contents"] += int(row.get("contents") or 0)
@@ -356,12 +412,56 @@ def window_delta(days: int = 7) -> dict[str, Any]:
     # 只有当**所有**当前账号都有基线时，整体增量才算可信。
     has_baseline = bool(current) and not missing_baseline
 
+    # ---- 次要口径：窗口内首末快照的差值 ----
+    # 主口径需要窗口外的基线快照，历史刚铺开时拿不到；
+    # 这份口径只需要窗口内有两份快照，覆盖天数短一些但仍是真的增量。
+    in_window_missing: list[str] = []
+    in_window_delta = {metric: 0 for metric in METRICS}
+    if in_window_from:
+        for key, row in current.items():
+            base = in_window_rows.get(key)
+            if base is None:
+                in_window_missing.append(f"{key[0]}:{key[1]}")
+                continue
+            for metric in METRICS:
+                in_window_delta[metric] += max(
+                    0, int(row.get(metric) or 0) - int(base.get(metric) or 0),
+                )
+    in_window_has_baseline = bool(
+        in_window_from and current and not in_window_missing,
+    )
+
+    # 同样把窗口内增量落到每个平台上——表格里"新增播放"列才有内容。
+    for key, row in current.items():
+        platform = key[0]
+        bucket = platforms.get(platform)
+        if bucket is None:
+            continue
+        base = in_window_rows.get(key)
+        if base is None:
+            bucket["inWindowHasBaseline"] = False
+            continue
+        for metric in METRICS:
+            bucket["inWindowDelta"][metric] += max(
+                0, int(row.get(metric) or 0) - int(base.get(metric) or 0),
+            )
+
     return {
         "days": days,
         "hasBaseline": has_baseline,
         "snapshotAt": snapshot_at,
+        "snapshotDate": current_date,
+        "staleDays": stale_days,
         "scope": SCOPE_INCREMENTAL if has_baseline else SCOPE_CONTENT_PUBLISHED,
         "missingBaseline": missing_baseline,
+        "inWindow": {
+            "from": in_window_from,
+            "to": current_date if in_window_from else "",
+            "hasBaseline": in_window_has_baseline,
+            "plays": in_window_delta["plays"] if in_window_has_baseline else 0,
+            "likes": in_window_delta["likes"] if in_window_has_baseline else 0,
+            "comments": in_window_delta["comments"] if in_window_has_baseline else 0,
+        },
         "platforms": list(platforms.values()),
     }
 
