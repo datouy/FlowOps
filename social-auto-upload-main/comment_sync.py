@@ -406,7 +406,10 @@ def start_comment_loop(interval_seconds: int = DEFAULT_INTERVAL) -> None:
 
     def _loop():
         runtime_guard.beat('comment-sync')
+        _generation = runtime_guard.current_generation('comment-sync')
         while True:
+            if not runtime_guard.is_current('comment-sync', _generation):
+                return
             try:
                 run_comment_sync_once()
                 runtime_guard.beat('comment-sync')

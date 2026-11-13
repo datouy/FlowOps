@@ -1216,6 +1216,9 @@ class BaseDmSync:
 
     def _background_loop(self) -> None:
         while True:
+            generation = runtime_guard.current_generation(self.guard_name)
+            if not runtime_guard.is_current(self.guard_name, generation):
+                return
             # 心跳只表示"这个循环还活着"：关闭自动同步、没有账号、平台没新消息
             # 都算正常活着；只有循环卡住或线程死了才该被看门狗抓出来。
             runtime_guard.beat(self.guard_name)

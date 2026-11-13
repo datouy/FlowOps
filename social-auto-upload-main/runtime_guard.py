@@ -79,7 +79,7 @@ class _Task:
         "name", "description", "interval", "launcher", "max_restarts",
         "registered_at", "started_at", "beat_at", "ok_at", "error",
         "consecutive_failures", "restarts", "restart_at", "stalled",
-        "thread",
+        "generation", "thread",
     )
 
     def __init__(
@@ -105,6 +105,7 @@ class _Task:
         self.restarts = 0
         self.restart_at = 0.0
         self.stalled = False
+        self.generation = 0
         self.thread: threading.Thread | None = None
 
     def alive(self) -> bool | None:
@@ -138,6 +139,7 @@ class _Task:
             "error": self.error,
             "consecutiveFailures": self.consecutive_failures,
             "restarts": self.restarts,
+            "generation": self.generation,
             "restartable": self.launcher is not None,
         }
 
@@ -237,6 +239,18 @@ def unregister(name: str) -> None:
         _tasks.pop(str(name or "").strip(), None)
 
 
+def current_generation(name: str) -> int:
+    """返回任务当前代际。后台循环每轮比对，不匹配则退出，避免旧代残留。"""
+    with _guard:
+        task = _tasks.get(str(name or "").strip())
+        return task.generation if task is not None else 0
+
+
+def is_current(name: str, generation: int) -> bool:
+    """当前循环是否仍是最新代际。"""
+    return generation == current_generation(name)
+
+
 # ---------------------------------------------------------------- 巡检
 
 def _restart(task: _Task, reason: str) -> None:
@@ -284,6 +298,7 @@ def check_once() -> list[dict[str, Any]]:
             task.stalled = True
             actions.append({"name": task.name, "action": "restart", "reason": "线程已退出"})
             _restart(task, "线程已退出")
+            task.generation += 1
             continue
         if stale:
             # 线程还在但心跳停了：通常是阻塞在网络等待上（平台不响应、
@@ -296,6 +311,7 @@ def check_once() -> list[dict[str, Any]]:
             task.stalled = True
             actions.append({"name": task.name, "action": "restart", "reason": f"心跳停滞 {age}s"})
             _restart(task, f"心跳停滞 {age:.0f}s")
+            task.generation += 1
     _watchdog_state["ticks"] += 1
     _watchdog_state["last_tick_at"] = now
     return actions

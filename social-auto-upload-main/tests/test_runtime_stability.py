@@ -120,6 +120,24 @@ def test_stale_heartbeat_is_marked_and_restarted(guard):
         thread._test_stop.set()
 
 
+def test_generation_bumps_on_restart(guard):
+    calls = []
+    task = guard.register("gen", interval=1, launcher=lambda: calls.append(1))
+    thread = _alive_thread()
+    try:
+        task.thread = thread
+        guard.beat("gen")
+        before = guard.current_generation("gen")
+        task.beat_at = time.time() - 600
+        guard.check_once()
+        after = guard.current_generation("gen")
+        assert after > before, "重启后应递增代际，旧代循环据此退出"
+        assert guard.is_current("gen", after) is True
+        assert guard.is_current("gen", before) is False
+    finally:
+        thread._test_stop.set()
+
+
 def test_status_lists_degraded_tasks(guard):
     task = guard.register("dead", interval=10)
     task.thread = _dead_thread()
