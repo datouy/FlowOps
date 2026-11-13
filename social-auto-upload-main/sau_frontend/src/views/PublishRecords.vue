@@ -455,6 +455,7 @@ const trend = ref({ months: 6, series: [] })
 const funnel = ref({ days: 30, stages: [], inbound_messages: 0, outbound_messages: 0 })
 const completion = ref({ estimated: false, estimated_completion: 0 })
 let timer = null
+let syncPollTimer = null
 
 async function loadTrend() {
   try {
@@ -816,14 +817,16 @@ async function linkContent() {
 
 async function triggerSync() {
   if (syncing.value) return
+  if (syncPollTimer) clearInterval(syncPollTimer)
   try {
     const response = await http.post('/stats/run')
     summary.value.sync = response.data || {running: true}
     ElMessage.success(response.msg || '数据同步已开始')
-    const poll = setInterval(async () => {
+    syncPollTimer = setInterval(async () => {
       await loadAll()
       if (!summary.value.sync?.running) {
-        clearInterval(poll)
+        clearInterval(syncPollTimer)
+        syncPollTimer = null
         const result = summary.value.sync?.last_result
         if (result) {
           ElMessage.success('同步完成，更新 ' + (result.saved || 0) + ' 条作品数据')
@@ -844,7 +847,7 @@ onMounted(async () => {
   loadAll()
   timer = setInterval(loadAll, 10000)
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncPollTimer) })
 </script>
 
 <style scoped>

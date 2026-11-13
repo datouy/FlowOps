@@ -4,6 +4,7 @@ import { API_BASE, authHeaders } from '@/config'
 // 创建axios实例
 const request = axios.create({
   baseURL: API_BASE,
+  timeout: 30000,
   headers: {
     'Content-Type': 'application/json'
   }
@@ -103,6 +104,7 @@ export const http = {
   
   upload(url, formData, onUploadProgress) {
     return request.post(url, formData, {
+      timeout: 600000,
       headers: {
         'Content-Type': 'multipart/form-data'
       },

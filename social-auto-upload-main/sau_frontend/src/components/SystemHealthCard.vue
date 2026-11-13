@@ -104,7 +104,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import {
   CircleCheckFilled,
   InfoFilled,
@@ -112,13 +112,13 @@ import {
   WarningFilled
 } from '@element-plus/icons-vue'
 import { http } from '@/utils/request'
+import { useLivePolling } from '@/composables/useLivePolling'
 
 const ready = ref({})
 const runtime = ref({})
 const loading = ref(false)
 const loaded = ref(false)
 const error = ref('')
-let timer = null
 
 const summary = computed(() => ({
   ready: Boolean(ready.value.ready),
@@ -182,15 +182,8 @@ const load = async () => {
   }
 }
 
-onMounted(() => {
-  load()
-  // 稳定性问题的特点是"悄悄坏掉"，所以定时刷新，不指望用户主动点
-  timer = setInterval(load, 60000)
-})
-
-onUnmounted(() => {
-  if (timer) clearInterval(timer)
-})
+useLivePolling(load, { interval: 60000 })
+load()
 </script>
 
 <style lang="scss" scoped>

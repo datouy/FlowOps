@@ -60,13 +60,13 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { http } from '@/utils/request'
 import { opsApi } from '@/api/ops'
+import { useLivePolling } from '@/composables/useLivePolling'
 
 const loading = ref(false)
 const movingId = ref(null)
 const scheduledItems = ref([])
 const suggest = ref({ platforms: [], conflicts: [] })
 const weekOffset = ref(0)
-let timer = null
 
 const platformNames = {1:'小红书',2:'视频号',3:'抖音',4:'快手',5:'微博',6:'百家号'}
 const platformTags = {1:'info',2:'warning',3:'danger',4:'success',5:'danger',6:'primary'}
@@ -158,11 +158,8 @@ async function onDrop(date) {
   finally { movingId.value = null }
 }
 
-onMounted(() => {
-  loadAll()
-  timer = setInterval(loadAll, 30000)
-})
-onUnmounted(() => clearInterval(timer))
+useLivePolling(loadAll, { interval: 30000 })
+loadAll()
 </script>
 
 <style scoped>
