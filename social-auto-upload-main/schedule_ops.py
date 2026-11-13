@@ -95,6 +95,7 @@ def register(app):
                 WHERE (record_id IS NULL OR record_id = 0)
                     AND content_key IS NOT NULL AND content_key != ''
                 ORDER BY id DESC
+            LIMIT 5000
             ''').fetchall()
         rows = stats_reflow.filter_current_account_rows([dict(r) for r in rows])
         return jsonify({'code': 200, 'data': rows, 'msg': None}), 200

@@ -29,6 +29,8 @@ COOKIE_DIR = Path(BASE_DIR / 'cookiesFile')
 PLATFORM_NAMES = {1: '小红书', 2: '视频号', 3: '抖音', 4: '快手', 5: '微博', 6: '百家号'}
 
 _lock = threading.Lock()
+_STATS_SUMMARY_CACHE = {}
+_STATS_SUMMARY_CACHE_TTL = 20.0
 _stats_started = False
 _state = {
     'running': False,
@@ -859,7 +861,10 @@ def start_stats_loop(interval_hours: int = 24):
 
     def _loop():
         runtime_guard.beat('stats-reflow')
+        _generation = runtime_guard.current_generation('stats-reflow')
         while True:
+            if not runtime_guard.is_current('stats-reflow', _generation):
+                return
             try:
                 run_stats_reflow_once()
                 runtime_guard.beat('stats-reflow')
@@ -1192,6 +1197,10 @@ def stats_summary() -> dict:
     """返回发布记录、每条记录的最新内容数据、平台/账号汇总。"""
     _db_prepare()
     accounts = _account_rows()
+    _ck = tuple(sorted((str(a.get('type') or ''), str(a.get('userName') or '')) for a in accounts))
+    _cached = _STATS_SUMMARY_CACHE.get(_ck)
+    if _cached and time.monotonic() - _cached[0] < _STATS_SUMMARY_CACHE_TTL:
+        return _cached[1]
     with get_conn() as c:
         records = [dict(r) for r in c.execute(
             'SELECT * FROM publish_records ORDER BY id DESC LIMIT 100'
@@ -1274,7 +1283,7 @@ def stats_summary() -> dict:
         key=lambda r: (int(r.get('plays') or 0), int(r.get('likes') or 0)),
         reverse=True,
     )[:20]
-    return {
+    _result = {
         'records': records,
         'platform_totals': sorted(
             platform_totals.values(),
@@ -1295,3 +1304,5 @@ def stats_summary() -> dict:
         'last_fetched_at': max((r.get('fetched_at') for r in rows if r.get('fetched_at')), default=None),
         'sync': stats_status(),
     }
+    _STATS_SUMMARY_CACHE[_ck] = (time.monotonic(), _result)
+    return _result

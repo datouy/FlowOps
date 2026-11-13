@@ -427,6 +427,15 @@ def _migrate_message_times(c):
         WHERE EXISTS (SELECT 1 FROM messages x WHERE x.contact_id=dm_contacts.id)""")
 
 
+
+
+def _migrate_reply_status_indexes(c):
+    """给 dm_reply_logs 的状态统计补复合索引。"""
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_dm_reply_logs_status_time
+        ON dm_reply_logs(status, created_at)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_dm_reply_logs_status_contact
+        ON dm_reply_logs(status, contact_id)""")
+
 def init_db():
     with get_conn() as c:
         apply_migrations(c, "dm_ops", {
@@ -442,6 +451,7 @@ def init_db():
             10: _migrate_message_media,
             11: _cleanup_dom_contact_duplicates,
             12: _cleanup_invalid_avatar_media,
+            13: _migrate_reply_status_indexes,
         })
         # account_deleted 独立于迁移版本补齐，保证旧库升级后删除账号可用
         _ensure_column(c, "dm_contacts", "account_deleted", "INTEGER DEFAULT 0")

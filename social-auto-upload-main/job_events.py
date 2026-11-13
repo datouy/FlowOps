@@ -267,9 +267,10 @@ def timeline(
         try:
             ensure_schema(conn)
             rows = conn.execute(
-                f"SELECT * FROM job_events {where} ORDER BY id ASC LIMIT ?",
+                f"SELECT * FROM job_events {where} ORDER BY id DESC LIMIT ?",
                 params,
             ).fetchall()
+            rows = list(reversed(rows))
         finally:
             conn.close()
     except Exception as exc:
