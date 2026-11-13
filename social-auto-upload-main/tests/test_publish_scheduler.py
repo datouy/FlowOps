@@ -71,6 +71,31 @@ def _create_job(pj, files, cookies, platform=2) -> int:
         return int(cur.lastrowid)
 
 
+def test_claim_job_token_is_atomic(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    first = pj.claim_job_token(job_id)
+    second = pj.claim_job_token(job_id)
+    assert first
+    assert second is None, "同一个任务只该被一个 worker 抢占"
+    assert pj.heartbeat_token(job_id, first) is True
+    assert pj.heartbeat_token(job_id, "wrong-token") is False
+
+
+def test_recover_pending_jobs_picks_up_stuck_schedule(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    with pj.get_conn() as c:
+        c.execute(
+            "INSERT INTO scheduled_items (job_id, account, file, scheduled_at, status)"
+            " VALUES (?,?,?,CURRENT_TIMESTAMP,'running')",
+            (job_id, COOKIE_A, "v.mp4"),
+        )
+    pj._recovery_done = False
+    recovered = pj.recover_pending_jobs()
+    assert job_id in recovered
+
+
 def _patch_dispatcher(monkeypatch, behaviour):
     """behaviour(cookie) -> None 表示成功，抛异常表示失败。"""
     import myUtils.platform_registry as registry

@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 import queue as _queue
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
@@ -26,8 +27,6 @@ from utils.errors import (
     TransientError,
     account_effect as _error_account_effect,
     backoff_seconds,
-    describe as describe_error,
-    error_code_for,
     is_retryable,
 )
 from utils.rate_limit import (
@@ -63,49 +62,45 @@ EXECUTOR_LEASE_SECONDS = int(os.environ.get("FLOWOPS_EXECUTOR_LEASE", "120") or 
 
 def claim_job(job_id: int) -> bool:
     """原子抢占 pending/过期租约任务。成功返回 True。"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return claim_job_token(job_id) is not None
+
+
+def claim_job_token(job_id: int, executor_id=None) -> str | None:
+    """原子抢占 pending/过期租约任务，返回本次唯一租约 token。"""
+    token = f"{executor_id or EXECUTOR_ID}-{uuid.uuid4().hex}"
     with get_conn() as c:
         _ensure_columns(c, 'jobs', (
             ('executor_id', "TEXT DEFAULT ''"),
             ('lease_until', "DATETIME"),
             ('heartbeat_at', "DATETIME"),
+            ('lease_token', "TEXT DEFAULT ''"),
         ))
-        row = c.execute(
-            "SELECT status, lease_until FROM jobs WHERE id=?", (int(job_id),)
-        ).fetchone()
-        if not row:
-            return False
-        status = str(row['status'] or '')
-        lease = str(row['lease_until'] or '')
-        expired = True
-        if lease:
-            try:
-                expired = lease <= now
-            except Exception:
-                expired = True
-        if status == 'pending' or (status == 'running' and expired):
-            c.execute(
-                "UPDATE jobs SET status='running', executor_id=?, "
-                "lease_until=datetime(CURRENT_TIMESTAMP, ?), "
-                "heartbeat_at=CURRENT_TIMESTAMP WHERE id=?",
-                (EXECUTOR_ID, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
-            )
-            return True
-        return False
+        cur = c.execute(
+            "UPDATE jobs SET status='running', executor_id=?, lease_token=?, "
+            "lease_until=datetime(CURRENT_TIMESTAMP, ?), "
+            "heartbeat_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND (status='pending' OR "
+            "(status='running' AND lease_until IS NOT NULL "
+            " AND lease_until<=CURRENT_TIMESTAMP))",
+            (EXECUTOR_ID, token, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
+        )
+        return token if int(cur.rowcount or 0) else None
 
 
-def heartbeat_job(job_id: int) -> None:
-    """执行中续期，防止被其他 worker 抢走。"""
+def heartbeat_token(job_id: int, token: str) -> bool:
+    """按租约 token 续期。token 已失效（被别人接管）时返回 False。"""
     try:
         with get_conn() as c:
-            c.execute(
+            _ensure_columns(c, 'jobs', (('lease_token', "TEXT DEFAULT ''"),))
+            cur = c.execute(
                 "UPDATE jobs SET heartbeat_at=CURRENT_TIMESTAMP, "
                 "lease_until=datetime(CURRENT_TIMESTAMP, ?) "
-                "WHERE id=? AND executor_id=?",
-                (f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id), EXECUTOR_ID),
+                "WHERE id=? AND lease_token=?",
+                (f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id), token or ""),
             )
+            return bool(cur.rowcount)
     except Exception:
-        pass
+        return False
 
 
 def release_stale_leases() -> int:
@@ -117,7 +112,7 @@ def release_stale_leases() -> int:
             ('heartbeat_at', "DATETIME"),
         ))
         cur = c.execute(
-            "UPDATE jobs SET status='pending', executor_id='', lease_until=NULL "
+            "UPDATE jobs SET status='pending', executor_id='', lease_until=NULL, lease_token='' "
             "WHERE status='running' AND lease_until IS NOT NULL "
             "AND lease_until < CURRENT_TIMESTAMP"
         )
@@ -242,6 +237,7 @@ def init_db():
             executor_id TEXT DEFAULT '',
             lease_until DATETIME,
             heartbeat_at DATETIME,
+            lease_token TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
         )''')
@@ -1862,12 +1858,25 @@ def recover_pending_jobs():
         rows = c.execute(
             "SELECT id FROM jobs WHERE status='pending' ORDER BY id"
         ).fetchall()
+        # 到点后进程在入队前崩溃的排期：job 已回 pending，但 scheduled_items
+        # 还停在 running（run_schedule_once 已把行置 running 却还没来得及入队）。
+        # 这种状态不会再次触发 run_schedule_once 的扫描，必须在这里补入队。
+        stuck = c.execute(
+            "SELECT DISTINCT j.id FROM jobs j "
+            "JOIN scheduled_items s ON s.job_id=j.id "
+            "WHERE j.status='pending' AND s.status='running' "
+            "AND datetime(s.scheduled_at)<=datetime(CURRENT_TIMESTAMP)"
+        ).fetchall()
     with _lock:
         if _recovery_done:
             return []
         _recovery_done = True
     recovered = _recover_interrupted_jobs()
-    job_ids = sorted({int(row['id']) for row in rows} | set(recovered))
+    job_ids = sorted(
+        {int(row['id']) for row in rows}
+        | {int(row['id']) for row in stuck}
+        | set(recovered)
+    )
     if job_ids:
         _start_workers()
         for job_id in job_ids:
@@ -1881,16 +1890,22 @@ def recover_pending_jobs():
 def _worker(worker_id):
     while True:
         job_id = _q.get()
+        token = None
+        _heartbeat_stop = threading.Event()
+        def _heartbeat_loop():
+            while not _heartbeat_stop.wait(max(5, int(EXECUTOR_LEASE_SECONDS // 3))):
+                if not heartbeat_token(int(job_id), token or ""):
+                    break
         try:
-            # P0-1 租约抢占：重复队列项/过期租约由 claim_job 仲裁
-            try:
-                if not claim_job(int(job_id)):
-                    logger.info("任务 {} 已被其它执行器领取，跳过", job_id)
-                    continue
-            except Exception:
-                pass
-            heartbeat_job(int(job_id))
-            _run_job(job_id)
+            token = claim_job_token(int(job_id), executor_id=f"{EXECUTOR_ID}-{worker_id}")
+            if not token:
+                logger.info("任务 {} 已被其它执行器领取，跳过", job_id)
+                continue
+            _heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop, name=f"lease-hb-{job_id}", daemon=True,
+            )
+            _heartbeat_thread.start()
+            _run_job(job_id, token)
         except Exception as e:
             try:
                 with get_conn() as c:
@@ -1898,9 +1913,10 @@ def _worker(worker_id):
             except Exception:
                 pass
         finally:
+            _heartbeat_stop.set()
             _q.task_done()
 
-def _run_job(job_id):
+def _run_job(job_id, token=None):
     """执行一个发布任务：展开成 account 级子任务后逐条执行。
 
     与旧实现的区别（也是"重复发布"bug 的修复点）：
@@ -2091,7 +2107,7 @@ def _run_job(job_id):
                     from utils.account_serial import account_serial as _serial
                     _acct_key = str(cookie or account_id or "unknown")
                     with _serial(f"account:{_acct_key}", timeout=600):
-                        heartbeat_job(int(job_id))
+                        heartbeat_token(int(job_id), token or "")
                         with publish_guard(account_id, type):
                             # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
                             # 恢复逻辑能区分"还没发出去"和"可能已经发出去了"，
@@ -2676,7 +2692,10 @@ def _start_lease_reclaimer(interval_seconds: int = 30) -> None:
 
     def _loop():
         runtime_guard.beat('executor-lease-reclaimer')
+        _generation = runtime_guard.current_generation('executor-lease-reclaimer')
         while True:
+            if not runtime_guard.is_current('executor-lease-reclaimer', _generation):
+                return
             try:
                 n = int(release_stale_leases() or 0)
                 if n:
@@ -2727,7 +2746,10 @@ def start_publish_runtime(
     if start_scheduler:
         def _schedule_loop():
             runtime_guard.beat('publish-scheduler')
+            _generation = runtime_guard.current_generation('publish-scheduler')
             while True:
+                if not runtime_guard.is_current('publish-scheduler', _generation):
+                    return
                 try:
                     run_schedule_once()
                     runtime_guard.beat('publish-scheduler')
@@ -2741,7 +2763,10 @@ def start_publish_runtime(
     if start_tracker:
         def _tracking_loop():
             runtime_guard.beat('publish-tracker')
+            _generation = runtime_guard.current_generation('publish-tracker')
             while True:
+                if not runtime_guard.is_current('publish-tracker', _generation):
+                    return
                 try:
                     run_tracking_once()
                     runtime_guard.beat('publish-tracker')
@@ -2778,7 +2803,10 @@ def start_patrol(interval_hours=12):
         _patrol_started = True
     def _loop():
         runtime_guard.beat('account-patrol')
+        _generation = runtime_guard.current_generation('account-patrol')
         while True:
+            if not runtime_guard.is_current('account-patrol', _generation):
+                return
             try:
                 run_patrol_once()
                 runtime_guard.beat('account-patrol')
