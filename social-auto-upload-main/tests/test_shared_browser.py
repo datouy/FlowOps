@@ -62,8 +62,10 @@ class _FakePlaywright:
 def shared(monkeypatch):
     module = pytest.importorskip("utils.shared_browser")
     module.reset_for_tests()
+    pytest.importorskip("utils.browser_pool").reset_for_tests()
     yield module
     module.reset_for_tests()
+    pytest.importorskip("utils.browser_pool").reset_for_tests()
 
 
 def test_shared_enabled_default_and_flag(shared, monkeypatch):
@@ -82,6 +84,7 @@ def test_account_context_sync_passes_everything(shared):
     ctx = shared.account_context_sync(
         playwright,
         storage_state={"cookies": [{"name": "a", "value": "1"}], "origins": []},
+        cookie_path="account-a.json",
         proxy={"server": "socks5://1.2.3.4:1080", "username": "u", "password": "p"},
         fingerprint_options={"user_agent": "Mozilla/5.0 (test)", "viewport": {"width": 1080, "height": 1920}},
         init_script="(function(){})();",
@@ -108,6 +111,7 @@ def test_account_context_sync_skips_empty_state(shared):
     shared.account_context_sync(
         playwright,
         storage_state=None,
+        cookie_path="account-a.json",
         proxy=None,
         fingerprint_options={},
         init_script="",
@@ -121,9 +125,10 @@ def test_account_context_sync_skips_empty_state(shared):
 def test_browser_reused_across_contexts(shared):
     browser = _FakeBrowser()
     playwright = _FakePlaywright(browser)
-    for _ in range(3):
+    for index in range(3):
         shared.account_context_sync(
             playwright, storage_state=None, proxy=None,
+            cookie_path=f"account-{index}.json",
             fingerprint_options={}, init_script="", headless=True, args=[],
         )
     # 三个 context 共享同一个 browser 实例（单进程）

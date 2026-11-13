@@ -250,6 +250,19 @@ def kill_browser_process(context: Any) -> bool:
         return False
 
     killed = False
+    # 共享浏览器上下文没有独立 Profile 目录。超时兜底只能重启整代共享实例：
+    # 让挂在僵死连接上的 context 立刻失败，其他账号稍后重开新实例。
+    try:
+        from utils.account_browser import context_profile_dir
+
+        if context is not None and not context_profile_dir(context):
+            from utils import shared_browser
+
+            result = shared_browser.terminate_all()
+            return bool(result.get("sync") or result.get("async"))
+    except Exception as exc:
+        logger.debug("共享浏览器超时重启失败: {}", exc)
+
     # Playwright 由 node driver 拉起 Chrome，Python 侧拿不到进程句柄。
     # 但 persistent context 的 ``browser`` 仍在，可以尝试走它自己的关闭路径。
     browser = getattr(context, "browser", None)

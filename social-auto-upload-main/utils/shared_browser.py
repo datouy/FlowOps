@@ -40,11 +40,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 import threading
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from utils import browser_timeout
 
 
 def shared_enabled() -> bool:
@@ -57,12 +60,26 @@ def shared_enabled() -> bool:
 _async_browser: Any = None
 _async_lock = asyncio.Lock()
 _async_starting: asyncio.Future | None = None
+_sync_browser: Any = None
+_sync_lock = threading.Lock()
+_browser_id = ""
+_CONTEXT_SLOTS: dict[int, object] = {}
+_CONTEXT_SLOTS_GUARD = threading.Lock()
+
+
+def _new_browser_id() -> str:
+    return f"shared-browser-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def browser_id() -> str:
+    return _browser_id
 
 
 async def get_browser(playwright, *, headless: bool, args: list[str],
                       executable_path: str, channel: str) -> Any:
     """取（或创建）共享 Chromium 实例。崩溃后自动重建。"""
     global _async_browser
+    global _browser_id
     if _async_browser is not None:
         try:
             if _async_browser.is_connected():
@@ -79,6 +96,7 @@ async def get_browser(playwright, *, headless: bool, args: list[str],
             opts["channel"] = channel
         logger.info("启动共享 Chromium 实例（headless={}）", headless)
         _async_browser = await playwright.chromium.launch(**opts)
+        _browser_id = _new_browser_id()
         return _async_browser
 
 
@@ -100,6 +118,8 @@ async def account_context(
     ``storage_state`` 是解密后的 Playwright storage_state（cookies + origins）。
     为 ``None`` 时（无凭据）仍开空 context，交由调用方走登录或报错。
     """
+    from utils.browser_pool import acquire_browser_slot, release_browser_slot
+
     browser = await get_browser(
         playwright,
         headless=headless,
@@ -107,26 +127,42 @@ async def account_context(
         executable_path=executable_path,
         channel=channel,
     )
-    options: dict[str, Any] = dict(fingerprint_options or {})
-    if proxy:
-        options["proxy"] = proxy
-    if storage_state:
-        options["storage_state"] = storage_state
-    context = await browser.new_context(**options)
-    if init_script:
-        await context.add_init_script(script=init_script)
+    slot = acquire_browser_slot(account=Path(cookie_path).name)
+    try:
+        options: dict[str, Any] = dict(fingerprint_options or {})
+        if proxy:
+            options["proxy"] = proxy
+        if storage_state:
+            options["storage_state"] = storage_state
+        context = await browser.new_context(**options)
+        if init_script:
+            await context.add_init_script(script=init_script)
+    except Exception:
+        release_browser_slot(slot)
+        raise
+    with _CONTEXT_SLOTS_GUARD:
+        _CONTEXT_SLOTS[id(context)] = slot
     return context
+
+
+async def close_context_async(context: Any) -> None:
+    """Close one shared context and release its browser slot."""
+    with _CONTEXT_SLOTS_GUARD:
+        slot = _CONTEXT_SLOTS.pop(id(context), None)
+    try:
+        await browser_timeout.close_async_resource_async(
+            context, label="关闭共享账号上下文",
+        )
+    finally:
+        from utils.browser_pool import release_browser_slot
+        release_browser_slot(slot)
 
 
 # ---------------------------------------------------------------- 同步单例
 
-_sync_browser: Any = None
-_sync_lock = threading.Lock()
-
-
 def get_browser_sync(playwright, *, headless: bool, args: list[str],
                      executable_path: str, channel: str) -> Any:
-    global _sync_browser
+    global _sync_browser, _browser_id
     if _sync_browser is not None:
         try:
             if _sync_browser.is_connected():
@@ -143,12 +179,14 @@ def get_browser_sync(playwright, *, headless: bool, args: list[str],
             opts["channel"] = channel
         logger.info("启动共享 Chromium 实例（headless={}，sync）", headless)
         _sync_browser = playwright.chromium.launch(**opts)
+        _browser_id = _new_browser_id()
         return _sync_browser
 
 
 def account_context_sync(
     playwright,
     *,
+    cookie_path: str | Path,
     storage_state: dict[str, Any] | None,
     proxy: dict[str, str] | None,
     fingerprint_options: dict[str, Any],
@@ -165,15 +203,37 @@ def account_context_sync(
         executable_path=executable_path,
         channel=channel,
     )
-    options: dict[str, Any] = dict(fingerprint_options or {})
-    if proxy:
-        options["proxy"] = proxy
-    if storage_state:
-        options["storage_state"] = storage_state
-    context = browser.new_context(**options)
-    if init_script:
-        context.add_init_script(script=init_script)
+    from utils.browser_pool import acquire_browser_slot, release_browser_slot
+
+    slot = acquire_browser_slot(account=Path(cookie_path).name)
+    try:
+        options: dict[str, Any] = dict(fingerprint_options or {})
+        if proxy:
+            options["proxy"] = proxy
+        if storage_state:
+            options["storage_state"] = storage_state
+        context = browser.new_context(**options)
+        if init_script:
+            context.add_init_script(script=init_script)
+    except Exception:
+        release_browser_slot(slot)
+        raise
+    with _CONTEXT_SLOTS_GUARD:
+        _CONTEXT_SLOTS[id(context)] = slot
     return context
+
+
+def close_context_sync(context: Any) -> None:
+    """Synchronous counterpart of :func:`close_context_async`."""
+    with _CONTEXT_SLOTS_GUARD:
+        slot = _CONTEXT_SLOTS.pop(id(context), None)
+    try:
+        browser_timeout.close_async_resource(
+            context, label="关闭共享账号上下文（sync）",
+        )
+    finally:
+        from utils.browser_pool import release_browser_slot
+        release_browser_slot(slot)
 
 
 # ---------------------------------------------------------------- 状态与清理
@@ -181,6 +241,7 @@ def account_context_sync(
 def status() -> dict[str, Any]:
     return {
         "enabled": shared_enabled(),
+        "browserId": _browser_id,
         "asyncConnected": bool(_async_browser is not None and _async_browser.is_connected()),
         "syncConnected": bool(_sync_browser is not None and _sync_browser.is_connected()),
     }
@@ -190,20 +251,37 @@ async def close_all_async() -> None:
     global _async_browser
     browser, _async_browser = _async_browser, None
     if browser is not None:
-        try:
-            await browser.close()
-        except Exception:
-            pass
+        await browser_timeout.close_async_resource_async(
+            browser, label="关闭共享 Chromium 实例",
+        )
 
 
 def close_all_sync() -> None:
     global _sync_browser
     browser, _sync_browser = _sync_browser, None
     if browser is not None:
-        try:
-            browser.close()
-        except Exception:
-            pass
+        browser_timeout.close_async_resource(
+            browser, label="关闭共享 Chromium 实例（sync）",
+        )
+
+
+def terminate_all() -> dict[str, bool]:
+    logger.warning("重启共享 Chromium 实例（当前代 {}）", _browser_id)
+    close_all_sync()
+    closed_async = False
+
+    async def _close_async():
+        await close_all_async()
+        return True
+
+    try:
+        browser_timeout.run_async_with_timeout(
+            _close_async, timeout=5, label="重启共享 Chromium 实例",
+        )
+        closed_async = True
+    except Exception as exc:
+        logger.warning("关闭异步共享 Chromium 实例失败: {}", exc)
+    return {"sync": _sync_browser is None, "async": closed_async}
 
 
 def reset_for_tests() -> None:
@@ -212,3 +290,5 @@ def reset_for_tests() -> None:
     global _async_browser, _async_starting
     _async_browser = None
     _async_starting = None
+    with _CONTEXT_SLOTS_GUARD:
+        _CONTEXT_SLOTS.clear()

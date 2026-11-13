@@ -11,10 +11,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 
 def max_browsers() -> int:
@@ -33,6 +34,7 @@ _PEAK = 0
 # context.close 即回收由调用方执行，这里只记分层供运维台面看密度。
 _WARM: dict[str, float] = {}
 WARM_TTL_SECONDS = 600.0
+_ACTIVE_TOKENS: set[object] = set()
 
 
 def _sem() -> threading.Semaphore:
@@ -49,6 +51,63 @@ def browser_slot(timeout: float = 600.0, account: str = ""):
     global _ACTIVE, _PEAK
     sem = _sem()
     acquired = sem.acquire(timeout=max(1.0, timeout))
+    if not acquired:
+        raise TimeoutError("浏览器槽位不足，请稍后重试或调大 FLOWOPS_MAX_BROWSERS")
+    with _GUARD:
+        _ACTIVE += 1
+        _PEAK = max(_PEAK, _ACTIVE)
+        if account:
+            _WARM[str(account)] = time.monotonic()
+    try:
+        yield {"active": _ACTIVE, "max": max_browsers(), "tier": tier_of(account) if account else "cold"}
+    finally:
+        with _GUARD:
+            _ACTIVE = max(0, _ACTIVE - 1)
+        try:
+            sem.release()
+        except ValueError:
+            pass
+
+
+def acquire_browser_slot(timeout: float = 600.0, account: str = "") -> object:
+    """Acquire a slot that is not tied to a ``with`` block."""
+    global _ACTIVE, _PEAK
+    sem = _sem()
+    acquired = sem.acquire(timeout=max(1.0, timeout))
+    if not acquired:
+        raise TimeoutError("浏览器槽位不足，请稍后重试或调大 FLOWOPS_MAX_BROWSERS")
+    token = object()
+    with _GUARD:
+        _ACTIVE += 1
+        _PEAK = max(_PEAK, _ACTIVE)
+        if account:
+            _WARM[str(account)] = time.monotonic()
+        _ACTIVE_TOKENS.add(token)
+    return token
+
+
+def release_browser_slot(token: object) -> None:
+    """Release a slot token exactly once."""
+    if token is None:
+        return
+    global _ACTIVE
+    with _GUARD:
+        if token not in _ACTIVE_TOKENS:
+            return
+        _ACTIVE_TOKENS.discard(token)
+        _ACTIVE = max(0, _ACTIVE - 1)
+    try:
+        _sem().release()
+    except ValueError:
+        pass
+
+
+@asynccontextmanager
+async def browser_slot_async(timeout: float = 600.0, account: str = ""):
+    """异步版本的浏览器槽位；共享 Chromium 分支同样要受全局上限约束。"""
+    global _ACTIVE, _PEAK
+    sem = _sem()
+    acquired = await asyncio.to_thread(sem.acquire, True, max(1.0, timeout))
     if not acquired:
         raise TimeoutError("浏览器槽位不足，请稍后重试或调大 FLOWOPS_MAX_BROWSERS")
     with _GUARD:
@@ -101,3 +160,4 @@ def reset_for_tests() -> None:
         _ACTIVE = 0
         _PEAK = 0
         _WARM.clear()
+        _ACTIVE_TOKENS.clear()

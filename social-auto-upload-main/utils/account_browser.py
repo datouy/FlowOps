@@ -46,6 +46,7 @@ _LOCKS_GUARD = threading.Lock()
 # 也不会返回。强杀之后挂起的网络读取立刻失败，线程才能走到 finally 释放锁。
 _PROFILE_DIRS: dict[int, str] = {}
 _PROFILE_DIRS_GUARD = threading.Lock()
+_SHARED_CONTEXTS: set[int] = set()
 
 
 def register_context_profile(context: Any, profile: Path) -> None:
@@ -63,7 +64,17 @@ def unregister_context_profile(context: Any) -> None:
 def context_profile_dir(context: Any) -> str:
     """取出一个上下文登记过的 Profile 目录。"""
     with _PROFILE_DIRS_GUARD:
-        return _PROFILE_DIRS.get(id(context), "")
+        return "" if id(context) in _SHARED_CONTEXTS else _PROFILE_DIRS.get(id(context), "")
+
+
+def register_shared_context(context: Any) -> None:
+    with _PROFILE_DIRS_GUARD:
+        _SHARED_CONTEXTS.add(id(context))
+
+
+def unregister_shared_context(context: Any) -> None:
+    with _PROFILE_DIRS_GUARD:
+        _SHARED_CONTEXTS.discard(id(context))
 
 
 def _profile_lock(profile: Path) -> threading.Lock:
@@ -340,15 +351,15 @@ async def persistent_account_context(
             channel=str(options.get("channel") or ""),
         )
         try:
+            register_shared_context(context)
             from runtime_config import FINGERPRINT_FAIL_CLOSED
             if FINGERPRINT_FAIL_CLOSED:
                 from utils.fingerprint_selfcheck import assert_fingerprint
                 await assert_fingerprint(context, fingerprint)
             yield context
         finally:
-            await browser_timeout.close_async_resource_async(
-                context, label="关闭共享账号上下文",
-            )
+            unregister_shared_context(context)
+            await shared_browser.close_context_async(context)
         return
 
     from utils.browser_pool import browser_slot
@@ -443,6 +454,7 @@ def persistent_account_context_sync(
         proxy = context_opts.pop("proxy", None)
         context = shared_browser.account_context_sync(
             playwright,
+            cookie_path=resolved,
             storage_state=_shared_storage_state(resolved),
             proxy=proxy,
             fingerprint_options=context_opts,
@@ -453,13 +465,15 @@ def persistent_account_context_sync(
             channel=str(options.get("channel") or ""),
         )
         try:
+            register_shared_context(context)
             from runtime_config import FINGERPRINT_FAIL_CLOSED
             if FINGERPRINT_FAIL_CLOSED:
                 from utils.fingerprint_selfcheck import assert_fingerprint_sync
                 assert_fingerprint_sync(context, fingerprint)
             yield context
         finally:
-            browser_timeout.close_async_resource(context, label="关闭共享账号上下文")
+            unregister_shared_context(context)
+            shared_browser.close_context_sync(context)
         return
 
     from utils.browser_pool import browser_slot as _browser_slot
