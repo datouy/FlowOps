@@ -16,6 +16,7 @@ from typing import Any
 from loguru import logger
 from patchright.async_api import async_playwright
 
+import access_scope
 import runtime_guard
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
@@ -899,7 +900,7 @@ def monthly_trend(months: int = 6) -> dict:
     评论、收藏、涨粉，以及环比增长率。
     """
     months = max(1, min(int(months or 6), 24))
-    accounts = _account_rows()
+    accounts = access_scope.filter_accounts(_account_rows())
     now = datetime.now()
     first_month = now.replace(day=1)
     # 回退 (months - 1) 个月。
@@ -1159,7 +1160,7 @@ def completion_rate(days: int = 30) -> dict:
     """
     days = max(1, min(int(days or 30), 365))
     since = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-    accounts = _account_rows()
+    accounts = access_scope.filter_accounts(_account_rows())
     with get_conn() as c:
         jobs = [
             dict(row) for row in c.execute(
@@ -1196,7 +1197,7 @@ def completion_rate(days: int = 30) -> dict:
 def stats_summary() -> dict:
     """返回发布记录、每条记录的最新内容数据、平台/账号汇总。"""
     _db_prepare()
-    accounts = _account_rows()
+    accounts = access_scope.filter_accounts(_account_rows())
     _ck = tuple(sorted((str(a.get('type') or ''), str(a.get('userName') or '')) for a in accounts))
     _cached = _STATS_SUMMARY_CACHE.get(_ck)
     if _cached and time.monotonic() - _cached[0] < _STATS_SUMMARY_CACHE_TTL:

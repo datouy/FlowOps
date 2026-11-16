@@ -11,7 +11,6 @@ FingerprintMismatchError，拒绝继续执行发布 / 私信 / 巡检动作。
 """
 from __future__ import annotations
 
-from typing import Any
 
 
 SELFCHECK_SCRIPT = r"""

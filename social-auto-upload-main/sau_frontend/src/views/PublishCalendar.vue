@@ -57,8 +57,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { http } from '@/utils/request'
+import { ref, computed } from 'vue'
 import { opsApi } from '@/api/ops'
 import { useLivePolling } from '@/composables/useLivePolling'
 

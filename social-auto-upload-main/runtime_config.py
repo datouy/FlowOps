@@ -117,7 +117,14 @@ ALLOW_REMOTE = _as_bool(_env_text("YUNCE_ALLOW_REMOTE"))
 CORS_ORIGINS = _split_csv(_env_text("YUNCE_CORS_ORIGINS")) or list(DEFAULT_ORIGINS)
 
 # 静态资源与健康检查不参与令牌校验。
-PUBLIC_PATHS = frozenset({"/health", "/favicon.ico", "/vite.svg"})
+PUBLIC_PATHS = frozenset({
+    "/health",
+    "/health/ready",
+    "/favicon.ico",
+    "/vite.svg",
+    # Webhook 使用独立密钥/HMAC，不能要求外部系统持有后台管理 Token。
+    "/dm/inbound",
+})
 PUBLIC_PREFIXES = ("/assets/",)
 
 # 发布执行期强制要求每个账号绑定独立代理出口。关闭时"无代理"只是提醒，

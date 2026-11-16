@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import io
 import json
 import re
 import shutil
+import threading
+import time
 import uuid
 import urllib.request
 from datetime import datetime, timedelta
@@ -18,11 +21,14 @@ from flask import Blueprint, Response, jsonify, request
 from conf import BASE_DIR
 import ai_content
 import ops_schema
+import runtime_config
+import task_jobs
 from db_utils import (
     apply_migrations, backup as db_backup, checkpoint as db_checkpoint,
     connect, integrity_ok, stats as db_stats,
 )
 from utils.log import logger
+from utils.pagination import page_args, page_meta
 
 bp = Blueprint("dm_ops", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
@@ -33,6 +39,11 @@ MAX_CHANNELS_MEDIA_REPLY_BYTES = 25 * 1024 * 1024
 MAX_XHS_IMAGE_REPLY_BYTES = 10 * 1024 * 1024
 MAX_XHS_VIDEO_REPLY_BYTES = 100 * 1024 * 1024
 MAX_MEDIA_REPLY_BYTES = MAX_XHS_VIDEO_REPLY_BYTES
+MAX_INBOUND_BYTES = 2 * 1024 * 1024
+MAX_INBOUND_ITEMS = 200
+INBOUND_RATE_LIMIT = 300
+INBOUND_RATE_WINDOW = 60
+HUB_SIGNATURE_WINDOW = 300
 IMAGE_REPLY_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_REPLY_SUFFIXES = {".mp4", ".mov", ".m4v"}
 ACCOUNT_PLATFORM_NAMES = {
@@ -1315,7 +1326,8 @@ def _build_ai_reply(c, contact: dict, content: str, platform: str,
         "资质或服务承诺；不要硬推。只输出回复正文。" + extra + "\n"
         f"对话记录：\n{history_text}\n"
     )
-    text = ai_content._call_with_retry(prompt, max_tokens=500, timeout=30)
+    with ai_content.ai_call_context("dm_reply", "system"):
+        text = ai_content._call_with_retry(prompt, max_tokens=500, timeout=30)
     return _clean(text, 260)
 
 
@@ -2163,6 +2175,7 @@ def priority_leads(limit: int = 8) -> list[dict]:
 
 
 def list_conversations():
+    page, page_size, offset = page_args(default_size=50, max_size=200)
     platform = request.args.get("platform")
     account = _clean(request.args.get("account"), 120)
     segment = request.args.get("segment")
@@ -2200,15 +2213,22 @@ def list_conversations():
             OR EXISTS (SELECT 1 FROM messages x WHERE x.contact_id=c.id AND x.content LIKE ?
                 AND """ + visible_sql + """))"""
         args += [like, like, like, like, like, like, like, like]
-    sql += " ORDER BY m.created_at DESC, m.id DESC LIMIT 300"
+    count_sql = "SELECT COUNT(*) FROM (" + sql + ") q"
+    sql += " ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?"
     with get_conn() as c:
+        total = int(c.execute(count_sql, args).fetchone()[0] or 0)
         rows = []
-        for row in c.execute(sql, args).fetchall():
+        for row in c.execute(sql, [*args, page_size, offset]).fetchall():
             item = dict(row)
             # dm_contacts 上的历史计数包含视频占位，列表必须按可见消息重算。
             item["unread_count"] = int(item.pop("visible_unread_count", 0) or 0)
             rows.append(_decorate_contact(item))
-    return jsonify({"code": 200, "data": rows, "msg": None})
+    return jsonify({
+        "code": 200,
+        "data": rows,
+        "pagination": page_meta(total, page, page_size),
+        "msg": None,
+    })
 
 
 def conversation_detail(cid: int):
@@ -2442,19 +2462,22 @@ def update_contact(cid: int):
     return jsonify({"code": 200, "msg": "ok"})
 
 
-def manual_reply(cid: int):
-    data = request.get_json(silent=True) or {}
-    text = _clean(data.get("text"), 2000)
+def _raise_contact_denied(denied) -> None:
+    if denied is not None:
+        raise PermissionError("无权访问该会话")
+
+
+def _manual_reply_payload(cid: int, text: str, *, guard: bool = True) -> dict:
+    text = _clean(text, 2000)
     if not text:
-        return jsonify({"code": 400, "msg": "回复内容不能为空"}), 400
+        raise ValueError("回复内容不能为空")
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
-            return jsonify({"code": 404, "msg": "conversation not found"}), 404
+            raise LookupError("conversation not found")
         contact = dict(row)
-        denied = _guard_contact(contact)
-        if denied is not None:
-            return denied
+        if guard:
+            _raise_contact_denied(_guard_contact(contact))
         settings = _get_settings(c)
         out_id = _insert_outbound(c, contact, text, "replied", None, auto=False)
         _log_reply(c, cid, None, out_id, None, "pending", "等待发送", text)
@@ -2468,7 +2491,20 @@ def manual_reply(cid: int):
         "nickname": contact["nickname"], "conversation_id": cid,
         "message_id": out_id, "text": text,
     }, settings)
-    return jsonify({"code": 200, "data": {"outbound_message_id": out_id, **delivery}, "msg": "ok"})
+    return {"outbound_message_id": out_id, **delivery}
+
+
+def manual_reply(cid: int):
+    data = request.get_json(silent=True) or {}
+    try:
+        result = _manual_reply_payload(cid, str(data.get("text") or ""), guard=True)
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc)}), 400
+    except LookupError:
+        return jsonify({"code": 404, "msg": "conversation not found"}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 403, "msg": str(exc)}), 403
+    return jsonify({"code": 200, "data": result, "msg": "ok"})
 
 
 @bp.route("/dm/conversations/<int:cid>/reply-media", methods=["POST"])
@@ -2545,26 +2581,36 @@ def manual_reply_media(cid: int):
     })
 
 
-def ai_draft(cid: int):
+def _ai_draft_payload(cid: int, *, guard: bool = True) -> dict:
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
-            return jsonify({"code": 404, "msg": "conversation not found"}), 404
-        denied = _guard_contact(dict(row))
-        if denied is not None:
-            return denied
+            raise LookupError("conversation not found")
+        if guard:
+            _raise_contact_denied(_guard_contact(dict(row)))
         contact = dict(row)
         last = c.execute("""SELECT content FROM messages m
             WHERE contact_id=? AND direction='inbound' AND """
             + _visible_message_sql("m") + """
             ORDER BY id DESC LIMIT 1""", (cid,)).fetchone()
         if not last:
-            return jsonify({"code": 400, "msg": "该会话还没有客户来信"}), 400
-        try:
-            text = _build_ai_reply(c, contact, last["content"], contact["platform"])
-        except Exception as exc:
-            return jsonify({"code": 500, "msg": str(exc)[:300]}), 500
-    return jsonify({"code": 200, "data": {"reply": text}, "msg": None})
+            raise ValueError("该会话还没有客户来信")
+        text = _build_ai_reply(c, contact, last["content"], contact["platform"])
+    return {"reply": text}
+
+
+def ai_draft(cid: int):
+    try:
+        result = _ai_draft_payload(cid, guard=True)
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc)}), 400
+    except LookupError:
+        return jsonify({"code": 404, "msg": "conversation not found"}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 403, "msg": str(exc)}), 403
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": str(exc)[:300]}), 500
+    return jsonify({"code": 200, "data": result, "msg": None})
 
 
 def analytics():
@@ -2667,14 +2713,48 @@ def export_contacts():
     })
 
 
-def _check_inbound_secret(settings: dict, body: dict):
+_INBOUND_RATE_LOCK = threading.Lock()
+_INBOUND_RATE: dict[str, list[float]] = {}
+
+
+def _inbound_rate_ok() -> bool:
+    key = str(request.remote_addr or "unknown")
+    now = time.monotonic()
+    cutoff = now - INBOUND_RATE_WINDOW
+    with _INBOUND_RATE_LOCK:
+        stamps = [value for value in _INBOUND_RATE.get(key, []) if value >= cutoff]
+        if len(stamps) >= INBOUND_RATE_LIMIT:
+            _INBOUND_RATE[key] = stamps
+            return False
+        stamps.append(now)
+        _INBOUND_RATE[key] = stamps
+    return True
+
+
+def _check_inbound_secret(settings: dict, body: dict, raw_body: bytes = b""):
     expected = _clean(settings.get("inbound_secret"), 200)
-    if not expected:
-        return True
+    signature = str(request.headers.get("X-YunCe-Signature") or "").strip()
+    if signature:
+        if not expected:
+            return False
+        timestamp = str(request.headers.get("X-YunCe-Timestamp") or "").strip()
+        try:
+            created_at = int(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if abs(int(time.time()) - created_at) > HUB_SIGNATURE_WINDOW:
+            return False
+        supplied = signature.removeprefix("sha256=").lower()
+        message = timestamp.encode("ascii") + b"." + (raw_body or b"")
+        digest = hmac.new(expected.encode("utf-8"), message, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(supplied, digest)
     supplied = (request.headers.get("X-YunCe-Secret")
                 or request.headers.get("X-FlowOps-Secret")
                 or body.get("secret"))
-    return str(supplied or "") == expected
+    if expected:
+        return hmac.compare_digest(str(supplied or ""), expected)
+    # 本机单用户模式允许零配置接入；一旦启用后台 Token，就拒绝无密钥 Webhook。
+    return not (runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE)
 
 
 @bp.route("/dm/conversations", methods=["GET"])
@@ -2706,9 +2786,39 @@ def dm_reply(cid):
     return manual_reply(cid)
 
 
+@bp.route("/dm/conversations/<int:cid>/reply-async", methods=["POST"])
+def dm_reply_async(cid):
+    body = request.get_json(silent=True) or {}
+    text = _clean(body.get("text"), 2000)
+    if not text:
+        return jsonify({"code": 400, "msg": "回复内容不能为空"}), 400
+    with get_conn() as c:
+        row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
+    if not row:
+        return jsonify({"code": 404, "msg": "conversation not found"}), 404
+    denied = _guard_contact(dict(row))
+    if denied is not None:
+        return denied
+    task = task_jobs.submit("dm.reply", {"contactId": int(cid), "text": text})
+    return jsonify({"code": 202, "msg": "私信发送已开始", "data": task}), 202
+
+
 @bp.route("/dm/conversations/<int:cid>/ai-draft", methods=["POST"])
 def dm_ai_draft(cid):
     return ai_draft(cid)
+
+
+@bp.route("/dm/conversations/<int:cid>/ai-draft-async", methods=["POST"])
+def dm_ai_draft_async(cid):
+    with get_conn() as c:
+        row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
+    if not row:
+        return jsonify({"code": 404, "msg": "conversation not found"}), 404
+    denied = _guard_contact(dict(row))
+    if denied is not None:
+        return denied
+    task = task_jobs.submit("dm.ai_draft", {"contactId": int(cid)})
+    return jsonify({"code": 202, "msg": "AI 草稿生成已开始", "data": task}), 202
 
 
 @bp.route("/dm/contacts/<int:cid>", methods=["PUT"])
@@ -2718,12 +2828,25 @@ def dm_contact_update(cid):
 
 @bp.route("/dm/inbound", methods=["POST"])
 def dm_inbound():
+    content_length = int(request.content_length or 0)
+    if content_length > MAX_INBOUND_BYTES:
+        return jsonify({"code": 413, "msg": "Webhook 请求体过大"}), 413
+    if not _inbound_rate_ok():
+        return jsonify({"code": 429, "msg": "Webhook 请求过于频繁"}), 429
+    raw_body = request.get_data(cache=True) or b""
+    if len(raw_body) > MAX_INBOUND_BYTES:
+        return jsonify({"code": 413, "msg": "Webhook 请求体过大"}), 413
     body = request.get_json(silent=True) or {}
     with get_conn() as c:
         settings = _get_settings(c)
-    if not _check_inbound_secret(settings, body):
+    if not _check_inbound_secret(settings, body, raw_body):
         return jsonify({"code": 401, "msg": "unauthorized"}), 401
     items = body.get("items") if isinstance(body.get("items"), list) else None
+    if items is not None and len(items) > MAX_INBOUND_ITEMS:
+        return jsonify({
+            "code": 413,
+            "msg": f"单次最多接收 {MAX_INBOUND_ITEMS} 条私信",
+        }), 413
     force_draft = _as_bool(body.get("draft_only"), False)
     if items is not None:
         result = ingest_many(

@@ -100,6 +100,17 @@ async def _focus_desc_editor(page) -> None:
 
 async def _click_visible_publish_confirm(page: Page) -> bool:
     """Confirm an already-open Ant Design publish dialog before touching the page behind it."""
+    try:
+        import selector_adapters as adapters
+
+        selector = await adapters.wait_publish_step_async(
+            page, "kuaishou", "publish_confirm", 1000
+        )
+        button = page.locator(selector).first
+        await button.click(timeout=8000)
+        return True
+    except Exception:
+        pass
     modal = page.locator("div.ant-modal-confirm-centered:visible").first
     if not await modal.count():
         return False
@@ -252,6 +263,18 @@ async def cookie_auth(account_file):
             if await login_btn.count() > 0:
                 kuaishou_logger.info(_msg("🥹", "cookie 已失效（介绍页）"))
                 return False
+
+            try:
+                import selector_adapters as adapters
+
+                if await adapters.publish_step_any_visible(page, "kuaishou", "login_marker"):
+                    kuaishou_logger.success(_msg("🥳", "cookie 有效"))
+                    return True
+                if await adapters.publish_step_any_visible(page, "kuaishou", "qrcode_marker"):
+                    kuaishou_logger.info(_msg("🥹", "cookie 已失效（出现扫码框）"))
+                    return False
+            except Exception:
+                pass
 
             # 正向证明：上传按钮存在 = 真正已登录
             try:
@@ -646,7 +669,15 @@ class KSVideo(KSBaseUploader):
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手上传主页"))
             await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
 
-            upload_button = page.locator("button[class^='_upload-btn']")
+            try:
+                import selector_adapters as adapters
+
+                _upload_selector = await adapters.wait_publish_step_async(
+                    page, "kuaishou", "upload_entry", 10000
+                )
+            except Exception:
+                _upload_selector = "button[class^='_upload-btn']"
+            upload_button = page.locator(_upload_selector).first
             await upload_button.wait_for(state="visible", timeout=10000)
 
             async with page.expect_file_chooser() as fc_info:

@@ -35,6 +35,10 @@ import comment_ops
 from app_logging import logger, setup_request_logging
 from utils.keep_awake import hold_system_awake
 from utils.credential_crypto import resolve_credential_path
+from utils.media_validation import MEDIA_SUFFIXES, UploadValidationError, validate_media_upload
+from utils.request_limiter import check_route_limit
+from utils.pagination import page_args, page_meta
+from utils.storage_guard import ensure_media_capacity, storage_overview
 from utils.account_environment import (
     _all_proxy_bindings,
     assign_pool_proxy,
@@ -131,12 +135,18 @@ import material_ops
 material_ops.register(app)
 import p0p1_ops
 p0p1_ops.register(app)
+import task_jobs
+import task_runners  # noqa: F401 - 注册异步任务执行器
+app.register_blueprint(task_jobs.bp)
 
 # 默认只允许本机前端跨域，避免任意站点在浏览器里调用本机接口
 CORS(
     app,
     resources={r"/*": {"origins": runtime_config.CORS_ORIGINS}},
-    allow_headers=["Content-Type", "Authorization", "X-YunCe-Token"],
+    allow_headers=[
+        "Content-Type", "Authorization", "X-YunCe-Token",
+        "X-YunCe-Secret", "X-YunCe-Signature", "X-YunCe-Timestamp",
+    ],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 
@@ -162,8 +172,51 @@ def _guard_access_token():
         )
         if identity is not None:
             g.identity = identity
+        allowed, retry_after = check_route_limit(request.method, request.path)
+        if not allowed:
+            response = jsonify({"code": 429, "msg": "请求过于频繁，请稍后重试", "data": None})
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        permission = access_scope.permission_for_request(request.method, request.path)
+        if permission:
+            denied = access_scope.require_permission(
+                permission, f"当前身份没有「{permission}」权限"
+            )
+            if denied is not None:
+                return denied
         return None
     return jsonify({"code": 401, "msg": "未授权：缺少或错误的访问令牌", "data": None}), 401
+
+
+@app.after_request
+def _security_headers(response):
+    """统一安全响应头；HTML 额外启用同源 CSP。"""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+    )
+    if response.mimetype == "text/html":
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob: https: http:; "
+            "media-src 'self' data: blob: https: http:; "
+            "connect-src 'self'; "
+            "font-src 'self' data:; "
+            "frame-src 'self' blob:; "
+            "object-src 'none'; base-uri 'self'; form-action 'self'; "
+            "frame-ancestors 'self'",
+        )
+    if request.path.startswith("/api/") or request.path in {
+        "/dm", "/messages", "/publish-records", "/jobs",
+    } or request.path.startswith(("/dm/", "/publish/", "/messages/", "/jobs/")):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 @app.route('/api/v2/session', methods=['GET'])
@@ -214,10 +267,17 @@ def health_ready():
     """
     import health_probe
     result = health_probe.readiness()
+    # 该接口供 Docker/Nginx 无 Token 探测，只返回状态摘要；路径、账号数等
+    # 详细信息继续由受鉴权保护的 /api/v2/system/health 提供。
     return jsonify({
         "code": 200 if result["ready"] else 503,
         "msg": None if result["ready"] else "服务未就绪",
-        "data": result,
+        "data": {
+            "ready": bool(result.get("ready")),
+            "checkedAt": result.get("checkedAt"),
+            "blockerCount": len(result.get("blockers") or []),
+            "warningCount": len(result.get("warnings") or []),
+        },
     }), (200 if result["ready"] else 503)
 
 
@@ -1043,8 +1103,7 @@ def _account_count() -> int:
         return 0
 
 
-@app.route('/api/v2/accounts/check-all', methods=['POST'])
-async def api_v2_accounts_check_all():
+async def _api_v2_accounts_check_all_sync():
     """批量健康检查：逐个跑 cookie 校验并回写状态，返回汇总。"""
     store = get_store(BASE_DIR)
     accounts = access_scope.filter_accounts(store.list())
@@ -1093,6 +1152,29 @@ async def api_v2_accounts_check_all():
         "msg": None,
         "data": {"ok": ok, "bad": bad, "total": len(results), "accounts": results},
     }), 200
+
+
+@app.route('/api/v2/accounts/check-all', methods=['POST'])
+def api_v2_accounts_check_all():
+    """提交全量账号检查任务；``?sync=1`` 保留旧调用兼容。"""
+    if str(request.args.get("sync") or "") in {"1", "true", "yes"}:
+        return asyncio.run(_api_v2_accounts_check_all_sync())
+    store = get_store(BASE_DIR)
+    accounts = access_scope.filter_accounts(store.list())
+    task = task_jobs.submit("accounts.check_all", {
+        "baseDir": str(BASE_DIR),
+        "accounts": [
+            {
+                "id": item.get("id"),
+                "name": item.get("name") or "",
+                "type": (item.get("platform") or {}).get("type"),
+                "cookie": (item.get("cookie") or {}).get("name") or "",
+                "cookieExists": bool((item.get("cookie") or {}).get("exists")),
+            }
+            for item in accounts
+        ],
+    })
+    return jsonify({"code": 202, "msg": "账号检查已开始", "data": task}), 202
 
 
 @app.route('/api/v2/accounts/<int:account_id>/proxy/verify', methods=['POST'])
@@ -1248,6 +1330,14 @@ def upload_file():
         safe_name = secure_filename(file.filename)
         if not safe_name:
             return jsonify({"code": 400, "data": None, "msg": "Invalid filename"}), 400
+        try:
+            validate_media_upload(file, safe_name)
+        except UploadValidationError as exc:
+            return jsonify({"code": 400, "data": None, "msg": str(exc)}), 400
+        try:
+            ensure_media_capacity(int(request.content_length or 0), BASE_DIR)
+        except ValueError as exc:
+            return jsonify({"code": 413, "data": None, "msg": str(exc)}), 413
         filepath = Path(BASE_DIR / "videoFile" / f"{uuid_v1}_{safe_name}")
         file.save(filepath)
         return jsonify({"code":200,"msg": "File uploaded successfully", "data": f"{uuid_v1}_{safe_name}"}), 200
@@ -1265,12 +1355,19 @@ def get_file():
     # 防止路径穿越攻击
     if '..' in filename or filename.startswith('/'):
         return jsonify({"code": 400, "msg": "Invalid filename", "data": None}), 400
+    if Path(filename).suffix.lower() not in MEDIA_SUFFIXES:
+        return jsonify({"code": 400, "msg": "仅允许预览图片或视频", "data": None}), 400
 
     # 拼接完整路径
     file_path = str(Path(BASE_DIR / "videoFile"))
 
     # 返回文件
-    return send_from_directory(file_path,filename)
+    response = send_from_directory(file_path, filename)
+    response.headers.setdefault(
+        "Content-Disposition",
+        f'inline; filename="{secure_filename(filename)}"',
+    )
+    return response
 
 
 @app.route('/download/<path:file_path>', methods=['GET'])
@@ -1287,6 +1384,8 @@ def download_file(file_path):
     normalized = str(file_path).replace('\\', '/')
     if '..' in normalized or normalized.startswith('/'):
         return jsonify({"code": 400, "msg": "Invalid file path", "data": None}), 400
+    if Path(normalized).suffix.lower() not in MEDIA_SUFFIXES:
+        return jsonify({"code": 400, "msg": "仅允许下载图片或视频", "data": None}), 400
 
     try:
         return send_from_directory(
@@ -1308,6 +1407,8 @@ def dm_media_file(file_path):
     target = (root / normalized).resolve()
     if not target.is_relative_to(root) or target == root:
         return jsonify({"code": 400, "msg": "Invalid file path", "data": None}), 400
+    if target.suffix.lower() not in MEDIA_SUFFIXES:
+        return jsonify({"code": 400, "msg": "仅允许访问图片或视频", "data": None}), 400
     try:
         return send_from_directory(
             str(root), normalized,
@@ -1343,6 +1444,15 @@ def upload_save():
         filename = secure_filename(file.filename)
     if not filename:
         return jsonify({"code": 400, "data": None, "msg": "Invalid filename"}), 400
+
+    try:
+        validate_media_upload(file, filename)
+    except UploadValidationError as exc:
+        return jsonify({"code": 400, "data": None, "msg": str(exc)}), 400
+    try:
+        ensure_media_capacity(int(request.content_length or 0), BASE_DIR)
+    except ValueError as exc:
+        return jsonify({"code": 413, "data": None, "msg": str(exc)}), 413
 
     try:
         # 生成 UUID v1
@@ -1389,12 +1499,39 @@ def upload_save():
 @app.route('/getFiles', methods=['GET'])
 def get_all_files():
     try:
+        page, page_size, offset = page_args(default_size=50, max_size=200)
+        legacy_all = not any(
+            key in request.args for key in ("page", "page_size", "limit")
+        )
+        keyword = str(request.args.get("q") or "").strip()
+        tag = str(request.args.get("tag") or "").strip()
+        where, where_args = "", []
+        if keyword:
+            where += " AND filename LIKE ?"
+            where_args.append(f"%{keyword}%")
+        if tag:
+            where += " AND tags LIKE ?"
+            where_args.append(f"%{tag}%")
         # 使用 with 自动管理数据库连接
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
 
-            # 查询所有记录
-            cursor.execute("SELECT * FROM file_records")
+            total = int(cursor.execute(
+                "SELECT COUNT(*) FROM file_records WHERE 1=1" + where,
+                where_args,
+            ).fetchone()[0] or 0)
+            if legacy_all:
+                cursor.execute(
+                    "SELECT * FROM file_records WHERE 1=1" + where
+                    + " ORDER BY id DESC",
+                    where_args,
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM file_records WHERE 1=1" + where
+                    + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                    [*where_args, page_size, offset],
+                )
             rows = cursor.fetchall()
 
             # 将结果转为字典列表，并提取UUID
@@ -1412,18 +1549,22 @@ def get_all_files():
                     row_dict['uuid'] = ''
                 data.append(row_dict)
 
-            md5_counts = {}
-            for item in data:
-                md5 = item.get('md5') or ''
-                if md5:
-                    md5_counts[md5] = md5_counts.get(md5, 0) + 1
+            md5_counts = {
+                str(row[0]): int(row[1])
+                for row in cursor.execute(
+                    "SELECT md5,COUNT(*) FROM file_records WHERE md5!='' GROUP BY md5"
+                ).fetchall()
+            }
             for item in data:
                 item['duplicate'] = md5_counts.get(item.get('md5') or '', 0) > 1
 
             return jsonify({
                 "code": 200,
                 "msg": "success",
-                "data": data
+                "data": data,
+                "pagination": page_meta(
+                    total, 1 if legacy_all else page, total if legacy_all else page_size
+                ),
             }), 200
     except Exception:
         return jsonify({
@@ -1724,13 +1865,20 @@ def delete_account():
 # SSE 登录接口
 @app.route('/jobs', methods=['GET'])
 def list_jobs():
-    limit = request.args.get('limit', 50)
+    page, page_size, offset = page_args(default_size=50, max_size=200)
     with publish_jobs.get_conn() as c:
-        rows = [dict(r) for r in c.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
+        total = int(c.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] or 0)
+        rows = [dict(r) for r in c.execute(
+            'SELECT * FROM jobs ORDER BY id DESC LIMIT ? OFFSET ?',
+            (page_size, offset),
+        ).fetchall()]
     rows = stats_reflow.filter_current_account_jobs(rows)
     # 多人协作：只返回令牌范围内的任务。
     rows = access_scope.filter_jobs(rows)
-    return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
+    return jsonify({
+        'code': 200, 'data': rows, 'msg': None,
+        'pagination': page_meta(total, page, page_size),
+    }), 200
 
 @app.route('/jobs/<int:job_id>', methods=['GET'])
 def get_job(job_id):
@@ -1827,12 +1975,19 @@ def review_reject(job_id):
 
 @app.route('/publish-records', methods=['GET'])
 def list_publish_records():
-    limit = request.args.get('limit', 100)
+    page, page_size, offset = page_args(default_size=50, max_size=200)
     with publish_jobs.get_conn() as c:
-        rows = [dict(r) for r in c.execute('SELECT * FROM publish_records ORDER BY id DESC LIMIT ?', (int(limit),)).fetchall()]
+        total = int(c.execute('SELECT COUNT(*) FROM publish_records').fetchone()[0] or 0)
+        rows = [dict(r) for r in c.execute(
+            'SELECT * FROM publish_records ORDER BY id DESC LIMIT ? OFFSET ?',
+            (page_size, offset),
+        ).fetchall()]
     rows = stats_reflow.filter_current_account_records(rows)
     rows = access_scope.filter_jobs(rows)
-    return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
+    return jsonify({
+        'code': 200, 'data': rows, 'msg': None,
+        'pagination': page_meta(total, page, page_size),
+    }), 200
 
 
 def _guard_publish_job(job_id: int, action: str = "") -> Any:
@@ -2182,7 +2337,8 @@ def dm_sync_health():
 
 @app.route('/account-status', methods=['GET'])
 def account_status():
-    return jsonify({'code': 200, 'data': latest_account_status(), 'msg': None}), 200
+    rows = access_scope.filter_accounts(latest_account_status())
+    return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 @app.route('/patrol/run', methods=['POST'])
 def trigger_patrol():
@@ -2250,6 +2406,9 @@ def comments_status():
 @app.route('/comments/sync', methods=['POST'])
 def comments_sync():
     """立即触发一轮评论自动同步。"""
+    if str(request.args.get("sync") or "") not in {"1", "true", "yes"}:
+        task = task_jobs.submit("comments.sync", {})
+        return jsonify({"code": 202, "msg": "评论同步已开始", "data": task}), 202
     import comment_sync
 
     result = comment_sync.run_comment_sync_once()
@@ -2307,10 +2466,7 @@ def comments_list():
     platform = request.args.get('platform') or ''
     account = request.args.get('account') or ''
     source_id = request.args.get('source_id') or ''
-    try:
-        limit = max(1, min(int(request.args.get('limit') or 100), 500))
-    except (TypeError, ValueError):
-        limit = 100
+    page, page_size, offset = page_args(default_size=50, max_size=200)
 
     # 评论表用 (platform, account) 标识所属账号，与私信侧一致，
     # 直接复用同一套账号名范围。
@@ -2332,11 +2488,13 @@ def comments_list():
     if source_id:
         sql += " AND source_id=?"
         args.append(source_id)
-    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
-    args.append(limit)
     try:
         with _comment_conn() as conn:
-            rows = [dict(row) for row in conn.execute(sql, args).fetchall()]
+            total = int(conn.execute("SELECT COUNT(*) FROM (" + sql + ") q", args).fetchone()[0] or 0)
+            page_sql = sql + " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?"
+            rows = [dict(row) for row in conn.execute(
+                page_sql, [*args, page_size, offset]
+            ).fetchall()]
     except Exception as exc:
         logger.warning("读取评论列表失败: {}", exc)
         return jsonify({'code': 500, 'msg': f"读取评论列表失败：{str(exc)[:200]}"}), 500
@@ -2345,6 +2503,7 @@ def comments_list():
         'data': {
             'items': rows,
             'capabilities': comment_ops.platform_capabilities(),
+            'pagination': page_meta(total, page, page_size),
         },
         'msg': None,
     }), 200
@@ -2511,8 +2670,15 @@ def ai_status():
 @app.route('/ai/generate', methods=['POST'])
 def ai_generate():
     data = request.get_json(force=True) or {}
+    caller = str((getattr(g, "identity", None) or {}).get("user") or "local")
+    if str(request.args.get("sync") or "") not in {"1", "true", "yes"}:
+        try:
+            task = task_jobs.submit("ai.content", {"data": data, "caller": caller})
+        except ValueError as exc:
+            return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+        return jsonify({'code': 202, 'data': task, 'msg': '文案生成已开始'}), 202
     try:
-        result = ai_content.generate_content(data)
+        result = ai_content.generate_content(data, caller=caller)
     except ValueError as exc:
         return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
     except Exception as exc:
@@ -2523,8 +2689,15 @@ def ai_generate():
 @app.route('/ai/generate-pack', methods=['POST'])
 def ai_generate_pack():
     data = request.get_json(force=True) or {}
+    caller = str((getattr(g, "identity", None) or {}).get("user") or "local")
+    if str(request.args.get("sync") or "") not in {"1", "true", "yes"}:
+        try:
+            task = task_jobs.submit("ai.content_pack", {"data": data, "caller": caller})
+        except ValueError as exc:
+            return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+        return jsonify({'code': 202, 'data': task, 'msg': '内容包生成已开始'}), 202
     try:
-        result = ai_content.generate_pack(data)
+        result = ai_content.generate_pack(data, caller=caller)
     except ValueError as exc:
         return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
     except Exception as exc:
@@ -2536,10 +2709,43 @@ def ai_generate_pack():
 def ai_pack_start():
     data = request.get_json(force=True) or {}
     try:
-        result = ai_pack_jobs.start(data)
+        caller = str((getattr(g, "identity", None) or {}).get("user") or "local")
+        result = ai_pack_jobs.start(data, caller=caller)
     except Exception as exc:
         return jsonify({'code': 500, 'data': None, 'msg': str(exc)}), 500
     return jsonify({'code': 200, 'data': result, 'msg': 'ok'}), 200
+
+
+@app.route('/api/v2/ai/usage', methods=['GET'])
+def ai_usage_summary():
+    import ai_usage
+
+    days = request.args.get('days', 30, type=int) or 30
+    return jsonify({
+        'code': 200,
+        'data': ai_usage.summary(days),
+        'msg': None,
+    }), 200
+
+
+@app.route('/api/v2/storage/overview', methods=['GET'])
+def api_storage_overview():
+    return jsonify({
+        'code': 200,
+        'data': storage_overview(BASE_DIR),
+        'msg': None,
+    }), 200
+
+
+@app.route('/api/v2/maintenance/run', methods=['POST'])
+def api_maintenance_run():
+    import maintenance
+
+    return jsonify({
+        'code': 200,
+        'data': maintenance.run_once(),
+        'msg': None,
+    }), 200
 
 
 @app.route('/ai/pack/status/<int:job_id>', methods=['GET'])
@@ -3259,6 +3465,20 @@ def _start_background_tasks() -> None:
         )
 
     publish_jobs.start_publish_runtime()
+    try:
+        task_jobs.start_runtime()
+    except Exception:
+        logger.exception("异步任务队列启动失败")
+    try:
+        ai_pack_jobs.start_runtime()
+    except Exception:
+        logger.exception("AI 内容包队列启动失败")
+    try:
+        import maintenance
+
+        maintenance.start()
+    except Exception:
+        logger.exception("数据维护线程启动失败")
     start_patrol()
     stats_reflow.start_stats_loop(24)
     douyin_dm_sync.start_background()

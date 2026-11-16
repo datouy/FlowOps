@@ -12,11 +12,8 @@ import os
 import tempfile
 import urllib.request
 from pathlib import Path
-from typing import Any
 
-from loguru import logger
 
-from conf import BASE_DIR
 
 EGRESS_DIR_NAME = ".egress"
 

@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-from pathlib import Path
 from utils.proxy_egress import record_egress, egress_status, detect_egress_ip, _ip_echo_endpoints
 
 

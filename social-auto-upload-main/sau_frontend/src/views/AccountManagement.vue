@@ -476,6 +476,7 @@ import { Refresh, CircleCheckFilled, CircleCloseFilled, Download, Upload, Loadin
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
+import { waitForTask } from '@/api/task'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'
 import { API_BASE, withToken, authHeaders } from '@/config'
@@ -536,17 +537,13 @@ const fetchAccounts = async () => {
   appStore.setAccountRefreshing(true)
 
   try {
-    const res = await accountApi.getValidAccounts()
-    if (res.code === 200 && res.data) {
-      // 校验接口负责回写状态；列表统一再从 v2 账号服务读取一次。
-      await accountStore.loadAccounts(true)
-      ElMessage.success('账号数据获取成功')
-      // 标记为已访问
-      if (appStore.isFirstTimeAccountManagement) {
-        appStore.setAccountManagementVisited()
-      }
-    } else {
-      ElMessage.error('获取账号数据失败')
+    const res = await accountApi.checkAllAccounts()
+    await waitForTask(res.data)
+    // 后台任务负责回写账号健康度；页面再从 v2 账号服务读取最终状态。
+    await accountStore.loadAccounts(true)
+    ElMessage.success('账号校验完成')
+    if (appStore.isFirstTimeAccountManagement) {
+      appStore.setAccountManagementVisited()
     }
   } catch (error) {
     console.error('获取账号数据失败:', error)
@@ -1130,7 +1127,7 @@ const handleUploadCookie = (row) => {
       formData.append('platform', row.platform)
 
       // 使用统一的http封装发送上传请求
-      const result = await http.upload('/uploadCookie', formData)
+      await http.upload('/uploadCookie', formData)
 
       ElMessage.success('Cookie文件上传成功')
       // 刷新账号列表以显示更新

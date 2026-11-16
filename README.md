@@ -155,7 +155,7 @@ http://127.0.0.1:5409/dm/inbound
 }
 ```
 
-`external_user_id` 用于合并同一客户，`external_message_id` 用于防止重复回复。若在设置中填写了接入密钥，请求需带 `X-YunCe-Secret` 请求头。
+`external_user_id` 用于合并同一客户，`external_message_id` 用于防止重复回复。设置接入密钥后，推荐使用 `X-YunCe-Timestamp` + `X-YunCe-Signature` HMAC 请求头；也兼容 `X-YunCe-Secret`。Webhook 不再要求外部系统持有后台管理 Token。
 
 发送行为分为三种：
 
@@ -202,7 +202,8 @@ http://127.0.0.1:5409/dm/inbound
 
 ```powershell
 python -m venv venv
-venv\Scripts\pip install -r social-auto-upload-main\requirements.txt
+venv\Scripts\pip install --require-hashes -r social-auto-upload-main\requirements.lock
+venv\Scripts\pip install -r social-auto-upload-main\requirements-dev.txt
 venv\Scripts\python -m playwright install chromium
 venv\Scripts\patchright install chromium
 
@@ -211,8 +212,8 @@ npm install
 cd ..\..
 ```
 
-`requirements.txt` 只声明直接依赖；如需复现当前已验证的完整环境，可改用
-`social-auto-upload-main\requirements.lock`。开发与测试依赖见
+`requirements.txt` 只声明直接依赖；安装和部署统一使用带哈希的
+`social-auto-upload-main\requirements.lock`。开发与测试依赖再安装
 `social-auto-upload-main\requirements-dev.txt`。
 
 ### 🔑 配置 AI
@@ -230,6 +231,8 @@ notepad social-auto-upload-main\.env
 FLOWOPS_SECRET_KEY=一串足够长的随机口令
 ```
 
+`WB_BASE_URL` 必须使用 HTTPS，只有 `127.0.0.1` / `localhost` 可使用 HTTP。AI 调用会记录场景、调用人、模型、Token、耗时和可选成本到 `db/ai_usage.db`，并受 `FLOWOPS_AI_DAILY_LIMIT` 全局日配额限制。
+
 异常通知可在同一文件中配置：
 
 ```text
@@ -245,6 +248,10 @@ OPS_WEBHOOK_TYPE=auto
 2. 启动 Python 后端；
 3. 启动 Vue 前端；
 4. 打开 http://localhost:5173。
+
+AI 生成、全量账号检查、评论同步、私信发送与 AI 草稿都通过 `/api/v2/tasks/<id>` 查询进度，浏览器请求不再依赖长连接超时。服务重启后，未完成的异步任务会从 SQLite 恢复。
+
+本地部署的权限、Webhook、AI、数据保留和验证方式见 [`docs/local-hardening-2026-11.md`](docs/local-hardening-2026-11.md)。
 
 也可以分别运行 `run_backend.bat` 和 `run_frontend.bat`。
 

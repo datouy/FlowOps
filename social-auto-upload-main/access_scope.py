@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import urlsplit
 
 from flask import g, has_app_context, jsonify
 
@@ -88,6 +89,46 @@ def require_permission(permission: str, message: str = "") -> Any:
     if has_permission(permission):
         return None
     return forbidden(message or f"当前身份没有「{permission}」权限")
+
+
+# 写接口按领域集中授权。顺序是从具体到宽泛，避免先命中通用前缀。
+_PERMISSION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("/api/v2/executors", "/api/v2/migrations", "/api/v2/selectors",
+      "/api/v2/proxy-pool", "/api/v2/proxy-risks", "/api/v2/webhooks",
+      "/api/v2/maintenance", "/notify/"), runtime_config.PERM_TEAM),
+    (("/api/v2/accounts", "/accounts/slots", "/interactiveLogin/",
+      "/login", "/loginPrepare", "/loginVerify", "/uploadCookie",
+      "/deleteAccount", "/patrol/run", "/api/v2/credentials"), runtime_config.PERM_ACCOUNT),
+    (("/api/v2/tasks/accounts",), runtime_config.PERM_ACCOUNT),
+    (("/dm/", "/messages", "/message-templates", "/comments"), runtime_config.PERM_MESSAGE),
+    (("/api/v2/tasks/dm", "/api/v2/tasks/comments"), runtime_config.PERM_MESSAGE),
+    (("/api/v2/contents", "/publish", "/postVideo", "/review/",
+      "/verify/", "/stats/", "/schedule/", "/materials/", "/media/",
+      "/compliance/", "/ai/", "/upload", "/uploadSave", "/deleteFile",
+      "/open/", "/api/v2/schedule/"), runtime_config.PERM_PUBLISH),
+)
+
+_DESTRUCTIVE_GET_PATHS = frozenset({"/deleteFile", "/deleteAccount"})
+
+
+def permission_for_request(method: str, path: str) -> str | None:
+    """返回接口所需权限点；只读接口返回 ``None``。
+
+    当未启用 Token 时，``require_permission`` 仍会放行，因此本机单用户模式
+    不需要任何额外配置。
+    """
+    method = str(method or "").upper()
+    path = urlsplit(str(path or "")).path
+    if path == "/dm/inbound":
+        return None  # 该接口使用独立 Webhook 密钥/HMAC。
+    mutating = method in {"POST", "PUT", "PATCH", "DELETE"} or path in _DESTRUCTIVE_GET_PATHS
+    if not mutating:
+        return None
+    for prefixes, permission in _PERMISSION_RULES:
+        if path.startswith(prefixes):
+            return permission
+    # 未登记的写接口默认要求发布权限，避免 viewer 因遗漏映射获得写能力。
+    return runtime_config.PERM_PUBLISH
 
 
 # ---------------------------------------------------------------- 账号范围

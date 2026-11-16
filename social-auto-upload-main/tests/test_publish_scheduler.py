@@ -82,6 +82,42 @@ def test_claim_job_token_is_atomic(env):
     assert pj.heartbeat_token(job_id, "wrong-token") is False
 
 
+def test_stale_lease_recovers_items_in_same_state_machine(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    pj._expand_publish_items(job)
+    with pj.get_conn() as c:
+        c.execute("""UPDATE publish_items SET status='running',submitted_at=NULL
+            WHERE job_id=?""", (job_id,))
+        c.execute("""UPDATE jobs SET status='running',lease_until=datetime('now','-2 minutes'),
+            retry_count=0 WHERE id=?""", (job_id,))
+
+    assert pj.release_stale_leases() == 1
+    assert pj.job_items(job_id)[0]["status"] == "pending"
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT status,retry_count FROM jobs WHERE id=?", (job_id,)).fetchone())
+    assert job["status"] == "pending"
+    assert job["retry_count"] == 1
+
+
+def test_stale_lease_marks_submitted_item_uncertain(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    pj._expand_publish_items(job)
+    with pj.get_conn() as c:
+        c.execute("""UPDATE publish_items SET status='running',submitted_at='2026-01-01 00:00:00'
+            WHERE job_id=?""", (job_id,))
+        c.execute("""UPDATE jobs SET status='running',lease_until=datetime('now','-2 minutes'),
+            retry_count=0 WHERE id=?""", (job_id,))
+
+    pj.release_stale_leases()
+    assert pj.job_items(job_id)[0]["status"] == "uncertain"
+
+
 def test_recover_pending_jobs_picks_up_stuck_schedule(env):
     pj, _base = env
     job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])

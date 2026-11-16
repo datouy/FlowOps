@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 from flask import jsonify, request
+
+import access_scope
 
 
 def _ensure_variant_tags(conn) -> None:
@@ -120,9 +121,21 @@ def register(app):
     @app.route('/api/v2/selectors/<platform>', methods=['GET'])
     def selectors_get(platform: str):
         import selector_adapters
+        step = str(request.args.get("step") or "").strip()
+        if step:
+            candidates = selector_adapters.publish_candidates(platform, step)
+        else:
+            candidates = selector_adapters.candidates(platform)
         return jsonify({"code": 200, "msg": None, "data": {
-            "platform": platform, "candidates": selector_adapters.candidates(platform),
+            "platform": platform, "step": step, "candidates": candidates,
         }}), 200
+
+    @app.route('/api/v2/selectors/versions', methods=['GET'])
+    def selectors_versions():
+        import selector_adapters
+        return jsonify({
+            "code": 200, "msg": None, "data": selector_adapters.adapter_versions(),
+        }), 200
 
     @app.route('/api/v2/selectors/refresh', methods=['POST'])
     def selectors_refresh():
@@ -279,27 +292,37 @@ def register(app):
             delta = {}
         with publish_jobs.get_conn() as c:
             try:
-                todos = [dict(r) for r in c.execute(
-                    "SELECT id,title,status,created_at FROM jobs WHERE status IN "
-                    "('pending','uncertain','processing') ORDER BY id DESC LIMIT 20").fetchall()]
+                job_rows = [dict(r) for r in c.execute(
+                    "SELECT id,title,type,status,account_list,created_at FROM jobs "
+                    "ORDER BY id DESC").fetchall()]
             except Exception:
-                todos = []
+                job_rows = []
             try:
-                by_status = [dict(r) for r in c.execute(
-                    "SELECT status,COUNT(*) n FROM jobs GROUP BY status").fetchall()]
-            except Exception:
-                by_status = []
-            try:
-                by_platform = [dict(r) for r in c.execute(
-                    "SELECT type platform,COUNT(*) n,SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok "
-                    "FROM jobs GROUP BY type").fetchall()]
-            except Exception:
-                by_platform = []
-            try:
-                week = [dict(r) for r in c.execute(
+                week_rows = [dict(r) for r in c.execute(
                     "SELECT * FROM scheduled_items ORDER BY scheduled_at DESC LIMIT 50").fetchall()]
             except Exception:
-                week = []
+                week_rows = []
+        jobs = access_scope.filter_jobs(job_rows)
+        todos = [
+            {key: row.get(key) for key in ("id", "title", "status", "created_at")}
+            for row in jobs if str(row.get("status")) in ("pending", "uncertain", "processing")
+        ][:20]
+        status_counts, platform_counts = {}, {}
+        for row in jobs:
+            status = str(row.get("status") or "")
+            platform = int(row.get("type") or 0)
+            status_counts[status] = status_counts.get(status, 0) + 1
+            bucket = platform_counts.setdefault(platform, {"platform": platform, "n": 0, "ok": 0})
+            bucket["n"] += 1
+            if status == "success":
+                bucket["ok"] += 1
+        by_status = [{"status": key, "n": value} for key, value in status_counts.items()]
+        by_platform = list(platform_counts.values())
+        allowed_names = access_scope.allowed_account_names()
+        week = [
+            row for row in week_rows
+            if allowed_names is None or str(row.get("account") or "") in allowed_names
+        ]
         # 四象限：今日待办 / 昨日对比 / 账号健康 / 成功率
         health = {}
         try:
@@ -384,8 +407,6 @@ def register(app):
 
     @app.route('/api/v2/roi/deals', methods=['POST'])
     def roi_deal_close():
-        from db_utils import connect
-        from conf import BASE_DIR
         import dm_ops
         payload = request.get_json(silent=True) or {}
         cid = int(payload.get("contactId") or 0)
@@ -447,12 +468,16 @@ def register(app):
             try:
                 import openpyxl  # type: ignore
                 from flask import Response
-                wb = openpyxl.Workbook(); ws = wb.active; ws.title = "roi"
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = "roi"
                 ws.append(["id", "name", "budget", "deals", "dealAmount", "costPerLead"])
                 for r in enriched:
                     ws.append([r.get("id"), r.get("name"), r.get("budget"),
                                r.get("deals"), r.get("dealAmount"), r.get("costPerLead")])
-                buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+                buf = io.BytesIO()
+                wb.save(buf)
+                buf.seek(0)
                 return Response(buf.getvalue(),
                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": "attachment; filename=roi.xlsx"})

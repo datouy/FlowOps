@@ -245,6 +245,18 @@ async def cookie_auth(account_file):
                 weibo_logger.info(_msg("🥹", "cookie 已失效（跳转到登录页）"))
                 return False
 
+            try:
+                import selector_adapters as adapters
+
+                if await adapters.publish_step_any_visible(page, "weibo", "login_marker"):
+                    weibo_logger.success(_msg("🥳", "cookie 有效"))
+                    return True
+                if await adapters.publish_step_any_visible(page, "weibo", "qrcode_marker"):
+                    weibo_logger.info(_msg("🥹", "cookie 已失效（出现扫码框）"))
+                    return False
+            except Exception:
+                pass
+
             # 检查是否有「登录」按钮（未登录态会显示）
             login_btn = page.get_by_text("登录", exact=True).first
             if await login_btn.count() and await login_btn.is_visible():
@@ -384,8 +396,15 @@ class WeiBoVideo(BaseVideoUploader):
     async def _open_video_publish_page(self, page: Page) -> Page:
         """点击首页「视频」入口，等待 popup 视频发布页。"""
         async with page.expect_popup(timeout=30000) as popup_info:
-            # 录制脚本：page.locator("span").filter(has_text="视频").click()
-            video_btn = page.locator("span").filter(has_text="视频").first
+            try:
+                import selector_adapters as adapters
+
+                selector = await adapters.wait_publish_step_async(
+                    page, "weibo", "video_entry", 15000
+                )
+            except Exception:
+                selector = 'span:has-text("视频")'
+            video_btn = page.locator(selector).first
             await video_btn.wait_for(state="visible", timeout=15000)
             await video_btn.click()
         publish_page = await popup_info.value
@@ -395,8 +414,15 @@ class WeiBoVideo(BaseVideoUploader):
 
     async def _upload_video_file(self, page: Page) -> None:
         """点击「上传视频」按钮并设置文件。"""
-        # 录制脚本：page2.get_by_role("button", name="上传视频").click()
-        upload_btn = page.get_by_role("button", name="上传视频")
+        try:
+            import selector_adapters as adapters
+
+            selector = await adapters.wait_publish_step_async(
+                page, "weibo", "upload_entry", 15000
+            )
+        except Exception:
+            selector = 'button:has-text("上传视频")'
+        upload_btn = page.locator(selector).first
         await upload_btn.wait_for(state="visible", timeout=15000)
 
         # 通过 file chooser 设置文件

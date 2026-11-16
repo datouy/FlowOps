@@ -50,7 +50,7 @@ install -d -o "$SVC_USER" -g "$SVC_USER" \
 log "4/9 创建虚拟环境并安装依赖"
 [[ -x "$VENV/bin/python" ]] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install --upgrade pip
-"$VENV/bin/pip" install -r "$APP_DIR/requirements.txt"
+"$VENV/bin/pip" install --require-hashes -r "$APP_DIR/requirements.lock"
 
 log "5/9 安装 Playwright Chromium（扫码登录、发布、私信同步都要用）"
 PLAYWRIGHT_BROWSERS_PATH="$APP_ROOT/.playwright" "$VENV/bin/playwright" install --with-deps chromium

@@ -50,9 +50,9 @@ RUN sed -i 's#deb.debian.org#mirrors.cloud.tencent.com#g' /etc/apt/sources.list.
  && apt-get install -y --no-install-recommends ca-certificates tzdata fonts-noto-cjk xvfb xauth \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+COPY requirements.txt requirements.lock ./
 RUN pip config set global.index-url "$PIP_INDEX_URL" \
- && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # 代码里大量用 channel="chromium"，必须有完整 chromium；--with-deps 顺手补齐系统库
 RUN playwright install --with-deps chromium

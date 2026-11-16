@@ -96,6 +96,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { http } from '@/utils/request'
+import { waitForTask } from '@/api/task'
 
 const router = useRouter()
 const platforms = ['小红书', '抖音', '视频号', '快手', '微博', '百家号']
@@ -142,7 +143,7 @@ async function generate() {
   loading.value = true
   try {
     const response = await http.post('/ai/generate', form.value)
-    result.value = response.data
+    result.value = await waitForTask(response.data)
     ElMessage.success('文案已生成')
   } catch (error) {
     ElMessage.error(error.message || '生成失败，请稍后重试')

@@ -4,6 +4,7 @@ flask-cors>=6,<7
 loguru>=0.7,<0.8
 numpy>=1.26
 opencv-python-headless>=4.10
+openpyxl>=3.1,<4
 # 凭据加密（AES-256-GCM）。没有它就不能落盘加密凭据，
 # 后端启动时会拒绝创建新的凭据文件。
 cryptography>=42,<51

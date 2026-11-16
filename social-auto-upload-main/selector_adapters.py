@@ -11,6 +11,7 @@ import hashlib
 import hmac as hmac_lib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -79,33 +80,86 @@ def candidates(platform: str) -> list[dict]:
     return list(BUILTIN.get(key, []))
 
 
+def _atomic_write(path: Path, body: str, version: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, path)
+    if version:
+        meta = path.with_suffix(path.suffix + ".meta.json")
+        meta_tmp = meta.with_suffix(meta.suffix + f".tmp-{os.getpid()}")
+        meta_tmp.write_text(json.dumps({
+            "version": version,
+            "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, ensure_ascii=False), encoding="utf-8")
+        os.replace(meta_tmp, meta)
+
+
+def adapter_versions() -> dict[str, str]:
+    versions = {}
+    for meta in ADAPTER_DIR.rglob("*.meta.json"):
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        key = (
+            str(meta.relative_to(ADAPTER_DIR))
+            .replace("\\", "/")
+            .removesuffix(".yaml.meta.json")
+        )
+        versions[key] = str(payload.get("version") or "")
+    return versions
+
+
 def refresh_from_remote(timeout: float = 15.0) -> dict:
-    """远端签名拉取适配包，HMAC-SHA256 校验。返回 {updated, error}。"""
+    """远端拉取适配包。
+
+    选择器会在浏览器里执行，因此开启远端源后必须配置 HMAC 密钥，并携带
+    ``X-FlowOps-Version``。文件先写临时文件再原子替换，避免进程中断留下半份 YAML。
+    """
     base = str(os.environ.get("FLOWOPS_ADAPTER_URL") or "").strip().rstrip("/")
     secret = str(os.environ.get("FLOWOPS_ADAPTER_KEY") or "")
     if not base:
         return {"updated": 0, "error": "未配置 FLOWOPS_ADAPTER_URL"}
+    if not secret:
+        return {"updated": 0, "error": "远端适配包必须配置 FLOWOPS_ADAPTER_KEY"}
     import urllib.request
     updated = 0
     errors: list[str] = []
-    for plat in ("douyin", "xiaohongshu", "channels"):
-        url = f"{base}/adapters/{plat}.yaml"
+    targets = [
+        (f"adapters/{plat}.yaml", ADAPTER_DIR / f"{plat}.yaml", plat)
+        for plat in ("douyin", "xiaohongshu", "channels")
+    ]
+    for platform, steps in PUBLISH_BUILTIN.items():
+        for step in steps:
+            targets.append((
+                f"adapters/publish/{platform}.{step}.yaml",
+                PUBLISH_DIR / f"{platform}.{step}.yaml",
+                f"{platform}.{step}",
+            ))
+    for remote_path, target, key in targets:
+        url = f"{base}/{remote_path}"
         try:
-            req = urllib.request.Request(url, headers={"X-FlowOps-Platform": plat})
+            req = urllib.request.Request(url, headers={"X-FlowOps-Platform": key})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8", "ignore")
                 sig = resp.headers.get("X-FlowOps-Signature", "")
-                if secret:
-                    expect = hmac_lib.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
-                    if not hmac_lib.compare_digest(expect, sig):
-                        errors.append(f"{plat}: 签名校验失败")
-                        continue
-            ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
-            (ADAPTER_DIR / f"{plat}.yaml").write_text(body, encoding="utf-8")
+                version = str(resp.headers.get("X-FlowOps-Version") or "").strip()
+            expect = hmac_lib.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+            if not hmac_lib.compare_digest(expect, sig.removeprefix("sha256=")):
+                errors.append(f"{key}: 签名校验失败")
+                continue
+            if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}", version):
+                errors.append(f"{key}: 缺少合法的 X-FlowOps-Version")
+                continue
+            if not _parse_simple_yaml(body):
+                errors.append(f"{key}: 适配包为空或格式错误")
+                continue
+            _atomic_write(target, body, version)
             updated += 1
         except Exception as exc:
-            errors.append(f"{plat}: {str(exc)[:120]}")
-    return {"updated": updated, "error": "；".join(errors)}
+            errors.append(f"{key}: {str(exc)[:120]}")
+    return {"updated": updated, "error": "；".join(errors), "versions": adapter_versions()}
 
 
 def drift_pack(platform: str, url: str, tried: list[str], dom: str = "",
@@ -113,7 +167,7 @@ def drift_pack(platform: str, url: str, tried: list[str], dom: str = "",
     """SelectorDrift 诊断包：URL/选择器/DOM/截图，打包为 JSON，一键导出。"""
     pack = {
         "platform": platform,
-        "url": url,
+        "url": re.sub(r"([?&](?:token|access_token)=)[^&]+", r"\1***", url or ""),
         "tried": list(tried or []),
         "dom_len": len(dom or ""),
         "dom_head": (dom or "")[:20000],
@@ -271,14 +325,42 @@ PUBLISH_BUILTIN: dict[str, dict[str, list[dict]]] = {
     "kuaishou": {
         "upload_entry": [
             {"selector": "button[class^='_upload-btn']", "assert": "visible", "timeout": 15000},
+            {"selector": 'button:has-text("上传视频")', "assert": "visible", "timeout": 15000},
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+        ],
+        "login_marker": [
+            {"selector": "button[class^='_upload-btn']", "assert": "visible", "timeout": 10000},
+            {"selector": 'button:has-text("上传视频")', "assert": "visible", "timeout": 10000},
+        ],
+        "qrcode_marker": [
+            {"selector": 'img[src*="qrcode"]', "assert": "visible", "timeout": 10000},
+            {"selector": 'p.qrcode-refresh', "assert": "visible", "timeout": 10000},
         ],
         "publish_confirm": [
             {"selector": "div.ant-modal-confirm-centered button.ant-btn-primary", "assert": "visible", "timeout": 8000},
         ],
+        "success_marker": [
+            {"selector": ':has-text("发布成功")', "assert": "visible", "timeout": 15000},
+            {"selector": ':has-text("作品发布成功")', "assert": "visible", "timeout": 15000},
+        ],
     },
     "weibo": {
+        "video_entry": [
+            {"selector": 'span:has-text("视频")', "assert": "visible", "timeout": 15000},
+            {"selector": 'a:has-text("视频")', "assert": "visible", "timeout": 15000},
+        ],
         "upload_entry": [
             {"selector": 'button:has-text("上传视频")', "assert": "visible", "timeout": 15000},
+            {"selector": 'input[type="file"]', "assert": "attached", "timeout": 15000},
+        ],
+        "login_marker": [
+            {"selector": '[class*="Nav_avatar"]', "assert": "visible", "timeout": 10000},
+            {"selector": '[class*="woo-avatar"]', "assert": "visible", "timeout": 10000},
+            {"selector": 'span:has-text("视频")', "assert": "visible", "timeout": 10000},
+        ],
+        "qrcode_marker": [
+            {"selector": 'img[src*="qrcode"]', "assert": "visible", "timeout": 10000},
+            {"selector": 'img[src*="qr"]', "assert": "visible", "timeout": 10000},
         ],
     },
     "douyin": {

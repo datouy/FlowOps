@@ -130,6 +130,11 @@
                 <el-badge v-if="item.unread_count" :value="item.unread_count" class="conv-badge" />
               </div>
               <el-empty v-if="!loadingConversations && !conversations.length" description="暂无会话" :image-size="70" />
+              <div v-if="conversationPagination.has_next" class="load-more-wrap">
+                <el-button size="small" text :loading="loadingMoreConversations" @click="loadMoreConversations">
+                  加载更多会话
+                </el-button>
+              </div>
             </div>
           </aside>
 
@@ -717,6 +722,7 @@ import { ref, reactive, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { dmApi } from '@/api/dm'
 import { useAccountStore } from '@/stores/account'
+import { waitForTask } from '@/api/task'
 import { API_BASE, withToken } from '@/config'
 import {
   avatarText, deliveryTagType, deliveryText, intentTagType, intentText,
@@ -777,6 +783,8 @@ const syncing = ref(false)
 const rules = ref([])
 const storageHealth = ref(null)
 const conversations = ref([])
+const conversationPagination = ref({ page: 1, page_size: 50, total: 0, pages: 0, has_next: false })
+const loadingMoreConversations = ref(false)
 const convFilters = reactive({ q: '', account: '', platform: '', segment: '', status: '' })
 const accountFilterKey = ref('')
 const loadingConversations = ref(false)
@@ -1264,8 +1272,17 @@ async function loadConversations(silent = false) {
   try {
     const params = {}
     Object.entries(convFilters).forEach(([key, value]) => { if (value) params[key] = value })
+    params.page = 1
+    params.page_size = conversationPagination.value.page_size || 50
     const res = await dmApi.getConversations(params)
-    conversations.value = res.data || []
+    const firstPage = res.data || []
+    if (silent && conversationPagination.value.page > 1) {
+      const firstIds = new Set(firstPage.map(item => item.id))
+      conversations.value = [...firstPage, ...conversations.value.filter(item => !firstIds.has(item.id))]
+    } else {
+      conversations.value = firstPage
+      conversationPagination.value = res.pagination || conversationPagination.value
+    }
     if (currentContact.value) {
       const latest = conversations.value.find(item => item.id === currentContact.value.id)
       if (latest) currentContact.value = { ...currentContact.value, ...latest }
@@ -1279,6 +1296,23 @@ async function loadConversations(silent = false) {
     }
   } catch (error) { console.error(error) }
   finally { if (!silent) loadingConversations.value = false }
+}
+
+async function loadMoreConversations() {
+  if (loadingMoreConversations.value || !conversationPagination.value.has_next) return
+  loadingMoreConversations.value = true
+  try {
+    const params = { page: conversationPagination.value.page + 1, page_size: conversationPagination.value.page_size }
+    Object.entries(convFilters).forEach(([key, value]) => { if (value) params[key] = value })
+    const res = await dmApi.getConversations(params)
+    const known = new Set(conversations.value.map(item => item.id))
+    conversations.value.push(...(res.data || []).filter(item => !known.has(item.id)))
+    conversationPagination.value = res.pagination || conversationPagination.value
+  } catch (error) {
+    ElMessage.error(error.message || '加载更多会话失败')
+  } finally {
+    loadingMoreConversations.value = false
+  }
 }
 
 async function loadLeads() {
@@ -1359,8 +1393,9 @@ async function generateDraft() {
   if (!currentContact.value) return
   drafting.value = true
   try {
-    const res = await dmApi.generateDraft(currentContact.value.id)
-    replyText.value = res.data.reply || ''
+    const res = await dmApi.generateDraftAsync(currentContact.value.id)
+    const data = await waitForTask(res.data)
+    replyText.value = data.reply || ''
     ElMessage.success('AI 草稿已生成，请核对价格和承诺')
   } catch (error) { console.error(error) }
   finally { drafting.value = false }
@@ -1374,15 +1409,16 @@ async function sendReply() {
   replyText.value = ''
   templateId.value = null
   try {
-    const res = await dmApi.sendReply(currentContact.value.id, text)
-    const status = res.data?.delivery_status
+    const res = await dmApi.sendReplyAsync(currentContact.value.id, text)
+    const data = await waitForTask(res.data)
+    const status = data?.delivery_status
     if (status === 'sent') {
       const message = { '抖音': '回复已发送到抖音', '小红书': '回复已发送到小红书', '视频号': '回复已发送到视频号' }[currentContact.value?.platform]
       ElMessage.success(message || '回复已通过连接器发送')
     }
     else if (status === 'failed') {
       replyText.value = text
-      ElMessage.error(res.data?.delivery_error || '回复发送失败')
+      ElMessage.error(data?.delivery_error || '回复发送失败')
     }
     else ElMessage.warning('回复已记录为待人工发送，可在消息旁复制')
     await Promise.all([loadConversation(currentContact.value.id), loadConversations(), loadAnalytics()])

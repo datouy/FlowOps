@@ -6,7 +6,10 @@ tools: contents.create / jobs.create / jobs.get / cockpit.get / roi.export / sel
 传输复用 yunce_cli 的 HTTP 层（YUNCE_BASE_URL / YUNCE_ACCESS_TOKEN）。
 """
 from __future__ import annotations
-import json, os, sys, urllib.request
+import json
+import os
+import sys
+import urllib.request
 
 BASE = os.environ.get("YUNCE_BASE_URL", "http://127.0.0.1:5409").rstrip("/")
 TOKEN = os.environ.get("YUNCE_ACCESS_TOKEN", "")
@@ -42,10 +45,16 @@ def main() -> int:
             continue
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
         if method == "tools/list":
-            sys.stdout.write(json.dumps({"id": mid, "result": sorted(TOOLS)}) + "\n"); sys.stdout.flush(); continue
+            sys.stdout.write(json.dumps({"id": mid, "result": sorted(TOOLS)}) + "\n")
+            sys.stdout.flush()
+            continue
         fn = TOOLS.get(method)
         if not fn:
-            sys.stdout.write(json.dumps({"id": mid, "error": f"unknown tool {method}"}) + "\n"); sys.stdout.flush(); continue
+            sys.stdout.write(
+                json.dumps({"id": mid, "error": f"unknown tool {method}"}) + "\n"
+            )
+            sys.stdout.flush()
+            continue
         try:
             sys.stdout.write(json.dumps({"id": mid, "result": fn(params)}, ensure_ascii=False) + "\n")
         except Exception as exc:

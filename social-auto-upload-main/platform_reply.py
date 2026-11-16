@@ -13,7 +13,7 @@ from loguru import logger
 
 from conf import BASE_DIR
 from db_utils import connect
-from utils.credential_crypto import credential_exists, resolve_credential_path
+from utils.credential_crypto import resolve_credential_path
 from utils.account_browser import open_persistent_account_context_sync
 
 MAIN_DB = Path(BASE_DIR / "db" / "database.db")

@@ -46,10 +46,8 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from loguru import logger
 
 from utils.credential_crypto import credential_exists
 from utils import browser_timeout

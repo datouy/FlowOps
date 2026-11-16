@@ -14,7 +14,7 @@
           @clear="handleSearch"
           @input="handleSearch"
         />
-        <el-input v-model="tagKeyword" placeholder="按标签筛选" clearable style="width:180px" />
+        <el-input v-model="tagKeyword" placeholder="按标签筛选" clearable style="width:180px" @input="handleSearch" />
         <div class="status-filter">
           <el-radio-group v-model="statusFilter" @change="handleSearch">
             <el-radio-button label="all">全部</el-radio-button>
@@ -69,6 +69,15 @@
       <div v-else class="empty-data">
         <el-empty description="暂无素材数据" />
       </div>
+      <el-pagination
+        v-if="materialTotal > materialPageSize"
+        v-model:current-page="materialPage"
+        :page-size="materialPageSize"
+        :total="materialTotal"
+        layout="prev, pager, next, total"
+        class="material-pagination"
+        @current-change="page => fetchMaterials(page, true)"
+      />
     </div>
     
     <!-- 上传对话框 -->
@@ -190,7 +199,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { Refresh, Upload } from '@element-plus/icons-vue'
 import { materialApi } from '@/api/material'
 import { useAppStore } from '@/stores/app'
@@ -220,6 +229,9 @@ async function loadPublished() {
 }
 const isRefreshing = ref(false)
 const isUploading = ref(false)
+const materialPage = ref(1)
+const materialPageSize = ref(50)
+const materialTotal = ref(0)
 
 // 对话框控制
 const uploadDialogVisible = ref(false)
@@ -242,14 +254,21 @@ watch(fileList, (newList) => {
 
 
 // 获取素材列表
-const fetchMaterials = async () => {
+const fetchMaterials = async (page = materialPage.value, silent = false) => {
   isRefreshing.value = true
   try {
-    const response = await materialApi.getAllMaterials()
+    const response = await materialApi.getAllMaterials({
+      page,
+      page_size: materialPageSize.value,
+      q: searchKeyword.value.trim() || undefined,
+      tag: tagKeyword.value.trim() || undefined
+    })
     
     if (response.code === 200) {
       appStore.setMaterials(response.data)
-      ElMessage.success('刷新成功')
+      materialPage.value = Number(response.pagination?.page || page)
+      materialTotal.value = Number(response.pagination?.total || response.data?.length || 0)
+      if (!silent) ElMessage.success('刷新成功')
     } else {
       ElMessage.error('获取素材列表失败')
     }
@@ -264,14 +283,6 @@ const fetchMaterials = async () => {
 // 过滤素材
 const filteredMaterials = computed(() => {
   let list = appStore.materials
-  if (searchKeyword.value) {
-    const keyword = searchKeyword.value.toLowerCase()
-    list = list.filter(material => material.filename.toLowerCase().includes(keyword))
-  }
-  if (tagKeyword.value) {
-    const tag = tagKeyword.value.toLowerCase()
-    list = list.filter(material => String(material.tags || '').toLowerCase().includes(tag))
-  }
   if (statusFilter.value === 'published') {
     list = list.filter(material => publishedFiles.value.has(material.filename))
   } else if (statusFilter.value === 'unpublished') {
@@ -331,9 +342,13 @@ async function doCleanup() {
 }
 
 // 搜索处理
+let searchTimer = null
 const handleSearch = () => {
-  // 搜索逻辑已通过计算属性实现
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => fetchMaterials(1, true), 250)
 }
+
+onUnmounted(() => clearTimeout(searchTimer))
 
 // 上传素材
 const handleUploadMaterial = () => {

@@ -357,6 +357,15 @@
       </el-table-column>
       <el-table-column prop="finished_at" label="完成时间" width="152" />
     </el-table>
+    <el-pagination
+      v-if="view === 'jobs' && jobPagination.total > jobPagination.page_size"
+      v-model:current-page="jobPage"
+      :page-size="jobPagination.page_size || 50"
+      :total="jobPagination.total"
+      layout="prev, pager, next, total"
+      class="job-pagination"
+      @current-change="loadAll"
+    />
 
     <template v-if="view === 'unmatched'">
       <el-alert type="info" :closable="false" class="account-alert"
@@ -429,6 +438,8 @@ const view = ref('overview')
 const accountStore = useAccountStore()
 const hasNoAccounts = computed(() => !accountStore.accounts.length)
 const jobs = ref([])
+const jobPage = ref(1)
+const jobPagination = ref({ page: 1, page_size: 50, total: 0, pages: 0, has_next: false })
 const unmatched = ref([])
 const linkDialog = ref(false)
 const linkStats = ref(null)
@@ -484,7 +495,6 @@ const platformTags = {1:'info',2:'warning',3:'danger',4:'success',5:'danger',6:'
 const platformName = t => platformNames[t] || ('类型' + t)
 const platformTag = t => platformTags[t] || 'info'
 const records = computed(() => summary.value.records || [])
-const rows = computed(() => summary.value.top_contents || [])
 const contentCount = computed(() => (summary.value.platform_totals || []).reduce((sum, p) => sum + Number(p.contents || 0), 0))
 const syncing = computed(() => Boolean(summary.value.sync?.running))
 const lastFetchedAt = computed(() => summary.value.last_fetched_at)
@@ -760,13 +770,14 @@ async function loadAll() {
   try {
     const [stats, jobResult, accountResult, unmatchedResult, notifyResult] = await Promise.all([
       http.get('/stats/summary'),
-      http.get('/jobs'),
+      http.get('/jobs', { page: jobPage.value, page_size: 50 }),
       http.get('/account-status'),
       http.get('/stats/unmatched'),
       http.get('/notify/status'),
     ])
     summary.value = stats.data
     jobs.value = jobResult.data
+    jobPagination.value = jobResult.pagination || jobPagination.value
     accountStatus.value = accountResult.data
     unmatched.value = unmatchedResult.data
     notify.value = notifyResult.data

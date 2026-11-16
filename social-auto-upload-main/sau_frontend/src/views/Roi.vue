@@ -37,9 +37,8 @@
 </template>
 <script setup>
 import { ref, onMounted } from 'vue'
-import { http } from '@/utils/request'
 import { opsApi } from '@/api/ops'
-import { API_BASE, withToken, authHeaders } from '@/config'
+import { API_BASE, withToken } from '@/config'
 
 const loading = ref(false)
 const pushing = ref(false)

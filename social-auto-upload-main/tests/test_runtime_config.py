@@ -32,6 +32,8 @@ def test_access_allowed_without_token_configured(monkeypatch):
 def test_access_allowed_keeps_health_and_preflight_public(monkeypatch):
     monkeypatch.setattr(runtime_config, "ACCESS_TOKEN", "secret")
     assert runtime_config.access_allowed("GET", "/health", {}, {}) is True
+    assert runtime_config.access_allowed("GET", "/health/ready", {}, {}) is True
+    assert runtime_config.access_allowed("POST", "/dm/inbound", {}, {}) is True
     assert runtime_config.access_allowed("OPTIONS", "/dm/messages", {}, {}) is True
 
 
@@ -45,6 +47,8 @@ def test_access_allowed_checks_header_and_query_token(monkeypatch):
 
 @pytest.mark.parametrize("path,expected", [
     ("/health", True),
+    ("/health/ready", True),
+    ("/dm/inbound", True),
     ("/assets/app.js", True),
     ("/dm/messages", False),
     ("/", True),

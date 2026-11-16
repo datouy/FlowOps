@@ -21,7 +21,9 @@ export const dmApi = {
   markConversationRead: id => http.post(`/dm/conversations/${id}/read`, {}, { silent: true }),
   getConversation: (id, params) => http.get(`/dm/conversations/${id}`, params),
   generateDraft: id => http.post(`/dm/conversations/${id}/ai-draft`),
+  generateDraftAsync: id => http.post(`/dm/conversations/${id}/ai-draft-async`),
   sendReply: (id, text) => http.post(`/dm/conversations/${id}/reply`, { text }),
+  sendReplyAsync: (id, text) => http.post(`/dm/conversations/${id}/reply-async`, { text }),
   uploadMedia(file, onUploadProgress) {
     const form = new FormData()
     form.append('file', file)

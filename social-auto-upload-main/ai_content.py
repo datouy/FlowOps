@@ -9,13 +9,20 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import urlparse
+
+import ai_usage
 
 BASE = Path(__file__).parent.resolve()
 ENV_FILE = BASE / ".env"
+_CALL_SCENE: ContextVar[str] = ContextVar("ai_call_scene", default="content")
+_CALL_CALLER: ContextVar[str] = ContextVar("ai_call_caller", default="")
 
 DEFAULTS = {
-    "WB_BASE_URL": "http://106.55.225.14/v1",
+    "WB_BASE_URL": "",
     "WB_MODEL": "deepseek-v4.1-flash",
     "WB_REALM": "cn",
 }
@@ -104,38 +111,110 @@ def _load_env() -> dict:
 
 def config_status() -> dict:
     env = _load_env()
+    base_url = str(env.get("WB_BASE_URL") or "").strip()
+    config_error = ""
+    if not base_url:
+        config_error = "未配置 WB_BASE_URL"
+    else:
+        try:
+            _validated_base_url(base_url)
+        except RuntimeError as exc:
+            config_error = str(exc)
     return {
-        "configured": bool(env.get("WB_API_KEY")),
+        "configured": bool(env.get("WB_API_KEY")) and not config_error,
         "model": env.get("WB_MODEL"),
-        "base_url": env.get("WB_BASE_URL"),
+        "base_url": base_url,
+        "error": config_error,
+        "dailyLimit": ai_usage.daily_limit(),
     }
 
 
-def _call_llm(prompt: str, max_tokens: int = 1200, timeout: int = 120) -> str:
+def _validated_base_url(raw: str) -> str:
+    value = str(raw or "").strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError("WB_BASE_URL 必须是有效的 HTTP(S) 地址")
+    allow_insecure = str(os.environ.get("FLOWOPS_AI_ALLOW_INSECURE", "0")).lower() in {
+        "1", "true", "yes", "on",
+    }
+    if (
+        parsed.scheme != "https"
+        and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        and not allow_insecure
+    ):
+        raise RuntimeError("AI 接口必须使用 HTTPS；仅本机地址可例外")
+    return value
+
+
+@contextmanager
+def ai_call_context(scene: str, caller: str = ""):
+    scene_token = _CALL_SCENE.set(str(scene or "content"))
+    caller_token = _CALL_CALLER.set(str(caller or ""))
+    try:
+        yield
+    finally:
+        _CALL_CALLER.reset(caller_token)
+        _CALL_SCENE.reset(scene_token)
+
+
+def _call_llm(
+    prompt: str,
+    max_tokens: int = 1200,
+    timeout: int = 120,
+    *,
+    scene: str | None = None,
+    caller: str | None = None,
+) -> str:
+    scene = scene or _CALL_SCENE.get()
+    caller = caller if caller is not None else _CALL_CALLER.get()
     env = _load_env()
     key = env.get("WB_API_KEY")
     if not key:
         raise RuntimeError("未配置 AI API Key，请在 .env 中设置 WB_API_KEY")
+    quota_ok, quota_reason = ai_usage.check_quota()
+    if not quota_ok:
+        raise RuntimeError(quota_reason)
+    base_url = _validated_base_url(env.get("WB_BASE_URL", ""))
+    model = env.get("WB_MODEL", DEFAULTS["WB_MODEL"])
     payload = json.dumps({
-        "model": env.get("WB_MODEL", DEFAULTS["WB_MODEL"]),
+        "model": model,
         "input": prompt,
         # 当前默认模型会先消耗推理 token，预留不足时正文会被截断。
         "max_output_tokens": max(max_tokens, 5000),
     }, ensure_ascii=False).encode("utf-8")
     realm = env.get("WB_REALM", "cn")
-    url = env.get("WB_BASE_URL", DEFAULTS["WB_BASE_URL"]).rstrip("/") + "/responses?realm=" + realm
+    url = base_url + "/responses?realm=" + realm
     req = urllib.request.Request(url, data=payload, headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + key,
         "X-Realm": realm,
     })
+    started = time.monotonic()
+    usage = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
+        usage = data.get("usage") if isinstance(data, dict) else None
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
+        try:
+            ai_usage.record_call(
+                scene=scene, caller=caller, model=model,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                ok=False, error=f"HTTP {exc.code}: {detail}",
+            )
+        except Exception:
+            pass
         raise RuntimeError(f"AI 接口返回 {exc.code}: {detail}")
     except Exception as exc:
+        try:
+            ai_usage.record_call(
+                scene=scene, caller=caller, model=model,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                ok=False, error=str(exc),
+            )
+        except Exception:
+            pass
         raise RuntimeError(f"AI 接口调用失败: {exc}")
     texts = []
     for item in data.get("output", []) or []:
@@ -144,20 +223,53 @@ def _call_llm(prompt: str, max_tokens: int = 1200, timeout: int = 120) -> str:
                 texts.append(block["text"])
     result = "\n".join(texts) or data.get("output_text", "")
     if not result:
+        try:
+            ai_usage.record_call(
+                scene=scene, caller=caller, model=model,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                usage=usage, ok=False, error="AI 返回内容为空",
+            )
+        except Exception:
+            pass
         raise RuntimeError("AI 返回内容为空")
+    try:
+        ai_usage.record_call(
+            scene=scene, caller=caller, model=model,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            usage=usage, ok=True,
+        )
+    except Exception:
+        pass
     return result.strip()
 
 
-def _call_with_retry(prompt: str, max_tokens: int = 1200, timeout: int = 120,
-                     attempts: int = 3) -> str:
+def _call_with_retry(
+    prompt: str,
+    max_tokens: int = 1200,
+    timeout: int = 120,
+    attempts: int = 3,
+    *,
+    scene: str | None = None,
+    caller: str | None = None,
+) -> str:
+    scene = scene or _CALL_SCENE.get()
+    caller = caller if caller is not None else _CALL_CALLER.get()
     last_error = None
     for attempt in range(max(1, attempts)):
         try:
-            return _call_llm(prompt, max_tokens, timeout=timeout)
+            return _call_llm(
+                prompt, max_tokens, timeout=timeout, scene=scene, caller=caller
+            )
         except RuntimeError as exc:
             last_error = exc
+            message = str(exc)
+            if any(marker in message for marker in (
+                "401", "403", "404", "400", "未配置", "HTTPS",
+                "WB_BASE_URL", "已达上限",
+            )):
+                raise
             if attempt < max(1, attempts) - 1:
-                time.sleep(1)
+                time.sleep(min(2 ** attempt, 5))
     raise last_error
 
 
@@ -292,7 +404,7 @@ def _template_content(platform, industry, fields, profile):
 
 
 
-def generate_content_with_ai(data: dict) -> dict:
+def generate_content_with_ai(data: dict, caller: str = "") -> dict:
     platform = (data.get("platform") or "小红书").strip()
     industry = _industry(data)
     profile = INDUSTRY_PROFILES.get(industry, INDUSTRY_PROFILES["通用"])
@@ -319,7 +431,7 @@ def generate_content_with_ai(data: dict) -> dict:
         + '{"title":"标题","body":"正文，可含换行","tags":["话题不带#号"],"tip":"发布建议一句"}'
     )
     try:
-        text = _call_with_retry(prompt, 1800)
+        text = _call_with_retry(prompt, 1800, scene="content", caller=caller)
     except RuntimeError:
         return _template_content(platform, industry, fields, profile)
     cleaned = _clean_json(text)
@@ -344,16 +456,24 @@ def generate_content_with_ai(data: dict) -> dict:
 
 
 
-def generate_content(data: dict) -> dict:
-    return generate_content_with_ai(data)
+def generate_content(data: dict, caller: str = "") -> dict:
+    return generate_content_with_ai(data, caller=caller)
 
 
-def _fallback_pack(data: dict, platforms: list, industry: str, progress_cb=None) -> dict:
+def _fallback_pack(
+    data: dict,
+    platforms: list,
+    industry: str,
+    progress_cb=None,
+    caller: str = "",
+) -> dict:
     generated = {}
     errors = []
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {
-            pool.submit(generate_content, dict(data, platform=platform)): platform
+            pool.submit(
+                generate_content, dict(data, platform=platform), caller
+            ): platform
             for platform in platforms
         }
         for future in as_completed(futures):
@@ -385,7 +505,7 @@ def _fallback_pack(data: dict, platforms: list, industry: str, progress_cb=None)
     }
 
 
-def generate_pack(data: dict, progress_cb=None) -> dict:
+def generate_pack(data: dict, progress_cb=None, caller: str = "") -> dict:
     """一次生成 6 个平台的内容；失败时降级为逐平台生成。"""
     platforms = ["小红书", "抖音", "视频号", "快手", "微博", "百家号"]
     industry = _industry(data)
@@ -417,9 +537,11 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
         except Exception:
             pass
     try:
-        text = _call_with_retry(prompt, 3000)
+        text = _call_with_retry(
+            prompt, 3000, scene="content_pack", caller=caller
+        )
     except RuntimeError:
-        return _fallback_pack(data, platforms, industry, progress_cb)
+        return _fallback_pack(data, platforms, industry, progress_cb, caller)
     if progress_cb:
         try:
             progress_cb(70)
@@ -429,7 +551,7 @@ def generate_pack(data: dict, progress_cb=None) -> dict:
     try:
         parsed = json.loads(cleaned)
     except Exception:
-        return _fallback_pack(data, platforms, industry, progress_cb)
+        return _fallback_pack(data, platforms, industry, progress_cb, caller)
     result = []
     for platform in platforms:
         item = _normalize_item(parsed.get(platform) or {})

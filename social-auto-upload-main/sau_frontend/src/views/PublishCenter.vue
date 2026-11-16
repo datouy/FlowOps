@@ -665,8 +665,6 @@ const materials = computed(() => appStore.materials)
 
 // 批量发布相关状态
 const batchPublishing = ref(false)
-const batchPublishMessage = ref('')
-const batchPublishType = ref('info')
 
 // 平台列表 - 对应后端type字段
 const platforms = [
@@ -843,7 +841,7 @@ const handleUploadSuccess = (response, file, tab) => {
 }
 
 // 处理文件上传失败
-const handleUploadError = (error) => {
+const handleUploadError = (_error) => {
   ElMessage.error('文件上传失败')
 }
 
@@ -939,7 +937,7 @@ const getAccountDisplayName = (accountId) => {
 }
 
 // 取消发布
-const cancelPublish = (tab) => {
+const cancelPublish = (_tab) => {
   ElMessage.info('已取消发布')
 }
 
@@ -1011,7 +1009,7 @@ const confirmPublish = async (tab) => {
     if (check.data && check.data.warnings && check.data.warnings.length) {
       ElMessage.warning(check.data.warnings.join('；'))
     }
-    const data = await publishApi.submit(publishData)
+    await publishApi.submit(publishData)
     tab.publishStatus = {
       message: '已加入发布队列，可在「发布记录」查看进度',
       type: 'success'

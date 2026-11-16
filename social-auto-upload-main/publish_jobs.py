@@ -104,19 +104,63 @@ def heartbeat_token(job_id: int, token: str) -> bool:
 
 
 def release_stale_leases() -> int:
-    """回收过期租约回 pending。返回回收数。"""
+    """回收过期租约，并同步修复其子任务/发布记录。返回可重试任务数。"""
     with get_conn() as c:
         _ensure_columns(c, 'jobs', (
             ('executor_id', "TEXT DEFAULT ''"),
             ('lease_until', "DATETIME"),
             ('heartbeat_at', "DATETIME"),
         ))
-        cur = c.execute(
-            "UPDATE jobs SET status='pending', executor_id='', lease_until=NULL, lease_token='' "
-            "WHERE status='running' AND lease_until IS NOT NULL "
-            "AND lease_until < CURRENT_TIMESTAMP"
+        rows = c.execute("""SELECT id,retry_count FROM jobs
+            WHERE status='running' AND lease_until IS NOT NULL
+              AND lease_until < CURRENT_TIMESTAMP""").fetchall()
+        recoverable = []
+        if not rows:
+            return 0
+        job_ids = [int(row['id']) for row in rows]
+        marks = ",".join("?" for _ in job_ids)
+        # 未提交的可以安全重跑；已经调用过平台的必须进入 uncertain，等待人工
+        # 或远端幂等检查，不能因为 lease 过期直接重复发布。
+        c.execute(
+            f"""UPDATE publish_items SET status='pending',
+                error=COALESCE(NULLIF(error,''),'执行器租约过期，等待重新执行')
+                WHERE job_id IN ({marks}) AND status='running'
+                  AND (submitted_at IS NULL OR submitted_at='')""",
+            job_ids,
         )
-        return int(cur.rowcount or 0)
+        c.execute(
+            f"""UPDATE publish_items SET status='uncertain',
+                error=COALESCE(NULLIF(error,''),'执行器租约过期且已提交平台，状态未知，禁止自动重发'),
+                error_kind='unverified',publish_stage='push',stage_status='doing',
+                next_check_at=NULL
+                WHERE job_id IN ({marks}) AND status='running'""",
+            job_ids,
+        )
+        c.execute(
+            f"""UPDATE publish_records SET status='failed',
+                error='执行器租约过期，任务已进入恢复流程',
+                finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP)
+                WHERE job_id IN ({marks}) AND status='running'""",
+            job_ids,
+        )
+        for row in rows:
+            job_id = int(row['id'])
+            if int(row['retry_count'] or 0) >= 1:
+                c.execute("""UPDATE publish_items SET status='failed',
+                    error=COALESCE(NULLIF(error,''),'执行器连续失去租约'),
+                    error_kind='unknown',finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP)
+                    WHERE job_id=? AND status='pending'""", (job_id,))
+                c.execute("""UPDATE jobs SET status='failed',result='执行器连续失去租约',
+                    executor_id='',lease_until=NULL,lease_token='',
+                    finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=?""",
+                    (job_id,))
+            else:
+                c.execute("""UPDATE jobs SET status='pending',retry_count=retry_count+1,
+                    result='',progress='executor lease expired, recovered',
+                    executor_id='',lease_until=NULL,lease_token='',finished_at=NULL
+                    WHERE id=?""", (job_id,))
+                recoverable.append(job_id)
+        return len(recoverable)
 
 
 def _reconcile_historical_item_stages(c) -> None:
@@ -1772,17 +1816,32 @@ def _finalize_replacement(job_id: int, extra: dict) -> None:
 # ---------- job worker ----------
 _q = _queue.Queue()
 _workers_started = False
+_worker_threads: dict[int, threading.Thread] = {}
 _recovery_done = False
 
-def _start_workers(n=2):
+def _worker_count() -> int:
+    try:
+        value = int(os.environ.get("FLOWOPS_PUBLISH_WORKERS", "2") or 2)
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, min(value, 8))
+
+
+def _start_workers(n=None):
     global _workers_started
+    desired = int(n or _worker_count())
+    desired = max(1, min(desired, 8))
     with _lock:
-        if _workers_started:
-            return
         _workers_started = True
-    for i in range(n):
-        t = threading.Thread(target=_worker, args=(i,), daemon=True)
-        t.start()
+        for index in range(desired):
+            existing = _worker_threads.get(index)
+            if existing is not None and existing.is_alive():
+                continue
+            thread = threading.Thread(
+                target=_worker, args=(index,), name=f"publish-worker-{index}", daemon=True,
+            )
+            _worker_threads[index] = thread
+            thread.start()
 
 
 def _recover_interrupted_jobs() -> list[int]:
@@ -1909,7 +1968,17 @@ def _worker(worker_id):
         except Exception as e:
             try:
                 with get_conn() as c:
-                    c.execute("UPDATE jobs SET status='failed', result=? WHERE id=?", (str(e)[:500], job_id))
+                    if token:
+                        c.execute(
+                            "UPDATE jobs SET status='failed', result=? "
+                            "WHERE id=? AND lease_token=?",
+                            (str(e)[:500], job_id, token),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE jobs SET status='failed', result=? WHERE id=?",
+                            (str(e)[:500], job_id),
+                        )
             except Exception:
                 pass
         finally:
@@ -1989,6 +2058,8 @@ def _run_job(job_id, token=None):
     )
     try:
         for item in _pending_items(job_id):
+            if token and not heartbeat_token(int(job_id), token):
+                raise RuntimeError("发布任务租约已失效，停止执行以避免重复发布")
             item_id = int(item['id'])
             latest = get_job_item(job_id, item_id)
             if latest is None or latest.get('status') not in (ITEM_PENDING, ITEM_FAILED):
@@ -2751,6 +2822,9 @@ def start_publish_runtime(
                 if not runtime_guard.is_current('publish-scheduler', _generation):
                     return
                 try:
+                    # 本地单进程模式也定期做 worker 存活检查；线程若异常退出，
+                    # 后续扫描会补起缺少的 worker。
+                    _start_workers()
                     run_schedule_once()
                     runtime_guard.beat('publish-scheduler')
                 except Exception as exc:

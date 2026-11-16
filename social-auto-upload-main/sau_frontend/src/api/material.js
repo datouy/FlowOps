@@ -4,8 +4,8 @@ import { API_BASE, withToken } from '@/config'
 // 素材管理API
 export const materialApi = {
   // 获取所有素材
-  getAllMaterials: () => {
-    return http.get('/getFiles')
+  getAllMaterials: (params = {}) => {
+    return http.get('/getFiles', params)
   },
   
   // 上传素材

@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import sys
 from pathlib import Path
 
@@ -112,3 +114,53 @@ def test_wait_publish_step_async_drift_on_all_fail(tmp_path, monkeypatch):
     # 全失败时自动打了诊断包（截图 + DOM + 试过的选择器）
     assert page._shot is True
     assert page.waited, "应该尝试过内置候选"
+
+
+def test_remote_adapter_refresh_requires_signing_key(monkeypatch):
+    monkeypatch.setenv("FLOWOPS_ADAPTER_URL", "https://adapters.example")
+    monkeypatch.delenv("FLOWOPS_ADAPTER_KEY", raising=False)
+    result = sa.refresh_from_remote(timeout=0.1)
+    assert result["updated"] == 0
+    assert "FLOWOPS_ADAPTER_KEY" in result["error"]
+
+
+def test_remote_adapter_refresh_is_signed_versioned_and_atomic(tmp_path, monkeypatch):
+    import urllib.request
+
+    body = '- selector: button.demo\n  assert: visible\n  timeout: 1000\n'
+    secret = "signing-key"
+    signature = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+    class Response:
+        headers = {
+            "X-FlowOps-Signature": signature,
+            "X-FlowOps-Version": "2026.11.16",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return body.encode()
+
+    monkeypatch.setenv("FLOWOPS_ADAPTER_URL", "https://adapters.example")
+    monkeypatch.setenv("FLOWOPS_ADAPTER_KEY", secret)
+    monkeypatch.setattr(sa, "ADAPTER_DIR", tmp_path)
+    monkeypatch.setattr(sa, "PUBLISH_DIR", tmp_path / "publish")
+    monkeypatch.setattr(sa, "PUBLISH_BUILTIN", {"weibo": {"upload_entry": []}})
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_kw: Response())
+
+    result = sa.refresh_from_remote(timeout=0.1)
+    assert result["updated"] == 4
+    assert (tmp_path / "douyin.yaml").is_file()
+    assert (tmp_path / "publish" / "weibo.upload_entry.yaml").is_file()
+    assert result["versions"]["publish/weibo.upload_entry"] == "2026.11.16"
+
+
+def test_drift_pack_redacts_access_tokens():
+    pack = sa.drift_pack("douyin", "https://example.test/a?token=secret&x=1", [])
+    assert "secret" not in pack["url"]
+    assert "token=***" in pack["url"]

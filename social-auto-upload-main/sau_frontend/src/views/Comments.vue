@@ -99,6 +99,9 @@
           <el-empty description="暂无评论" :image-size="60" />
         </template>
       </el-table>
+      <div v-if="commentPagination.has_next" class="load-more-wrap">
+        <el-button size="small" text :loading="loadingMore" @click="loadMoreComments">加载更多评论</el-button>
+      </div>
     </el-card>
 
     <el-dialog v-model="replyDialog" title="回复评论" width="520px">
@@ -126,12 +129,15 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { commentApi } from '@/api/comment'
+import { waitForTask } from '@/api/task'
 
 const comments = ref([])
 const capabilities = ref([])
 const loading = ref(false)
 const syncing = ref(false)
+const loadingMore = ref(false)
 const lastSyncText = ref('')
+const commentPagination = ref({ page: 1, page_size: 50, total: 0, pages: 0, has_next: false })
 
 const filters = ref({
   platform: '',
@@ -159,18 +165,14 @@ const accounts = computed(() => {
 
 const hasComments = computed(() => comments.value.length > 0)
 
-function supportsAction(platform, action) {
-  const item = capabilities.value.find(entry => entry.name === platform)
-  if (!item) return true
-  return (item.actions || []).includes(action)
-}
-
 async function loadComments() {
   loading.value = true
   try {
     const params = {}
     if (filters.value.platform) params.platform = filters.value.platform
     if (filters.value.account) params.account = filters.value.account
+    params.page = 1
+    params.page_size = commentPagination.value.page_size || 50
     const res = await commentApi.list(params)
     const data = res.data || {}
     let items = data.items || []
@@ -182,6 +184,7 @@ async function loadComments() {
       )
     }
     comments.value = items
+    commentPagination.value = data.pagination || commentPagination.value
     if (Array.isArray(data.capabilities)) {
       capabilities.value = data.capabilities
     }
@@ -189,6 +192,28 @@ async function loadComments() {
     console.warn('加载评论失败:', error)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadMoreComments() {
+  if (loadingMore.value || !commentPagination.value.has_next) return
+  loadingMore.value = true
+  try {
+    const params = {
+      page: commentPagination.value.page + 1,
+      page_size: commentPagination.value.page_size
+    }
+    if (filters.value.platform) params.platform = filters.value.platform
+    if (filters.value.account) params.account = filters.value.account
+    const res = await commentApi.list(params)
+    const data = res.data || {}
+    const known = new Set(comments.value.map(item => item.id))
+    comments.value.push(...(data.items || []).filter(item => !known.has(item.id)))
+    commentPagination.value = data.pagination || commentPagination.value
+  } catch (error) {
+    ElMessage.error(error.message || '加载更多评论失败')
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -208,7 +233,8 @@ async function runSync() {
   syncing.value = true
   try {
     const res = await commentApi.sync()
-    const count = res.data?.synced || 0
+    const data = await waitForTask(res.data)
+    const count = data?.synced || 0
     ElMessage.success(`同步完成，新增 ${count} 条评论`)
     await loadComments()
     await loadStatus()

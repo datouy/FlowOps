@@ -8,9 +8,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from conf import BASE_DIR
+import access_scope
 import ai_content
 import daily_metrics
 import ops_schema
@@ -18,17 +19,29 @@ import publish_jobs
 import stats_reflow
 from db_utils import connect, record_schema_version
 from myUtils.platform_registry import PLATFORM_NAMES
+from utils.pagination import page_args, page_meta
 
 bp = Blueprint("ops_center", __name__)
 DB = Path(BASE_DIR / "db" / "ops_center.db")
 
-_TODO_CACHE: dict = {"at": 0.0, "payload": None}
+_TODO_CACHE: dict[tuple, tuple[float, dict]] = {}
 TODO_CACHE_TTL = 10.0
 
 
 def invalidate_todo_cache() -> None:
     """账号写操作完成后立即失效待办缓存，避免短暂显示旧账号数。"""
-    _TODO_CACHE.update(at=0.0, payload=None)
+    _TODO_CACHE.clear()
+
+
+def _todo_cache_key() -> tuple:
+    identity = access_scope.current_identity()
+    if identity is None:
+        return ("local",)
+    return (
+        str(identity.get("user") or ""),
+        str(identity.get("role") or ""),
+        tuple(sorted(access_scope.scope_entries())),
+    )
 
 INTENT_WORDS = {
     "high": ["价格", "多少钱", "报价", "费用", "报名", "行程", "几天", "优惠", "怎么去", "联系", "微信", "电话"],
@@ -82,18 +95,30 @@ def list_messages():
     intent = request.args.get("intent")
     try:
         import dm_ops
-        scope_sql, args = dm_ops.account_scope_sql("m.platform", "m.account")
+        scope_sql, scope_args = dm_ops.account_scope_sql("m.platform", "m.account")
     except Exception:
-        scope_sql, args = " AND 0=1", []
+        scope_sql, scope_args = " AND 0=1", []
+    args = list(scope_args)
     sql = "SELECT * FROM messages m WHERE 1=1" + scope_sql
     for field, value in (("status", status), ("platform", platform), ("intent", intent)):
         if value:
             sql += f" AND m.{field}=?"
             args.append(value)
-    sql += " ORDER BY CASE m.intent WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, m.id DESC LIMIT 500"
+    page, page_size, offset = page_args(default_size=100, max_size=500)
+    count_sql = "SELECT COUNT(*) FROM messages m WHERE 1=1" + scope_sql
+    count_args = list(scope_args)
+    for field, value in (("status", status), ("platform", platform), ("intent", intent)):
+        if value:
+            count_sql += f" AND m.{field}=?"
+            count_args.append(value)
+    sql += " ORDER BY CASE m.intent WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, m.id DESC LIMIT ? OFFSET ?"
     with get_conn() as c:
-        rows = [dict(r) for r in c.execute(sql, args).fetchall()]
-    return jsonify({"code": 200, "data": rows, "msg": None})
+        total = int(c.execute(count_sql, count_args).fetchone()[0] or 0)
+        rows = [dict(r) for r in c.execute(sql, [*args, page_size, offset]).fetchall()]
+    return jsonify({
+        "code": 200, "data": rows, "msg": None,
+        "pagination": page_meta(total, page, page_size),
+    })
 
 
 def add_messages():
@@ -134,7 +159,9 @@ def ai_reply(mid):
         "只输出回复正文。"
     )
     try:
-        text = ai_content._call_llm(prompt, max_tokens=800)
+        caller = str((getattr(g, "identity", None) or {}).get("user") or "local")
+        with ai_content.ai_call_context("message_reply", caller):
+            text = ai_content._call_llm(prompt, max_tokens=800)
     except Exception as exc:
         return jsonify({"code": 500, "msg": str(exc)}), 500
     with get_conn() as c:
@@ -159,8 +186,10 @@ def add_template():
 
 
 def todo_summary():
-    if _TODO_CACHE["payload"] is not None and time.monotonic() - _TODO_CACHE["at"] < TODO_CACHE_TTL:
-        return jsonify({"code": 200, "data": _TODO_CACHE["payload"], "msg": None})
+    cache_key = _todo_cache_key()
+    cached = _TODO_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < TODO_CACHE_TTL:
+        return jsonify({"code": 200, "data": cached[1], "msg": None})
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     try:
@@ -183,15 +212,31 @@ def todo_summary():
         except Exception:
             auto_ready = 0
     with publish_jobs.get_conn() as c:
-        failed_jobs = c.execute("SELECT COUNT(*) FROM jobs WHERE status='failed'").fetchone()[0]
-        pending_review = c.execute("SELECT COUNT(*) FROM jobs WHERE status='pending_review'").fetchone()[0]
+        job_rows = [dict(row) for row in c.execute(
+            "SELECT id,type,title,status,account_list,created_at FROM jobs"
+        ).fetchall()]
+        failed_jobs = sum(
+            1 for row in access_scope.filter_jobs(job_rows)
+            if str(row.get("status") or "") == "failed"
+        )
+        pending_review = sum(
+            1 for row in access_scope.filter_jobs(job_rows)
+            if str(row.get("status") or "") == "pending_review"
+        )
         try:
             # 用范围比较而不是 substr(scheduled_at,1,10)=?——
             # scheduled_at 是 'YYYY-MM-DD HH:MM:SS' 格式，范围条件能走上索引。
-            scheduled_today = c.execute(
-                "SELECT COUNT(*) FROM scheduled_items WHERE scheduled_at>=? AND scheduled_at<=?",
+            scheduled_rows = [dict(row) for row in c.execute(
+                "SELECT id,job_id,account AS account_name,file,scheduled_at,status "
+                "FROM scheduled_items WHERE scheduled_at>=? AND scheduled_at<=?",
                 (f"{today} 00:00:00", f"{today} 23:59:59"),
-            ).fetchone()[0]
+            ).fetchall()]
+            allowed_names = access_scope.allowed_account_names()
+            scheduled_today = sum(
+                1 for row in scheduled_rows
+                if allowed_names is None
+                or str(row.get("account_name") or "") in allowed_names
+            )
         except Exception:
             scheduled_today = 0
         try:
@@ -200,7 +245,8 @@ def todo_summary():
             last_sync = None
     expired = 0
     try:
-        expired = sum(1 for a in publish_jobs.latest_account_status() if not a.get("alive"))
+        visible_accounts = access_scope.filter_accounts(publish_jobs.latest_account_status())
+        expired = sum(1 for a in visible_accounts if not a.get("alive"))
     except Exception:
         expired = 0
     unused_assets = 0
@@ -251,7 +297,10 @@ def todo_summary():
                    "urgent_leads": urgent_leads},
         "priority_leads": priority_items,
     }
-    _TODO_CACHE.update(at=time.monotonic(), payload=payload)
+    _TODO_CACHE[cache_key] = (time.monotonic(), payload)
+    if len(_TODO_CACHE) > 32:
+        oldest = min(_TODO_CACHE, key=lambda key: _TODO_CACHE[key][0])
+        _TODO_CACHE.pop(oldest, None)
     return jsonify({"code": 200, "data": payload, "msg": None})
 
 

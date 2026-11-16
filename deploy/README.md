@@ -116,7 +116,7 @@ docker compose up -d --build
 docker compose logs -f yunce        # 首次启动会跑库初始化 + 建默认配置
 ```
 
-镜像里做了四件事，知道就行：前端 `npm run build` → 产物摆到 `/app/index.html` + `/app/assets/`；Python 依赖按 `requirements.txt` 装；`playwright install --with-deps chromium`；启动前执行 `db/createTable.py` 建 `user_info`/`file_records`（其余库是模块导入时自建）。
+镜像里做了四件事，知道就行：前端 `npm run build` → 产物摆到 `/app/index.html` + `/app/assets/`；Python 依赖按带哈希的 `requirements.lock` 安装；`playwright install --with-deps chromium`；启动前执行 `db/createTable.py` 建 `user_info`/`file_records`（其余库是模块导入时自建）。
 
 ### 3.4 验证
 
@@ -151,7 +151,7 @@ cd /root/flowOps
 bash deploy/install-baremetal.sh
 ```
 
-脚本依次做：装系统依赖（含 `fonts-noto-cjk`、chromium 运行库）→ 建 `yunce` 用户 → 代码同步到 `/opt/yunce/app` → venv + `requirements.txt` → `playwright install --with-deps chromium` → 生成 `/opt/yunce/app/.env`（内含随机令牌）→ 构建前端并摆好静态产物 → 建 `database.db` 表 → 装 `yunce.service` 并启动 → 轮询 `/health`。
+脚本依次做：装系统依赖（含 `fonts-noto-cjk`、chromium 运行库）→ 建 `yunce` 用户 → 代码同步到 `/opt/yunce/app` → venv + `requirements.lock` → `playwright install --with-deps chromium` → 生成 `/opt/yunce/app/.env`（内含随机令牌）→ 构建前端并摆好静态产物 → 建 `database.db` 表 → 装 `yunce.service` 并启动 → 轮询 `/health`。
 
 要点：
 
@@ -348,7 +348,7 @@ bash smoke.sh
 1. **单进程**：不能水平扩容、不能开多 worker。要上多实例得先把内存队列/线程/SSE 换成外部队列，那是改造不是部署。
 2. **没有多用户体系**：一个令牌 = 全权限。多人用就靠 Nginx Basic Auth 分账号，或者你们内部约定。
 3. **机房 IP 风控**：平台侧对云服务器 IP 更敏感，扫码登录/发布可能比家里网络更容易触发验证，必要时走代理或迁 Cookie。
-4. **AI 文案默认指向第三方中转**（`WB_BASE_URL` 默认值在 `.env.example` 里），生产建议改成你自己的合规端点，别把 key 提交进仓库（`.env` 已在 `.gitignore`）。
+4. **AI 端点必须显式配置**。默认不再使用第三方明文 HTTP 地址；生产只能使用 HTTPS，并把 Key 放在 `.env` / `.env.deploy` 中，禁止提交进仓库。
 5. **`uploader/xhs_uploader` 那套需要本地签名服务 `127.0.0.1:11901`**，Web 端的小红书流程走的是浏览器版 `xiaohongshu_uploader`，**不需要**这个服务，别被 `conf.py` 里的 `XHS_SERVER` 误导。
 
 ---

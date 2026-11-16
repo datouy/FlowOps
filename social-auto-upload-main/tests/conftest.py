@@ -17,3 +17,11 @@ os.environ.setdefault("FLOWOPS_PUBLISH_PREFLIGHT", "0")
 # ``launch_persistent_context`` 没有 ``chromium.launch``，会走不进共享分支。测试
 # 默认回退到 persistent 老路径；共享分支由 tests/test_shared_browser.py 显式开启验证。
 os.environ.setdefault("FLOWOPS_SHARED_BROWSER", "0")
+
+# 导入后端时不应启动真实发布、私信、评论、回流等循环。否则 pytest 进程退出时
+# 这些线程仍在写临时库/日志，既会拖慢全量测试，也会造成测试之间互相串扰。
+# 需要验证后台任务的用例会直接调用对应函数，不依赖应用导入时的副作用。
+os.environ.setdefault("FLOWOPS_DISABLE_BACKGROUND", "1")
+os.environ.setdefault("FLOWOPS_RUNTIME_GUARD", "0")
+os.environ.setdefault("FLOWOPS_AI_DAILY_LIMIT", "0")
+os.environ.setdefault("FLOWOPS_MEDIA_QUOTA_GB", "0")

@@ -1,6 +1,3 @@
-from utils.credential_crypto import materialize_storage_state
-from utils.account_browser import save_account_storage_state
-# -*- coding: utf-8 -*-
 """YouTube uploader (browser automation via YouTube Studio).
 
 Unlike the other platforms here, YouTube also offers an official Data API. We deliberately
@@ -13,6 +10,8 @@ used by every other uploader in this project.
 Login is interactive (Google account, no QR code): the browser opens, the user signs in, and
 the storage_state is saved. Reuse it afterwards for fully unattended uploads.
 """
+from __future__ import annotations
+
 import asyncio
 from pathlib import Path
 
@@ -20,7 +19,9 @@ from patchright.async_api import Page, Playwright, async_playwright
 
 from conf import DEBUG_MODE
 from uploader.base_video import BaseVideoUploader
+from utils.account_browser import save_account_storage_state
 from utils.base_social_media import set_init_script
+from utils.credential_crypto import materialize_storage_state
 from utils.log import youtube_logger
 
 try:

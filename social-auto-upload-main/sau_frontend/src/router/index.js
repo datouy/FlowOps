@@ -1,20 +1,21 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
-import Dashboard from '../views/Dashboard.vue'
-import AccountManagement from '../views/AccountManagement.vue'
-import MaterialManagement from '../views/MaterialManagement.vue'
-import PublishCenter from '../views/PublishCenter.vue'
-import About from '../views/About.vue'
-import PublishCalendar from '../views/PublishCalendar.vue'
-import PublishRecords from '../views/PublishRecords.vue'
-import AIContent from '../views/AIContent.vue'
-import Messages from '../views/Messages.vue'
-import Comments from '../views/Comments.vue'
-import Todo from '../views/Todo.vue'
-import ContentPack from '../views/ContentPack.vue'
-import Review from '../views/Review.vue'
-import WeeklyReport from '../views/WeeklyReport.vue'
-import Roi from '../views/Roi.vue'
-import OpsConsole from '../views/OpsConsole.vue'
+
+const Dashboard = () => import('../views/Dashboard.vue')
+const AccountManagement = () => import('../views/AccountManagement.vue')
+const MaterialManagement = () => import('../views/MaterialManagement.vue')
+const PublishCenter = () => import('../views/PublishCenter.vue')
+const About = () => import('../views/About.vue')
+const PublishCalendar = () => import('../views/PublishCalendar.vue')
+const PublishRecords = () => import('../views/PublishRecords.vue')
+const AIContent = () => import('../views/AIContent.vue')
+const Messages = () => import('../views/Messages.vue')
+const Comments = () => import('../views/Comments.vue')
+const Todo = () => import('../views/Todo.vue')
+const ContentPack = () => import('../views/ContentPack.vue')
+const Review = () => import('../views/Review.vue')
+const WeeklyReport = () => import('../views/WeeklyReport.vue')
+const Roi = () => import('../views/Roi.vue')
+const OpsConsole = () => import('../views/OpsConsole.vue')
 
 const routes = [
   {

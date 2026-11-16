@@ -24,6 +24,8 @@ frontend*.log
 social-auto-upload-main/*-check.json
 social-auto-upload-main/verify_code.txt
 social-auto-upload-main/dm_media/
+social-auto-upload-main/adapters/**/*.meta.json
+social-auto-upload-main/adapters/**/*.tmp-*
 social-auto-upload-main/debug_ui_core_*.png
 *.db-wal
 *.db-shm
@@ -57,6 +59,8 @@ __pycache__/
 node_modules/
 dist/
 .vite/
+test-results/
+playwright-report/
 
 # ---- OS / editor ----
 .DS_Store
