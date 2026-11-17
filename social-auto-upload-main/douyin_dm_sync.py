@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """抖音创作者中心私信本地只读同步适配器。
 
-使用本机 Playwright 与已保存的账号 Cookie 定时读取私信列表，不点开会话、
-不标记已读、不调用抖音发送接口。同步结果复用私信工作台的入站处理逻辑，
+使用本机 Playwright 与已保存的账号 Cookie 定时读取私信列表，并只读展开
+会话历史；不主动标记已读、不调用抖音发送接口。同步结果复用私信工作台的入站处理逻辑，
 自动回复统一保存为“待人工发送”。
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import threading
@@ -23,10 +24,11 @@ from flask import Blueprint
 
 import dm_cursor
 import dm_ops
+import douyin_im_api
 from dm_media_cache import attach_message_media
 from utils.credential_crypto import credential_exists
 from dm_platform_common import (
-    BaseDmSync, SyncError, account_name, public_account,
+    MAX_HISTORY_DAYS, BaseDmSync, SyncError, account_name, public_account,
 )
 from utils.account_browser import open_persistent_account_context
 
@@ -36,6 +38,13 @@ CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 # 历史窗口不再写死：由同步设置里的 history_days 换算成小时（0 = 不限）。
 # 同一会话签名在这么长时间内不重复回补历史，避免每轮都点开所有会话。
 HISTORY_RESCAN_SECONDS = 1800
+# 进程停机或账号长时间没有成功同步后，首轮不能只读“当前未读”。
+# 6 小时内按普通增量处理；超过后自动按“上次成功同步到现在”补缺口。
+CATCHUP_GAP_SECONDS = 6 * 60 * 60
+CATCHUP_OVERLAP_HOURS = 24
+HISTORY_MAX_SCROLL_ROUNDS = 128
+HISTORY_IDLE_ROUNDS = 3
+HISTORY_BACKFILL_VERSION = "douyin_history_backfill_v4"
 
 PLACEHOLDER_TEXTS = (
     "你收到一条新类型消息，请打开抖音app查看",
@@ -225,8 +234,9 @@ SCAN_SCRIPT = r"""
     try {
       const parsed = new URL(text, window.location.href);
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-      // 头像 CDN 会轮换签名参数；只保留域名和路径，避免同一用户每次扫码后变成新会话。
-      return `${parsed.origin}${parsed.pathname}`;
+      // 头像 CDN 会同时轮换主机名和签名参数（例如 p3 -> p11）；
+      // 路径才是头像资源身份，主机名变化不能让同一会话换 ID。
+      return parsed.pathname || '';
     } catch {
       return '';
     }
@@ -242,6 +252,9 @@ SCAN_SCRIPT = r"""
     .sort((a, b) => a.index - b.index)
     .map(entry => entry.el);
   for (const el of elements.slice(0, Math.max(1, limit || 20))) {
+    // “全部”里会混入一个名为“陌生人消息”的聚合入口。它不是具体会话，
+    // 点击后会改变列表位置；真正的陌生人会话由“陌生人私信”页签采集。
+    if (el.querySelector('[class*="stranger-item-left-"]')) continue;
     const header = el.querySelector('.semi-list-item-body-header');
     if (!header) continue;
     const nameNode = el.querySelector('[class*="item-header-name"]');
@@ -284,20 +297,43 @@ SCAN_SCRIPT = r"""
 
 HISTORY_SCRIPT = r"""
 () => {
-  const nodes = Array.from(document.querySelectorAll('.box-item-W0TV01'));
+  const visible = el => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 1 && rect.height > 1 &&
+      style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0;
+  };
+  // 连续切换会话时页面会保留已卸载聊天的零尺寸副本。只解析当前可见的
+  // 聊天内容容器，否则会读到上一会话或 DOM 回收后的错位节点。
+  const currentBox = Array.from(document.querySelectorAll('[class*="box-content-"]'))
+    .filter(visible)
+    .find(el => el.querySelector('[class*="box-item-"]'));
+  // 虚拟列表滚动后会把已卸载/回收的消息行保留成零尺寸副本，文本可能已经
+  // 错位，甚至丢失 is-me- 方向标记。只解析有实际尺寸的可见行，否则会把上
+  // 一会话或回收节点错当成客户消息、方向也判反。
+  const nodes = Array.from(
+    (currentBox || document).querySelectorAll('[class*="box-item-"]')
+  ).filter(visible);
   const rows = [];
   let currentTime = '';
   for (let index = 0; index < nodes.length; index++) {
     const el = nodes[index];
     const cls = String(el.className || '');
-    if (cls.includes('time-Tl7Z4j')) {
+    if (/(?:^|\s)time-/.test(cls)) {
       currentTime = String(el.innerText || '').trim();
       continue;
     }
-    if (cls.includes('tip-skRp_9')) continue;
-    const textNode = el.querySelector('.text-prz9K6, .text-item-message-zUNhSB');
-    const text = String(textNode?.innerText || '').trim();
-    const direction = cls.includes('is-me-cb9NAa') ? 'outbound' : 'inbound';
+    // 新类型消息也使用 tip-skRp_9，不能整类跳过；普通系统提示稍后由
+    // Python 按 is_tip + 占位文案识别，避免把“撤回/进群”当成客户消息。
+    const isTip = /(?:^|\s)tip-/.test(cls);
+    const textNode = el.querySelector(
+      '.text-prz9K6, .text-item-message-zUNhSB, [class*="text-"]'
+    );
+    // 普通文本在 text-* 子节点；新类型消息则把提示文字直接挂在 box-item
+    // 容器本身。优先读取子节点，缺失时再回退到容器文本。
+    const text = String(textNode?.innerText || el.innerText || '').trim();
+    const direction = /(?:^|\s)is-me-/.test(cls) ? 'outbound' : 'inbound';
     const httpUrl = value => {
       let text = String(value || '').trim();
       if (text.startsWith('//')) text = `https:${text}`;
@@ -350,7 +386,7 @@ HISTORY_SCRIPT = r"""
         media_type: 'video',
         media_url: videoUrl,
         media_thumb_url: poster && poster !== videoUrl ? poster : '',
-        direction, display_time: currentTime,
+        direction, display_time: currentTime, is_tip: isTip,
       });
       continue;
     }
@@ -363,24 +399,19 @@ HISTORY_SCRIPT = r"""
         text: '', media: true,
         media_type: isSticker ? 'sticker' : 'image',
         media_url: image.url,
-        direction, display_time: currentTime,
+        direction, display_time: currentTime, is_tip: isTip,
       });
       continue;
     }
-    let displayTime = currentTime;
-    if (!displayTime) {
-      for (let next = index + 1; next < Math.min(nodes.length, index + 4); next++) {
-        const nextCls = String(nodes[next].className || '');
-        if (nextCls.includes('time-Tl7Z4j')) {
-          displayTime = String(nodes[next].innerText || '').trim();
-          break;
-        }
-      }
-    }
+    // 抖音的时间节点标在消息组上方。气泡自己头上没有时间节点时，不能向
+    // 后借下一个时间节点——那是后面那组消息的时间，借过来整批时间都会
+    // 往后错位。宁可标记为无时间（走回退），也不能张冠李戴。
+    const displayTime = currentTime;
     rows.push({
       text: text.slice(0, 4000),
       direction: direction,
       display_time: displayTime,
+      is_tip: isTip,
     });
   }
   return rows;
@@ -390,27 +421,27 @@ HISTORY_SCRIPT = r"""
 
 SCROLL_HISTORY_SCRIPT = r"""
 () => {
-  const item = document.querySelector('.box-item-W0TV01');
-  if (!item) return false;
-  let el = item.parentElement;
-  while (el && el !== document.body) {
+  const visible = el => {
+    const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
-    const scrollable = /(auto|scroll)/.test(style.overflowY);
-    if (scrollable && el.scrollHeight > el.clientHeight + 40) {
-      const before = el.scrollTop;
-      el.scrollTop = Math.max(0, el.scrollTop - el.clientHeight * 0.9);
-      return el.scrollTop !== before;
-    }
-    el = el.parentElement;
+    return rect.width > 1 && rect.height > 1 &&
+      style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity || 1) > 0;
+  };
+  const currentBox = Array.from(document.querySelectorAll('[class*="box-content-"]'))
+    .filter(visible)
+    .find(el => el.querySelector('[class*="box-item-"]'));
+  if (!currentBox) return false;
+  const style = window.getComputedStyle(currentBox);
+  if (!/(auto|scroll)/.test(style.overflowY) ||
+      currentBox.scrollHeight <= currentBox.clientHeight + 40) {
+    return false;
   }
-  const candidates = Array.from(document.querySelectorAll('div'))
-    .filter(node => node.scrollHeight > node.clientHeight + 120)
-    .filter(node => getComputedStyle(node).overflowY !== 'hidden');
-  const target = candidates[candidates.length - 1];
-  if (!target) return false;
-  const before = target.scrollTop;
-  target.scrollTop = Math.max(0, target.scrollTop - target.clientHeight * 0.9);
-  return target.scrollTop !== before;
+  const before = currentBox.scrollTop;
+  currentBox.scrollTop = Math.max(
+    0, before - currentBox.clientHeight * 0.9,
+  );
+  return Math.abs(currentBox.scrollTop - before) > 1;
 }
 """
 
@@ -458,6 +489,65 @@ def _legacy_external_ids_by_name(account: str) -> dict[str, str]:
     return {
         name: next(iter(ids)) for name, ids in grouped.items() if len(ids) == 1
     }
+
+
+def _merge_douyin_user_details(
+    target: dict[str, dict], payload: Any,
+    requested_ids: list[str] | None = None,
+) -> int:
+    """Extract numeric ids and nicknames from the creator user-detail response."""
+    if not isinstance(payload, dict):
+        return 0
+    added = 0
+    entries = payload.get("user_list")
+    if not isinstance(entries, list):
+        return 0
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        user = entry.get("user") if isinstance(entry.get("user"), dict) else entry
+        response_id = next((
+            _clean_text(entry.get(key), 160) or _clean_text(user.get(key), 160)
+            for key in ("user_id", "uid", "id")
+            if _clean_text(entry.get(key), 160) or _clean_text(user.get(key), 160)
+        ), "")
+        requested_id = (
+            _clean_text(requested_ids[index], 160)
+            if requested_ids and index < len(requested_ids) else ""
+        )
+        # The response carries the sec_uid that was requested.  Prefer it over
+        # positional correlation because the server may reorder user_list.
+        user_id = response_id or requested_id
+        nickname = next((
+            _clean_text(user.get(key), 120)
+            for key in ("nickname", "nick_name", "name")
+            if _clean_text(user.get(key), 120)
+        ), "")
+        avatar = next((
+            _safe_media_url(user.get(key))
+            for key in ("avatar_thumb", "avatar_medium", "avatar_larger", "avatar_uri")
+            if _safe_media_url(user.get(key))
+        ), "")
+        if not user_id or not nickname:
+            continue
+        previous = target.get(user_id) or {}
+        target[user_id] = {
+            "nickname": nickname,
+            "avatar": avatar or previous.get("avatar") or "",
+        }
+        added += 1
+    return added
+
+
+def _user_detail_request_ids(post_data: Any) -> list[str]:
+    try:
+        payload = json.loads(str(post_data or ""))
+    except (TypeError, ValueError):
+        return []
+    values = payload.get("user_ids") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [_clean_text(value, 160) for value in values if _clean_text(value, 160)]
 
 
 def _history_marker_key(account_name: str, cid: str) -> str:
@@ -515,11 +605,131 @@ def _history_marker_fresh(account_name: str, cid: str, signature: str) -> bool:
     return (time.time() - saved_at) < HISTORY_RESCAN_SECONDS
 
 
-def _window_hours(settings: dict | None) -> int:
+def _last_account_success(account: dict | None) -> datetime | None:
+    """读取账号最后一次完整扫描成功时间，用于识别停机期间的消息缺口。"""
+    data = account or {}
+    account_key = str(data.get("id") or _account_name(data) or "")[:64]
+    if not account_key:
+        return None
     try:
-        return max(0, int((settings or {}).get("history_window_hours") or 0))
+        with dm_ops.get_conn() as conn:
+            row = conn.execute(
+                """SELECT last_success_at FROM dm_account_sync_state
+                   WHERE platform='抖音' AND account_key=?""",
+                (account_key,),
+            ).fetchone()
+    except Exception:
+        return None
+    label = str(row["last_success_at"] or "") if row else ""
+    if not label:
+        try:
+            schedule = dm_cursor.load_schedule("抖音", account_key)
+            label = str(schedule.get("lastSuccessAt") or "")
+        except Exception:
+            label = ""
+    try:
+        return datetime.strptime(label, "%Y-%m-%d %H:%M:%S") if label else None
+    except ValueError:
+        return None
+
+
+def _history_backfill_key(account: dict | None) -> str:
+    data = account or {}
+    account_key = str(data.get("id") or _account_name(data) or "")[:64]
+    if not account_key:
+        return ""
+    digest = hashlib.sha1(account_key.encode("utf-8")).hexdigest()
+    return f"{HISTORY_BACKFILL_VERSION}_{digest}"
+
+
+def _history_backfill_done(account: dict | None) -> bool:
+    key = _history_backfill_key(account)
+    if not key:
+        return False
+    try:
+        with dm_ops.get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM dm_meta WHERE key=?", (key,),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _save_history_backfill_done(account: dict | None) -> None:
+    key = _history_backfill_key(account)
+    if not key:
+        return
+    try:
+        with dm_ops.get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO dm_meta (key,value) VALUES (?,?)",
+                (key, str(int(time.time()))),
+            )
+    except Exception:
+        pass
+
+
+def _history_fetch_plan(
+    settings: dict | None, account: dict | None, now: datetime | None = None,
+) -> tuple[int, bool, int]:
+    """返回 (实际回补小时数, 是否缺口补采, 距离上次成功同步小时数)。
+
+    ``history_days`` 是日常回看窗口。进程长时间未运行时，如果仍只按这个
+    固定窗口扫描，刚过窗口边界的中间消息会被永久跳过。这里把上次成功同步
+    时间也纳入下界，并保留 24 小时重叠用于处理平台时间精度和边界消息。
+    """
+    configured_hours = _window_hours(settings)
+    last_success = _last_account_success(account)
+    if last_success is None:
+        # 新账号/旧数据库没有成功时间时，至少按配置窗口完整回补一次。
+        return configured_hours, True, 0
+    current = now or datetime.now()
+    gap_seconds = max(0, int((current - last_success).total_seconds()))
+    gap_hours = gap_seconds // 3600
+    if gap_seconds < CATCHUP_GAP_SECONDS and _history_backfill_done(account):
+        return configured_hours, False, gap_hours
+    if configured_hours <= 0:
+        return 0, True, gap_hours
+    catchup_hours = (
+        gap_seconds + CATCHUP_OVERLAP_HOURS * 3600 + 3599
+    ) // 3600
+    # 平台页面不可能无限向上加载；沿用设置允许的最大天数作为硬上限。
+    catchup_hours = min(
+        MAX_HISTORY_DAYS * 24, max(configured_hours, int(catchup_hours)),
+    )
+    return catchup_hours, True, gap_hours
+
+
+def _history_round_limit(hours: int) -> int:
+    """按时间窗口决定历史窗口最多向上滚动多少屏。"""
+    if hours <= 0:
+        return HISTORY_MAX_SCROLL_ROUNDS
+    return min(
+        HISTORY_MAX_SCROLL_ROUNDS,
+        max(32, 24 + (int(hours) + 2) // 3),
+    )
+
+
+def _window_hours(settings: dict | None) -> int:
+    data = settings or {}
+    try:
+        explicit = int(data.get("history_window_hours") or 0)
     except (TypeError, ValueError):
-        return 0
+        explicit = 0
+    if explicit > 0:
+        return min(MAX_HISTORY_DAYS * 24, explicit)
+    if "recent_only" in data:
+        try:
+            if not int(data.get("recent_only") or 0):
+                return 0
+        except (TypeError, ValueError):
+            pass
+    try:
+        days = int(data.get("history_days") or 7)
+    except (TypeError, ValueError):
+        days = 7
+    return min(MAX_HISTORY_DAYS * 24, max(0, days) * 24)
 
 
 def _window_cutoff(hours: int) -> datetime | None:
@@ -540,6 +750,25 @@ def _display_time_to_text(value: str) -> str:
     now = datetime.now()
     if not label or label == "刚刚":
         return now.strftime("%Y-%m-%d %H:%M:%S")
+    # 抖音会按时段显示时间，例如"凌晨 00:02 / 早上 8:15 / 下午 3:20 /
+    # 晚上 9:40"。这些是真实时间标签，不能落进兜底——兜底返回当前时刻
+    # 会让这条消息每轮同步都被刷新，永远漂到时间线末尾。
+    match = re.fullmatch(
+        r"(凌晨|清晨|早上|上午|中午|午后|下午|傍晚|晚上|深夜)\s*(\d{1,2}):(\d{2})",
+        label,
+    )
+    if match:
+        prefix = match.group(1)
+        hour = int(match.group(2))
+        minute = int(match.group(3))
+        if prefix in ("下午", "傍晚", "晚上") and hour < 12:
+            hour += 12
+        candidate = now.replace(
+            hour=min(hour, 23), minute=minute, second=0, microsecond=0,
+        )
+        if candidate > now + timedelta(minutes=5):
+            candidate -= timedelta(days=1)
+        return candidate.strftime("%Y-%m-%d %H:%M:%S")
     # 抖音常见的“昨天 22:26 / 前天 10:17 / 星期三 15:12”组合格式。
     match = re.fullmatch(
         r"(昨天|前天|星期[一二三四五六日天])\s*(\d{1,2}):(\d{2})", label
@@ -642,58 +871,197 @@ async def _select_dm_tab(page, label: str) -> tuple[str, bool]:
 async def _click_conversation(
     page, cid: str, max_scrolls: int = 20, settle_ms: int = 1600,
     click_timeout_ms: int = 5000, is_group: bool = False,
-    is_stranger: bool = False,
+    is_stranger: bool = False, expected_name: str = "",
 ) -> bool:
+    async def _scan_current_tab(tab_label: str, reset: bool = False) -> bool:
+        # 会话列表可能和聊天记录同时存在多个 ReactVirtualized Grid。
+        # 必须从可见列表项反查它所属的 Grid，不能盲点页面里的第一个 Grid。
+        if reset:
+            await page.evaluate("""() => {
+                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                    .find(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 1 && rect.height > 1;
+                    });
+                const grid = item?.closest('.ReactVirtualized__Grid');
+                if (grid) grid.scrollTop = 0;
+            }""")
+            await page.wait_for_timeout(300)
+        original_scroll_top = await page.evaluate("""() => {
+            const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                .find(el => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 1 && rect.height > 1;
+                });
+            const grid = item?.closest('.ReactVirtualized__Grid');
+            return grid ? Number(grid.scrollTop || 0) : 0;
+        }""")
+
+        async def _restore_scroll_and_fail() -> bool:
+            await page.evaluate("""(scrollTop) => {
+                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                    .find(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 1 && rect.height > 1;
+                    });
+                const grid = item?.closest('.ReactVirtualized__Grid');
+                if (grid) grid.scrollTop = Number(scrollTop || 0);
+            }""", original_scroll_top)
+            await page.wait_for_timeout(120)
+            return False
+
+        for _ in range(max(1, max_scrolls)):
+            await page.evaluate(
+                SCAN_SCRIPT, {"limit": 200, "tab_label": tab_label},
+            )
+            found = await page.evaluate("""(cid) => {
+                document.querySelectorAll('[data-flowops-dm-target]').forEach(el => {
+                    el.removeAttribute('data-flowops-dm-target');
+                });
+                const clickable = el => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    if (rect.width <= 1 || rect.height <= 1 ||
+                        style.display === 'none' || style.visibility === 'hidden' ||
+                        Number(style.opacity || 1) <= 0 ||
+                        rect.bottom <= 0 || rect.right <= 0 ||
+                        rect.top >= window.innerHeight || rect.left >= window.innerWidth) {
+                        return false;
+                    }
+                    const x = Math.max(1, Math.min(
+                        window.innerWidth - 1, rect.left + rect.width / 2
+                    ));
+                    const y = Math.max(1, Math.min(
+                        window.innerHeight - 1, rect.top + rect.height / 2
+                    ));
+                    const hit = document.elementFromPoint(x, y);
+                    return Boolean(hit && (el === hit || el.contains(hit)));
+                };
+                const items = Array.from(document.querySelectorAll('.semi-list-item'))
+                    .filter(clickable);
+                const target = items.find(
+                    el => el.getAttribute('data-flowops-dm-cid') === cid
+                );
+                if (!target) return false;
+                target.setAttribute('data-flowops-dm-target', '1');
+                return true;
+            }""", cid)
+            if found:
+                # 页面会保留一组零尺寸的旧列表行；索引必须取自可见行，否则
+                # 后续会话会被定位到隐藏副本并因不可见而点击失败。
+                try:
+                    # 先拍下当前消息面板的内容签名：点击后必须等到面板内容
+                    # 真正换成新会话再读，否则上一个会话的残留节点会被当成
+                    # 新会话的消息入库，同一条消息会串进一串无关会话。
+                    panel_signature = await page.evaluate("""() => {
+                        const visible = el => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 1 && rect.height > 1 &&
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden';
+                        };
+                        const box = Array.from(
+                            document.querySelectorAll('[class*="box-content-"]')
+                        ).filter(visible).find(
+                            el => el.querySelector('[class*="box-item-"]')
+                        );
+                        if (!box) return '';
+                        return String(box.innerText || '').slice(0, 2000);
+                    }""")
+                    await page.locator('.semi-list-item[data-flowops-dm-target="1"]').click(
+                        timeout=max(500, click_timeout_ms)
+                    )
+                except Exception:
+                    return await _restore_scroll_and_fail()
+                await page.wait_for_timeout(settle_ms)
+                if not expected_name:
+                    return True
+                # 点击只代表列表项收到事件，不代表右侧详情已经切换到目标会话。
+                # 以详情标题中出现目标昵称为准，避免把上一会话残留节点当成新数据。
+                for _ in range(24):
+                    detail_ready = await page.evaluate("""(args) => {
+                        const [name, prevSignature] = args;
+                        const titled = Array.from(document.querySelectorAll(
+                            '[class*="box-container-"]'
+                        )).some(el => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 1 && rect.height > 1 &&
+                                style.display !== 'none' && style.visibility !== 'hidden' &&
+                                String(el.innerText || '').includes(name);
+                        });
+                        const hasMessage = Array.from(document.querySelectorAll(
+                            '[class*="box-item-"]'
+                        )).some(el => {
+                            const rect = el.getBoundingClientRect();
+                            return rect.width > 1 && rect.height > 1;
+                        });
+                        const visible = el => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 1 && rect.height > 1 &&
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden';
+                        };
+                        const box = Array.from(
+                            document.querySelectorAll('[class*="box-content-"]')
+                        ).filter(visible).find(
+                            el => el.querySelector('[class*="box-item-"]')
+                        );
+                        const signature = box ?
+                            String(box.innerText || '').slice(0, 2000) : '';
+                        return {
+                            titled: titled,
+                            hasMessage: hasMessage,
+                            signature: signature,
+                        };
+                    }""", [expected_name, panel_signature])
+                    if (detail_ready.get("titled") and detail_ready.get("hasMessage")
+                            and (not panel_signature or
+                                 detail_ready.get("signature") != panel_signature)):
+                        return True
+                    await page.wait_for_timeout(250)
+                return await _restore_scroll_and_fail()
+            moved = await page.evaluate("""() => {
+                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                    .find(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 1 && rect.height > 1 &&
+                            rect.bottom > 0 && rect.right > 0 &&
+                            rect.top < window.innerHeight &&
+                            rect.left < window.innerWidth;
+                    });
+                const grid = item?.closest('.ReactVirtualized__Grid');
+                if (!grid) return false;
+                const before = grid.scrollTop;
+                grid.scrollTop = Math.min(
+                    grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85
+                );
+                return grid.scrollTop !== before;
+            }""")
+            if not moved:
+                return await _restore_scroll_and_fail()
+            await page.wait_for_timeout(450)
+        return await _restore_scroll_and_fail()
+
+    # “全部”会包含暂未进入朋友/陌生人分类的会话。列表数据按自上而下
+    # 的顺序处理，因此只在切换页签时回到顶部，后续会话从当前位置继续
+    # 向下找，避免每个会话都重新扫描整张列表。
+    all_status, _current = await _select_dm_tab(page, "全部")
+    if all_status != "missing":
+        if await _scan_current_tab("全部", reset=all_status == "switched"):
+            return True
+    elif await _scan_current_tab(""):
+        return True
+
     tab_label = "群消息" if is_group else (
         "陌生人私信" if is_stranger else "朋友私信"
     )
     status, _current = await _select_dm_tab(page, tab_label)
-    # 页面无子页签时，目标会话就在唯一列表里，继续按原逻辑查找。
-    await page.evaluate("""() => {
-        const grid = document.querySelector('.ReactVirtualized__Grid');
-        if (grid) grid.scrollTop = 0;
-    }""")
-    await page.wait_for_timeout(350)
-    for _ in range(max(1, max_scrolls)):
-        await page.evaluate(
-            SCAN_SCRIPT, {"limit": 200, "tab_label": tab_label},
-        )
-        found = await page.evaluate("""(cid) => {
-            document.querySelectorAll('[data-flowops-dm-target]').forEach(el => {
-                el.removeAttribute('data-flowops-dm-target');
-            });
-            const items = Array.from(document.querySelectorAll('.semi-list-item'))
-                .filter(el => {
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 1 && rect.height > 1 &&
-                        style.display !== 'none' && style.visibility !== 'hidden' &&
-                        Number(style.opacity || 1) > 0;
-                });
-            const target = items.find(el => el.getAttribute('data-flowops-dm-cid') === cid);
-            if (!target) return false;
-            target.setAttribute('data-flowops-dm-target', '1');
-            return true;
-        }""", cid)
-        if found:
-            # 页面会保留一组零尺寸的旧列表行；索引必须取自可见行，否则
-            # 后续会话会被定位到隐藏副本并因不可见而点击失败。
-            await page.locator('.semi-list-item[data-flowops-dm-target="1"]').click(
-                timeout=max(500, click_timeout_ms)
-            )
-            await page.wait_for_timeout(settle_ms)
-            return True
-        moved = await page.evaluate("""() => {
-            const grid = document.querySelector('.ReactVirtualized__Grid');
-            if (!grid) return false;
-            const before = grid.scrollTop;
-            grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
-            return grid.scrollTop !== before;
-        }""")
-        if not moved:
-            return False
-        await page.wait_for_timeout(500)
-    return False
+    if status == "missing":
+        return False
+    return await _scan_current_tab(tab_label, reset=status == "switched")
 
 
 def _history_time(value: str) -> datetime | None:
@@ -706,42 +1074,76 @@ def _history_time(value: str) -> datetime | None:
         return None
 
 
+def _history_batch_key(item: dict) -> tuple:
+    """跨滚动窗口去重的消息身份键（不含时间，时间在不同窗口可能缺失）。"""
+    return (
+        item.get("direction"), _clean_text(item.get("text"), 4000),
+        bool(item.get("media")), _clean_text(item.get("media_type"), 20),
+        _clean_text(item.get("media_url"), 400),
+        _clean_text(item.get("media_thumb_url"), 400),
+    )
+
+
+def _merge_history_batches(batches: list[list[dict]]) -> list[dict]:
+    """按 DOM 节点顺序重建消息时间线。
+
+    采集是从最新窗口向上滚动进行的，因此批次列表倒序拼接（越晚的批次
+    越旧），批次内保持节点自上而下的顺序。同一条消息在相邻窗口的交叠
+    区会出现两次：一份贴着时间节点、一份（位于窗口顶部）拿不到时间。
+    保留带时间的那份，避免"有时间/无时间"两份指纹不同导致重复入库。
+    """
+    chosen: dict[tuple, dict] = {}
+    for batch in batches:
+        for item in batch:
+            key = _history_batch_key(item)
+            current = chosen.get(key)
+            if current is None:
+                chosen[key] = item
+            elif not _clean_text(current.get("display_time"), 40) and \
+                    _clean_text(item.get("display_time"), 40):
+                chosen[key] = item
+    ordered: list[dict] = []
+    for batch in reversed(batches):
+        for item in batch:
+            if chosen.get(_history_batch_key(item)) is item:
+                ordered.append(item)
+    return ordered
+
+
 async def _collect_history(page, quick: bool = False, hours: int = 0) -> list[dict]:
     """向上滚动聊天窗口，收集最近 ``hours`` 小时（0=不限）的完整历史消息。"""
-    merged: dict[tuple, dict] = {}
-    rounds = 4 if quick else 16
+    batches: list[list[dict]] = []
+    rounds = 4 if quick else _history_round_limit(hours)
     cutoff = _window_cutoff(hours)
     idle = 0
     for _ in range(rounds):
         batch = await page.evaluate(HISTORY_SCRIPT)
-        added = 0
+        kept: list[dict] = []
         oldest = None
         for item in batch if isinstance(batch, list) else []:
             text = _clean_text(item.get("text"), 4000)
             if not text and not item.get("media"):
                 continue
-            key = (
-                item.get("direction"), item.get("display_time"), text,
-                bool(item.get("media")), item.get("media_url"),
-                item.get("media_thumb_url"),
-            )
-            if key not in merged:
-                merged[key] = item
-                added += 1
+            kept.append(item)
             stamp = _history_time(item.get("display_time"))
             if stamp and (oldest is None or stamp < oldest):
                 oldest = stamp
-        if added == 0:
-            idle += 1
-            if idle >= 1:
-                break
+        batches.append(kept)
         if cutoff and oldest and oldest < cutoff:
             break
         moved = await page.evaluate(SCROLL_HISTORY_SCRIPT)
         if not moved:
-            break
-        await page.wait_for_timeout(450 if quick else 700)
-    return list(merged.values())
+            # 页面向上加载是异步的。到达顶部后多等两拍，避免异步一批还没
+            # 渲染出来时就被误判为“没有更多历史”。
+            idle += 1
+            if idle >= (1 if quick else HISTORY_IDLE_ROUNDS):
+                break
+        else:
+            # 只要列表还能向上移动就继续；虚拟列表偶尔要滚几次才渲染出
+            # 新节点。只有位置不再变化时才累计空闲轮次。
+            idle = 0
+        await page.wait_for_timeout(350 if quick else 450)
+    return _merge_history_batches(batches)
 
 
 def _history_items(row: dict, history: list[dict], account: dict,
@@ -750,6 +1152,29 @@ def _history_items(row: dict, history: list[dict], account: dict,
     user_id = _stable_user_id(cid)
     nickname = _display_name(row)
     unread = max(0, int(row.get("unread") or 0))
+    is_group = bool(row.get("is_group"))
+    # 方向误判：虚拟列表回收节点在重渲染瞬间可能丢掉 is-me- 标记，导致
+    # 自己发出的消息被当成客户消息入库；私聊同样会出现这种镜像脏数据。
+    # 用"自己发过的内容+时间"做鬼影判定，宁可漏收一条客户撞车回复，
+    # 也不能让脏数据反复堆积。
+    own_outbound_keys: set[tuple[str, str]] = set()
+    own_outbound_texts: set[str] = set()
+    try:
+        with dm_ops.get_conn() as conn:
+            rows_out = conn.execute(
+                """SELECT content, created_at FROM messages
+                   WHERE platform='抖音' AND account=? AND external_user_id=?
+                     AND direction='outbound' AND created_at >= datetime('now','-2 days')""",
+                (_account_name(account), user_id),
+            ).fetchall()
+        for item in rows_out:
+            text = str(item["content"] or "")
+            if not text:
+                continue
+            own_outbound_keys.add((text, str(item["created_at"] or "")[:16]))
+            own_outbound_texts.add(text)
+    except Exception:
+        pass
     inbound_positions = [index for index, item in enumerate(history) if item.get("direction") == "inbound"]
     first_unread = max(0, len(inbound_positions) - unread)
     inbound_seen = 0
@@ -761,6 +1186,8 @@ def _history_items(row: dict, history: list[dict], account: dict,
         media_url = _safe_media_url(item.get("media_url"))
         media_thumb_url = _safe_media_url(item.get("media_thumb_url"))
         if not text and not item.get("media"):
+            continue
+        if item.get("is_tip") and not item.get("media") and not _is_placeholder(text):
             continue
         if item.get("media") and not media_type:
             media_type = "other"
@@ -775,25 +1202,65 @@ def _history_items(row: dict, history: list[dict], account: dict,
         if not item.get("media") and not _media_type_from_text(text) and _is_placeholder(text):
             text = UNPARSEABLE_CONTENT
         direction = "outbound" if item.get("direction") == "outbound" else "inbound"
-        display_time = _clean_text(item.get("display_time"), 40)
-        created_at = _display_time_to_text(display_time)
-        stamp = _history_time(display_time)
+        raw_display_time = _clean_text(item.get("display_time"), 40)
+        # “刚刚”是相对时间：作为身份指纹会随渲染稳定（每轮都是“刚刚”），
+        # 但作为修正目标会把已入库消息的时间每轮刷成同步时刻，导致历史
+        # 消息永远漂在时间线末尾。状态判定仍视其为有效时间（确实是新
+        # 消息），身份与修正则走无时间通道。
+        time_reliable = bool(raw_display_time) and raw_display_time != "刚刚"
+        has_time = bool(raw_display_time)
+        display_time = raw_display_time
+        created_at_hint = _clean_text(item.get("created_at"), 40)
+        if not display_time:
+            # 新类型消息气泡本身不带时间；回退到会话列表的最后消息时间，
+            # 仅用于展示排序，不参与消息身份指纹（见下方 has_time 分支）。
+            display_time = _clean_text(row.get("display_time"), 40)
+        created_at = created_at_hint or _display_time_to_text(display_time)
+        stamp = _history_time(created_at_hint or display_time)
         if cutoff and stamp and stamp < cutoff:
             continue
+        if direction == "inbound" and text:
+            # 自己发出的消息被回收节点丢掉 is-me- 标记后会变成入站副本。
+            # 同一分钟已有相同内容的 outbound，或无时间节点但内容完全撞上
+            # 自己近期发过的消息时，判定为方向鬼影，直接丢弃。
+            if (text, str(created_at or "")[:16]) in own_outbound_keys:
+                continue
+            if not time_reliable and text in own_outbound_texts:
+                continue
+        if direction == "outbound":
+            # 本批刚处理的 outbound 也要实时参与鬼影比对：入库前的数据库
+            # 查询看不到它们，同批内紧跟其后的 inbound 镜像会漏拦。
+            own_outbound_keys.add((text, str(created_at or "")[:16]))
+            own_outbound_texts.add(text)
         marker = "outbound" if direction == "outbound" else ""
-        # 抖音虚拟列表会在滚动边界丢失消息前面的时间节点。没有 display_time
-        # 时不能把本次同步时刻写进指纹，否则同一条消息每轮同步都会生成新 ID。
-        # 有可见时间时仍保留时间参与指纹，以免吞掉用户真实重复发送的内容。
-        fingerprint = "|".join((
-            cid, display_time, "7", text, marker, media_url,
-        ))
-        if text == UNPARSEABLE_CONTENT:
-            fingerprint = "|".join((cid, "unparseable-content", marker))
+        # 抖音虚拟列表会在滚动边界丢失消息前面的时间节点。没有真实时间节点时
+        # 不能把会话列表时间写进指纹——它会在用户发送新消息后变成“刚刚”，
+        # 导致同一条卡片消息每轮同步都生成新 ID、重复入库。此时用不含时间的
+        # 稳定指纹，保证同一消息在后续同步中直接命中去重。
+        external_message_id = _clean_text(item.get("external_message_id"), 160)
+        if not external_message_id:
+            if text == UNPARSEABLE_CONTENT:
+                fingerprint = "|".join((cid, "unparseable-content", marker))
+            elif not time_reliable:
+                fingerprint = "|".join((
+                    cid, "notime", text, marker, media_type, media_url,
+                ))
+            else:
+                fingerprint = "|".join((cid, display_time, "7", text, marker, media_url))
+            external_message_id = (
+                "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24]
+            )
         status = "replied"
         if direction == "inbound":
-            status = "new" if inbound_seen >= first_unread else "replied"
+            # 没有真实时间的消息不能冒充“刚收到”：不进入未读窗口，避免占位
+            # 卡片被当成待回复的新消息。
+            if has_time and inbound_seen >= first_unread:
+                status = "new"
             inbound_seen += 1
-        source = "抖音创作者中心聊天记录"
+        source = (
+            "抖音创作者中心IM接口"
+            if item.get("is_api_message") else "抖音创作者中心聊天记录"
+        )
         if row.get("is_stranger"):
             source += " · 陌生人会话"
         result.append({
@@ -801,8 +1268,8 @@ def _history_items(row: dict, history: list[dict], account: dict,
             "account": _account_name(account),
             "external_user_id": user_id,
             "is_group": bool(row.get("is_group")),
-            "external_message_id": "dy-sync-" + hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:24],
-            "_douyin_history_message": True,
+            "external_message_id": external_message_id,
+            "_douyin_history_message": not bool(item.get("is_api_message")),
             "author": nickname if direction == "inbound" else "我",
             "nickname": nickname,
             "content": text,
@@ -817,8 +1284,98 @@ def _history_items(row: dict, history: list[dict], account: dict,
             "media_type": media_type,
             "media_url": media_url,
             "media_thumb_url": media_thumb_url,
+            "_time_unreliable": not time_reliable and not created_at_hint,
+        })
+    if is_group:
+        # 方向鬼影兜底：同一时间线里自己发出的内容后面紧跟一条同内容的
+        # inbound（回收节点丢标记的典型形态），直接丢弃 inbound，宁可漏
+        # 收一条客户撞车回复，也不能让脏数据入库。
+        batch_outbound_keys = {
+            (item["content"], str(item["created_at"] or "")[:16])
+            for item in result if item["direction"] == "outbound"
+        }
+        batch_outbound_texts = {
+            item["content"] for item in result
+            if item["direction"] == "outbound"
+        }
+        result = [
+            item for item in result
+            if not (
+                item["direction"] == "inbound"
+                and (
+                    (item["content"], str(item["created_at"] or "")[:16])
+                    in batch_outbound_keys
+                    or (item.get("_time_unreliable")
+                        and item["content"] in batch_outbound_texts)
+                )
+            )
+        ]
+    # DOM 节点顺序就是消息的真实先后。没有时间节点的消息不能拿"会话
+    # 列表最后消息时间"回退，否则整段卡片消息会被推到最后、顺序错位。
+    # 沿时间线依次排放：无时间消息继承上一条的时间；位于最前、还没有
+    # 任何时间锚点的消息借用后面第一条真实时间，保证排序稳定不越界。
+    ordered: list[dict] = []
+    pending: list[dict] = []
+    last_time = ""
+    for item in result:
+        if item.get("_time_unreliable"):
+            if last_time:
+                item["created_at"] = last_time
+                ordered.append(item)
+            else:
+                pending.append(item)
+            continue
+        last_time = str(item.get("created_at") or "")
+        for waiting in pending:
+            waiting["created_at"] = last_time
+        ordered.extend(pending)
+        pending.clear()
+        ordered.append(item)
+    ordered.extend(pending)
+    return ordered
+
+
+def _api_history_entries(messages: list[dict]) -> list[dict]:
+    """Translate decoded IM messages to the existing history-ingest shape."""
+    result = []
+    for message in messages:
+        media_type = _clean_text(message.get("media_type"), 20)
+        result.append({
+            "text": _clean_text(message.get("text"), 4000),
+            "direction": message.get("direction") or "inbound",
+            "display_time": _clean_text(message.get("created_at"), 40),
+            "created_at": _clean_text(message.get("created_at"), 40),
+            "external_message_id": _clean_text(
+                message.get("external_message_id"), 160,
+            ),
+            "message_type": int(message.get("message_type") or 0),
+            "media": bool(media_type),
+            "media_type": media_type,
+            "media_url": _safe_media_url(message.get("media_url")),
+            "media_thumb_url": _safe_media_url(message.get("media_thumb_url")),
+            "is_api_message": True,
         })
     return result
+
+
+def _api_conversation_name(
+    conversation: dict, user_details: dict[str, dict], dom_row: dict | None,
+) -> str:
+    detail = user_details.get(str(conversation.get("peer_sec_uid") or "")) or {}
+    name = _clean_text(detail.get("nickname"), 120)
+    if name:
+        return name
+    name = _clean_text(conversation.get("nickname"), 120)
+    if name:
+        return name
+    if dom_row:
+        return _display_name(dom_row)
+    peer_id = _clean_text(conversation.get("peer_user_id"), 160)
+    if peer_id:
+        return "抖音用户" + peer_id[-8:]
+    return "抖音会话" + hashlib.sha1(
+        str(conversation.get("conversation_id") or "").encode("utf-8")
+    ).hexdigest()[:8]
 
 
 async def _page_is_login(page) -> bool:
@@ -921,6 +1478,25 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
             "抖音账号持久浏览器启动失败，请确认 Chromium 已安装"
         ) from exc
     page = await context.new_page()
+    user_details: dict[str, dict] = {}
+
+    async def _capture_user_detail(response):
+        if "/aweme/v1/creator/im/user_detail/" not in str(response.url):
+            return
+        try:
+            if not response.ok:
+                return
+            payload = await response.json()
+            requested_ids = _user_detail_request_ids(
+                response.request.post_data,
+            )
+            _merge_douyin_user_details(user_details, payload, requested_ids)
+        except Exception:
+            # Nicknames are an enhancement.  A malformed auxiliary response
+            # must not abort the actual message synchronization.
+            return
+
+    page.on("response", _capture_user_detail)
     try:
         from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -936,24 +1512,22 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
             import selector_adapters as _ad
             await _ad.wait_first_visible_async(page, "douyin", 12000)
         except Exception as _ad_exc:
-            from utils.errors import SelectorDriftError as _Drift
-            if isinstance(_ad_exc, _Drift):
-                raise SyncError(str(_ad_exc)[:300]) from _ad_exc
-            if await page.locator(".semi-list-item").count():
-                pass
-            else:
+            # 适配包在慢网络下可能在会话行刚渲染时先超时并生成 Drift 包。
+            # 再给当前页面一个本地等待机会；只有列表仍不可用才向上报错。
+            try:
+                await page.wait_for_selector(
+                    ".semi-list-item", state="visible", timeout=25000,
+                )
+            except PlaywrightTimeoutError:
+                if await _page_is_login(page):
+                    raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
+                body = ""
                 try:
-                    await page.wait_for_selector(".semi-list-item", timeout=12000)
-                except PlaywrightTimeoutError:
-                    if await _page_is_login(page):
-                        raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
-                    body = ""
-                    try:
-                        body = await page.locator("body").inner_text(timeout=5000)
-                    except Exception:
-                        pass
-                    if not any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
-                        raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败")
+                    body = await page.locator("body").inner_text(timeout=5000)
+                except Exception:
+                    pass
+                if not any(marker in body for marker in ("私信", "暂无消息", "暂无会话")):
+                    raise SyncError("未能读取抖音私信列表，页面可能改版或加载失败") from _ad_exc
         await page.wait_for_timeout(300 if quick else 1200)
         if await _page_is_login(page):
             raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
@@ -966,7 +1540,7 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
 
     session = {
         "context": context, "page": page, "cookie_mtime": cookie_mtime,
-        "created_at": time.monotonic(),
+        "created_at": time.monotonic(), "user_details": user_details,
     }
     _douyin_browser_runtime["sessions"][key] = session
     return key, session
@@ -990,7 +1564,8 @@ async def _scan_douyin_in_browser(
             raise SyncError("本机未安装 Playwright，请先安装依赖和 Chromium 浏览器") from exc
 
         await page.evaluate("""() => {
-            const grid = document.querySelector('.ReactVirtualized__Grid');
+            const list = document.querySelector('.semi-list-items');
+            const grid = list?.closest('.ReactVirtualized__Grid');
             if (grid) grid.scrollTop = 0;
         }""")
         if not await page.locator(".semi-list-item").count():
@@ -1010,13 +1585,25 @@ async def _scan_douyin_in_browser(
             raise SyncError("抖音登录已失效，请重新登录并更新 Cookie")
         timings["page_ready_ms"] = int((time.monotonic() - started_mono) * 1000)
 
+        history_hours, catchup, gap_hours = _history_fetch_plan(settings, account)
+        deep_scan = (not quick) or catchup
+        timings.update({
+            "catchup": int(catchup),
+            "deep_scan": int(deep_scan),
+            "gap_hours": int(gap_hours),
+            "history_window_hours": int(history_hours),
+            "history_attempted": 0,
+            "history_loaded": 0,
+            "history_failures": 0,
+            "history_failed_samples": [],
+        })
         limit = int(settings.get("max_conversations") or 100)
-        if quick:
+        if quick and not deep_scan:
             limit = min(limit, 20)
         collected = {}
 
         async def _collect_current_tab(tab_label: str = "") -> None:
-            for _ in range(1 if quick else 20):
+            for _ in range(1 if (quick and not deep_scan) else 20):
                 rows = await page.evaluate(
                     SCAN_SCRIPT, {"limit": limit, "tab_label": tab_label},
                 )
@@ -1046,7 +1633,12 @@ async def _scan_douyin_in_browser(
                 if len(collected) >= limit:
                     break
                 moved = await page.evaluate("""() => {
-                    const grid = document.querySelector('.ReactVirtualized__Grid');
+                    const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                        .find(el => {
+                            const rect = el.getBoundingClientRect();
+                            return rect.width > 1 && rect.height > 1;
+                        });
+                    const grid = item?.closest('.ReactVirtualized__Grid');
                     if (!grid) return false;
                     const before = grid.scrollTop;
                     grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
@@ -1058,17 +1650,17 @@ async def _scan_douyin_in_browser(
 
         # 先采集当前页签，再遍历其余子页签；未关注/陌生人会话在
         # "陌生人私信"页签下，不切换就永远扫不到。
-        await _collect_current_tab("全部")
-        current_tab_collected = True
+        all_status, _all_active = await _select_dm_tab(page, "全部")
+        if all_status != "missing":
+            await _collect_current_tab("全部")
+        else:
+            # 旧版/精简页面没有分类页签时，当前唯一列表就是全部会话。
+            await _collect_current_tab("")
         for tab_label in ("陌生人私信", "朋友私信", "群消息"):
-            status, already_active = await _select_dm_tab(page, tab_label)
+            status, _already_active = await _select_dm_tab(page, tab_label)
             if status == "missing":
                 continue
-            if already_active and current_tab_collected:
-                current_tab_collected = False
-                continue
             await _collect_current_tab(tab_label)
-            current_tab_collected = True
         timings["list_ms"] = int((time.monotonic() - started_mono) * 1000)
 
         data = list(collected.values())
@@ -1078,9 +1670,196 @@ async def _scan_douyin_in_browser(
             legacy_id = legacy_ids.get(_clean_text(row.get("name"), 120))
             if legacy_id:
                 row["cid"] = legacy_id
+        dom_by_name = {
+            _clean_text(row.get("name"), 120): row
+            for row in data if _clean_text(row.get("name"), 120)
+        }
         pending_unread = _pending_conversation_unread(account_name)
         seen_history_users: set[str] = set()
-        history_hours = _window_hours(settings)
+
+        def _note_history_failure(row: dict, reason: str) -> None:
+            timings["history_failures"] += 1
+            samples = timings["history_failed_samples"]
+            if len(samples) < 20:
+                samples.append({
+                    "name": _display_name(row),
+                    "cid": str(row.get("dom_cid") or row.get("cid") or ""),
+                    "reason": reason[:160],
+                })
+
+        api_rows: list[dict] = []
+        matched_dom_cids: set[str] = set()
+        user_details = session.get("user_details") or {}
+        last_success = _last_account_success(account)
+        last_success_ms = int(last_success.timestamp() * 1000) if last_success else 0
+        cutoff_ms = (
+            int((time.time() - history_hours * 3600) * 1000)
+            if history_hours > 0 else 0
+        )
+        timings.update({
+            "transport": "im_api",
+            "api_listed": 0,
+            "api_message_requests": 0,
+            "api_messages": 0,
+            "api_errors": 0,
+            "api_error_samples": [],
+        })
+        try:
+            client = douyin_im_api.DouyinImClient(page)
+            normal = await client.list_conversations(limit=limit)
+            remaining = max(0, limit - len(normal))
+            strangers = (
+                await client.list_stranger_conversations(limit=remaining)
+                if remaining else []
+            )
+            api_conversations = normal + strangers
+            timings["api_listed"] = len(api_conversations)
+            for conversation in api_conversations:
+                profile = user_details.get(
+                    str(conversation.get("peer_sec_uid") or ""),
+                ) or {}
+                nickname = _api_conversation_name(conversation, user_details, None)
+                dom_row = dom_by_name.get(nickname)
+                if not dom_row:
+                    recent = (conversation.get("recent_messages") or [{}])[-1]
+                    recent_text = _clean_text(recent.get("text"), 300)
+                    if recent_text:
+                        dom_row = next((
+                            row for row in data
+                            if _clean_text(row.get("preview"), 300)
+                            and (
+                                _clean_text(row.get("preview"), 300) in recent_text
+                                or recent_text in _clean_text(row.get("preview"), 300)
+                            )
+                        ), None)
+                nickname = _api_conversation_name(
+                    conversation, user_details, dom_row,
+                )
+                unread = max(
+                    int(conversation.get("unread") or 0),
+                    int((dom_row or {}).get("unread") or 0),
+                )
+                latest_time_ms = int(conversation.get("latest_time_ms") or 0)
+                should_fetch = bool(deep_scan or unread)
+                if not should_fetch and latest_time_ms and last_success_ms:
+                    # Even when the message was read on another device, a
+                    # recently updated conversation must still be reconciled.
+                    should_fetch = latest_time_ms >= last_success_ms - 10 * 60 * 1000
+                messages: list[dict] = []
+                fetch_error = ""
+                if should_fetch:
+                    timings["history_attempted"] += 1
+                    timings["api_message_requests"] += 1
+                    failure_row = dom_row or {
+                        "name": nickname,
+                        "cid": str(conversation.get("peer_user_id") or ""),
+                    }
+                    try:
+                        try:
+                            messages = await client.fetch_messages(
+                                conversation,
+                                cutoff_ms=cutoff_ms,
+                                max_pages=60 if deep_scan else 4,
+                            )
+                        except Exception:
+                            if not conversation.get("is_stranger"):
+                                raise
+                            messages = []
+                        if not messages and conversation.get("is_stranger"):
+                            try:
+                                messages = await client.fetch_stranger_messages(
+                                    conversation,
+                                )
+                            except douyin_im_api.DouyinImApiError:
+                                # The normal conversation endpoint already
+                                # worked for many strangers; a second endpoint
+                                # miss is not by itself a failed synchronization.
+                                messages = []
+                        timings["api_messages"] += len(messages)
+                        timings["history_loaded"] += 1
+                    except Exception as exc:
+                        fetch_error = str(exc)[:200]
+                        timings["api_errors"] += 1
+                        if len(timings["api_error_samples"]) < 20:
+                            timings["api_error_samples"].append({
+                                "name": nickname[:80],
+                                "reason": fetch_error,
+                            })
+                        _note_history_failure(failure_row, fetch_error)
+
+                merged_messages = {
+                    str(message.get("external_message_id") or ""): message
+                    for message in [
+                        *(conversation.get("recent_messages") or []),
+                        *messages,
+                    ]
+                    if message.get("external_message_id")
+                }
+                ordered_messages = sorted(
+                    merged_messages.values(),
+                    key=lambda message: (
+                        int(message.get("created_time_ms") or 0),
+                        str(message.get("external_message_id") or ""),
+                    ),
+                )
+                history = _api_history_entries(ordered_messages)
+                if not should_fetch and not history:
+                    continue
+                latest = ordered_messages[-1] if ordered_messages else {}
+                if fetch_error and not history:
+                    # Keep the DOM scanner as the fallback when the usable
+                    # conversation had no decoded recent message either.
+                    continue
+                peer_id = _clean_text(conversation.get("peer_user_id"), 160)
+                is_group = bool(conversation.get("is_group"))
+                if is_group:
+                    api_cid = "dy-group-" + hashlib.sha1(
+                        str(conversation.get("conversation_id") or "").encode("utf-8")
+                    ).hexdigest()[:20]
+                else:
+                    api_cid = peer_id or "dy-conversation-" + hashlib.sha1(
+                        str(conversation.get("conversation_id") or "").encode("utf-8")
+                    ).hexdigest()[:20]
+                cid = legacy_ids.get(nickname) or api_cid
+                latest_text = _clean_text(latest.get("text"), 300)
+                if not latest_text and latest.get("media_type"):
+                    latest_text = _unavailable_media_text(latest["media_type"])
+                row = {
+                    "cid": cid,
+                    "dom_cid": str((dom_row or {}).get("dom_cid") or ""),
+                    "name": nickname,
+                    "name_visible": True,
+                    "avatar": _safe_media_url(profile.get("avatar")),
+                    "display_time": _clean_text(latest.get("created_at"), 40),
+                    "preview": latest_text,
+                    "created_at": _clean_text(latest.get("created_at"), 40),
+                    "message_type": int(latest.get("message_type") or 0),
+                    "is_from_me": latest.get("direction") == "outbound",
+                    "is_recalled": False,
+                    "is_group": is_group,
+                    "is_stranger": bool(conversation.get("is_stranger")),
+                    "unread": unread,
+                    "history": history,
+                    "history_source": "im_api",
+                    "api_conversation_id": str(conversation.get("conversation_id") or ""),
+                }
+                api_rows.append(row)
+                if dom_row and dom_row.get("dom_cid"):
+                    matched_dom_cids.add(str(dom_row["dom_cid"]))
+        except Exception as exc:
+            timings["transport"] = "dom_fallback"
+            timings["api_errors"] += 1
+            if len(timings["api_error_samples"]) < 20:
+                timings["api_error_samples"].append({
+                    "name": "私信接口",
+                    "reason": str(exc)[:200],
+                })
+        if api_rows:
+            data = api_rows + [
+                row for row in data
+                if str(row.get("dom_cid") or "") not in matched_dom_cids
+            ]
+
         for row in data:
             try:
                 cid = str(row.get("cid") or "")
@@ -1095,31 +1874,46 @@ async def _scan_douyin_in_browser(
                     raw_unread, int(pending_unread.get(user_id) or 0)
                 )
                 row["unread"] = effective_unread
-                # 手动“同步全部私信”扫描所有会话；定时增量只看有未读的会话。
-                should_scan_history = (not quick) or effective_unread > 0
+                if row.get("history_source") == "im_api":
+                    seen_history_users.add(user_id)
+                    if deep_scan:
+                        _save_history_marker(
+                            account_name, cid, _history_signature(row),
+                        )
+                    continue
+                # 手动同步、首次扫描或停机超过阈值时扫描全部会话；短间隔
+                # 自动轮询才只看有未读的会话。
+                should_scan_history = deep_scan or effective_unread > 0
                 if should_scan_history and user_id in seen_history_users:
                     continue
                 if not should_scan_history:
                     continue
+                timings["history_attempted"] += 1
                 if await _click_conversation(
                     page, str(row.get("dom_cid") or cid),
-                    max_scrolls=2 if quick else 20,
-                    settle_ms=400 if quick else 1600,
-                    click_timeout_ms=900 if quick else 5000,
+                    max_scrolls=2 if (quick and not deep_scan) else 20,
+                    settle_ms=400 if (quick and not deep_scan) else 1600,
+                    click_timeout_ms=900 if (quick and not deep_scan) else 5000,
                     is_group=bool(row.get("is_group")),
                     is_stranger=bool(row.get("is_stranger")),
+                    expected_name=_display_name(row),
                 ):
                     history = await _collect_history(
-                        page, quick=quick, hours=history_hours,
+                        page, quick=(quick and not deep_scan), hours=history_hours,
                     )
                     if isinstance(history, list) and history:
                         row["history"] = history
                         seen_history_users.add(user_id)
+                        timings["history_loaded"] += 1
                         # 增量同步只回看少量轮次，不能代表完整历史已经补齐。
-                        if not quick:
+                        if deep_scan:
                             _save_history_marker(account_name, cid, signature)
-            except Exception:
-                pass
+                    else:
+                        _note_history_failure(row, "详情中未读取到消息节点")
+                else:
+                    _note_history_failure(row, "无法打开目标会话详情")
+            except Exception as exc:
+                _note_history_failure(row, f"读取异常：{exc}")
         timings["history_ms"] = int((time.monotonic() - started_mono) * 1000)
         return {"rows": data, "scanned": len(data), "timings": timings}
     except Exception as exc:
@@ -1246,6 +2040,10 @@ def _reconcile_preview_times(items: list[dict], account: dict) -> int:
     for item in items:
         if not str(item.get("source_content") or "").startswith(history_source):
             continue
+        if item.get("_time_unreliable"):
+            # 权威历史自身时间不可靠（“刚刚”/无时间节点回退），不能拿它
+            # 去刷预览时间，否则预览也会跟着每轮漂移。
+            continue
         key = (
             str(item.get("external_user_id") or ""),
             str(item.get("direction") or ""),
@@ -1269,6 +2067,10 @@ def _reconcile_preview_times(items: list[dict], account: dict) -> int:
                 account_name, user_id, direction, content,
             )).fetchall()
             for preview in previews:
+                if str(preview["created_at"] or "") in set(stamps):
+                    # 预览时间已经是任一权威候选值时不再刷写，避免同一会话
+                    # 两条同内容历史消息（时间相差 1 分钟）每轮互相拉扯翻转。
+                    continue
                 index = bisect_right(stamps, str(preview["created_at"] or "")) - 1
                 if index < 0:
                     continue
@@ -1340,8 +2142,9 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
         raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
     merged_contacts = dm_ops.merge_dom_contact_duplicates()
     scan = _scan_douyin(settings, account, quick=quick)
-    # 时间窗口统一由同步设置的 history_days 决定；0 表示不限。
-    history_hours = _window_hours(settings)
+    # 日常窗口由 history_days 决定；长时间未成功同步时自动扩展下界，避免
+    # 恰好落在固定窗口之外的中间消息被跳过。0 表示不限。
+    history_hours, _catchup, _gap_hours = _history_fetch_plan(settings, account)
     items = []
     skipped = 0
     skip_reasons: dict[str, int] = {}
@@ -1364,6 +2167,13 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
             dm_ops.repair_contact_nickname(
                 "抖音", name, _stable_user_id(row.get("cid")), _display_name(row),
             )
+        if row.get("history_source") == "im_api":
+            history_items = _history_items(
+                row, row.get("history") or [], account, history_hours,
+            )
+            history_items.sort(key=lambda value: value.get("created_at") or "")
+            items.extend(history_items)
+            continue
         if row.get("history_synced"):
             continue
         item, reason = _row_to_item(row, account, history_hours=history_hours)
@@ -1387,19 +2197,41 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
     ingest = dm_ops.ingest_many(items, allow_auto_reply=True, force_draft=True)
     for item, result in zip(items, ingest.get("items", [])):
         if result.get("duplicate") and result.get("message_id") and item.get("created_at"):
+            if item.get("_time_unreliable"):
+                # 无真实时间节点的消息，created_at 是"本次同步时刻"的回退值，
+                # 不能拿它覆盖库里已有的时间，否则每轮同步都会把旧消息刷成
+                # "刚刚收到"。
+                continue
             dm_ops.repair_message_timestamp(result["message_id"], item["created_at"])
+    timings = scan.get("timings") or {}
+    history_complete = not bool(timings.get("deep_scan")) or (
+        timings.get("transport") == "im_api"
+        and not int(timings.get("history_failures") or 0)
+    )
     for contact_id in {
         int(result.get("contact_id")) for result in ingest.get("items", [])
         if result.get("contact_id")
     }:
         dm_ops.dedupe_contact_messages(contact_id)
-    dm_ops.prune_placeholder_messages("抖音")
+    dm_ops.prune_placeholder_messages(
+        "抖音", any_direction=bool(
+            timings.get("deep_scan") and history_complete
+        ),
+    )
     ready = sum(
         1 for result in ingest.get("items", [])
         if (result.get("auto_reply") or {}).get("status") == "ready"
     )
+    if timings.get("deep_scan") and history_complete:
+        _save_history_backfill_done(account)
     return {
         "ok": True,
+        "complete": history_complete,
+        "incomplete_reason": ("" if history_complete else (
+            "私信接口不可用，仅完成页面回退同步"
+            if timings.get("transport") != "im_api" else
+            f"历史补采未完成：{int(timings.get('history_failures') or 0)} 个会话未能读取详情"
+        )),
         "account": _public_account(account),
         "scanned": int(scan.get("scanned") or 0),
         "imported": int(ingest.get("added") or 0),
@@ -1408,7 +2240,7 @@ def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
         "failed": int(ingest.get("failed") or 0),
         "auto_replies_ready": ready,
         "skip_reasons": skip_reasons,
-        "timings": scan.get("timings") or {},
+        "timings": timings,
         "media_downloaded": media_result["downloaded"],
         "media_failed": media_result["failed"],
         "merged_contacts": merged_contacts,

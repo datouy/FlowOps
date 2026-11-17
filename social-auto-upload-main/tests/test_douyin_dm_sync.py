@@ -107,6 +107,145 @@ def test_history_external_id_is_stable_when_virtual_list_loses_time(monkeypatch)
     assert first == second
 
 
+def test_history_id_stable_when_conversation_time_changes(monkeypatch):
+    # 卡片气泡没有真实时间节点，展示时间回退到会话列表时间。用户发送新消息后
+    # 会话列表时间会从“11:00”变成“刚刚”，但消息身份必须保持不变，否则重复入库。
+    account = {"id": 1, "userName": "测试账号"}
+    history = [{
+        "text": "该内容为视频，该平台上无法正常展示", "media": True,
+        "media_type": "video", "direction": "inbound", "display_time": "",
+    }]
+    first = dy._history_items(
+        {"cid": "c-x", "name": "群聊", "unread": 0, "display_time": "11:00"},
+        history, account,
+    )[0]
+    second = dy._history_items(
+        {"cid": "c-x", "name": "群聊", "unread": 0, "display_time": "刚刚"},
+        history, account,
+    )[0]
+
+    assert first["external_message_id"] == second["external_message_id"]
+    assert first["status"] == "replied"
+
+
+def _fake_conn_with_outbound(rows):
+    class _Cursor:
+        def fetchall(self):
+            return rows
+    class _Conn:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, *_args, **_kwargs):
+            return _Cursor()
+    return _Conn()
+
+
+def test_group_inbound_ghost_matching_own_outbound_is_skipped(monkeypatch):
+    account = {"id": 1, "userName": "测试账号"}
+    row = {"cid": "c-g", "name": "群聊", "unread": 0, "is_group": True,
+           "display_time": "11:00"}
+    history = [
+        {"text": "测试", "direction": "outbound", "display_time": "11:00"},
+        {"text": "测试", "direction": "inbound", "display_time": "11:00"},
+    ]
+    monkeypatch.setattr(dy.dm_ops, "get_conn", lambda: _fake_conn_with_outbound([
+        {"content": "测试", "created_at": "2026-11-17 11:00:00"},
+    ]))
+
+    items = dy._history_items(row, history, account, hours=0)
+    directions = [item["direction"] for item in items]
+
+    assert directions == ["outbound"]
+
+
+def test_group_notime_inbound_echoing_own_text_is_skipped(monkeypatch):
+    account = {"id": 1, "userName": "测试账号"}
+    row = {"cid": "c-g", "name": "群聊", "unread": 0, "is_group": True}
+    history = [{"text": "已收到", "direction": "inbound", "display_time": ""}]
+    monkeypatch.setattr(dy.dm_ops, "get_conn", lambda: _fake_conn_with_outbound([
+        {"content": "已收到", "created_at": "2026-11-17 09:30:00"},
+    ]))
+
+    items = dy._history_items(row, history, account, hours=0)
+
+    assert items == []
+
+
+def test_group_in_batch_outbound_mirror_is_skipped_without_db(monkeypatch):
+    # 回归：outbound 还没入库时，同批内紧跟的 inbound 镜像拦不住。
+    # 现在批内实时比对，不依赖数据库里已有的 outbound。
+    monkeypatch.setattr(
+        dy.dm_ops, "get_conn",
+        lambda: (_ for _ in ()).throw(RuntimeError("no db")),
+    )
+    account = {"id": 1, "userName": "测试账号"}
+    row = {"cid": "c-g", "name": "群聊", "unread": 0, "is_group": True,
+           "display_time": "17:29"}
+    history = [
+        {"text": "测试", "direction": "outbound", "display_time": "17:29"},
+        {"text": "测试", "direction": "inbound", "display_time": "17:29"},
+    ]
+
+    items = dy._history_items(row, history, account, hours=0)
+
+    assert [item["direction"] for item in items] == ["outbound"]
+
+
+def test_private_chat_in_batch_outbound_mirror_is_skipped(monkeypatch):
+    # 私聊同样会出现方向镜像：自己刚发的消息后面紧跟一条同内容 inbound。
+    monkeypatch.setattr(
+        dy.dm_ops, "get_conn",
+        lambda: (_ for _ in ()).throw(RuntimeError("no db")),
+    )
+    account = {"id": 1, "userName": "测试账号"}
+    row = {"cid": "c-p", "name": "客户", "unread": 0, "display_time": "13:21"}
+    history = [
+        {"text": "句号。", "direction": "outbound", "display_time": "13:21"},
+        {"text": "句号。", "direction": "inbound", "display_time": "13:21"},
+    ]
+
+    items = dy._history_items(row, history, account, hours=0)
+
+    assert [item["direction"] for item in items] == ["outbound"]
+
+
+def test_just_now_label_keeps_stable_identity_without_time_drift(monkeypatch):
+    # “刚刚”每轮都在变：同一消息必须命中同一个不含时间的稳定指纹，
+    # 且标记 _time_unreliable，阻止 created_at 被刷成同步时刻漂移。
+    monkeypatch.setattr(
+        dy.dm_ops, "get_conn",
+        lambda: (_ for _ in ()).throw(RuntimeError("no db")),
+    )
+    account = {"id": 1, "userName": "测试账号"}
+    row = {"cid": "c-n", "name": "客户", "unread": 1, "display_time": "刚刚"}
+    history = [{"text": "僵尸表情", "direction": "inbound", "display_time": "刚刚"}]
+
+    first = dy._history_items(row, history, account, hours=0)[0]
+    second = dy._history_items(row, history, account, hours=0)[0]
+
+    assert first["external_message_id"] == second["external_message_id"]
+    assert first["_time_unreliable"] is True
+    assert first["status"] == "new"
+
+
+def test_click_conversation_requires_panel_content_change():
+    import inspect
+
+    source = inspect.getsource(dy._click_conversation)
+    # 会话切换必须等消息面板内容签名变化，防止上一会话残留节点串会话入库。
+    assert "panel_signature" in source
+    assert '!= panel_signature' in source
+
+
+def test_display_time_parses_period_prefixes():
+    # 回归："凌晨 00:02"这类时段标签曾落进兜底返回同步时刻，导致消息
+    # 每轮被刷新、永远漂到时间线末尾。
+    assert dy._display_time_to_text("凌晨 00:02").endswith(" 00:02:00")
+    assert dy._display_time_to_text("早上 8:15").endswith(" 08:15:00")
+    assert dy._display_time_to_text("下午 3:20").endswith(" 15:20:00")
+    assert dy._display_time_to_text("晚上 9:40").endswith(" 21:40:00")
 def test_row_to_item_maps_platform_video_placeholder_to_explicit_notice():
     item, reason = dy._row_to_item({
         "cid": "c1", "name": "258", "unread": 1,
@@ -133,7 +272,7 @@ def test_scan_script_excludes_hidden_virtual_rows():
 
 
 def test_scan_script_uses_stable_avatar_identity():
-    assert "parsed.origin}${parsed.pathname}" in dy.SCAN_SCRIPT
+    assert "return parsed.pathname || ''" in dy.SCAN_SCRIPT
     assert "hashCid(`${rawName}|${canonicalAvatar(avatar)}`)" in dy.SCAN_SCRIPT
 
 
@@ -161,3 +300,53 @@ def test_reconcile_rewrites_legacy_image_placeholder_without_duplicate(tmp_path,
     assert len(rows) == 1
     assert rows[0]["content"] == "该内容为视频，该平台上无法正常展示"
     assert rows[0]["external_message_id"] == "video-history"
+
+
+def test_merge_history_batches_keeps_node_order_and_time_bearing_copy():
+    # 采集从最新窗口向上滚动：batch0 是最底部（最新）窗口，batch1 更旧。
+    # 消息B 在最新窗口顶部拿不到时间节点，在旧窗口里贴着时间节点，
+    # 合并后必须只保留带时间那份，且整体按节点时间线排序。
+    batch_new = [
+        {"text": "消息B", "direction": "inbound", "display_time": ""},
+        {"text": "消息C", "direction": "inbound", "display_time": "17:00"},
+    ]
+    batch_old = [
+        {"text": "消息A", "direction": "inbound", "display_time": "16:50"},
+        {"text": "消息B", "direction": "inbound", "display_time": "16:55"},
+    ]
+    ordered = dy._merge_history_batches([batch_new, batch_old])
+
+    assert [(item["text"], item["display_time"]) for item in ordered] == [
+        ("消息A", "16:50"), ("消息B", "16:55"), ("消息C", "17:00"),
+    ]
+
+
+def test_history_items_follow_dom_node_order_without_time(monkeypatch):
+    # 用户要求：先列出 DOM 节点，再依次排放聊天记录。无时间节点的卡片
+    # 消息不能拿会话列表时间（17:25）回退，否则整段被推到最后、顺序错位。
+    fake_parse = {
+        "16:00": "2026-11-16 16:00:00",
+        "17:00": "2026-11-17 17:00:00",
+        "17:25": "2026-11-17 17:25:00",
+    }
+    monkeypatch.setattr(
+        dy, "_display_time_to_text", lambda value: fake_parse.get(value, value),
+    )
+    row = {"cid": "c1", "name": "群友", "unread": 0, "display_time": "17:25"}
+    history = [
+        {"text": "卡片1", "direction": "inbound", "display_time": ""},
+        {"text": "卡片2", "direction": "inbound", "display_time": ""},
+        {"text": "真实A", "direction": "inbound", "display_time": "16:00"},
+        {"text": "卡片3", "direction": "inbound", "display_time": ""},
+        {"text": "真实B", "direction": "inbound", "display_time": "17:00"},
+    ]
+    items = dy._history_items(row, history, {"id": 1, "userName": "测试"}, hours=0)
+
+    assert [(item["content"], item["created_at"]) for item in items] == [
+        ("卡片1", "2026-11-16 16:00:00"),
+        ("卡片2", "2026-11-16 16:00:00"),
+        ("真实A", "2026-11-16 16:00:00"),
+        ("卡片3", "2026-11-16 16:00:00"),
+        ("真实B", "2026-11-17 17:00:00"),
+    ]
+
