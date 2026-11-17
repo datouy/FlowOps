@@ -1,28 +1,47 @@
-// 颜色变量
-$primary-color: #409eff;
-$success-color: #67c23a;
-$warning-color: #e6a23c;
-$danger-color: #f56c6c;
-$info-color: #909399;
+// FlowOps interface tokens
+// One low-saturation field-note palette for operational surfaces.
 
-// 文字颜色
-$text-primary: #303133;
-$text-regular: #606266;
-$text-secondary: #909399;
-$text-placeholder: #c0c4cc;
+$ink-950: #171a18;
+$ink-900: #1d211e;
+$ink-850: #242925;
+$ink-800: #2c322d;
+$ink-700: #3d4540;
+$ink-600: #5b625c;
+$ink-500: #7b827b;
+$ink-400: #9ba09a;
+$ink-300: #bdc1bb;
+$ink-200: #d7dad4;
+$ink-150: #e4e6e1;
+$ink-100: #edeee9;
+$ink-050: #f4f3ef;
+$paper: #fffefb;
 
-// 边框颜色
-$border-base: #dcdfe6;
-$border-light: #e4e7ed;
-$border-lighter: #ebeef5;
-$border-extra-light: #f2f6fc;
+$primary-color: #a64b2a;
+$primary-color-dark: #893b20;
+$primary-color-soft: #f5e9e2;
+$success-color: #2f7d5a;
+$success-color-soft: #edf6f1;
+$warning-color: #9a681f;
+$warning-color-soft: #fbf3e4;
+$danger-color: #b5463f;
+$danger-color-soft: #faeeed;
+$info-color: #737a73;
 
-// 背景颜色
-$bg-color: #ffffff;
-$bg-color-page: #f2f3f5;
-$bg-color-overlay: #ffffff;
+$text-primary: #232621;
+$text-regular: #454b45;
+$text-secondary: #697068;
+$text-placeholder: #989d97;
 
-// 字体大小
+$border-base: #cfd3cc;
+$border-light: #dde0da;
+$border-lighter: #e9ebe6;
+$border-extra-light: #f1f2ee;
+
+$bg-color: $paper;
+$bg-color-page: $ink-050;
+$bg-color-overlay: $paper;
+$bg-color-raised: #f8f7f3;
+
 $font-size-extra-large: 20px;
 $font-size-large: 18px;
 $font-size-medium: 16px;
@@ -30,25 +49,27 @@ $font-size-base: 14px;
 $font-size-small: 13px;
 $font-size-extra-small: 12px;
 
-// 间距
 $spacing-xs: 4px;
 $spacing-sm: 8px;
 $spacing-md: 16px;
 $spacing-lg: 24px;
 $spacing-xl: 32px;
 
-// 圆角
-$border-radius-base: 4px;
-$border-radius-small: 2px;
-$border-radius-round: 20px;
+$border-radius-base: 8px;
+$border-radius-small: 6px;
+$border-radius-card: 14px;
+$border-radius-panel: 18px;
+$border-radius-round: 999px;
 $border-radius-circle: 50%;
 
-// 阴影
-$box-shadow-base: 0 2px 4px rgba(0, 0, 0, 0.12), 0 0 6px rgba(0, 0, 0, 0.04);
-$box-shadow-dark: 0 2px 4px rgba(0, 0, 0, 0.12), 0 0 6px rgba(0, 0, 0, 0.12);
-$box-shadow-light: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
+$box-shadow-base: 0 1px 2px rgba(23, 26, 24, 0.05);
+$box-shadow-dark: 0 8px 24px rgba(23, 26, 24, 0.08);
+$box-shadow-light: 0 1px 2px rgba(23, 26, 24, 0.04);
 
-// 层级
 $z-index-normal: 1;
 $z-index-top: 1000;
 $z-index-popper: 2000;
+
+$ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+$duration-fast: 140ms;
+$duration-base: 180ms;

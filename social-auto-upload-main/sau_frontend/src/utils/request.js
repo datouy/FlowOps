@@ -32,8 +32,8 @@ request.interceptors.response.use(
   (response) => {
     const { data } = response
     
-    // 根据后端接口规范处理响应
-    if (data.code === 200 || data.success) {
+    // 根据后端接口规范处理响应（202 表示异步任务已受理，不是错误）
+    if (data.code === 200 || data.code === 202 || data.success) {
       return data
     } else {
       const message = data.msg || data.message || '请求失败'

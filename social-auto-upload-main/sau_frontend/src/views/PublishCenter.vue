@@ -1,5 +1,19 @@
 <template>
   <div class="publish-center">
+    <header class="page-heading">
+      <div class="page-heading__copy">
+        <h1>发布中心</h1>
+        <p>选择素材、账号和平台，完成内容设置后提交发布或审核。</p>
+      </div>
+      <div class="page-heading__actions">
+        <el-button :loading="batchPublishing" @click="batchPublish">批量发布</el-button>
+        <el-button type="primary" @click="addTab">
+          <el-icon><Plus /></el-icon>
+          新建发布
+        </el-button>
+      </div>
+    </header>
+
     <!-- 等待验证码提示 -->
     <div v-if="verifyRequest && !verifyDialogVisible" class="verify-pending-banner">
       <el-icon class="verify-pending-icon"><WarningFilled /></el-icon>
@@ -28,26 +42,6 @@
               <Close />
             </el-icon>
           </div>
-        </div>
-        <div class="tab-actions">
-          <el-button 
-            type="primary" 
-            size="small" 
-            @click="addTab"
-            class="add-tab-btn"
-          >
-            <el-icon><Plus /></el-icon>
-            添加Tab
-          </el-button>
-          <el-button 
-            type="success" 
-            size="small" 
-            @click="batchPublish"
-            :loading="batchPublishing"
-            class="batch-publish-btn"
-          >
-            批量发布
-          </el-button>
         </div>
       </div>
     </div>
@@ -468,10 +462,10 @@
           </el-dialog>
 
           <!-- 定时发布 -->
-          <div class="schedule-section" style="margin-bottom:12px">
+          <div class="schedule-section review-section">
             <h3>团队审核</h3>
             <el-switch v-model="tab.reviewRequired" active-text="提交审核后再发布" />
-            <span style="margin-left:10px;color:#909399;font-size:12px">开启后任务进入「审核中心」，通过后才开始发布</span>
+            <span class="section-note">开启后任务进入「审核中心」，通过后才开始发布</span>
           </div>
           <div class="schedule-section">
             <h3>定时发布</h3>
@@ -1325,90 +1319,89 @@ onUnmounted(() => {
 .publish-center {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  min-height: 100%;
+  padding-bottom: 32px;
   
   // Tab管理区域
   .tab-management {
-    background-color: #fff;
-    border-radius: 4px;
-    box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
-    margin-bottom: 20px;
-    padding: 15px 20px;
+    overflow: hidden;
+    background-color: $paper;
+    border: 1px solid $border-lighter;
+    border-radius: 14px;
+    box-shadow: none;
+    margin-bottom: 16px;
+    padding: 0 20px;
     
     .tab-header {
       display: flex;
-      align-items: flex-start;
-      gap: 15px;
+      align-items: center;
+      gap: 12px;
+      min-height: 56px;
       
       .tab-list {
         display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
+        flex-wrap: nowrap;
+        gap: 4px;
         flex: 1;
         min-width: 0;
+        overflow-x: auto;
+        scrollbar-width: none;
+
+        &::-webkit-scrollbar {
+          display: none;
+        }
         
         .tab-item {
            display: flex;
            align-items: center;
            gap: 6px;
-           padding: 6px 12px;
-           background-color: #f5f7fa;
-           border: 1px solid #dcdfe6;
-           border-radius: 4px;
+           flex: none;
+           padding: 0 12px;
+           background-color: transparent;
+           border: 0;
+           border-bottom: 2px solid transparent;
+           border-radius: 0;
            cursor: pointer;
-           transition: all 0.3s;
+           transition: color $duration-base $ease-out, background-color $duration-base $ease-out,
+             border-color $duration-base $ease-out;
            font-size: 14px;
-           height: 32px;
+           height: 56px;
+           color: $text-secondary;
+           white-space: nowrap;
            
            &:hover {
-             background-color: #ecf5ff;
-             border-color: #b3d8ff;
+             color: $text-primary;
+             background-color: $bg-color-raised;
            }
            
            &.active {
-             background-color: #409eff;
-             border-color: #409eff;
-             color: #fff;
+             background-color: transparent;
+             border-bottom-color: $primary-color;
+             color: $text-primary;
              
              .close-icon {
-               color: #fff;
+               color: $text-secondary;
                
                &:hover {
-                 background-color: rgba(255, 255, 255, 0.2);
+                 color: $text-primary;
+                 background-color: $ink-100;
                }
              }
            }
            
            .close-icon {
              padding: 2px;
-             border-radius: 2px;
+             border-radius: 4px;
              cursor: pointer;
-             transition: background-color 0.3s;
+             transition: color $duration-base $ease-out, background-color $duration-base $ease-out;
              font-size: 12px;
              
              &:hover {
-               background-color: rgba(0, 0, 0, 0.1);
+               background-color: $ink-100;
              }
            }
          }
        }
-       
-      .tab-actions {
-        display: flex;
-        gap: 10px;
-        flex-shrink: 0;
-        
-        .add-tab-btn,
-        .batch-publish-btn {
-          display: flex;
-          align-items: center;
-          gap: 4px;
-          height: 32px;
-          padding: 6px 12px;
-          font-size: 14px;
-          white-space: nowrap;
-        }
-      }
     }
   }
   
@@ -1470,29 +1463,31 @@ onUnmounted(() => {
   // 内容区域
   .publish-content {
     flex: 1;
-    background-color: #fff;
-    border-radius: 4px;
-    box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
-    padding: 20px;
+    background-color: $paper;
+    border: 1px solid $border-lighter;
+    border-radius: 18px;
+    box-shadow: none;
+    padding: 28px 32px 0;
     
     .tab-content-wrapper {
       display: flex;
-      justify-content: center;
+      justify-content: flex-start;
       
       .tab-content {
         width: 100%;
-        max-width: 800px;
+        max-width: 1040px;
         
         h3 {
-          font-size: 16px;
+          font-size: 14px;
           font-weight: 500;
           color: $text-primary;
-          margin: 0 0 10px 0;
+          margin: 0 0 12px 0;
+          line-height: 1.35;
 
           .section-hint {
-            font-size: 12px;
-            font-weight: 400;
             color: $text-secondary;
+            font-size: 11px;
+            font-weight: 400;
             margin-left: 6px;
           }
         }
@@ -1504,13 +1499,22 @@ onUnmounted(() => {
         .product-section,
         .topic-section,
         .schedule-section {
-          margin-bottom: 30px;
+          margin-bottom: 24px;
+        }
+
+        .upload-section,
+        .account-section {
+          min-height: 168px;
+          padding: 20px;
+          border: 1px solid $border-lighter;
+          border-radius: 14px;
+          background: #fbfaf6;
         }
 
         .product-section {
           .product-name-input,
           .product-link-input {
-            margin-bottom: 5px;
+            margin-bottom: 8px;
           }
         }
         
@@ -1538,7 +1542,68 @@ onUnmounted(() => {
         }
         
         .title-input {
-          max-width: 600px;
+          max-width: 100%;
+        }
+
+        .upload-options {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .account-display {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 12px;
+        }
+
+        .selected-accounts {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          min-height: 32px;
+        }
+
+        .selected-accounts:empty::before {
+          color: $text-secondary;
+          font-size: 12px;
+          content: '尚未选择账号';
+        }
+
+        .platform-radios {
+          display: flex;
+          align-items: center;
+          gap: 8px 20px;
+          flex-wrap: wrap;
+        }
+
+        .content-type-section {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-top: 16px;
+          padding-top: 16px;
+          border-top: 1px solid $border-lighter;
+        }
+
+        .content-type-label,
+        .section-note {
+          color: $text-secondary;
+          font-size: 12px;
+        }
+
+        .section-note {
+          margin-left: 10px;
+          line-height: 1.55;
+        }
+
+        .review-section {
+          margin-bottom: 8px;
+          padding: 16px 0 8px;
+          border-top: 1px solid $border-lighter;
         }
         
         .topic-display {
@@ -1568,10 +1633,11 @@ onUnmounted(() => {
           gap: 15px;
 
           .schedule-settings {
-            margin-top: 15px;
-            padding: 15px;
-            background-color: #f5f7fa;
-            border-radius: 4px;
+            margin-top: 12px;
+            padding: 16px;
+            border: 1px solid $border-lighter;
+            background-color: $bg-color-raised;
+            border-radius: 12px;
 
             .schedule-item {
               display: flex;
@@ -1601,27 +1667,28 @@ onUnmounted(() => {
         .action-buttons {
           display: flex;
           justify-content: flex-end;
-          gap: 10px;
-          margin-top: 30px;
-          padding-top: 20px;
-          border-top: 1px solid #ebeef5;
+          gap: 8px;
+          margin: 8px -32px 0;
+          padding: 16px 32px 20px;
+          border-top: 1px solid $border-lighter;
+          background: $paper;
         }
 
         .draft-section {
-          margin: 20px 0;
+          margin: 0 0 8px;
 
           .draft-checkbox {
             display: block;
-            margin: 10px 0;
+            margin: 0;
           }
         }
 
         .original-section {
-          margin: 10px 0 20px;
+          margin: 0 0 8px;
 
           .original-checkbox {
             display: block;
-            margin: 10px 0;
+            margin: 0;
           }
         }
       }
@@ -1630,13 +1697,13 @@ onUnmounted(() => {
 
   // 已上传文件列表样式
   .uploaded-files {
-    margin-top: 20px;
+    margin-top: 16px;
     
     h4 {
-      font-size: 16px;
+      font-size: 12px;
       font-weight: 500;
-      margin-bottom: 12px;
-      color: #303133;
+      margin-bottom: 8px;
+      color: $text-secondary;
     }
     
     .file-list {
@@ -1647,9 +1714,10 @@ onUnmounted(() => {
       .file-item {
         display: flex;
         align-items: center;
-        padding: 10px 15px;
-        background-color: #f5f7fa;
-        border-radius: 4px;
+        padding: 10px 12px;
+        border: 1px solid $border-lighter;
+        background-color: $paper;
+        border-radius: 8px;
         
         .el-link {
           margin-right: 10px;
@@ -1660,8 +1728,8 @@ onUnmounted(() => {
         }
         
         .file-size {
-          color: #909399;
-          font-size: 13px;
+          color: $text-secondary;
+          font-size: 12px;
           margin-right: auto;
         }
       }
@@ -1707,8 +1775,8 @@ onUnmounted(() => {
             justify-content: center;
             
             &.el-button--primary {
-              background-color: #409eff;
-              border-color: #409eff;
+              background-color: $ink-850;
+              border-color: $ink-850;
               color: white;
             }
           }
@@ -1729,16 +1797,16 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 16px;
-  margin-bottom: 12px;
-  background-color: #fdf6ec;
-  border: 1px solid #f3d19e;
-  border-radius: 6px;
-  color: #b88230;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background-color: $warning-color-soft;
+  border: 1px solid #edd9b5;
+  border-radius: 12px;
+  color: $warning-color;
 
   .verify-pending-icon {
     font-size: 18px;
-    color: #e6a23c;
+    color: $warning-color;
   }
 
   .verify-pending-text {
@@ -1754,7 +1822,7 @@ onUnmounted(() => {
 
   .verify-tip {
     margin: 0 0 10px;
-    color: #303133;
+    color: $text-primary;
     font-size: 14px;
     line-height: 1.6;
   }
@@ -1764,7 +1832,7 @@ onUnmounted(() => {
     flex-wrap: wrap;
     gap: 8px 16px;
     margin-bottom: 16px;
-    color: #909399;
+    color: $text-secondary;
     font-size: 13px;
   }
 
@@ -1774,7 +1842,7 @@ onUnmounted(() => {
 
   .verify-hint {
     margin: 10px 0 0;
-    color: #909399;
+    color: $text-secondary;
     font-size: 12px;
   }
 }
@@ -1815,6 +1883,71 @@ onUnmounted(() => {
           background: #f4f4f5;
           border-radius: 3px;
           padding: 1px 6px;
+        }
+      }
+    }
+  }
+}
+
+@media (max-width: 900px) {
+  .publish-center {
+    .tab-management {
+      padding-inline: 16px;
+    }
+
+    .publish-content {
+      padding: 24px 24px 0;
+
+      .tab-content .action-buttons {
+        margin-inline: -24px;
+        padding-inline: 24px;
+      }
+    }
+  }
+}
+
+@media (max-width: 600px) {
+  .publish-center {
+    padding-bottom: 20px;
+
+    .tab-management {
+      padding-inline: 12px;
+    }
+
+    .publish-content {
+      padding: 18px 16px 0;
+
+      .tab-content {
+        .upload-section,
+        .account-section {
+          min-height: 0;
+          padding: 16px;
+        }
+
+        .content-type-section {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .schedule-settings .schedule-item {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 8px;
+
+          .label {
+            min-width: 0;
+            margin-right: 0;
+          }
+        }
+
+        .section-note {
+          display: block;
+          margin: 8px 0 0;
+        }
+
+        .action-buttons {
+          margin-inline: -16px;
+          padding: 14px 16px 18px;
         }
       }
     }

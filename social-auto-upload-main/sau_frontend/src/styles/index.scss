@@ -4,17 +4,411 @@
 // 导入变量
 @use './variables.scss' as *;
 
+// Element Plus theme mapping. The chrome stays neutral; copper is reserved for
+// selection, focus and state markers rather than being spread across every button.
+:root {
+  --el-color-primary: #{$primary-color};
+  --el-color-primary-light-3: #bd7257;
+  --el-color-primary-light-5: #cf9a85;
+  --el-color-primary-light-7: #e3c2b5;
+  --el-color-primary-light-8: #edd5cc;
+  --el-color-primary-light-9: #f8ede8;
+  --el-color-primary-dark-2: #{$primary-color-dark};
+  --el-color-success: #{$success-color};
+  --el-color-warning: #{$warning-color};
+  --el-color-danger: #{$danger-color};
+  --el-color-error: #{$danger-color};
+  --el-color-info: #{$info-color};
+  --el-text-color-primary: #{$text-primary};
+  --el-text-color-regular: #{$text-regular};
+  --el-text-color-secondary: #{$text-secondary};
+  --el-text-color-placeholder: #{$text-placeholder};
+  --el-border-color: #{$border-base};
+  --el-border-color-light: #{$border-light};
+  --el-border-color-lighter: #{$border-lighter};
+  --el-border-color-extra-light: #{$border-extra-light};
+  --el-bg-color: #{$paper};
+  --el-bg-color-page: #{$bg-color-page};
+  --el-bg-color-overlay: #{$paper};
+  --el-fill-color-blank: #{$paper};
+  --el-fill-color-light: #{$bg-color-raised};
+  --el-fill-color-lighter: #faf9f6;
+  --el-font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-border-radius-round: 999px;
+  --el-box-shadow-light: 0 8px 24px rgba(23, 26, 24, 0.08);
+}
+
 // 全局样式
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
   color: $text-primary;
   background-color: $bg-color-page;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #app {
   min-height: 100vh;
+}
+
+::selection {
+  color: $text-primary;
+  background: $primary-color-soft;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: $ink-300 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: $ink-300;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.el-card {
+  --el-card-border-color: #{$border-lighter};
+  --el-card-border-radius: 14px;
+  --el-card-padding: 24px;
+  --el-card-shadow: none;
+  color: $text-primary;
+}
+
+.el-card__header {
+  padding: 20px 24px;
+  border-bottom-color: $border-lighter;
+}
+
+.el-button {
+  min-height: 36px;
+  padding: 0 16px;
+  border-radius: 8px;
+  font-weight: 500;
+  transition: color $duration-base $ease-out, background-color $duration-base $ease-out,
+    border-color $duration-base $ease-out, transform $duration-fast $ease-out;
+}
+
+.el-button:not(.is-disabled):active {
+  transform: scale(0.98);
+}
+
+.el-button--primary {
+  --el-button-bg-color: #{$ink-850};
+  --el-button-border-color: #{$ink-850};
+  --el-button-text-color: #ffffff;
+  --el-button-hover-bg-color: #{$ink-700};
+  --el-button-hover-border-color: #{$ink-700};
+  --el-button-hover-text-color: #ffffff;
+  --el-button-active-bg-color: #{$ink-950};
+  --el-button-active-border-color: #{$ink-950};
+}
+
+.el-button--primary.is-plain {
+  --el-button-bg-color: #{$bg-color-raised};
+  --el-button-border-color: #{$border-light};
+  --el-button-text-color: #{$text-primary};
+  --el-button-hover-bg-color: #{$ink-100};
+  --el-button-hover-border-color: #{$ink-200};
+  --el-button-hover-text-color: #{$text-primary};
+}
+
+.el-button--success {
+  --el-button-bg-color: #{$success-color-soft};
+  --el-button-border-color: #d5e8dd;
+  --el-button-text-color: #24684a;
+  --el-button-hover-bg-color: #e2f1e9;
+  --el-button-hover-border-color: #c7dfd2;
+  --el-button-hover-text-color: #1f5c40;
+}
+
+.el-button--danger {
+  --el-button-bg-color: #{$danger-color-soft};
+  --el-button-border-color: #efd6d4;
+  --el-button-text-color: #{$danger-color};
+  --el-button-hover-bg-color: #f6e2e1;
+  --el-button-hover-border-color: #e8c3c0;
+  --el-button-hover-text-color: #9f342f;
+}
+
+.el-button--info {
+  --el-button-bg-color: #{$bg-color-raised};
+  --el-button-border-color: #{$border-light};
+  --el-button-text-color: #{$text-regular};
+  --el-button-hover-bg-color: #{$ink-100};
+  --el-button-hover-border-color: #{$ink-200};
+}
+
+.el-button.is-text,
+.el-button.is-link {
+  min-height: 32px;
+  padding-inline: 6px;
+  color: $text-regular;
+}
+
+.el-button.is-text:hover,
+.el-button.is-link:hover {
+  color: $primary-color;
+  background: $primary-color-soft;
+}
+
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner,
+.el-input-number,
+.el-date-editor.el-input__wrapper,
+.el-time-select .el-input__wrapper {
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px $border-light inset;
+  transition: box-shadow $duration-base $ease-out, background-color $duration-base $ease-out;
+}
+
+.el-input__wrapper,
+.el-select__wrapper {
+  min-height: 36px;
+}
+
+.el-input__wrapper:hover,
+.el-select__wrapper:hover,
+.el-textarea__inner:hover {
+  box-shadow: 0 0 0 1px $ink-300 inset;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px $primary-color inset, 0 0 0 3px rgba(166, 75, 42, 0.1);
+}
+
+.el-textarea__inner {
+  padding: 10px 12px;
+  line-height: 1.65;
+}
+
+.el-table {
+  --el-table-border-color: #{$border-lighter};
+  --el-table-header-bg-color: #{$bg-color-raised};
+  --el-table-row-hover-bg-color: #faf8f4;
+  --el-table-text-color: #{$text-regular};
+  --el-table-header-text-color: #{$text-secondary};
+  font-size: 13px;
+}
+
+.el-table th.el-table__cell {
+  height: 44px;
+  padding: 0;
+  font-weight: 500;
+}
+
+.el-table td.el-table__cell {
+  padding: 12px 0;
+}
+
+.el-table .cell {
+  line-height: 1.5;
+}
+
+.el-table::before,
+.el-table__inner-wrapper::before {
+  display: none;
+}
+
+.el-tabs__nav-wrap::after {
+  height: 1px;
+  background: $border-lighter;
+}
+
+.el-tabs__item {
+  height: 40px;
+  padding-inline: 18px;
+  color: $text-secondary;
+  font-weight: 500;
+}
+
+.el-tabs__item.is-active,
+.el-tabs__item:hover {
+  color: $text-primary;
+}
+
+.el-tabs__active-bar {
+  height: 2px;
+  background: $primary-color;
+}
+
+.el-tag {
+  --el-tag-bg-color: #{$bg-color-raised};
+  --el-tag-border-color: #{$border-light};
+  --el-tag-text-color: #{$text-secondary};
+  min-height: 24px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.el-tag--success {
+  --el-tag-bg-color: #{$success-color-soft};
+  --el-tag-border-color: #d5e8dd;
+  --el-tag-text-color: #24684a;
+}
+
+.el-tag--warning {
+  --el-tag-bg-color: #{$warning-color-soft};
+  --el-tag-border-color: #edd9b5;
+  --el-tag-text-color: #835718;
+}
+
+.el-tag--danger {
+  --el-tag-bg-color: #{$danger-color-soft};
+  --el-tag-border-color: #efd6d4;
+  --el-tag-text-color: #a63a35;
+}
+
+.el-tag--info {
+  --el-tag-bg-color: #{$bg-color-raised};
+  --el-tag-border-color: #{$border-light};
+  --el-tag-text-color: #{$text-secondary};
+}
+
+.el-dialog {
+  border-radius: 16px;
+  box-shadow: 0 24px 64px rgba(23, 26, 24, 0.2);
+}
+
+.el-dialog__header {
+  padding: 24px 24px 12px;
+}
+
+.el-dialog__body {
+  padding: 12px 24px 20px;
+}
+
+.el-dialog__footer {
+  padding: 12px 24px 24px;
+}
+
+.el-message-box,
+.el-message {
+  border-radius: 12px;
+  border-color: $border-lighter;
+  box-shadow: 0 12px 32px rgba(23, 26, 24, 0.12);
+}
+
+:focus-visible {
+  outline: 2px solid $primary-color;
+  outline-offset: 2px;
+}
+
+// Shared page language
+.page-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.page-heading__copy {
+  min-width: 0;
+}
+
+.page-heading h1,
+.page-heading h2 {
+  margin: 0;
+  color: $text-primary;
+  font-size: clamp(26px, 2.4vw, 34px);
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+}
+
+.page-heading p {
+  max-width: 720px;
+  margin: 8px 0 0;
+  color: $text-secondary;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.page-heading__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.panel {
+  border: 1px solid $border-lighter;
+  border-radius: $border-radius-panel;
+  background: $paper;
+}
+
+.mono {
+  font-family: ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: $text-secondary;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.status-key::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: $info-color;
+  content: '';
+}
+
+.status-key.is-good::before {
+  background: $success-color;
+}
+
+.status-key.is-warning::before {
+  background: $warning-color;
+}
+
+.status-key.is-danger::before {
+  background: $danger-color;
+}
+
+@media (max-width: 720px) {
+  .page-heading {
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .page-heading__actions {
+    justify-content: flex-start;
+    width: 100%;
+  }
 }
 
 // 通用工具类
