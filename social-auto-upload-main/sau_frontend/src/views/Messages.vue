@@ -1,58 +1,67 @@
 <template>
   <div class="dm-page">
-    <el-alert
-      v-if="hasNoAccounts"
-      title="当前没有登录账号，无法查看私信"
-      description="请先到「账号管理」添加并登录账号，登录后私信会自动同步显示。"
-      type="info"
-      show-icon
-      :closable="false"
-      style="margin-bottom: 14px;"
-    />
-    <el-alert
-      v-for="problem in dmProblems"
-      :key="problem.platform + '|' + problem.kind"
-      :title="`${problem.platform}私信同步有问题`"
-      :description="problem.message"
-      :type="problem.kind === 'no_accounts' ? 'info' : 'warning'"
-      show-icon
-      :closable="false"
-      style="margin-bottom: 10px;"
-    />
-    <div class="page-head">
-      <div>
-        <h2>私信自动回复</h2>
-        <p class="sub">统一收件箱 · 意向识别 · 自定义回复规则 · 线索沉淀</p>
+    <header class="page-heading dm-heading">
+      <div class="page-heading__copy">
+        <h1>私信中心</h1>
+        <p>统一收件箱、意向识别、自动回复与线索沉淀</p>
+        <div class="head-status-line">
+          <span class="status-key" :class="settings.enabled ? 'is-good' : ''">
+            {{ settings.enabled ? '自动回复运行中' : '自动回复已暂停' }}
+          </span>
+          <span class="status-key" :class="syncTagType === 'success' ? 'is-good' : 'is-warning'">{{ syncTagText }}</span>
+          <span v-if="tierSummaryText" class="status-key" :class="nightMode ? 'is-warning' : ''">{{ tierSummaryText }}</span>
+          <span class="head-refresh-note">界面 5 秒自动刷新</span>
+        </div>
       </div>
-      <div class="head-actions">
-        <el-tag :type="settings.enabled ? 'success' : 'info'" effect="dark" round>
-          {{ settings.enabled ? '自动回复运行中' : '自动回复已暂停' }}
-        </el-tag>
-        <el-tag :type="syncTagType" effect="plain" round>{{ syncTagText }}</el-tag>
-        <el-tag v-if="tierSummaryText" :type="nightMode ? 'warning' : 'info'" effect="plain" round>
-          {{ tierSummaryText }}
-        </el-tag>
-        <el-tag type="success" effect="plain" round>界面 5 秒自动刷新</el-tag>
+      <div class="page-heading__actions head-actions">
         <el-button @click="helpDialog = true">接入说明</el-button>
         <el-button :loading="syncing || syncAnyRunning" :disabled="syncAnyRunning" @click="runAllPlatformSync">同步全部私信</el-button>
         <el-button type="primary" @click="activeTab = 'rules'">回复规则</el-button>
       </div>
-    </div>
+    </header>
+
+    <details v-if="hasNoAccounts || dmProblems.length" class="sync-notices" aria-label="私信同步提示">
+      <summary class="notice-summary">
+        <span class="status-key is-warning">同步提示</span>
+        <span class="notice-summary-text">{{ hasNoAccounts ? '当前没有可用的登录账号' : `${dmProblems.length} 个平台需要检查` }}</span>
+        <span class="notice-toggle-text">查看详情</span>
+      </summary>
+      <div class="notice-body">
+        <div v-if="hasNoAccounts" class="notice-row">
+          <div>
+            <strong>当前没有登录账号，无法查看私信</strong>
+            <p>请先到账号管理添加并登录账号，登录后私信会自动同步显示。</p>
+          </div>
+          <el-button size="small" @click="router.push('/account-management')">去账号管理</el-button>
+        </div>
+        <div
+          v-for="problem in dmProblems"
+          :key="problem.platform + '|' + problem.kind"
+          class="notice-row"
+        >
+          <div>
+            <strong>{{ problem.platform }}私信同步有问题</strong>
+            <p>{{ problem.message }}</p>
+          </div>
+          <span class="notice-kind">{{ problem.kind === 'no_accounts' ? '未登录' : '待检查' }}</span>
+        </div>
+      </div>
+    </details>
 
     <div class="metric-grid">
-      <div class="metric-card" @click="jumpToPending">
+      <div class="metric-card is-interactive" role="button" tabindex="0" @click="jumpToPending" @keyup.enter="jumpToPending">
         <span>待人工处理</span>
         <strong>{{ analytics.pending || 0 }}</strong>
         <small>有客户来信尚未人工回复</small>
       </div>
-      <div class="metric-card" @click="jumpToHighIntent">
+      <div class="metric-card is-interactive" role="button" tabindex="0" @click="jumpToHighIntent" @keyup.enter="jumpToHighIntent">
         <span>高意向客户</span>
         <strong class="danger">{{ analytics.high_intent || 0 }}</strong>
         <small>价格 / 预约 / 购买 / 联系方式</small>
       </div>
       <div class="metric-card">
         <span>今日自动回复</span>
-        <strong class="success">{{ analytics.today_auto || 0 }}</strong>
+        <strong :class="analytics.today_auto ? 'success' : ''">{{ analytics.today_auto || 0 }}</strong>
         <small>已发送 {{ analytics.sent || 0 }} · 待发送 {{ analytics.ready || 0 }}</small>
       </div>
       <div class="metric-card">
@@ -64,7 +73,11 @@
 
     <el-tabs v-model="activeTab" class="main-tabs" @tab-change="handleTabChange">
       <el-tab-pane label="会话工作台" name="inbox">
-        <div class="inbox-layout">
+        <div
+          ref="inboxLayout"
+          class="inbox-layout"
+          :style="inboxHeight ? { '--inbox-custom-height': `${inboxHeight}px` } : undefined"
+        >
           <aside class="conversation-pane">
             <div class="conversation-filters">
               <el-input v-model="convFilters.q" clearable placeholder="搜索用户 ID / 昵称 / 群名 / 内容" @keyup.enter="loadConversations">
@@ -91,6 +104,12 @@
                 </el-select>
               </div>
               <div class="filter-row actions">
+                <el-button
+                  size="small"
+                  class="inbox-height-toggle"
+                  :title="inboxHeight ? '恢复默认高度' : '一键加高工作台'"
+                  @click="toggleInboxExpanded"
+                >{{ inboxHeight ? '恢复高度' : '加高工作台' }}</el-button>
                 <el-button size="small" @click="loadConversations">刷新</el-button>
                 <el-button size="small" @click="importDialog = true">批量导入</el-button>
               </div>
@@ -162,6 +181,11 @@
               </div>
 
               <div ref="messageList" v-loading="loadingMessages" class="message-list">
+                <div v-if="hasOlderMessages" class="load-older-wrap">
+                  <el-button size="small" text :loading="loadingOlderMessages" @click="loadOlderMessages">
+                    加载更早的聊天记录
+                  </el-button>
+                </div>
                 <div v-for="(msg, index) in visibleMessages" :key="msg.id || index" class="message-row" :class="msg.direction">
                   <div class="message-bubble">
                     <div v-if="!mediaOnlyMessage(msg)" class="message-text">{{ msg.content }}</div>
@@ -227,8 +251,8 @@
                 <el-input
                   v-model="replyText"
                   type="textarea"
-                  :rows="4"
-                  resize="none"
+                  :rows="2"
+                  resize="vertical"
                   placeholder="回复客户。Enter 发送并记录，Shift + Enter 换行。"
                   @keydown="handleComposerKeydown"
                 />
@@ -256,6 +280,20 @@
             </template>
             <el-empty v-else description="从左侧选择一个客户会话" :image-size="100" />
           </section>
+          <div
+            class="inbox-resizer"
+            role="separator"
+            tabindex="0"
+            aria-label="调整会话工作台高度"
+            aria-orientation="horizontal"
+            title="上下拖动调整高度，双击恢复默认"
+            @pointerdown="startInboxResize"
+            @dblclick="resetInboxHeight"
+            @keydown.up.prevent="resizeInboxBy(-40)"
+            @keydown.down.prevent="resizeInboxBy(40)"
+          >
+            <span aria-hidden="true"></span>
+          </div>
         </div>
       </el-tab-pane>
 
@@ -381,7 +419,7 @@
                   />
                   <span class="form-hint">
                     {{ activeSyncForm.recent_only
-                      ? `天；每次回补最近 ${activeSyncForm.history_days || 7} 天的聊天记录`
+                      ? `天；平时回补最近 ${activeSyncForm.history_days || 7} 天，项目长时间未运行会自动补上次成功同步以来的缺口（最多 30 天）`
                       : '关闭后尽量拉取平台能给出的全部历史' }}
                   </span>
                 </div>
@@ -719,7 +757,7 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 
 <script setup>
 import { ref, reactive, computed, onMounted, nextTick } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { dmApi } from '@/api/dm'
 import { useAccountStore } from '@/stores/account'
 import { waitForTask } from '@/api/task'
@@ -731,6 +769,7 @@ import {
 import { useLivePolling } from '@/composables/useLivePolling'
 
 const route = useRoute()
+const router = useRouter()
 const apiBase = API_BASE
 const accountStore = useAccountStore()
 const hasNoAccounts = computed(() => !accountStore.accounts.some(account => account.status === '正常'))
@@ -801,6 +840,10 @@ const visibleMessages = computed(() => messages.value.filter(message => {
     && !text.startsWith('该内容为分享内容')
 }))
 const loadingMessages = ref(false)
+const loadingOlderMessages = ref(false)
+const hasOlderMessages = ref(false)
+const inboxLayout = ref(null)
+const inboxHeight = ref(0)
 const messageList = ref(null)
 const lastMessageId = ref(0)
 const liveTick = ref(0)
@@ -1331,6 +1374,7 @@ async function selectConversation(item, markRead = true) {
   currentContact.value = item
   templateId.value = null
   lastMessageId.value = 0
+  hasOlderMessages.value = false
   await loadConversation(item.id)
   if (markRead && Number(item.unread_count || 0) > 0) {
     await markConversationRead(item.id)
@@ -1358,6 +1402,9 @@ async function loadConversation(id, silent = false, incremental = false) {
     const res = await dmApi.getConversation(id, params)
     currentContact.value = res.data.contact
     const incoming = res.data.messages || []
+    if (!incremental) {
+      hasOlderMessages.value = Boolean(res.data.has_more_before)
+    }
     if (incremental && messages.value.length) {
       const byId = new Map(messages.value.map(message => [message.id, message]))
       for (const message of incoming) byId.set(message.id, message)
@@ -1378,6 +1425,39 @@ async function loadConversation(id, silent = false, incremental = false) {
     scrollToBottom()
   } catch (error) { console.error(error) }
   finally { if (!silent) loadingMessages.value = false }
+}
+
+async function loadOlderMessages() {
+  const contactId = currentContact.value?.id
+  const first = messages.value[0]
+  if (!contactId || !first || loadingOlderMessages.value) return
+  loadingOlderMessages.value = true
+  const previousHeight = Number(messageList.value?.scrollHeight || 0)
+  try {
+    const res = await dmApi.getConversation(contactId, {
+      before: Number(first.id || 0),
+      before_at: first.created_at || '',
+    })
+    const older = res.data.messages || []
+    const byId = new Map(messages.value.map(message => [message.id, message]))
+    for (const message of older) byId.set(message.id, message)
+    messages.value = [...byId.values()].sort((a, b) => (
+      String(a.created_at || '').localeCompare(String(b.created_at || ''))
+      || Number(a.id || 0) - Number(b.id || 0)
+    ))
+    hasOlderMessages.value = Boolean(res.data.has_more_before)
+    await nextTick()
+    if (messageList.value) {
+      messageList.value.scrollTop += Math.max(
+        0,
+        Number(messageList.value.scrollHeight || 0) - previousHeight,
+      )
+    }
+  } catch (error) {
+    console.error(error)
+  } finally {
+    loadingOlderMessages.value = false
+  }
 }
 
 function scrollToBottom() {
@@ -1526,6 +1606,56 @@ function jumpToHighIntent() {
   loadConversations()
 }
 
+function clampInboxHeight(height) {
+  return Math.round(Math.min(Math.max(560, height), Math.max(720, window.innerHeight + 420)))
+}
+
+function currentInboxHeight() {
+  return inboxHeight.value || Math.round(inboxLayout.value?.getBoundingClientRect().height || 680)
+}
+
+function resizeInboxBy(delta) {
+  inboxHeight.value = clampInboxHeight(currentInboxHeight() + delta)
+}
+
+function resetInboxHeight() {
+  inboxHeight.value = 0
+}
+
+function toggleInboxExpanded() {
+  if (inboxHeight.value) {
+    resetInboxHeight()
+    return
+  }
+  inboxHeight.value = clampInboxHeight(Math.max(currentInboxHeight() + 320, window.innerHeight + 220))
+}
+
+function startInboxResize(event) {
+  if (window.innerWidth <= 860 || event.button !== 0) return
+  event.preventDefault()
+  const startY = event.clientY
+  const startHeight = currentInboxHeight()
+  const previousUserSelect = document.body.style.userSelect
+  const previousCursor = document.body.style.cursor
+  document.body.style.userSelect = 'none'
+  document.body.style.cursor = 'ns-resize'
+
+  const handleMove = moveEvent => {
+    inboxHeight.value = clampInboxHeight(startHeight + moveEvent.clientY - startY)
+  }
+  const handleEnd = () => {
+    window.removeEventListener('pointermove', handleMove)
+    window.removeEventListener('pointerup', handleEnd)
+    window.removeEventListener('pointercancel', handleEnd)
+    document.body.style.userSelect = previousUserSelect
+    document.body.style.cursor = previousCursor
+  }
+
+  window.addEventListener('pointermove', handleMove)
+  window.addEventListener('pointerup', handleEnd)
+  window.addEventListener('pointercancel', handleEnd)
+}
+
 function handleTabChange(name) {
   if (name === 'leads') loadLeads()
   if (name === 'rules') {
@@ -1653,74 +1783,115 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.dm-page { padding: 6px 4px 20px; }
-.page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
-.page-head h2 { margin: 0 0 6px; font-size: 22px; color: #303133; }
-.sub { margin: 0; color: #909399; font-size: 13px; }
-.head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dm-page { padding-bottom: 24px; }
+.dm-heading { gap: 16px; margin-bottom: 14px; }
+.dm-heading h1 { font-size: 28px; line-height: 1.1; }
+.dm-heading p { margin-top: 4px; font-size: 12px; line-height: 1.5; }
+.head-status-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+.head-status-line .status-key { font-size: 11px; }
+.head-refresh-note { color: #8a9088; font-size: 10px; }
+.head-actions { align-self: flex-start; gap: 6px; }
+.head-actions :deep(.el-button) { height: 32px; min-height: 32px; padding: 0 14px; font-size: 12px; }
 
-.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }
-.metric-card { background: #fff; border: 1px solid #ebeef5; border-radius: 10px; padding: 15px 17px; display: flex; flex-direction: column; gap: 4px; cursor: pointer; transition: .2s; }
-.metric-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(64, 158, 255, .1); }
-.metric-card span { color: #606266; font-size: 13px; }
-.metric-card strong { font-size: 27px; line-height: 1.15; color: #303133; }
-.metric-card small { color: #a0a4ab; font-size: 12px; }
-.metric-card strong.danger { color: #f56c6c; }
-.metric-card strong.success { color: #67c23a; }
+.sync-notices { overflow: hidden; margin-bottom: 16px; border: 1px solid #e9e2d5; border-radius: 14px; background: #fbf7ef; }
+.notice-summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto 12px; align-items: center; gap: 10px; min-height: 42px; padding: 8px 16px; color: #69645b; font-size: 12px; list-style: none; cursor: pointer; user-select: none; }
+.notice-summary::-webkit-details-marker { display: none; }
+.notice-summary:focus-visible { outline: 2px solid rgba(166, 75, 42, .35); outline-offset: -3px; }
+.notice-summary-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notice-toggle-text { color: #8c7a5d; white-space: nowrap; }
+.notice-summary::after { width: 7px; height: 7px; border-right: 1.5px solid #8c7a5d; border-bottom: 1.5px solid #8c7a5d; content: ''; transform: rotate(45deg); transition: transform 180ms cubic-bezier(.22, 1, .36, 1); }
+.sync-notices[open] .notice-summary::after { transform: rotate(-135deg); }
+.sync-notices[open] .notice-toggle-text { font-size: 0; }
+.sync-notices[open] .notice-toggle-text::after { content: '收起详情'; font-size: 12px; }
+.notice-body { border-top: 1px solid #efe8dc; }
+.notice-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid #efe8dc; }
+.notice-row:last-child { border-bottom: 0; }
+.notice-row strong { display: block; color: #3d3932; font-size: 12px; font-weight: 500; }
+.notice-row p { margin: 4px 0 0; color: #777168; font-size: 11px; line-height: 1.55; }
+.notice-kind { color: #8c7a5d; font-size: 11px; white-space: nowrap; }
+
+.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: hidden; margin-bottom: 14px; border: 1px solid #e9ebe6; border-radius: 14px; background: #fffefb; }
+.metric-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'label value' 'hint hint'; align-items: center; column-gap: 12px; row-gap: 2px; min-width: 0; padding: 9px 16px; cursor: default; transition: background-color 180ms cubic-bezier(.22,1,.36,1); }
+.metric-card.is-interactive { cursor: pointer; }
+.metric-card.is-interactive:hover { background: #fbfaf6; }
+.metric-card + .metric-card { border-left: 1px solid #e9ebe6; }
+.metric-card span { grid-area: label; overflow: hidden; color: #697068; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.metric-card strong { grid-area: value; color: #232621; font-size: 22px; font-weight: 500; line-height: 1; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.metric-card small { grid-area: hint; overflow: hidden; color: #8a9088; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.metric-card strong.danger { color: #b5463f; }
+.metric-card strong.success { color: #2f7d5a; }
 
 .main-tabs { background: transparent; }
-.inbox-layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; height: calc(100vh - 250px); min-height: 700px; }
-.conversation-pane, .chat-pane { background: #fff; border: 1px solid #ebeef5; border-radius: 10px; overflow: hidden; }
+.main-tabs :deep(.el-tabs__content) { overflow: visible; }
+.inbox-layout { position: relative; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 0; height: var(--inbox-custom-height, clamp(620px, calc(100dvh - 340px), 900px)); min-height: 560px; overflow: hidden; border: 1px solid #e9ebe6; border-radius: 16px; background: #fffefb; }
+.inbox-resizer { position: absolute; z-index: 8; right: 0; bottom: 0; left: 0; display: flex; justify-content: center; height: 10px; cursor: ns-resize; touch-action: none; }
+.inbox-resizer span { align-self: flex-end; width: 44px; height: 4px; margin-bottom: 2px; border-radius: 999px; background: #c9c4ba; box-shadow: 0 1px 0 rgba(255, 255, 255, .8); transition: background-color 160ms ease, width 160ms ease; }
+.inbox-resizer:hover span, .inbox-resizer:focus-visible span { width: 56px; background: #a64b2a; }
+.inbox-resizer:focus-visible { outline: none; }
+.conversation-pane, .chat-pane { overflow: hidden; border: 0; border-radius: 0; background: #fffefb; }
 .conversation-pane { display: flex; flex-direction: column; }
-.conversation-filters { padding: 12px; border-bottom: 1px solid #ebeef5; display: flex; flex-direction: column; gap: 8px; }
-.filter-row { display: flex; gap: 6px; align-items: center; }
+.chat-pane { border-left: 1px solid #e9ebe6; }
+.conversation-filters { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; border-bottom: 1px solid #ebeef5; }
+.conversation-filters :deep(.el-input__wrapper) { min-height: 30px; padding: 1px 10px; }
+.conversation-filters :deep(.el-select__wrapper) { min-height: 28px; padding: 1px 8px; }
+.conversation-filters :deep(.el-input__inner),
+.conversation-filters :deep(.el-select__selected-item),
+.conversation-filters :deep(.el-select__placeholder) { font-size: 12px; }
+.conversation-filters :deep(.el-button) { height: 28px; min-height: 28px; padding: 0 10px; font-size: 11px; }
+.filter-row { display: flex; gap: 5px; align-items: center; }
 .filter-row .el-select { flex: 1; min-width: 0; }
 .filter-row.actions { justify-content: flex-end; }
 .conversation-list { flex: 1; overflow-y: auto; }
 .conversation-item { position: relative; display: flex; gap: 10px; padding: 12px 13px; border-bottom: 1px solid #f2f4f7; cursor: pointer; transition: .15s; }
-.conversation-item:hover { background: #f7faff; }
-.conversation-item.active { background: #ecf5ff; box-shadow: inset 3px 0 0 #409eff; }
+.conversation-item:hover { background: #faf8f4; }
+.conversation-item.active { background: #f7f0eb; box-shadow: inset 2px 0 0 #a64b2a; }
 .conversation-main { min-width: 0; flex: 1; }
 .conversation-top { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-.conversation-top strong { font-size: 14px; color: #303133; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-top strong { font-size: 14px; color: #232621; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-time { flex: none; font-size: 11px; color: #a0a4ab; }
 .conversation-id { margin-top: 3px; color: #8a8f98; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-tags { display: flex; gap: 4px; margin: 4px 0; flex-wrap: wrap; }
+.conversation-tags :deep(.el-tag), .chat-name :deep(.el-tag) { min-height: 0; height: auto; padding: 0; color: #697068; border: 0; background: transparent; font-size: 11px; font-weight: 400; }
+.conversation-tags :deep(.el-tag + .el-tag::before), .chat-name :deep(.el-tag + .el-tag::before) { margin-right: 6px; color: #b5b9b3; content: '·'; }
+.conversation-tags :deep(.el-tag--danger), .chat-name :deep(.el-tag--danger) { color: #b5463f; }
+.conversation-tags :deep(.el-tag--warning), .chat-name :deep(.el-tag--warning) { color: #697068; }
 .conversation-preview { color: #7a7f87; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.reply-mark { color: #409eff; }
+.reply-mark { color: #a64b2a; }
 .conv-badge { position: absolute; right: 12px; bottom: 12px; }
 .conv-badge :deep(.el-badge__content) { transform: none; }
 
 .chat-pane { display: flex; flex-direction: column; }
 .chat-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 13px 16px; border-bottom: 1px solid #ebeef5; }
 .chat-user { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.chat-name { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-weight: 600; color: #303133; }
-.chat-sub { color: #909399; font-size: 12px; margin-top: 3px; }
+.chat-name { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-weight: 500; color: #232621; }
+.chat-sub { color: #697068; font-size: 12px; margin-top: 3px; }
 .chat-actions { display: flex; gap: 6px; flex: none; }
-.message-list { flex: 1; overflow-y: auto; padding: 18px; background: #f7f8fa; display: flex; flex-direction: column; gap: 12px; }
+.message-list { flex: 1; overflow-y: auto; padding: 18px; background: #f7f6f2; display: flex; flex-direction: column; gap: 12px; }
+.load-older-wrap { text-align: center; padding: 2px 0 6px; }
 .message-row { display: flex; }
 .message-row.inbound { justify-content: flex-start; }
 .message-row.outbound { justify-content: flex-end; }
 .message-bubble { max-width: 74%; background: #fff; border: 1px solid #e9ecf2; padding: 10px 12px; border-radius: 10px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
-.message-row.outbound .message-bubble { background: #e8f3ff; border-color: #cfe5ff; }
-.message-text { white-space: pre-wrap; word-break: break-word; line-height: 1.65; color: #303133; font-size: 14px; }
+.message-row.outbound .message-bubble { background: #f5ebe6; border-color: #ead8cf; }
+.message-text { white-space: pre-wrap; word-break: break-word; line-height: 1.65; color: #232621; font-size: 14px; }
 .message-media { margin-top: 4px; }
 .message-image { display: block; max-width: min(360px, 58vw); max-height: 320px; border-radius: 8px; cursor: zoom-in; }
 .message-video { display: block; width: min(390px, 60vw); max-height: 360px; border-radius: 8px; background: #111; }
 .media-fallback { padding: 8px 2px; }
-.media-note { margin-top: 4px; color: #909399; font-size: 12px; }
+.media-note { margin-top: 4px; color: #697068; font-size: 12px; }
 .media-actions { margin-top: 5px; font-size: 12px; }
-.media-actions a { color: #409eff; text-decoration: none; }
+.media-actions a { color: #a64b2a; text-decoration: none; }
 .composer-send-actions { display: flex; align-items: center; gap: 8px; }
 .hidden-file-input { display: none; }
 .message-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: #a0a4ab; font-size: 11px; flex-wrap: wrap; }
-.message-source { margin-top: 6px; color: #909399; font-size: 11px; }
-.message-error { margin-top: 6px; color: #f56c6c; font-size: 11px; line-height: 1.5; word-break: break-word; }
+.message-source { margin-top: 6px; color: #697068; font-size: 11px; }
+.message-error { margin-top: 6px; color: #b5463f; font-size: 11px; line-height: 1.5; word-break: break-word; }
 .composer { border-top: 1px solid #ebeef5; padding: 12px 14px; background: #fff; }
+.composer :deep(.el-textarea__inner) { min-height: 64px; resize: vertical; }
 .composer-tools { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .composer-tools .el-select { width: 180px; }
 .composer-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 8px; }
-.connector-note { color: #909399; font-size: 12px; }
+.connector-note { color: #697068; font-size: 12px; }
 
 .rule-layout { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(360px, .9fr); gap: 14px; margin-bottom: 14px; }
 .settings-card, .ingress-card, .rules-card, .sync-card { border-radius: 10px; }
@@ -1733,24 +1904,24 @@ onMounted(async () => {
 .time-range .el-date-editor { width: 120px; }
 .ingress-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ingress-label { color: #606266; font-size: 13px; }
-.webhook-url { background: #f5f7fa; border: 1px solid #ebeef5; padding: 5px 8px; border-radius: 5px; font-size: 12px; color: #409eff; word-break: break-all; }
+.webhook-url { background: #f8f7f3; border: 1px solid #e9ebe6; padding: 5px 8px; border-radius: 6px; font-size: 12px; color: #a64b2a; word-break: break-all; }
 .ingress-tip { color: #606266; font-size: 13px; line-height: 1.7; margin: 12px 0; }
 .ingress-tip code { background: #f5f7fa; padding: 1px 4px; border-radius: 3px; }
 .delivery-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 14px 0; }
 .delivery-summary div { background: #f7f8fa; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
-.delivery-summary span { color: #909399; font-size: 12px; }
+.delivery-summary span { color: #697068; font-size: 12px; }
 .delivery-summary strong { font-size: 20px; }
-.delivery-summary strong.success { color: #67c23a; }
+.delivery-summary strong.success { color: #2f7d5a; }
 .delivery-summary strong.warning { color: #e6a23c; }
-.delivery-summary strong.danger { color: #f56c6c; }
+.delivery-summary strong.danger { color: #b5463f; }
 .ingress-actions { display: flex; gap: 8px; margin-top: 14px; }
 .sync-card { margin-bottom: 14px; }
 .sync-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 4px 0 10px; }
 .sync-summary div { background: #f7f8fa; border-radius: 8px; padding: 9px 10px; display: flex; flex-direction: column; gap: 2px; }
-.sync-summary span { color: #909399; font-size: 11px; }
+.sync-summary span { color: #697068; font-size: 11px; }
 .sync-summary strong { font-size: 18px; }
-.sync-summary strong.success { color: #67c23a; }
-.sync-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: #909399; font-size: 12px; margin-bottom: 10px; }
+.sync-summary strong.success { color: #2f7d5a; }
+.sync-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: #697068; font-size: 12px; margin-bottom: 10px; }
 .sync-range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sync-range .el-input-number { width: 108px; }
 .sync-note { margin-top: 10px; }
@@ -1759,9 +1930,9 @@ onMounted(async () => {
 
 .simulate-result { border: 1px solid #ebeef5; border-radius: 8px; background: #f8fafc; padding: 12px; }
 .simulate-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 9px; }
-.simulate-reply { color: #303133; line-height: 1.7; white-space: pre-wrap; }
-.simulate-fields { margin-top: 8px; color: #909399; font-size: 12px; }
-.dialog-hint { color: #909399; font-size: 12px; margin: 0 0 10px; }
+.simulate-reply { color: #232621; line-height: 1.7; white-space: pre-wrap; }
+.simulate-fields { margin-top: 8px; color: #697068; font-size: 12px; }
+.dialog-hint { color: #697068; font-size: 12px; margin: 0 0 10px; }
 .dialog-hint code { background: #f5f7fa; padding: 2px 5px; border-radius: 3px; }
 .import-option { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: #606266; font-size: 13px; }
 .token-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
@@ -1772,23 +1943,36 @@ onMounted(async () => {
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .drawer-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 14px; border-top: 1px solid #ebeef5; }
 .help-section { margin-bottom: 18px; }
-.help-section h4 { margin: 0 0 8px; color: #303133; }
+.help-section h4 { margin: 0 0 8px; color: #232621; }
 .help-section p, .help-section li { color: #606266; font-size: 13px; line-height: 1.8; }
 .help-section ul { padding-left: 20px; margin: 6px 0; }
 .code-block { background: #1f2937; color: #dce6f3; padding: 12px; border-radius: 8px; font-size: 12px; line-height: 1.65; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 
 @media (max-width: 1200px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-card:nth-child(3) { border-top: 1px solid #e9ebe6; border-left: 0; }
+  .metric-card:nth-child(4) { border-top: 1px solid #e9ebe6; }
   .rule-layout { grid-template-columns: 1fr; }
-  .inbox-layout { grid-template-columns: 290px minmax(0, 1fr); }
+  .inbox-layout { grid-template-columns: 300px minmax(0, 1fr); }
 }
 
 @media (max-width: 860px) {
-  .page-head { flex-direction: column; }
-  .inbox-layout { grid-template-columns: 1fr; height: auto; }
+  .head-actions { align-self: auto; }
+  .inbox-layout { grid-template-columns: 1fr; height: auto; min-height: 0; overflow: visible; }
+  .inbox-resizer { display: none; }
+  .inbox-height-toggle { display: none; }
   .conversation-pane { max-height: 380px; }
-  .chat-pane { min-height: 620px; }
+  .chat-pane { min-height: 620px; border-top: 1px solid #e9ebe6; border-left: 0; }
   .message-bubble { max-width: 90%; }
   .metric-grid { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 560px) {
+  .head-status-line { gap: 10px 14px; }
+  .notice-summary { grid-template-columns: auto minmax(0, 1fr) 12px; gap: 8px; padding-right: 12px; padding-left: 12px; }
+  .notice-toggle-text { display: none; }
+  .metric-card { column-gap: 8px; padding: 9px 12px; }
+  .notice-row { grid-template-columns: 1fr; gap: 8px; }
+  .conversation-pane { max-height: 460px; }
 }
 </style>
