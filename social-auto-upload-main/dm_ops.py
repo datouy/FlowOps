@@ -579,8 +579,9 @@ def _backfill_contacts(c):
                   (contact_id, external, item["id"]))
 
 
-def prune_placeholder_messages(platform: str) -> int:
+def prune_placeholder_messages(platform: str, any_direction: bool = False) -> int:
     """清掉伪造的未读占位；有真实内容时也移除“无法展示”提示。"""
+    direction_clause = "" if any_direction else "AND x.direction='inbound'"
     with get_conn() as c:
         legacy = c.execute(
             """SELECT id, contact_id FROM messages
@@ -595,7 +596,7 @@ def prune_placeholder_messages(platform: str) -> int:
                  AND EXISTS (
                      SELECT 1 FROM messages x
                      WHERE x.contact_id=m.contact_id AND x.id<>m.id
-                       AND x.direction='inbound'
+                       """ + direction_clause + """
                        AND x.content<>'当前内容无法在平台上展示'
                        AND x.content NOT LIKE '您有 % 条未读消息%'
                  )""",
@@ -2236,6 +2237,11 @@ def conversation_detail(cid: int):
         after = max(0, int(request.args.get("after") or 0))
     except (TypeError, ValueError):
         after = 0
+    try:
+        before = max(0, int(request.args.get("before") or 0))
+    except (TypeError, ValueError):
+        before = 0
+    before_at = _clean(request.args.get("before_at"), 40)
     with get_conn() as c:
         row = c.execute("SELECT * FROM dm_contacts WHERE id=?", (cid,)).fetchone()
         if not row:
@@ -2246,11 +2252,35 @@ def conversation_detail(cid: int):
         if row["account_deleted"] or not is_active_account_contact(dict(row)):
             return jsonify({"code": 404, "msg": "conversation not found"}), 404
         contact = _decorate_contact(dict(row))
+        visible_sql = _visible_message_sql("m")
+        if before_at:
+            # 历史回补会把旧消息以新 id 入库，向前翻页必须按业务时间游标，
+            # 不能只按自增 id，否则会跳过刚补进来的聊天记录。
+            page_sql = """contact_id=? AND (
+                created_at < ? OR (created_at=? AND id<?)
+            ) AND """ + visible_sql
+            page_args = (cid, before_at, before_at, before)
+        elif before:
+            page_sql = "contact_id=? AND id<? AND " + visible_sql
+            page_args = (cid, before)
+        else:
+            page_sql = "contact_id=? AND id>? AND " + visible_sql
+            page_args = (cid, after)
         messages = [dict(r) for r in c.execute("""SELECT * FROM (
-            SELECT * FROM messages m WHERE contact_id=? AND id>? AND
-                """ + _visible_message_sql("m") + """
+            SELECT * FROM messages m WHERE """ + page_sql + """
             ORDER BY created_at DESC, id DESC LIMIT 200
-        ) ORDER BY created_at ASC, id ASC""", (cid, after)).fetchall()]
+        ) ORDER BY created_at ASC, id ASC""", page_args).fetchall()]
+        has_more_before = False
+        if messages and not after:
+            first = messages[0]
+            first_at = str(first.get("created_at") or "")
+            first_id = int(first.get("id") or 0)
+            has_more_before = c.execute("""SELECT 1 FROM messages m
+                WHERE m.contact_id=? AND (
+                    m.created_at<? OR (m.created_at=? AND m.id<?)
+                ) AND """ + visible_sql + " LIMIT 1""", (
+                cid, first_at, first_at, first_id,
+            )).fetchone() is not None
         contact["needs_reply"] = bool(
             messages and messages[-1].get("direction") == "inbound"
             and messages[-1].get("status") in ("new", "read")
@@ -2271,6 +2301,7 @@ def conversation_detail(cid: int):
                 )
     return jsonify({"code": 200, "data": {
         "contact": contact, "messages": messages, "logs": logs,
+        "has_more_before": has_more_before,
     }, "msg": None})
 
 

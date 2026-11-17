@@ -900,6 +900,7 @@ class BaseDmSync:
 
     def _scan_accounts(
         self, settings: dict, accounts: list[dict], quick: bool = False,
+        force: bool = False,
     ) -> list[dict]:
         """按账号并行扫描；结果顺序与账号顺序一致。
 
@@ -910,7 +911,9 @@ class BaseDmSync:
         skipped_cold = 0
         for account in accounts:
             try:
-                if dm_cursor.is_due(self.platform, self._account_key(account)):
+                if force or dm_cursor.is_due(
+                    self.platform, self._account_key(account)
+                ):
                     due_accounts.append(account)
                 else:
                     skipped_cold += 1
@@ -974,8 +977,15 @@ class BaseDmSync:
             return
         now = now_text()
         ok = bool(result.get("ok"))
-        error = "" if ok else str(result.get("error") or "同步失败")[:500]
-        kind = "" if ok else classify_dm_error(error)
+        complete = bool(result.get("complete", True))
+        state_success = ok and complete
+        if state_success:
+            error = ""
+        elif ok:
+            error = str(result.get("incomplete_reason") or "同步未完成")[:500]
+        else:
+            error = str(result.get("error") or "同步失败")[:500]
+        kind = "" if state_success else classify_dm_error(error)
         try:
             with dm_ops.get_conn() as conn:
                 conn.execute(
@@ -994,7 +1004,7 @@ class BaseDmSync:
                          last_imported=excluded.last_imported""",
                     (
                         self.platform, key, self.account_name(account),
-                        now if ok else "", error, kind, now,
+                        now if state_success else "", error, kind, now,
                         int(result.get("imported") or 0),
                     ),
                 )
@@ -1100,11 +1110,15 @@ class BaseDmSync:
                 ),
             )
             account_results = self._scan_accounts(
-                settings, selected_accounts, quick=trigger in self.quick_triggers
+                settings, selected_accounts, quick=trigger in self.quick_triggers,
+                force=trigger == "manual",
             )
 
             succeeded = [item for item in account_results if item.get("ok")]
             failed = [item for item in account_results if not item.get("ok")]
+            incomplete = [
+                item for item in succeeded if not bool(item.get("complete", True))
+            ]
             scanned = sum(int(item.get("scanned") or 0) for item in succeeded)
             imported = sum(int(item.get("imported") or 0) for item in succeeded)
             duplicates = sum(int(item.get("duplicates") or 0) for item in succeeded)
@@ -1119,8 +1133,8 @@ class BaseDmSync:
                 items.extend(result.get("items") or [])
             error_summary = "；".join(
                 f"{self.account_name(item.get('account'))}："
-                f"{item.get('error') or '同步失败'}"
-                for item in failed
+                f"{item.get('error') or item.get('incomplete_reason') or '同步失败'}"
+                for item in [*failed, *incomplete]
             )[:1000]
             finished_at = now_text()
             duration_ms = int((time.monotonic() - started_mono) * 1000)
@@ -1153,7 +1167,7 @@ class BaseDmSync:
             )
             return {
                 "ok": bool(succeeded) or skipped_all,
-                "partial": bool(failed and succeeded),
+                "partial": bool(incomplete or (failed and succeeded)),
                 "skipped_all": skipped_all,
                 "skipped_cold": int(self._skipped_cold),
                 "trigger": trigger,
