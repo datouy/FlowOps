@@ -263,7 +263,10 @@ def clear_account_stats(platform: int, account_name: str) -> int:
             'DELETE FROM content_stats WHERE platform=? AND account=?',
             (int(platform), account_name),
         )
-        return max(0, int(cursor.rowcount or 0))
+        removed = max(0, int(cursor.rowcount or 0))
+    if removed:
+        _STATS_SUMMARY_CACHE.clear()
+    return removed
 
 
 def _to_int(value: Any) -> int:
@@ -339,10 +342,19 @@ def _item_from_dict(item: dict) -> dict | None:
         return 0
 
     plays = pick('play_count', 'playCount', 'view_count', 'viewCount', 'read_count', 'watch_count', 'exposure_count')
-    likes = pick('like_count', 'likeCount', 'liked_count', 'likedCount', 'digg_count')
-    comments = pick('comment_count', 'commentCount', 'comments_count')
-    collects = pick('collect_count', 'collectCount', 'collected_count', 'fav_count')
-    shares = pick('share_count', 'shareCount', 'forward_count')
+    likes = pick(
+        'like_count', 'likeCount', 'liked_count', 'likedCount', 'digg_count',
+        # 小红书创作后台列表接口使用短字段名。
+        'likes',
+    )
+    comments = pick('comment_count', 'commentCount', 'comments_count', 'comments')
+    collects = pick(
+        'collect_count', 'collectCount', 'collected_count', 'fav_count',
+        'collected',
+    )
+    shares = pick(
+        'share_count', 'shareCount', 'shared_count', 'forward_count', 'shares',
+    )
     followers = pick('follow_count', 'fans_count', 'new_fans', 'follower_count')
     if not any(_to_int(v) for v in (plays, likes, comments, collects, shares)):
         return None
@@ -468,7 +480,12 @@ async def _collect_dom_items(page) -> list[dict]:
     return _dedupe_items(result)
 
 
-async def _collect_api_items(page, url: str, wait_ms: int = 10000) -> list[dict]:
+async def _collect_api_items(
+    page,
+    url: str,
+    wait_ms: int = 10000,
+    auto_scroll: bool = False,
+) -> list[dict]:
     responses = []
 
     def on_response(response):
@@ -483,6 +500,38 @@ async def _collect_api_items(page, url: str, wait_ms: int = 10000) -> list[dict]
     page.on('response', on_response)
     await page.goto(url, wait_until='domcontentloaded', timeout=90000)
     await page.wait_for_timeout(wait_ms)
+    if auto_scroll:
+        # 小红书笔记管理页首批只加载 10 条，继续滚动才会请求 page=1、2…。
+        # 以接口响应数和页面滚动状态连续不变作为结束条件，避免写死页数。
+        last_signature = None
+        stable_rounds = 0
+        for _ in range(20):
+            page_state = await page.evaluate('''() => {
+                window.scrollTo(0, document.body.scrollHeight);
+                const scrollers = [
+                    ...document.querySelectorAll(
+                        '.notes-container,.content,.panel,.d-tabs-pane,[class*=scroll]'
+                    )
+                ];
+                for (const element of scrollers) {
+                    if (element.scrollHeight > element.clientHeight) {
+                        element.scrollTop = element.scrollHeight;
+                    }
+                }
+                return {
+                    height: document.documentElement.scrollHeight,
+                    cards: document.querySelectorAll('.note-card').length,
+                };
+            }''')
+            await page.wait_for_timeout(800)
+            signature = (len(responses), page_state.get('height'), page_state.get('cards'))
+            if signature == last_signature:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    break
+            else:
+                stable_rounds = 0
+                last_signature = signature
     items = []
     for response in responses[-40:]:
         try:
@@ -596,7 +645,12 @@ async def _fetch_xhs(account: dict | None, platform: int) -> list[dict]:
         context = await set_init_script(context)
         page = await context.new_page()
         try:
-            return await _collect_api_items(page, 'https://creator.xiaohongshu.com/new/note-manager', 10000)
+            return await _collect_api_items(
+                page,
+                'https://creator.xiaohongshu.com/new/note-manager',
+                3000,
+                auto_scroll=True,
+            )
         except Exception:
             xiaohongshu_logger.warning('小红书数据回流抓取失败: ' + traceback.format_exc()[-300:])
             return []
@@ -730,6 +784,8 @@ def _save_stats(
                 item.get('published_at', ''), item.get('raw', ''), now,
             ))
             saved += 1
+    if saved:
+        _STATS_SUMMARY_CACHE.clear()
     return saved
 
 
@@ -1194,20 +1250,88 @@ def completion_rate(days: int = 30) -> dict:
     }
 
 
-def stats_summary() -> dict:
-    """返回发布记录、每条记录的最新内容数据、平台/账号汇总。"""
+STATS_SORT_FIELDS = {
+    'contents', 'plays', 'avg_plays', 'likes', 'comments', 'collects',
+    'followers',
+}
+
+
+def _optional_non_negative_int(value: Any, label: str) -> int | None:
+    if value is None or str(value).strip() == '':
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{label}必须是整数') from exc
+    if parsed < 0:
+        raise ValueError(f'{label}不能小于 0')
+    return parsed
+
+
+def stats_summary(
+    platform: int | str | None = None,
+    account: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_plays: int | str | None = None,
+    max_plays: int | str | None = None,
+    sort_by: str = 'avg_plays',
+    sort_order: str = 'desc',
+) -> dict:
+    """返回按平台、账号、发布时间和播放量筛选后的内容汇总。"""
     _db_prepare()
+    platform_filter = _optional_non_negative_int(platform, '平台')
+    if platform_filter == 0:
+        raise ValueError('平台参数不正确')
+    account_filter = str(account or '').strip() or None
+    min_plays_filter = _optional_non_negative_int(min_plays, '最低播放量')
+    max_plays_filter = _optional_non_negative_int(max_plays, '最高播放量')
+    if (
+        min_plays_filter is not None and max_plays_filter is not None
+        and min_plays_filter > max_plays_filter
+    ):
+        raise ValueError('最低播放量不能大于最高播放量')
+
+    start_value = str(start_date or '').strip() or None
+    end_value = str(end_date or '').strip() or None
+    start_at = _parse_time(start_value)
+    end_at = _parse_time(end_value)
+    if start_value and start_at is None:
+        raise ValueError('开始日期格式不正确')
+    if end_value and end_at is None:
+        raise ValueError('结束日期格式不正确')
+    if start_at and len(start_value) == 10:
+        start_at = start_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    if end_at and len(end_value) == 10:
+        end_at = end_at.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if start_at and end_at and start_at > end_at:
+        raise ValueError('开始日期不能晚于结束日期')
+
+    sort_field = str(sort_by or 'avg_plays').strip()
+    if sort_field not in STATS_SORT_FIELDS:
+        raise ValueError('排序字段不支持')
+    sort_direction = str(sort_order or 'desc').strip().lower()
+    if sort_direction not in {'asc', 'desc'}:
+        raise ValueError('排序方向只支持 asc 或 desc')
+
     accounts = access_scope.filter_accounts(_account_rows())
-    _ck = tuple(sorted((str(a.get('type') or ''), str(a.get('userName') or '')) for a in accounts))
-    _cached = _STATS_SUMMARY_CACHE.get(_ck)
+    account_scope_key = tuple(sorted(
+        (str(a.get('type') or ''), str(a.get('userName') or '')) for a in accounts
+    ))
+    cache_key = (
+        account_scope_key, platform_filter, account_filter, start_value,
+        end_value, min_plays_filter, max_plays_filter, sort_field,
+        sort_direction,
+    )
+    _cached = _STATS_SUMMARY_CACHE.get(cache_key)
     if _cached and time.monotonic() - _cached[0] < _STATS_SUMMARY_CACHE_TTL:
         return _cached[1]
+
     with get_conn() as c:
         records = [dict(r) for r in c.execute(
-            'SELECT * FROM publish_records ORDER BY id DESC LIMIT 100'
+            'SELECT * FROM publish_records ORDER BY id DESC LIMIT 500'
         ).fetchall()]
-        # content_key 现在有唯一索引，每条内容只有一行最新快照，
-        # 不需要再套 MAX(id) GROUP BY 子查询去重。
+        # content_key 有唯一索引，每条内容只保留一行最新快照。
         rows = [dict(r) for r in c.execute('''
             SELECT * FROM content_stats
             WHERE content_key IS NOT NULL AND content_key != ''
@@ -1217,10 +1341,60 @@ def stats_summary() -> dict:
     records = filter_current_account_records(records, accounts)
     rows = filter_current_account_rows(rows, accounts)
 
+    date_filter_active = start_at is not None or end_at is not None
+    play_filter_active = (
+        min_plays_filter is not None or max_plays_filter is not None
+    )
+    content_metric_filter_active = date_filter_active or play_filter_active
+    filtered_rows = []
+    undated_contents = 0
+    for row in rows:
+        platform_id = int(row.get('platform') or 0)
+        row_account = str(row.get('account') or '').strip()
+        if platform_filter is not None and platform_id != platform_filter:
+            continue
+        if account_filter is not None and row_account != account_filter:
+            continue
+        if date_filter_active:
+            published_at = _parse_time(row.get('published_at'))
+            if published_at is None:
+                undated_contents += 1
+                continue
+            if start_at is not None and published_at < start_at:
+                continue
+            if end_at is not None and published_at > end_at:
+                continue
+        plays = int(row.get('plays') or 0)
+        if min_plays_filter is not None and plays < min_plays_filter:
+            continue
+        if max_plays_filter is not None and plays > max_plays_filter:
+            continue
+        filtered_rows.append(row)
+    rows = filtered_rows
+
+    selected_account_names = {
+        str(row.get('userName') or '').strip() for row in accounts
+        if account_filter is None or str(row.get('userName') or '').strip() == account_filter
+    }
+    filtered_records = []
+    for record in records:
+        if platform_filter is not None and int(record.get('type') or 0) != platform_filter:
+            continue
+        if account_filter is not None:
+            record_names = {
+                str(item.get('userName') or '').strip()
+                for item in _record_accounts(record, accounts)
+            }
+            if not (record_names & selected_account_names):
+                continue
+        filtered_records.append(record)
+    records = filtered_records
+
     by_record: dict[int, list[dict]] = {}
-    platform_totals: dict[str, dict] = {}
+    platform_totals: dict[int, dict] = {}
     account_totals: dict[tuple[int, str], dict] = {}
-    topic_totals: dict[str, dict] = {}
+    # 话题按平台和账号拆分。即使选择“全部账号”，也不会把同名话题混成一行。
+    topic_totals: dict[tuple[int, str, str], dict] = {}
     for row in rows:
         topics = {
             re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', match, flags=re.IGNORECASE)
@@ -1230,30 +1404,40 @@ def stats_summary() -> dict:
         row['topics'] = sorted(topics)
         if row.get('record_id'):
             by_record.setdefault(int(row['record_id']), []).append(row)
-        platform = str(row.get('platform') or '')
-        platform_id = int(platform) if platform.isdigit() else 0
-        p = platform_totals.setdefault(platform, {
-            'platform': platform_id, 'name': PLATFORM_NAMES.get(platform_id, platform),
+        platform_id = int(row.get('platform') or 0)
+        p = platform_totals.setdefault(platform_id, {
+            'platform': platform_id,
+            'name': PLATFORM_NAMES.get(platform_id, str(platform_id)),
             'contents': 0, 'plays': 0, 'likes': 0, 'comments': 0,
             'collects': 0, 'shares': 0, 'followers': 0,
         })
-        account_key = (int(row.get('platform') or 0), str(row.get('account') or ''))
+        account_key = (platform_id, str(row.get('account') or '').strip())
         a = account_totals.setdefault(account_key, {
-            'platform': account_key[0], 'name': PLATFORM_NAMES.get(account_key[0], str(account_key[0])),
-            'account': account_key[1], 'contents': 0, 'plays': 0, 'likes': 0,
-            'comments': 0, 'collects': 0, 'shares': 0, 'followers': 0,
+            'platform': account_key[0],
+            'name': PLATFORM_NAMES.get(account_key[0], str(account_key[0])),
+            'account': account_key[1], 'contents': 0, 'plays': 0,
+            'likes': 0, 'comments': 0, 'collects': 0, 'shares': 0,
+            'followers': 0,
         })
         for target in (p, a):
             target['contents'] += 1
-            for metric in ('plays', 'likes', 'comments', 'collects', 'shares', 'followers'):
+            for metric in (
+                'plays', 'likes', 'comments', 'collects', 'shares', 'followers'
+            ):
                 target[metric] += int(row.get(metric) or 0)
         for topic in topics:
-            t = topic_totals.setdefault(topic, {
-                'topic': topic, 'contents': 0, 'plays': 0, 'likes': 0,
-                'comments': 0, 'collects': 0, 'followers': 0,
+            topic_key = (platform_id, account_key[1], topic)
+            t = topic_totals.setdefault(topic_key, {
+                'platform': platform_id,
+                'name': PLATFORM_NAMES.get(platform_id, str(platform_id)),
+                'account': account_key[1], 'topic': topic,
+                'contents': 0, 'plays': 0, 'likes': 0, 'comments': 0,
+                'collects': 0, 'shares': 0, 'followers': 0,
             })
             t['contents'] += 1
-            for metric in ('plays', 'likes', 'comments', 'collects', 'followers'):
+            for metric in (
+                'plays', 'likes', 'comments', 'collects', 'shares', 'followers'
+            ):
                 t[metric] += int(row.get(metric) or 0)
 
     for summary_row in list(platform_totals.values()) + list(account_totals.values()):
@@ -1265,8 +1449,12 @@ def stats_summary() -> dict:
             topic_row['plays'] / topic_row['contents'], 1
         ) if topic_row['contents'] else 0
 
+    kept_records = []
     for record in records:
         stats = by_record.get(int(record['id']), [])
+        # 时间/播放量是内容指标，不能用一条无关的发布审计记录占位。
+        if content_metric_filter_active and not stats:
+            continue
         record['account_names'] = [
             str((account or {}).get('userName') or '')
             for account in _record_accounts(record, accounts)
@@ -1275,35 +1463,58 @@ def stats_summary() -> dict:
         record['stats'] = stats
         record['stats_summary'] = {
             metric: sum(int(item.get(metric) or 0) for item in stats)
-            for metric in ('plays', 'likes', 'comments', 'collects', 'shares', 'followers')
+            for metric in (
+                'plays', 'likes', 'comments', 'collects', 'shares', 'followers'
+            )
         }
         record['content_count'] = len(stats)
+        kept_records.append(record)
+    records = kept_records
 
+    def ordered(items, secondary: str):
+        return sorted(
+            items,
+            key=lambda item: (
+                float(item.get(sort_field) or 0),
+                float(item.get('plays') or 0),
+                str(item.get(secondary) or ''),
+            ),
+            reverse=sort_direction == 'desc',
+        )
+
+    content_sort_field = 'plays' if sort_field in {'avg_plays', 'contents'} else sort_field
     top_contents = sorted(
         rows,
-        key=lambda r: (int(r.get('plays') or 0), int(r.get('likes') or 0)),
-        reverse=True,
-    )[:20]
+        key=lambda row: (
+            int(row.get(content_sort_field) or 0),
+            int(row.get('plays') or 0),
+            str(row.get('published_at') or ''),
+        ),
+        reverse=sort_direction == 'desc',
+    )[:200]
     _result = {
         'records': records,
-        'platform_totals': sorted(
-            platform_totals.values(),
-            key=lambda item: (item['plays'], item['contents']),
-            reverse=True,
-        ),
-        'account_totals': sorted(
-            account_totals.values(),
-            key=lambda item: (item['followers'], item['plays']),
-            reverse=True,
-        ),
-        'topic_totals': sorted(
-            topic_totals.values(),
-            key=lambda item: (item['avg_plays'], item['plays']),
-            reverse=True,
-        )[:20],
+        'platform_totals': ordered(platform_totals.values(), 'name'),
+        'account_totals': ordered(account_totals.values(), 'account'),
+        'topic_totals': ordered(topic_totals.values(), 'topic')[:30],
         'top_contents': top_contents,
-        'last_fetched_at': max((r.get('fetched_at') for r in rows if r.get('fetched_at')), default=None),
+        'last_fetched_at': max(
+            (r.get('fetched_at') for r in rows if r.get('fetched_at')),
+            default=None,
+        ),
         'sync': stats_status(),
+        'filtered_contents': len(rows),
+        'undated_contents': undated_contents,
+        'filters': {
+            'platform': platform_filter,
+            'account': account_filter,
+            'start_date': start_value,
+            'end_date': end_value,
+            'min_plays': min_plays_filter,
+            'max_plays': max_plays_filter,
+            'sort_by': sort_field,
+            'sort_order': sort_direction,
+        },
     }
-    _STATS_SUMMARY_CACHE[_ck] = (time.monotonic(), _result)
+    _STATS_SUMMARY_CACHE[cache_key] = (time.monotonic(), _result)
     return _result
