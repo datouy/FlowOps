@@ -1252,7 +1252,7 @@ def completion_rate(days: int = 30) -> dict:
 
 STATS_SORT_FIELDS = {
     'contents', 'plays', 'avg_plays', 'likes', 'comments', 'collects',
-    'followers',
+    'followers', 'published_at',
 }
 
 
@@ -1410,6 +1410,7 @@ def stats_summary(
             'name': PLATFORM_NAMES.get(platform_id, str(platform_id)),
             'contents': 0, 'plays': 0, 'likes': 0, 'comments': 0,
             'collects': 0, 'shares': 0, 'followers': 0,
+            'first_published_at': '', 'latest_published_at': '',
         })
         account_key = (platform_id, str(row.get('account') or '').strip())
         a = account_totals.setdefault(account_key, {
@@ -1417,14 +1418,27 @@ def stats_summary(
             'name': PLATFORM_NAMES.get(account_key[0], str(account_key[0])),
             'account': account_key[1], 'contents': 0, 'plays': 0,
             'likes': 0, 'comments': 0, 'collects': 0, 'shares': 0,
-            'followers': 0,
+            'followers': 0, 'first_published_at': '',
+            'latest_published_at': '',
         })
+        row_published_at = _parse_time(row.get('published_at'))
         for target in (p, a):
             target['contents'] += 1
             for metric in (
                 'plays', 'likes', 'comments', 'collects', 'shares', 'followers'
             ):
                 target[metric] += int(row.get(metric) or 0)
+            if row_published_at:
+                first_at = _parse_time(target.get('first_published_at'))
+                latest_at = _parse_time(target.get('latest_published_at'))
+                if first_at is None or row_published_at < first_at:
+                    target['first_published_at'] = row_published_at.strftime(
+                        '%Y-%m-%d %H:%M:%S'
+                    )
+                if latest_at is None or row_published_at > latest_at:
+                    target['latest_published_at'] = row_published_at.strftime(
+                        '%Y-%m-%d %H:%M:%S'
+                    )
         for topic in topics:
             topic_key = (platform_id, account_key[1], topic)
             t = topic_totals.setdefault(topic_key, {
@@ -1433,12 +1447,24 @@ def stats_summary(
                 'account': account_key[1], 'topic': topic,
                 'contents': 0, 'plays': 0, 'likes': 0, 'comments': 0,
                 'collects': 0, 'shares': 0, 'followers': 0,
+                'first_published_at': '', 'latest_published_at': '',
             })
             t['contents'] += 1
             for metric in (
                 'plays', 'likes', 'comments', 'collects', 'shares', 'followers'
             ):
                 t[metric] += int(row.get(metric) or 0)
+            if row_published_at:
+                first_at = _parse_time(t.get('first_published_at'))
+                latest_at = _parse_time(t.get('latest_published_at'))
+                if first_at is None or row_published_at < first_at:
+                    t['first_published_at'] = row_published_at.strftime(
+                        '%Y-%m-%d %H:%M:%S'
+                    )
+                if latest_at is None or row_published_at > latest_at:
+                    t['latest_published_at'] = row_published_at.strftime(
+                        '%Y-%m-%d %H:%M:%S'
+                    )
 
     for summary_row in list(platform_totals.values()) + list(account_totals.values()):
         summary_row['avg_plays'] = round(
@@ -1472,6 +1498,24 @@ def stats_summary(
     records = kept_records
 
     def ordered(items, secondary: str):
+        if sort_field == 'published_at':
+            time_field = (
+                'latest_published_at'
+                if sort_direction == 'desc' else 'first_published_at'
+            )
+            dated = []
+            undated = []
+            for item in items:
+                published_at = _parse_time(item.get(time_field))
+                if published_at is None:
+                    undated.append(item)
+                else:
+                    dated.append((published_at, item))
+            dated.sort(
+                key=lambda pair: (pair[0], str(pair[1].get(secondary) or '')),
+                reverse=sort_direction == 'desc',
+            )
+            return [item for _published_at, item in dated] + undated
         return sorted(
             items,
             key=lambda item: (
@@ -1482,16 +1526,36 @@ def stats_summary(
             reverse=sort_direction == 'desc',
         )
 
-    content_sort_field = 'plays' if sort_field in {'avg_plays', 'contents'} else sort_field
-    top_contents = sorted(
-        rows,
-        key=lambda row: (
-            int(row.get(content_sort_field) or 0),
-            int(row.get('plays') or 0),
-            str(row.get('published_at') or ''),
-        ),
-        reverse=sort_direction == 'desc',
-    )[:200]
+    if sort_field == 'published_at':
+        dated_contents = []
+        undated_content_rows = []
+        for row in rows:
+            published_at = _parse_time(row.get('published_at'))
+            if published_at is None:
+                undated_content_rows.append(row)
+            else:
+                dated_contents.append((published_at, row))
+        dated_contents.sort(
+            key=lambda pair: (pair[0], int(pair[1].get('plays') or 0)),
+            reverse=sort_direction == 'desc',
+        )
+        top_contents = [
+            row for _published_at, row in dated_contents
+        ] + undated_content_rows
+    else:
+        content_sort_field = (
+            'plays' if sort_field in {'avg_plays', 'contents'} else sort_field
+        )
+        top_contents = sorted(
+            rows,
+            key=lambda row: (
+                int(row.get(content_sort_field) or 0),
+                int(row.get('plays') or 0),
+                str(row.get('published_at') or ''),
+            ),
+            reverse=sort_direction == 'desc',
+        )
+    top_contents = top_contents[:200]
     _result = {
         'records': records,
         'platform_totals': ordered(platform_totals.values(), 'name'),

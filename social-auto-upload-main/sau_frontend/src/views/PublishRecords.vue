@@ -598,6 +598,7 @@ const summary = ref({
   undated_contents: 0,
 })
 const sortOptions = [
+  { value: 'published_at', label: '发布时间' },
   { value: 'avg_plays', label: '平均播放' },
   { value: 'plays', label: '总播放' },
   { value: 'likes', label: '点赞' },
