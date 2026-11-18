@@ -1689,7 +1689,7 @@ def stats_summary(
         'records': records,
         'platform_totals': ordered(platform_totals.values(), 'name'),
         'account_totals': ordered(account_totals.values(), 'account'),
-        'topic_totals': ordered(topic_totals.values(), 'topic')[:30],
+        'topic_totals': ordered(topic_totals.values(), 'topic'),
         'top_contents': top_contents,
         'last_fetched_at': max(
             (r.get('fetched_at') for r in rows if r.get('fetched_at')),

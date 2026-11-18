@@ -210,10 +210,10 @@
         <template #header>
           <div class="section-heading">
             <span>内容话题表现</span>
-            <span class="section-context">{{ filterContextText }}</span>
+            <span class="section-context">{{ topicTotals.length }} 个话题 · {{ filterContextText }}</span>
           </div>
         </template>
-        <el-table v-if="summary.topic_totals?.length" :data="summary.topic_totals" size="small" stripe>
+        <el-table v-if="topicTotals.length" :data="topicTotals" size="small" stripe max-height="640">
           <el-table-column label="归属账号" min-width="145">
             <template #default="s">
               <strong class="account-name">{{ s.row.account }}</strong>
@@ -668,6 +668,7 @@ const platformTags = {1:'info',2:'warning',3:'danger',4:'success',5:'danger',6:'
 const platformName = t => platformNames[t] || ('类型' + t)
 const platformTag = t => platformTags[t] || 'info'
 const records = computed(() => summary.value.records || [])
+const topicTotals = computed(() => summary.value.topic_totals || [])
 const contentCount = computed(() => (summary.value.platform_totals || []).reduce((sum, p) => sum + Number(p.contents || 0), 0))
 const filteredContents = computed(() => Number(summary.value.filtered_contents ?? contentCount.value))
 const syncing = computed(() => Boolean(summary.value.sync?.running))
