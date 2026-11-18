@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
 from patchright.sync_api import Error as PlaywrightError
@@ -415,6 +416,20 @@ class InteractivePlatformLogin:
         identity_source = "localStorage:finder_username" if identity else ""
         if not identity_value:
             identity_value, identity_source = file_identity(cookie_path, platform_type)
+        # 新版创作平台的登录身份落在 localStorage.USER_INFO 里，不再保证
+        # 下发 x-user-id-creator cookie。storage_state 已经包含这段 script，
+        # 但 account_store.file_identity 只能识别顶层 user_id/USER_ID 键，
+        # 这里用已经解析出的 USER_INFO.userId 作为稳定身份兜底。
+        if (
+            not identity_value
+            and self.platform == "xiaohongshu"
+            and self._xhs_user_info.get("user_id")
+        ):
+            identity_value = str(self._xhs_user_info["user_id"])
+            identity_source = "localStorage:USER_INFO"
+        nickname = ""
+        if self.platform == "xiaohongshu":
+            nickname = str(self._xhs_user_info.get("nickname") or "").strip()
         if self.platform == "tencent" and identity_value and not target_id:
             existing = self._find_tencent_account_by_identity(identity_value)
             if existing:
@@ -433,6 +448,7 @@ class InteractivePlatformLogin:
             account_id=target_id,
             identity=identity_value,
             identity_source=identity_source,
+            nickname=nickname,
             # The target Channels environment is still being verified.  Keep
             # the account out of the publish queue until that check succeeds.
             status=0 if self.platform == "tencent" else 1,
@@ -869,11 +885,10 @@ class InteractivePlatformLogin:
             if cookie.get("value")
         }
 
-        if not (names & self._auth_cookie_names):
-            return False
-
         if self.platform == "xiaohongshu":
             return self._xhs_logged_in(context, names, page)
+        if not (names & self._auth_cookie_names):
+            return False
         return True
 
     def _xhs_logged_in(self, context, names: set[str], page=None) -> bool:
@@ -891,9 +906,21 @@ class InteractivePlatformLogin:
            访问主站 explore 也会拿到一个游客态 web_session，拿它当"已登录"
            会在窗口刚打开时就误报成功。
 
-        创作平台的 cookie 只有用户真的在创作平台登录过才会有，所以只要这组
-        cookie 在，判据就成立（这正是官方登录窗口走的路径）。
+        新版创作平台可能不下发旧版会话 cookie，只把用户身份写入
+        ``localStorage.USER_INFO``；因此同时接受“创作平台页面 + userId”的
+        正面证据。主站游客态不会生成这段带 userId 的创作者信息。
         """
+        # 新版创作平台把登录用户写到 localStorage.USER_INFO，并且可能只保留
+        # 主站 web_session，不再下发 customer-sso-sid 等旧版创作 Cookie。
+        # 页面已经进入创作平台且 USER_INFO 有 userId，就是可靠的正面证据。
+        user_info = self._read_xhs_user_info(page)
+        if user_info.get("user_id"):
+            current_url = str(getattr(page, "url", "") or "")
+            path = urlparse(current_url).path if current_url else ""
+            if "creator.xiaohongshu.com" in current_url and not path.startswith("/login"):
+                self._xhs_user_info = user_info
+                return True
+
         if names & XHS_CREATOR_AUTH_COOKIE_NAMES:
             # 创作平台会话成立。USER_INFO 有 userId 时把它记下来，
             # 后面保存账号时用它做身份识别。
@@ -980,8 +1007,6 @@ class InteractivePlatformLogin:
             return None
 
         try:
-            from urllib.parse import parse_qs, urlparse
-
             current_url = str(getattr(page, "url", "") or "")
             if "finder_username=" in current_url:
                 from_url = (parse_qs(urlparse(current_url).query).get("finder_username") or [""])[0]
