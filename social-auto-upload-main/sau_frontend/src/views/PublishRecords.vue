@@ -1155,7 +1155,15 @@ onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncP
 .toolbar { margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sync-time { color: #909399; font-size: 12px; margin-right: 4px; }
-.filter-card { margin-bottom: 16px; border-color: #e4eaf2; }
+.filter-card {
+  margin-bottom: 16px;
+  border-color: #e4eaf2;
+  position: sticky;
+  top: -32px;
+  z-index: 8;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(31, 45, 61, 0.08);
+}
 .filter-card :deep(.el-card__body) { padding: 14px 16px 12px; }
 .filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .filter-heading > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
@@ -1203,9 +1211,13 @@ onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncP
 .funnel-rate { width: 68px; text-align: right; color: #909399; font-size: 12px; }
 .funnel-hint { margin-top: 10px; font-size: 11px; color: #909399; line-height: 1.5; }
 @media (max-width: 900px) {
+  .filter-card { position: static; box-shadow: none; }
   .metric-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
   .filter-actions { margin-left: 0; }
   .filter-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+}
+@media (min-width: 901px) and (max-width: 1100px) {
+  .filter-card { top: -24px; }
 }
 @media (max-width: 520px) {
   .metric-grid { grid-template-columns: 1fr; }
