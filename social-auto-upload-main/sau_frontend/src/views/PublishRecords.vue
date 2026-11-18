@@ -34,6 +34,109 @@
       </div>
     </div>
 
+    <el-card
+      v-if="view === 'overview' || view === 'records'"
+      shadow="never"
+      class="filter-card"
+    >
+      <div class="filter-heading">
+        <div>
+          <strong>筛选与排序</strong>
+          <span>按作品发布时间、平台和账号独立查看数据</span>
+        </div>
+        <span class="filter-count">当前筛选 {{ filteredContents }} 条作品</span>
+      </div>
+      <el-form class="filter-form" inline @submit.prevent="applyFilters">
+        <el-form-item label="平台">
+          <el-select
+            v-model="filterDraft.platform"
+            clearable
+            placeholder="全部平台"
+            style="width: 132px"
+            @change="handlePlatformChange"
+          >
+            <el-option
+              v-for="item in availablePlatforms"
+              :key="item.value"
+              :label="item.label"
+              :value="item.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="账号">
+          <el-select
+            v-model="filterDraft.accountKey"
+            clearable
+            filterable
+            placeholder="全部账号"
+            style="width: 210px"
+          >
+            <el-option
+              v-for="item in availableAccountOptions"
+              :key="item.value"
+              :label="item.label"
+              :value="item.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="发布时间">
+          <el-date-picker
+            v-model="filterDraft.dateRange"
+            type="daterange"
+            value-format="YYYY-MM-DD"
+            range-separator="至"
+            start-placeholder="开始日期"
+            end-placeholder="结束日期"
+            :shortcuts="dateShortcuts"
+            style="width: 260px"
+          />
+        </el-form-item>
+        <el-form-item label="播放量">
+          <div class="play-range">
+            <el-input-number
+              v-model="filterDraft.minPlays"
+              :min="0"
+              :controls="false"
+              placeholder="最低"
+            />
+            <span>至</span>
+            <el-input-number
+              v-model="filterDraft.maxPlays"
+              :min="0"
+              :controls="false"
+              placeholder="最高"
+            />
+          </div>
+        </el-form-item>
+        <el-form-item label="排序">
+          <div class="sort-controls">
+            <el-select v-model="filterDraft.sortBy" style="width: 116px">
+              <el-option
+                v-for="item in sortOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-select v-model="filterDraft.sortOrder" style="width: 88px">
+              <el-option label="降序" value="desc" />
+              <el-option label="升序" value="asc" />
+            </el-select>
+          </div>
+        </el-form-item>
+        <el-form-item class="filter-actions">
+          <el-button type="primary" @click="applyFilters">查询</el-button>
+          <el-button @click="resetFilters">重置</el-button>
+        </el-form-item>
+      </el-form>
+      <div class="filter-context">
+        <el-tag effect="plain" type="info">{{ filterContextText }}</el-tag>
+        <span v-if="summary.undated_contents">
+          {{ summary.undated_contents }} 条作品缺少可识别的发布时间，未计入时间筛选
+        </span>
+      </div>
+    </el-card>
+
     <template v-if="view === 'overview'">
       <div class="metric-grid">
         <div class="metric-card">
@@ -103,9 +206,22 @@
         </el-col>
       </el-row>
 
-      <el-card v-if="summary.topic_totals?.length" shadow="never" class="panel-card">
-        <template #header><span>内容话题表现</span></template>
-        <el-table :data="summary.topic_totals" size="small" stripe>
+      <el-card shadow="never" class="panel-card">
+        <template #header>
+          <div class="section-heading">
+            <span>内容话题表现</span>
+            <span class="section-context">{{ filterContextText }}</span>
+          </div>
+        </template>
+        <el-table v-if="summary.topic_totals?.length" :data="summary.topic_totals" size="small" stripe>
+          <el-table-column label="归属账号" min-width="145">
+            <template #default="s">
+              <strong class="account-name">{{ s.row.account }}</strong>
+              <el-tag size="small" :type="platformTag(s.row.platform)" class="platform-tag">
+                {{ s.row.name || platformName(s.row.platform) }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column label="话题" min-width="150">
             <template #default="s"><el-tag size="small" effect="plain">#{{ s.row.topic }}</el-tag></template>
           </el-table-column>
@@ -126,6 +242,17 @@
             <template #default="s">{{ formatNum(s.row.followers) }}</template>
           </el-table-column>
         </el-table>
+        <el-empty
+          v-else
+          :image-size="64"
+        >
+          <template #description>
+            <div>当前筛选条件下没有可识别的话题</div>
+            <small v-if="showXhsTopicHint" class="topic-empty-hint">
+              小红书创作后台列表不返回正文话题，作品仍会计入播放量、筛选和下方作品表现。
+            </small>
+          </template>
+        </el-empty>
       </el-card>
 
       <el-row :gutter="12" class="panel-row">
@@ -184,7 +311,13 @@
       </el-row>
 
       <el-card shadow="never" class="panel-card top-card">
-        <template #header><span>播放量 Top 作品</span></template>        <el-table :data="summary.top_contents" size="small" stripe>
+        <template #header>
+          <div class="section-heading">
+            <span>作品表现</span>
+            <span class="section-context">{{ filteredContents }} 条 · 按{{ sortFieldLabel(summary.filters?.sort_by) }}{{ summary.filters?.sort_order === 'asc' ? '升序' : '降序' }}</span>
+          </div>
+        </template>
+        <el-table v-if="summary.top_contents?.length" :data="summary.top_contents" size="small" stripe>
           <el-table-column type="index" label="#" width="52" />
           <el-table-column label="平台" width="84">
             <template #default="s"><el-tag size="small" :type="platformTag(s.row.platform)">{{ platformName(s.row.platform) }}</el-tag></template>
@@ -207,7 +340,7 @@
           </el-table-column>
           <el-table-column prop="published_at" label="发布时间" width="150" />
         </el-table>
-        <el-empty v-if="!summary.top_contents.length" description="同步发布数据后，这里会展示作品表现" :image-size="70" />
+        <el-empty v-else description="当前筛选条件下没有作品数据" :image-size="70" />
       </el-card>
     </template>
 
@@ -460,8 +593,47 @@ const summary = ref({
   topic_totals: [],
   last_fetched_at: null,
   sync: {},
+  filters: {},
+  filtered_contents: 0,
+  undated_contents: 0,
 })
-      // 月度趋势与成交漏斗。
+const sortOptions = [
+  { value: 'avg_plays', label: '平均播放' },
+  { value: 'plays', label: '总播放' },
+  { value: 'likes', label: '点赞' },
+  { value: 'comments', label: '评论' },
+  { value: 'collects', label: '收藏' },
+  { value: 'followers', label: '涨粉' },
+  { value: 'contents', label: '作品数' },
+]
+
+function createFilterDraft() {
+  return {
+    platform: null,
+    accountKey: '',
+    dateRange: [],
+    minPlays: null,
+    maxPlays: null,
+    sortBy: 'avg_plays',
+    sortOrder: 'desc',
+  }
+}
+
+function dateRangeForDays(days) {
+  const end = new Date()
+  const start = new Date()
+  start.setDate(start.getDate() - days + 1)
+  return [start, end]
+}
+
+const filterDraft = ref(createFilterDraft())
+const dateShortcuts = [
+  { text: '近 7 天', value: () => dateRangeForDays(7) },
+  { text: '近 30 天', value: () => dateRangeForDays(30) },
+  { text: '近 90 天', value: () => dateRangeForDays(90) },
+]
+
+// 月度趋势与成交漏斗。
 const trend = ref({ months: 6, series: [] })
 const funnel = ref({ days: 30, stages: [], inbound_messages: 0, outbound_messages: 0 })
 const completion = ref({ estimated: false, estimated_completion: 0 })
@@ -496,6 +668,7 @@ const platformName = t => platformNames[t] || ('类型' + t)
 const platformTag = t => platformTags[t] || 'info'
 const records = computed(() => summary.value.records || [])
 const contentCount = computed(() => (summary.value.platform_totals || []).reduce((sum, p) => sum + Number(p.contents || 0), 0))
+const filteredContents = computed(() => Number(summary.value.filtered_contents ?? contentCount.value))
 const syncing = computed(() => Boolean(summary.value.sync?.running))
 const lastFetchedAt = computed(() => summary.value.last_fetched_at)
 const expiredAccounts = computed(() => accountStatus.value.filter(a => !a.alive).map(a => a.account_name || ('账号#' + a.account_id)))
@@ -507,6 +680,124 @@ const engagementRate = computed(() => {
   if (!totals.value.plays) return '0.0'
   return (((totals.value.likes + totals.value.comments + totals.value.collects) / totals.value.plays) * 100).toFixed(1)
 })
+
+const availablePlatforms = computed(() => {
+  const values = new Map()
+  const add = (type, label = '') => {
+    const platform = Number(type)
+    if (!platform || values.has(platform)) return
+    values.set(platform, { value: platform, label: label || platformName(platform) })
+  }
+  accountStore.accounts.forEach(item => add(item.type, item.platform))
+  ;(summary.value.account_totals || []).forEach(item => add(item.platform, item.name))
+  return [...values.values()].sort((a, b) => a.value - b.value)
+})
+
+const availableAccountOptions = computed(() => {
+  const platform = Number(filterDraft.value.platform || 0)
+  const values = new Map()
+  const add = (type, name) => {
+    const platformId = Number(type)
+    const accountName = String(name || '').trim()
+    if (!platformId || !accountName || (platform && platformId !== platform)) return
+    const value = `${platformId}::${accountName}`
+    if (!values.has(value)) {
+      values.set(value, {
+        value,
+        type: platformId,
+        name: accountName,
+        label: `${accountName} · ${platformName(platformId)}`,
+      })
+    }
+  }
+  accountStore.accounts.forEach(item => add(item.type, item.name))
+  ;(summary.value.account_totals || []).forEach(item => add(item.platform, item.account))
+  return [...values.values()].sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
+})
+
+function selectedAccountOption() {
+  return availableAccountOptions.value.find(
+    item => item.value === filterDraft.value.accountKey,
+  )
+}
+
+function handlePlatformChange() {
+  const account = selectedAccountOption()
+  const platform = Number(filterDraft.value.platform || 0)
+  if (account && platform && account.type !== platform) {
+    filterDraft.value.accountKey = ''
+  }
+}
+
+function sortFieldLabel(value) {
+  return sortOptions.find(item => item.value === value)?.label || '平均播放'
+}
+
+const filterContextText = computed(() => {
+  const filters = summary.value.filters || {}
+  const parts = [
+    filters.platform ? platformName(filters.platform) : '全部平台',
+    filters.account || '全部账号',
+  ]
+  if (filters.start_date || filters.end_date) {
+    parts.push(`${filters.start_date || '最早'} 至 ${filters.end_date || '最新'}`)
+  } else {
+    parts.push('全部时间')
+  }
+  if (filters.min_plays !== null && filters.min_plays !== undefined && filters.max_plays !== null && filters.max_plays !== undefined) {
+    parts.push(`播放量 ${formatNum(filters.min_plays)}–${formatNum(filters.max_plays)}`)
+  } else if (filters.min_plays !== null && filters.min_plays !== undefined) {
+    parts.push(`播放量 ≥ ${formatNum(filters.min_plays)}`)
+  } else if (filters.max_plays !== null && filters.max_plays !== undefined) {
+    parts.push(`播放量 ≤ ${formatNum(filters.max_plays)}`)
+  } else {
+    parts.push('播放量不限')
+  }
+  parts.push(`${sortFieldLabel(filters.sort_by)}${filters.sort_order === 'asc' ? '升序' : '降序'}`)
+  return parts.join(' · ')
+})
+
+const showXhsTopicHint = computed(() => (
+  Number(summary.value.filtered_contents || 0) > 0
+  && Number(summary.value.filters?.platform || 0) === 1
+))
+
+function buildSummaryParams() {
+  const params = {
+    sort_by: filterDraft.value.sortBy || 'avg_plays',
+    sort_order: filterDraft.value.sortOrder || 'desc',
+  }
+  const account = selectedAccountOption()
+  const platform = account?.type || Number(filterDraft.value.platform || 0)
+  if (platform) params.platform = platform
+  if (account) params.account = account.name
+  if (Array.isArray(filterDraft.value.dateRange) && filterDraft.value.dateRange.length === 2) {
+    params.start_date = filterDraft.value.dateRange[0]
+    params.end_date = filterDraft.value.dateRange[1]
+  }
+  if (filterDraft.value.minPlays !== null && filterDraft.value.minPlays !== undefined) {
+    params.min_plays = Number(filterDraft.value.minPlays)
+  }
+  if (filterDraft.value.maxPlays !== null && filterDraft.value.maxPlays !== undefined) {
+    params.max_plays = Number(filterDraft.value.maxPlays)
+  }
+  return params
+}
+
+async function applyFilters() {
+  const min = filterDraft.value.minPlays
+  const max = filterDraft.value.maxPlays
+  if (min !== null && min !== undefined && max !== null && max !== undefined && Number(min) > Number(max)) {
+    ElMessage.warning('最低播放量不能大于最高播放量')
+    return
+  }
+  await loadAll()
+}
+
+async function resetFilters() {
+  filterDraft.value = createFilterDraft()
+  await loadAll()
+}
 
 function formatNum(n) {
   const value = Number(n || 0)
@@ -769,7 +1060,7 @@ async function loadAll() {
   if (hasNoAccounts.value) return
   try {
     const [stats, jobResult, accountResult, unmatchedResult, notifyResult] = await Promise.all([
-      http.get('/stats/summary'),
+      http.get('/stats/summary', buildSummaryParams()),
       http.get('/jobs', { page: jobPage.value, page_size: 50 }),
       http.get('/account-status'),
       http.get('/stats/unmatched'),
@@ -867,6 +1158,25 @@ onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncP
 .toolbar { margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sync-time { color: #909399; font-size: 12px; margin-right: 4px; }
+.filter-card { margin-bottom: 16px; border-color: #e4eaf2; }
+.filter-card :deep(.el-card__body) { padding: 14px 16px 12px; }
+.filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.filter-heading > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.filter-heading strong { color: #303133; font-size: 14px; }
+.filter-heading span { color: #909399; font-size: 12px; }
+.filter-form { display: flex; align-items: flex-start; gap: 2px 10px; flex-wrap: wrap; }
+.filter-form :deep(.el-form-item) { margin-right: 8px; margin-bottom: 8px; }
+.filter-form :deep(.el-form-item__label) { padding-right: 7px; color: #606266; }
+.play-range, .sort-controls { display: flex; align-items: center; gap: 6px; }
+.play-range :deep(.el-input-number) { width: 92px; }
+.play-range > span { color: #909399; font-size: 12px; }
+.filter-actions { margin-left: auto; }
+.filter-context { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: #909399; font-size: 12px; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section-context { color: #909399; font-size: 12px; font-weight: normal; }
+.account-name { display: block; color: #303133; font-weight: 500; }
+.platform-tag { margin-top: 3px; }
+.topic-empty-hint { display: block; max-width: 560px; margin-top: 6px; color: #909399; line-height: 1.5; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 14px; margin-bottom: 16px; }
 .metric-card { background: linear-gradient(135deg, #f7faff 0%, #fff 100%); border: 1px solid #e7edf5; border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 5px; }
 .metric-card strong { font-size: 28px; color: #1f2d3d; line-height: 1.2; }
@@ -897,8 +1207,13 @@ onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncP
 .funnel-hint { margin-top: 10px; font-size: 11px; color: #909399; line-height: 1.5; }
 @media (max-width: 900px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+  .filter-actions { margin-left: 0; }
+  .filter-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
 }
 @media (max-width: 520px) {
   .metric-grid { grid-template-columns: 1fr; }
+  .filter-form :deep(.el-form-item) { width: 100%; margin-right: 0; }
+  .filter-form :deep(.el-select), .filter-form :deep(.el-date-editor) { width: 100% !important; }
+  .section-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
 }
 </style>

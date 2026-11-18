@@ -2355,7 +2355,20 @@ def trigger_patrol():
 
 @app.route('/stats/summary', methods=['GET'])
 def stats_summary():
-    return jsonify({'code': 200, 'data': stats_reflow.stats_summary(), 'msg': None}), 200
+    try:
+        data = stats_reflow.stats_summary(
+            platform=request.args.get('platform'),
+            account=request.args.get('account'),
+            start_date=request.args.get('start_date'),
+            end_date=request.args.get('end_date'),
+            min_plays=request.args.get('min_plays'),
+            max_plays=request.args.get('max_plays'),
+            sort_by=request.args.get('sort_by', 'avg_plays'),
+            sort_order=request.args.get('sort_order', 'desc'),
+        )
+    except ValueError as exc:
+        return jsonify({'code': 400, 'data': None, 'msg': str(exc)}), 400
+    return jsonify({'code': 200, 'data': data, 'msg': None}), 200
 
 
 @app.route('/stats/trend', methods=['GET'])
