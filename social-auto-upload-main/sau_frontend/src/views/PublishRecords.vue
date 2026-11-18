@@ -248,8 +248,8 @@
         >
           <template #description>
             <div>当前筛选条件下没有可识别的话题</div>
-            <small v-if="showXhsTopicHint" class="topic-empty-hint">
-              小红书创作后台列表不返回正文话题，作品仍会计入播放量、筛选和下方作品表现。
+            <small class="topic-empty-hint">
+              话题从作品标题和正文中的 # 标签识别。
             </small>
           </template>
         </el-empty>
@@ -757,11 +757,6 @@ const filterContextText = computed(() => {
   parts.push(`${sortFieldLabel(filters.sort_by)}${filters.sort_order === 'asc' ? '升序' : '降序'}`)
   return parts.join(' · ')
 })
-
-const showXhsTopicHint = computed(() => (
-  Number(summary.value.filtered_contents || 0) > 0
-  && Number(summary.value.filters?.platform || 0) === 1
-))
 
 function buildSummaryParams() {
   const params = {

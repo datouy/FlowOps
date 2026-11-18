@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import re
 import threading
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from loguru import logger
 from patchright.async_api import async_playwright
@@ -310,6 +312,40 @@ def _normalize_title(value: Any) -> str:
     return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', text)[:160]
 
 
+def _extract_topics(value: Any) -> set[str]:
+    """从标题、正文或话题列表里提取统一的纯文本话题名。"""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    topics = set()
+    for item in values:
+        text = str(item or '')
+        matches = re.findall(r'#([^#\s]{1,40})', text)
+        if not matches and text and not text.startswith('#'):
+            matches = [text]
+        for match in matches:
+            topic = re.sub(
+                r'[^0-9a-z\u4e00-\u9fff]+', '', match, flags=re.IGNORECASE
+            )
+            if len(topic) >= 2:
+                topics.add(topic)
+    return topics
+
+
+def _content_topics(row: dict) -> list[str]:
+    topics = _extract_topics(row.get('title'))
+    raw = row.get('raw')
+    if raw:
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            for key in ('description', 'desc', 'body', 'content'):
+                topics.update(_extract_topics(payload.get(key)))
+            for key in ('topics', 'tags', 'tag_list', 'tagList'):
+                topics.update(_extract_topics(payload.get(key)))
+    return sorted(topics)
+
+
 def _title_score(record_title: str, content_title: str) -> float:
     left = _normalize_title(record_title)
     right = _normalize_title(content_title)
@@ -326,6 +362,10 @@ def _item_from_dict(item: dict) -> dict | None:
     title = (
         item.get('title') or item.get('display_title') or item.get('desc')
         or item.get('description') or item.get('caption')
+    )
+    description = (
+        item.get('description') or item.get('desc') or item.get('body')
+        or item.get('content')
     )
     if not title:
         return None
@@ -374,6 +414,10 @@ def _item_from_dict(item: dict) -> dict | None:
     return {
         'id': str(item_id),
         'title': str(title)[:200],
+        'description': str(description or '')[:6000],
+        'topics': sorted(_extract_topics(
+            item.get('topics') or item.get('tag_list') or item.get('tagList')
+        )),
         'plays': _to_int(plays),
         'likes': _to_int(likes),
         'comments': _to_int(comments),
@@ -381,6 +425,8 @@ def _item_from_dict(item: dict) -> dict | None:
         'shares': _to_int(shares),
         'followers': _to_int(followers),
         'published_at': str(published or ''),
+        '_xsec_token': str(item.get('xsec_token') or ''),
+        '_xsec_source': str(item.get('xsec_source') or ''),
     }
 
 
@@ -545,6 +591,92 @@ async def _collect_api_items(
     return items
 
 
+def _meta_description(markup: str) -> str:
+    """读取公开笔记页面里的正文摘要，兼容 meta 属性顺序。"""
+    patterns = (
+        re.compile(
+            r'<meta\b[^>]*(?:name|property)=["\'](?:description|og:description)["\']'
+            r'[^>]*content=["\'](.*?)["\'][^>]*>',
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r'<meta\b[^>]*content=["\'](.*?)["\'][^>]*'
+            r'(?:name|property)=["\'](?:description|og:description)["\'][^>]*>',
+            re.IGNORECASE | re.DOTALL,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(markup or '')
+        if match:
+            return html_lib.unescape(match.group(1)).strip()
+    return ''
+
+
+async def _enrich_xhs_topics(request_context, items: list[dict]) -> list[dict]:
+    """用列表里的 xsec_token 打开公开笔记，补齐正文话题。"""
+    candidates = [
+        item for item in items
+        if item.get('id') and item.get('_xsec_token')
+    ]
+    if not candidates:
+        for item in items:
+            item.pop('_xsec_token', None)
+            item.pop('_xsec_source', None)
+        return items
+
+    semaphore = asyncio.Semaphore(4)
+    completed = 0
+
+    async def enrich(item):
+        nonlocal completed
+        note_id = str(item.get('id') or '')
+        query = urlencode({
+            'xsec_token': item.get('_xsec_token') or '',
+            'xsec_source': item.get('_xsec_source') or 'pc_creatormng',
+        })
+        url = f'https://www.xiaohongshu.com/explore/{note_id}?{query}'
+        async with semaphore:
+            try:
+                response = await request_context.get(url, timeout=30000)
+                try:
+                    if response.status != 200:
+                        return
+                    description = _meta_description(await response.text())
+                finally:
+                    await response.dispose()
+            except Exception as exc:
+                logger.debug('小红书笔记详情读取失败 {}: {}', note_id, exc)
+                return
+        if not description:
+            return
+        topics = sorted(_extract_topics(description))
+        item['description'] = description[:6000]
+        item['topics'] = topics
+        raw = {}
+        if item.get('raw'):
+            try:
+                existing = json.loads(item['raw'])
+                if isinstance(existing, dict):
+                    raw.update(existing)
+            except (TypeError, ValueError):
+                pass
+        raw['description'] = description[:6000]
+        raw['topics'] = topics
+        item['raw'] = json.dumps(raw, ensure_ascii=False)
+        if topics:
+            completed += 1
+
+    await asyncio.gather(*(enrich(item) for item in candidates))
+    for item in items:
+        item.pop('_xsec_token', None)
+        item.pop('_xsec_source', None)
+    logger.info(
+        '小红书详情回填完成：尝试 {} 条，识别到话题 {} 条',
+        len(candidates), completed,
+    )
+    return items
+
+
 async def _fetch_douyin(account: dict | None, platform: int) -> list[dict]:
     from utils.log import douyin_logger
     cookie = _account_cookie(account, platform)
@@ -645,12 +777,13 @@ async def _fetch_xhs(account: dict | None, platform: int) -> list[dict]:
         context = await set_init_script(context)
         page = await context.new_page()
         try:
-            return await _collect_api_items(
+            items = await _collect_api_items(
                 page,
                 'https://creator.xiaohongshu.com/new/note-manager',
                 3000,
                 auto_scroll=True,
             )
+            return await _enrich_xhs_topics(context.request, items)
         except Exception:
             xiaohongshu_logger.warning('小红书数据回流抓取失败: ' + traceback.format_exc()[-300:])
             return []
@@ -776,7 +909,7 @@ def _save_stats(
                     shares=excluded.shares,
                     followers=excluded.followers,
                     published_at=excluded.published_at,
-                    raw=excluded.raw,
+                    raw=COALESCE(NULLIF(excluded.raw, ''), content_stats.raw),
                     fetched_at=excluded.fetched_at''', (
                 record_id, platform, account_name, content_key, item.get('title', ''),
                 item.get('plays', 0), item.get('likes', 0), item.get('comments', 0),
@@ -1396,11 +1529,7 @@ def stats_summary(
     # 话题按平台和账号拆分。即使选择“全部账号”，也不会把同名话题混成一行。
     topic_totals: dict[tuple[int, str, str], dict] = {}
     for row in rows:
-        topics = {
-            re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', match, flags=re.IGNORECASE)
-            for match in re.findall(r'#([^#\s]{1,30})', str(row.get('title') or ''))
-        }
-        topics = {topic for topic in topics if len(topic) >= 2}
+        topics = set(_content_topics(row))
         row['topics'] = sorted(topics)
         if row.get('record_id'):
             by_record.setdefault(int(row['record_id']), []).append(row)
