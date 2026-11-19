@@ -3,7 +3,7 @@
     <header class="page-heading">
       <div class="page-heading__copy">
       <h1>账号管理</h1>
-        <p>管理各平台登录会话、健康状态与发布环境。异常账号可以在这里直接补登或复检。</p>
+        <p>每个账号分别校验登录、发布、作品回查、评论、主站私信和身份绑定。</p>
       </div>
     </header>
     
@@ -95,7 +95,7 @@
                     </div>
                   </template>
                 </el-table-column>
-                <el-table-column prop="status" label="状态" width="110">
+                <el-table-column prop="status" label="登录状态" width="110">
                   <template #default="scope">
                     <button
                       class="status-value"
@@ -110,6 +110,26 @@
                       <span v-else class="status-square" aria-hidden="true" />
                       {{ scope.row.status }}
                     </button>
+                  </template>
+                </el-table-column>
+                <el-table-column label="账号能力" width="390">
+                  <template #default="scope">
+                    <div class="capability-grid">
+                      <el-tooltip
+                        v-for="capability in accountCapabilities(scope.row)"
+                        :key="capability.key"
+                        :content="capability.reason || capability.label"
+                        placement="top"
+                      >
+                        <span
+                          class="capability-pill"
+                          :class="`is-${capability.state}`"
+                        >
+                          <span class="capability-name">{{ capability.label }}</span>
+                          <span class="capability-state">{{ capability.stateLabel }}</span>
+                        </span>
+                      </el-tooltip>
+                    </div>
                   </template>
                 </el-table-column>
                 <el-table-column label="操作" width="190" align="right">
@@ -621,6 +641,41 @@ const sharedSessionGroups = computed(() => {
 
 const isSharedSession = (row) =>
   Boolean(row?.sessionGroup && sharedSessionGroups.value[row.sessionGroup])
+
+const CAPABILITY_LABELS = {
+  login: '登录',
+  publish: '发布',
+  verification: '回查',
+  comments: '评论',
+  dm: '私信',
+  identity: '身份',
+}
+
+const CAPABILITY_STATE_LABELS = {
+  ready: '正常',
+  blocked: '阻断',
+  unknown: '待检',
+  unsupported: '未接入',
+}
+
+// 后端逐项判断；这里仅做展示映射，不再从“账号状态正常”推导其它能力。
+const accountCapabilities = (row) => {
+  const capabilities = row?.capabilities || {}
+  return Object.entries(CAPABILITY_LABELS).map(([key, label]) => {
+    const item = capabilities[key] || {
+      ok: false,
+      state: 'unknown',
+      reason: '后端尚未返回该能力状态',
+    }
+    return {
+      key,
+      label,
+      state: item.state || (item.ok ? 'ready' : 'unknown'),
+      stateLabel: CAPABILITY_STATE_LABELS[item.state] || '待检',
+      reason: item.reason || '',
+    }
+  })
+}
 
 const handleCheckAccount = async (row) => {
   checkingAccountId.value = row.id
@@ -1985,7 +2040,7 @@ onBeforeUnmount(() => {
 
   .account-table {
     width: 100%;
-    min-width: 900px;
+    min-width: 1460px;
   }
 
   .account-identity {
@@ -2051,6 +2106,103 @@ onBeforeUnmount(() => {
 
   .status-value:disabled {
     opacity: 1;
+  }
+
+  .capability-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-width: 360px;
+  }
+
+  .capability-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border: 1px solid $border-light;
+    border-radius: 3px;
+    background: $bg-color-raised;
+    font-size: 11px;
+    line-height: 18px;
+    white-space: nowrap;
+  }
+
+  .capability-name {
+    color: $text-primary;
+    font-weight: 500;
+  }
+
+  .capability-state {
+    color: currentColor;
+  }
+
+  .capability-pill.is-ready {
+    color: $success-color;
+    border-color: #cce5d8;
+    background: #f2faf6;
+  }
+
+  .capability-pill.is-blocked {
+    color: $danger-color;
+    border-color: #efd6d4;
+    background: #fff6f5;
+  }
+
+  .capability-pill.is-unknown {
+    color: $warning-color;
+    border-color: #f0dfba;
+    background: #fffbf2;
+  }
+
+  .capability-pill.is-unsupported {
+    color: $text-secondary;
+    background: $bg-color-page;
+  }
+
+  .egress-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .egress-grid {
+    display: grid;
+    grid-template-columns: 78px 1fr;
+    gap: 5px 10px;
+    padding: 10px 12px;
+    border: 1px solid $border-lighter;
+    border-radius: 4px;
+    background: $bg-color-raised;
+    font-size: 12px;
+  }
+
+  .egress-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .egress-ip {
+    color: $text-primary;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+
+  .egress-muted,
+  .egress-hint {
+    color: $text-secondary;
+    font-size: 11px;
+  }
+
+  .egress-error {
+    overflow: hidden;
+    color: $danger-color;
+    font-size: 11px;
+    line-height: 1.5;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .status-square {

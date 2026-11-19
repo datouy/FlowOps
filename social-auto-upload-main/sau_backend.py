@@ -29,6 +29,7 @@ from account_store import (
     platform_type_of,
     read_storage_state,
 )
+from account_capabilities import build_account_capabilities
 import runtime_config
 import access_scope
 import comment_ops
@@ -669,6 +670,40 @@ def _account_error_kind(item: dict) -> str:
     return "expired" if status == 0 else "ok"
 
 
+def _dm_account_states() -> dict[str, dict]:
+    """Return account-scoped DM health without hiding platform-level context."""
+    states: dict[str, dict] = {}
+    managers = (
+        douyin_dm_sync.sync_manager,
+        xiaohongshu_dm_sync.sync_manager,
+        channels_dm_sync.sync_manager,
+    )
+    for manager in managers:
+        try:
+            payload = manager.health_payload()
+        except Exception as exc:
+            logger.warning("读取账号私信能力失败: {}", exc)
+            continue
+        for item in payload.get("accounts") or []:
+            account_id = item.get("id")
+            if account_id is None or account_id == "":
+                continue
+            states[str(account_id)] = {
+                **item,
+                "platformKey": payload.get("key") or "",
+            }
+    return states
+
+
+def _apply_account_capabilities(accounts: list[dict]) -> list[dict]:
+    dm_states = _dm_account_states()
+    for item in accounts:
+        item["capabilities"] = build_account_capabilities(
+            item, dm_states.get(str(item.get("id")))
+        )
+    return accounts
+
+
 @app.route('/api/v2/accounts', methods=['GET'])
 def api_v2_accounts():
     """结构化账号列表：平台元数据 + 身份 + 健康度 + 凭据状态 + 汇总。"""
@@ -680,6 +715,7 @@ def api_v2_accounts():
     accounts = access_scope.filter_accounts(store.list(pid))
     for item in accounts:
         item["errorKind"] = _account_error_kind(item)
+    _apply_account_capabilities(accounts)
     return jsonify({
         "code": 200,
         "msg": None,
@@ -725,6 +761,7 @@ def api_v2_account(account_id: int):
         cookie_file=str((item.get("cookie") or {}).get("name") or ""),
     ):
         return access_scope.forbidden("无权访问该账号")
+    _apply_account_capabilities([item])
     return jsonify({"code": 200, "msg": None, "data": item}), 200
 
 

@@ -54,9 +54,14 @@ export const useAccountStore = defineStore('account', () => {
       platform: item.platform?.label || '未知',
       lastCheckAt: item.lastCheckAt || '',
       failReason: item.failReason || '',
+      errorKind: item.errorKind || '',
+      failStreak: Number(item.failStreak || 0),
       identity: item.identity?.masked || '',
       identityBound: Boolean(item.identity?.bound),
-      sessionGroup: item.cookie?.sessionGroup || ''
+      sessionGroup: item.cookie?.sessionGroup || '',
+      cookie: item.cookie || {},
+      environment: item.environment || {},
+      capabilities: item.capabilities || null
     }))
     accountsLoaded.value = true
     accountsLoadedAt = Date.now()

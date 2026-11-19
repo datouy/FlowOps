@@ -384,10 +384,16 @@ def test_api_v2_accounts_shape(client):
     assert account_row["platform"]["label"] == "视频号"
     assert account_row["identity"]["masked"].startswith("fin")
     assert account_row["cookie"]["exists"] is True
+    assert set(account_row["capabilities"]) == {
+        "login", "publish", "verification", "comments", "dm", "identity"
+    }
+    assert account_row["capabilities"]["login"]["ok"] is True
+    assert account_row["capabilities"]["identity"]["ok"] is True
     assert payload["stats"]["total"] == 1
 
     detail = http.get(f"/api/v2/accounts/{account['id']}").get_json()["data"]
     assert detail["name"] == "频道A"
+    assert detail["capabilities"]["publish"]["ok"] is True
 
     creds = http.get(f"/api/v2/accounts/{account['id']}/credentials").get_json()["data"]
     assert "finder_username" in creds["storageKeys"]
