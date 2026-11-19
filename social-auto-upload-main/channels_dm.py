@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import requests
 
 from dm_platform_common import account_name, clean_text
-from utils.credential_crypto import credential_exists
+from utils.credential_crypto import credential_exists, read_storage_state
 from utils.account_http import (
     FALLBACK_USER_AGENT,
     account_proxies,
@@ -47,7 +47,7 @@ class ChannelsAuthError(ChannelsError):
 
 def _load_cookies(path: str | Path) -> list[dict]:
     try:
-        state = json.loads(Path(path).read_text(encoding="utf-8"))
+        state = read_storage_state(path)
     except Exception as exc:
         raise ChannelsAuthError("视频号 Cookie 文件无法读取，请重新扫码登录") from exc
     cookies = state.get("cookies") if isinstance(state, dict) else None

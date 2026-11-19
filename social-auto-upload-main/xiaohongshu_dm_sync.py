@@ -13,7 +13,9 @@ from dm_platform_common import (
     BaseDmSync, SyncError, account_name, clean_text, friendly_error, is_recent,
     now_text, public_account, timestamp_text,
 )
-from xiaohongshu_dm import XhsAuthError, XhsClient, XhsError
+from xiaohongshu_dm import (
+    XhsAuthError, XhsClient, XhsError, run_sync_playwright_isolated,
+)
 
 bp = Blueprint("xiaohongshu_dm_sync", __name__)
 
@@ -355,7 +357,9 @@ class XiaohongshuDmSync(BaseDmSync):
             pass
 
     def scan_account(self, settings: dict, account: dict) -> dict:
-        return _sync_account(settings, account)
+        # 每次小红书同步独占一个新的线程，避免上一次 Playwright Sync API
+        # 留下的 asyncio loop 污染下一次会话。
+        return run_sync_playwright_isolated(_sync_account, settings, account)
 
 
 sync_manager = XiaohongshuDmSync(

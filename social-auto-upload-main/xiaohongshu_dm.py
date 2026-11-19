@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from utils.credential_crypto import credential_exists
+from utils.credential_crypto import credential_exists, read_storage_state
 from dm_platform_common import account_name, clean_text, normalize_timestamp
 from utils.account_browser import open_persistent_account_context_sync
 
@@ -23,6 +25,35 @@ XHS_IMAGE_LIMIT_BYTES = 10 * 1024 * 1024
 XHS_VIDEO_LIMIT_BYTES = 100 * 1024 * 1024
 XHS_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 XHS_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v"}
+
+
+def run_sync_playwright_isolated(func, /, *args, **kwargs):
+    """Run one synchronous Playwright workflow on a fresh thread.
+
+    Patchright's sync API leaves an asyncio loop attached to a long-lived
+    worker thread after a browser session is closed. Starting the next sync
+    Playwright session on that same thread then raises "Sync API inside the
+    asyncio loop". A fresh thread per browser session gives every session its
+    own loop lifecycle, while keeping the caller's blocking/result semantics.
+    """
+    outcome: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def runner():
+        try:
+            outcome.put((True, func(*args, **kwargs)))
+        except BaseException as exc:  # preserve the original failure for caller
+            outcome.put((False, exc))
+
+    thread = threading.Thread(
+        target=runner, name="xhs-playwright-session", daemon=True,
+    )
+    thread.start()
+    thread.join()
+    ok, value = outcome.get()
+    if ok:
+        return value
+    raise value
+
 
 SYSTEM_CONTENT_TYPES = {0, 4, 5, 10, 15, 18}
 MESSAGE_TYPE_NAMES = {
@@ -189,7 +220,7 @@ def _headless() -> bool:
 
 def _load_storage_state(path: str | Path) -> dict:
     try:
-        state = json.loads(Path(path).read_text(encoding="utf-8"))
+        state = read_storage_state(path)
     except Exception as exc:
         raise XhsAuthError("小红书 Cookie 文件无法读取，请重新登录账号") from exc
     if not isinstance(state, dict) or not state.get("cookies"):

@@ -534,13 +534,16 @@ def send_xiaohongshu(account_name: str, external_user_id: str, text: str) -> dic
     account = _account_by_type(1, account_name)
     if not account:
         raise RuntimeError("未找到可用的小红书登录账号，请先在账号管理中登录")
-    from xiaohongshu_dm import XhsClient
+    from xiaohongshu_dm import XhsClient, run_sync_playwright_isolated
 
-    client = XhsClient(account)
-    try:
-        return client.send_text(external_user_id, text)
-    finally:
-        client.close()
+    def deliver():
+        client = XhsClient(account)
+        try:
+            return client.send_text(external_user_id, text)
+        finally:
+            client.close()
+
+    return run_sync_playwright_isolated(deliver)
 
 
 def send_xiaohongshu_media(account_name: str, external_user_id: str,
@@ -555,13 +558,16 @@ def send_xiaohongshu_media(account_name: str, external_user_id: str,
     account = _account_by_type(1, account_name)
     if not account:
         raise RuntimeError("未找到可用的小红书登录账号，请先在账号管理中登录")
-    from xiaohongshu_dm import XhsClient
+    from xiaohongshu_dm import XhsClient, run_sync_playwright_isolated
 
-    client = XhsClient(account)
-    try:
-        return client.send_media(external_user_id, path)
-    finally:
-        client.close()
+    def deliver():
+        client = XhsClient(account)
+        try:
+            return client.send_media(external_user_id, path)
+        finally:
+            client.close()
+
+    return run_sync_playwright_isolated(deliver)
 
 
 def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
