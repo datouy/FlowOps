@@ -756,7 +756,7 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onActivated, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { dmApi } from '@/api/dm'
 import { useAccountStore } from '@/stores/account'
@@ -1759,6 +1759,19 @@ function exportLeads() {
 
 useLivePolling(refreshLive, { interval: 1000, isActive: () => activeTab.value === 'inbox' })
 
+let messagesReady = false
+
+async function openRoutedConversation() {
+  // 从「今日优先跟进」跳转时携带 ?contact=<id>，直接打开对应会话。
+  const contactId = Number(route.query.contact || 0)
+  if (!contactId) return
+  const target = conversations.value.find(item => Number(item.id) === contactId)
+  if (target) {
+    activeTab.value = 'inbox'
+    await selectConversation(target, false)
+  }
+}
+
 onMounted(async () => {
   try {
     await accountStore.loadAccounts()
@@ -1770,15 +1783,12 @@ onMounted(async () => {
     loadSettings(), loadAnalytics(), loadConversations(), loadRules(), loadTemplates(),
     loadSyncStatus(), loadStorageHealth(),
   ])
-  // 从「今日优先跟进」跳转时携带 ?contact=<id>，直接打开对应会话。
-  const contactId = Number(route.query.contact || 0)
-  if (contactId) {
-    const target = conversations.value.find(item => Number(item.id) === contactId)
-    if (target) {
-      activeTab.value = 'inbox'
-      await selectConversation(target, false)
-    }
-  }
+  messagesReady = true
+  await openRoutedConversation()
+})
+
+onActivated(() => {
+  if (messagesReady) openRoutedConversation()
 })
 </script>
 

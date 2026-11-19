@@ -70,7 +70,11 @@
         </header>
         <el-main class="main-content">
           <div class="content-frame">
-            <router-view />
+            <router-view v-slot="{ Component, route: viewRoute }">
+              <KeepAlive>
+                <component :is="Component" :key="viewRoute.name || viewRoute.path" />
+              </KeepAlive>
+            </router-view>
           </div>
         </el-main>
       </el-container>

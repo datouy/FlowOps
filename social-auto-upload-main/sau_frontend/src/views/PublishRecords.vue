@@ -562,7 +562,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { http } from '@/utils/request'
 import { useAccountStore } from '@/stores/account'
@@ -1137,16 +1137,43 @@ async function triggerSync() {
   }
 }
 
+function startAutoRefresh() {
+  recordsActive = true
+  if (timer) return
+  timer = setInterval(loadAll, 10000)
+}
+
+function stopBackgroundPolling() {
+  recordsActive = false
+  if (timer) {
+    clearInterval(timer)
+    timer = null
+  }
+  if (syncPollTimer) {
+    clearInterval(syncPollTimer)
+    syncPollTimer = null
+  }
+}
+
+let initialLoadFinished = false
+let recordsActive = false
+
 onMounted(async () => {
   try {
     await accountStore.loadAccounts()
   } catch (error) {
     console.error('加载账号列表失败:', error)
   }
-  loadAll()
-  timer = setInterval(loadAll, 10000)
+  await loadAll()
+  initialLoadFinished = true
+  if (recordsActive) startAutoRefresh()
 })
-onUnmounted(() => { clearInterval(timer); if (syncPollTimer) clearInterval(syncPollTimer) })
+onActivated(async () => {
+  startAutoRefresh()
+  if (initialLoadFinished) await loadAll()
+})
+onDeactivated(stopBackgroundPolling)
+onUnmounted(stopBackgroundPolling)
 </script>
 
 <style scoped>

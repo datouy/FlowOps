@@ -590,7 +590,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
 import { Upload, Plus, Close, Folder, WarningFilled, Check, InfoFilled } from '@element-plus/icons-vue'
 import { useRoute } from 'vue-router'
 import { useAccountStore } from '@/stores/account'
@@ -630,7 +630,7 @@ function titleMaxLength(tab) {
   return PLATFORM_TITLE_MAX[tab?.selectedPlatform] || 30
 }
 
-onMounted(() => {
+function applyRoutePrefill() {
   const q = route.query
   if (q.title || q.body) {
     const tab = tabs[0] || (tabs[0] = makeNewTab())
@@ -644,7 +644,9 @@ onMounted(() => {
     if (q.body) tab.desc = String(q.body)
     if (q.tags) tab.selectedTopics = String(q.tags).split(',').map(t => t.trim()).filter(Boolean)
   }
-})
+}
+
+onActivated(applyRoutePrefill)
 
 // 上传相关状态
 const uploadOptionsVisible = ref(false)
@@ -1199,6 +1201,7 @@ const verifyResending = ref(false)
 const verifyInputRef = ref(null)
 const dismissedVerifyId = ref('')
 let verifyPollTimer = null
+let verifyPollingActive = false
 // 没有待验证任务时用低频轮询（10s），有任务时切回高频（3s），
 // 避免在没有任何验证码待处理时也持续高频请求后端。
 const VERIFY_POLL_FAST = 3000
@@ -1206,6 +1209,7 @@ const VERIFY_POLL_SLOW = 10000
 
 const scheduleVerifyPoll = () => {
   if (verifyPollTimer) clearInterval(verifyPollTimer)
+  if (!verifyPollingActive) return
   const interval = verifyRequest.value ? VERIFY_POLL_FAST : VERIFY_POLL_SLOW
   verifyPollTimer = setInterval(fetchPendingVerify, interval)
 }
@@ -1300,17 +1304,25 @@ const resendVerifyCode = async () => {
   }
 }
 
-onMounted(() => {
-  fetchPendingVerify()
-  scheduleVerifyPoll()
-})
-
-onUnmounted(() => {
+const stopVerifyPoll = () => {
+  verifyPollingActive = false
   if (verifyPollTimer) {
     clearInterval(verifyPollTimer)
     verifyPollTimer = null
   }
-})
+}
+
+const startVerifyPoll = () => {
+  verifyPollingActive = true
+  if (verifyPollTimer) return
+  fetchPendingVerify()
+  scheduleVerifyPoll()
+}
+
+onMounted(startVerifyPoll)
+onActivated(startVerifyPoll)
+onDeactivated(stopVerifyPoll)
+onUnmounted(stopVerifyPoll)
 </script>
 
 <style lang="scss" scoped>
