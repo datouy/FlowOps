@@ -102,9 +102,9 @@ PLATFORM_META: dict[int, dict[str, Any]] = {
 PLATFORM_NAMES: dict[int, str] = {k: v["name"] for k, v in PLATFORM_META.items()}
 
 # 平台是否支持"API 直发"（RPA 只负责传文件，创建作品走平台自己的接口）。
-# 目前只有抖音和小红书能安全回放创建请求；视频号的创建接口与文件上传
-# 强耦合，暂时保持纯 RPA。
-SUPPORTS_API_PUBLISH: frozenset[int] = frozenset({1, 3})
+# 视频号的文件上传仍走 RPA，但上传完成后的 post_create 可以由账号模板回放；
+# 发布器只对普通即时视频启用，复杂表单选项继续使用 RPA。
+SUPPORTS_API_PUBLISH: frozenset[int] = frozenset({1, 2, 3})
 
 
 def get_platform_meta(platform_type: int) -> dict[str, Any]:

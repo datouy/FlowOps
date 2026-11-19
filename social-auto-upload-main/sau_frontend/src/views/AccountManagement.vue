@@ -518,7 +518,7 @@
         <div class="transport-list" v-loading="environmentLoading">
           <div class="transport-item" v-for="item in transportRows" :key="item.platformType">
             <div class="transport-head">
-              <span class="transport-name">{{ item.platformType === 1 ? '小红书' : item.platformType === 3 ? '抖音' : `平台 ${item.platformType}` }}</span>
+              <span class="transport-name">{{ transportPlatformName(item.platformType) }}</span>
               <el-tag :type="item.hybridEnabled ? 'success' : 'info'" effect="plain" size="small">
                 {{ item.hybridEnabled ? 'API 直发可用' : '页面自动化' }}
               </el-tag>
@@ -810,6 +810,15 @@ const egressForm = reactive({
 const transportHasTemplate = computed(() =>
   transportRows.value.some((item) => item.templateReady)
 )
+
+const TRANSPORT_PLATFORM_NAMES = {
+  1: '小红书',
+  2: '视频号',
+  3: '抖音',
+}
+
+const transportPlatformName = (platformType) =>
+  TRANSPORT_PLATFORM_NAMES[platformType] || `平台 ${platformType}`
 
 // 表单验证规则
 const rules = {

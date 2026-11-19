@@ -31,15 +31,21 @@
 * 请求结果**不确定**（超时、断网）→ **绝不**再点一次发布按钮，
   而是记成"已提交，未验证"，交给状态查询线程去平台核对。
 
-只支持有明确创建接口的抖音（3）和小红书（1）；视频号的创建接口与文件上传
-强耦合，暂时保持 RPA。
+目前支持抖音（3）、小红书（1）和视频号（2）。视频号的文件上传仍由 RPA 完成，
+创建作品时回放页面录制到的 ``post_create`` 请求；只对普通即时视频启用，复杂
+表单选项继续走 RPA。
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from loguru import logger
 
@@ -53,11 +59,16 @@ TRANSPORT_HYBRID = "hybrid"
 # 各平台"创建作品"请求的 URL 特征。
 CREATE_URL_MARKERS: dict[int, tuple[str, ...]] = {
     1: ("/web_api/sns/v2/note", "/api/sns/web/v1/note"),
+    2: ("/cgi-bin/mmfinderassistant-bin/post/post_create",),
     3: ("/aweme/create_v2/", "/aweme/create/"),
 }
 # 同一前缀下的其它接口（列表、删除等）不能误判成创建请求。
 CREATE_URL_EXCLUDES: dict[int, tuple[str, ...]] = {
     1: ("/note/manage", "/note/delete", "/note/post", "/note/list", "/note/comment"),
+    2: (
+        "/post/post_draft", "/post/post_clip_video", "/post/post_list",
+        "/post/post_delete", "/post/post_search",
+    ),
     3: ("/aweme/create_list/", "/aweme/delete/"),
 }
 
@@ -73,7 +84,71 @@ UPLOAD_URL_MARKERS = (
 # 上传还没结束或者混进了别的资源，回放时无法确定该用哪个，索性放弃直发。
 MEDIA_ID_KEYS: dict[int, tuple[str, ...]] = {
     1: ("file_id", "fileId", "image_id", "imageId", "media_id", "material_id"),
+    2: ("draftId", "clipKey", "DownloadURL"),
     3: ("vid", "video_id", "videoid", "upload_id", "material_id", "media_id"),
+}
+
+TENCENT_CREATE_HOST = "https://finder.video.qq.com"
+TENCENT_VIDEO_FILETYPE = "20302"
+TENCENT_COVER_FILETYPE = "20304"
+
+# 视频号创建请求里的资源与任务字段。按路径替换，避免相同数字（宽、高、时间戳）
+# 在请求体其它位置被误替换。报告接口里 width/height 的命名与媒体对象相反，
+# 这是平台自身的行为，这里照录。
+_TENCENT_PATH_KEYS: dict[str, tuple[tuple[str | int, ...], ...]] = {
+    "video_url": (
+        ("objectDesc", "media", 0, "url"),
+        ("megavideoDesc", "media", 0, "url"),
+    ),
+    "cover_url": (
+        ("objectDesc", "media", 0, "coverUrl"),
+        ("objectDesc", "media", 0, "fullCoverUrl"),
+        ("objectDesc", "media", 0, "fullThumbUrl"),
+        ("objectDesc", "media", 0, "thumbUrl"),
+        ("megavideoDesc", "media", 0, "coverUrl"),
+        ("megavideoDesc", "media", 0, "thumbUrl"),
+    ),
+    "share_cover_url": (
+        ("objectDesc", "media", 0, "shareCoverUrl"),
+    ),
+    "video_md5": (
+        ("objectDesc", "media", 0, "md5sum"),
+        ("megavideoDesc", "media", 0, "md5sum"),
+    ),
+    "file_size": (
+        ("objectDesc", "media", 0, "fileSize"),
+        ("report", "fileSize"),
+        ("megavideoDesc", "media", 0, "fileSize"),
+    ),
+    "video_width": (
+        ("objectDesc", "media", 0, "width"),
+        ("report", "height"),
+        ("megavideoDesc", "media", 0, "width"),
+    ),
+    "video_height": (
+        ("objectDesc", "media", 0, "height"),
+        ("report", "width"),
+        ("megavideoDesc", "media", 0, "height"),
+    ),
+    "duration": (
+        ("objectDesc", "media", 0, "videoPlayLen"),
+        ("report", "duration"),
+        ("megavideoDesc", "media", 0, "videoPlayLen"),
+    ),
+    "duration_ms": (
+        ("megavideoDesc", "media", 0, "videoPlayLenMs"),
+    ),
+    "draft_id": (
+        ("objectDesc", "media", 0, "urlCdnTaskId"),
+        ("report", "draftId"),
+        ("videoClipTaskId",),
+    ),
+    "clip_key": (
+        ("report", "clipKey"),
+    ),
+    "upload_cost": (
+        ("report", "uploadCost"),
+    ),
 }
 
 # 请求头里不能回放的东西。
@@ -319,6 +394,115 @@ def _apply_replacements(value: Any, replacements: list[tuple[str, str]]) -> Any:
     return value
 
 
+def _path_get(value: Any, path: tuple[str | int, ...]) -> Any:
+    current = value
+    for part in path:
+        try:
+            current = current[part]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return current
+
+
+def _path_set(value: Any, path: tuple[str | int, ...], replacement: Any) -> bool:
+    if not path:
+        return False
+    current = value
+    for part in path[:-1]:
+        try:
+            current = current[part]
+        except (KeyError, IndexError, TypeError):
+            return False
+    try:
+        current[path[-1]] = replacement
+    except (KeyError, IndexError, TypeError):
+        return False
+    return True
+
+
+def _first_nested_value(value: Any, keys: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        lowered = {str(key).lower(): item for key, item in value.items()}
+        for key in keys:
+            item = lowered.get(key.lower())
+            if item not in (None, ""):
+                return item
+        for item in value.values():
+            found = _first_nested_value(item, keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_nested_value(item, keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def normalize_tencent_download_url(value: Any) -> str:
+    """把视频号上传接口返回的资源路径补成可回放的完整 URL。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return "https:" + text
+    if text.startswith("/"):
+        return TENCENT_CREATE_HOST + text
+    if text.startswith(("http://", "https://")):
+        return text
+    if "qq.com" in text:
+        suffix = text.split("qq.com", 1)[1]
+        return TENCENT_CREATE_HOST + (suffix if suffix.startswith("/") else "/" + suffix)
+    return TENCENT_CREATE_HOST + "/" + text.lstrip("/")
+
+
+def _tencent_filetype(headers: dict[str, Any]) -> str:
+    arguments = ""
+    for key, value in (headers or {}).items():
+        if str(key).lower() == "x-arguments":
+            arguments = str(value or "")
+            break
+    if not arguments:
+        return ""
+    parsed = parse_qs(arguments, keep_blank_values=True)
+    return str((parsed.get("filetype") or [""])[0] or "")
+
+
+def _tencent_is_full_post(width: Any, height: Any) -> int | None:
+    try:
+        width_value = float(width)
+        height_value = float(height)
+    except (TypeError, ValueError):
+        return None
+    if width_value <= 0 or height_value <= 0:
+        return None
+    return 1 if width_value / height_value <= 0.857 else 0
+
+
+def _apply_tencent_placeholders(body: Any) -> Any:
+    if not isinstance(body, dict):
+        return body
+    rendered = copy.deepcopy(body)
+    for key, paths in _TENCENT_PATH_KEYS.items():
+        marker = "{{media:%s}}" % key
+        for path in paths:
+            _path_set(rendered, path, marker)
+
+    if isinstance(rendered.get("topics"), list):
+        rendered["topics"] = "{{tencent:tags}}"
+    object_desc = rendered.get("objectDesc")
+    if isinstance(object_desc, dict) and isinstance(object_desc.get("shortTitle"), list):
+        object_desc["shortTitle"] = "{{tencent:short_title_list}}"
+
+    report = rendered.get("report")
+    if isinstance(report, dict):
+        report["timestamp"] = "{{tencent:timestamp}}"
+        report["clientid"] = "{{tencent:client_id}}"
+    if "timestamp" in rendered:
+        rendered["timestamp"] = "{{tencent:timestamp}}"
+    return rendered
+
+
 def build_template(
     *,
     url: str,
@@ -346,21 +530,35 @@ def build_template(
     }
     text_repl = text_replacements(title, desc, tags)
     rendered = _apply_replacements(body, text_repl)
+    media_keys = sorted((media_ids or {}).keys())
+    if platform_type == 2:
+        rendered = _apply_tencent_placeholders(rendered)
+        # 视频号按路径生成占位符；不再按数值全局替换，避免 1080、时长、
+        # 毫秒时间戳等短值误伤请求体里其它字段。
+        media_keys = [
+            key for key, paths in _TENCENT_PATH_KEYS.items()
+            if any(_path_get(body, path) is not None for path in paths)
+        ]
     # 文本替换后重新序列化，素材 ID 按值替换（值是长随机串，不会误伤）。
     text = json.dumps(rendered, ensure_ascii=False)
     used_media: dict[str, str] = {}
-    for key, value in (media_ids or {}).items():
-        token = str(value or "")
+    for key in media_keys:
+        placeholder = "{{media:%s}}" % key
+        if placeholder in text:
+            used_media[key] = placeholder
+            continue
+        if platform_type == 2:
+            continue
+        token = str((media_ids or {}).get(key) or "")
         if not token or token not in text:
             continue
-        placeholder = "{{media:%s}}" % key
         text = text.replace(token, placeholder)
         used_media[key] = placeholder
     try:
         final_body = json.loads(text)
     except ValueError:
         final_body = text
-    return {
+    template = {
         "url": str(url),
         "method": str(method or "POST").upper(),
         "headers": kept_headers,
@@ -369,6 +567,26 @@ def build_template(
         "signature": str(signature or ""),
         "created_at": _now(),
     }
+    if platform_type == 2 and isinstance(final_body, dict):
+        width = (media_ids or {}).get("video_width")
+        height = (media_ids or {}).get("video_height")
+        try:
+            duration = int((media_ids or {}).get("duration"))
+        except (TypeError, ValueError):
+            duration = 0
+        full_post = _tencent_is_full_post(width, height)
+        if full_post is None and final_body.get("isFullPost") in (0, 1):
+            full_post = int(final_body["isFullPost"])
+        template["requirements"] = {
+            "isFullPost": full_post,
+            "tagCount": len(tags or []),
+            "longVideo": bool(
+                duration > 60
+                or "megavideoDesc" in final_body
+                or final_body.get("mode") == 1
+            ),
+        }
+    return template
 
 
 def _platform_of_markers(url: str) -> int:
@@ -417,7 +635,25 @@ def form_signature(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def render_body(template: dict, values: dict[str, str]) -> Any:
+def _render_value(value: Any, values: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {key: _render_value(item, values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_value(item, values) for item in value]
+    if not isinstance(value, str):
+        return value
+    if value in values:
+        # 整个字段就是占位符时保留真实类型；视频号的宽高、文件大小和话题列表
+        # 都不能被一律序列化成字符串。
+        return copy.deepcopy(values[value])
+    text = value
+    for placeholder, replacement in values.items():
+        if placeholder in text:
+            text = text.replace(placeholder, str(replacement))
+    return text
+
+
+def render_body(template: dict, values: dict[str, Any]) -> Any:
     """把模板渲染成本次请求体。"""
     body = template.get("body")
     if isinstance(body, str):
@@ -429,7 +665,7 @@ def render_body(template: dict, values: dict[str, str]) -> Any:
             return json.loads(text)
         except ValueError:
             return text
-    return _apply_replacements(body, [(k, str(v)) for k, v in values.items()])
+    return _render_value(body, values)
 
 
 def template_placeholders(template: dict) -> set[str]:
@@ -612,6 +848,45 @@ def interpret_response(platform_type: int, payload: Any, http_status: int = 200)
                 "raw_status": raw_status or f"HTTP {http_status}",
             }
         return {"status": "accepted", "post_id": post_id, "raw_status": raw_status}
+    if platform == 2:
+        code = payload.get("errCode") if isinstance(payload, dict) else None
+        base = data.get("baseResp") if isinstance(data.get("baseResp"), dict) else {}
+        base_code = base.get("errcode", base.get("errCode"))
+        message = str(
+            (payload.get("errMsg") if isinstance(payload, dict) else "")
+            or base.get("errmsg")
+            or base.get("errMsg")
+            or ""
+        )
+        status_text = (message + " " + str(code) + " " + str(base_code)).lower()
+        if any(marker in status_text for marker in ("登录", "login", "300330", "300333", "300334")):
+            return {"status": "rejected", "post_id": "", "raw_status": message or str(code)}
+        if code not in (None, 0, "0") or base_code not in (None, 0, "0"):
+            return {
+                "status": "rejected", "post_id": "",
+                "raw_status": message or str(code or base_code),
+            }
+        if http_status >= 500 or http_status <= 0:
+            return {
+                "status": "unknown", "post_id": "",
+                "raw_status": message or f"HTTP {http_status}",
+            }
+        if http_status >= 400:
+            return {
+                "status": "rejected", "post_id": "",
+                "raw_status": message or f"HTTP {http_status}",
+            }
+        post_id = str(_first_nested_value(
+            data,
+            ("objectId", "postId", "finderPostId", "exportId", "feedId"),
+        ) or "")
+        raw_status = message or str(base.get("errmsg") or "")
+        if code in (0, "0") or base_code in (0, "0"):
+            return {"status": "accepted", "post_id": post_id, "raw_status": raw_status}
+        return {
+            "status": "unknown", "post_id": post_id,
+            "raw_status": raw_status or "平台未返回明确创建结果",
+        }
     if http_status >= 400:
         return {"status": "rejected", "post_id": "", "raw_status": f"HTTP {http_status}"}
     return {"status": "accepted", "post_id": "", "raw_status": ""}
@@ -638,6 +913,8 @@ class HybridPublisher:
         desc: str = "",
         tags: list[str] | None = None,
         signature: str = "",
+        media_file: str | Path = "",
+        short_title: str = "",
     ):
         self.platform_type = int(platform_type)
         self.cookie_path = str(cookie_path)
@@ -645,9 +922,13 @@ class HybridPublisher:
         self.desc = str(desc or "")
         self.tags = [str(tag) for tag in (tags or []) if str(tag).strip()]
         self.signature = str(signature or "")
-        self.media_ids: dict[str, str] = {}
+        self.media_file = str(media_file or "")
+        self.short_title = str(short_title or "")
+        self.media_ids: dict[str, Any] = {}
         self.template_saved = False
         self._upload_payloads: list[Any] = []
+        self._tencent_cover_urls: list[str] = []
+        self._file_fingerprint = ""
 
     # -- 录制 ----------------------------------------------------------
 
@@ -658,18 +939,30 @@ class HybridPublisher:
 
     async def _on_response(self, response) -> None:
         url = str(getattr(response, "url", "") or "").lower()
+        payload = None
+        if self.platform_type == 2 and (
+            "/completepartuploaddfs" in url or "/post/post_clip_video" in url
+        ):
+            try:
+                payload = await response.json()
+            except Exception:
+                payload = None
+            self._capture_tencent_response(response, url, payload)
         if not any(marker in url for marker in UPLOAD_URL_MARKERS):
             return
-        try:
-            payload = await response.json()
-        except Exception:
-            return
+        if payload is None:
+            try:
+                payload = await response.json()
+            except Exception:
+                return
         self._upload_payloads.append(payload)
         self.media_ids.update(
             collect_media_ids([payload], self.platform_type)
         )
 
     async def _on_request(self, request) -> None:
+        if self.platform_type == 2:
+            await self._capture_tencent_request(request)
         if self.template_saved:
             return
         url = str(getattr(request, "url", "") or "")
@@ -707,6 +1000,145 @@ class HybridPublisher:
                 self.platform_type, template_path(self.cookie_path, self.platform_type).name,
             )
 
+    def _capture_tencent_response(self, response, url: str, payload: Any) -> None:
+        if payload is None:
+            return
+        if "/completepartuploaddfs" in url:
+            download_url = normalize_tencent_download_url(_first_nested_value(
+                payload, ("DownloadURL", "downloadUrl", "downloadURL"),
+            ))
+            if not download_url:
+                return
+            try:
+                headers = dict(getattr(getattr(response, "request", None), "headers", {}) or {})
+            except Exception:
+                headers = {}
+            filetype = _tencent_filetype(headers)
+            if not filetype:
+                # 个别 Chromium 版本在跨域重定向后拿不到原请求的 X-Arguments。
+                # 视频一定先于封面完成，用响应顺序做保守兜底。
+                filetype = (
+                    TENCENT_VIDEO_FILETYPE
+                    if not self.media_ids.get("video_url")
+                    else TENCENT_COVER_FILETYPE
+                )
+            if filetype == TENCENT_VIDEO_FILETYPE:
+                self.media_ids["video_url"] = download_url
+            elif filetype == TENCENT_COVER_FILETYPE:
+                if download_url not in self._tencent_cover_urls:
+                    self._tencent_cover_urls.append(download_url)
+                self.media_ids["cover_url"] = self._tencent_cover_urls[0]
+                if len(self._tencent_cover_urls) > 1:
+                    self.media_ids["share_cover_url"] = self._tencent_cover_urls[1]
+            return
+        if "/post/post_clip_video" in url:
+            draft_id = _first_nested_value(payload, ("draftId", "draftID", "draft_id"))
+            clip_key = _first_nested_value(payload, ("clipKey", "clip_key"))
+            if draft_id:
+                self.media_ids["draft_id"] = str(draft_id)
+            if clip_key:
+                self.media_ids["clip_key"] = str(clip_key)
+
+    async def _capture_tencent_request(self, request) -> None:
+        url = str(getattr(request, "url", "") or "").lower()
+        if "/post/post_clip_video" not in url:
+            return
+        body_text = getattr(request, "post_data", None)
+        if not body_text:
+            return
+        body, _content_type = _parse_request_body(body_text)
+        if not isinstance(body, dict):
+            return
+        video_url = normalize_tencent_download_url(
+            body.get("url") or _first_nested_value(body, ("DownloadURL", "downloadUrl")),
+        )
+        if video_url:
+            self.media_ids["video_url"] = video_url
+        for source, target in (
+            ("width", "video_width"),
+            ("height", "video_height"),
+            ("fileSize", "file_size"),
+        ):
+            value = body.get(source)
+            if value in (None, ""):
+                value = _first_nested_value(body, (source,))
+            if value not in (None, ""):
+                self.media_ids[target] = value
+        duration = body.get("duration")
+        if duration in (None, ""):
+            duration = _first_nested_value(body, ("duration",))
+        if duration not in (None, ""):
+            self.media_ids["duration"] = duration
+
+    async def _refresh_media_file_facts(self) -> None:
+        if self.platform_type != 2 or not self.media_file:
+            return
+        path = Path(self.media_file)
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        fingerprint = f"{stat.st_mtime_ns}:{stat.st_size}"
+        self.media_ids["file_size"] = int(stat.st_size)
+        self.media_ids["upload_cost"] = int((stat.st_size + 524286) // 524287 * 1000)
+        if fingerprint == self._file_fingerprint and self.media_ids.get("video_md5"):
+            return
+        self._file_fingerprint = fingerprint
+        try:
+            import asyncio
+
+            self.media_ids["video_md5"] = await asyncio.to_thread(_file_md5, path)
+        except OSError as exc:
+            logger.warning("视频号本地文件 MD5 计算失败（{}）: {}", path.name, exc)
+
+    def _refresh_tencent_derived_values(self) -> None:
+        if self._tencent_cover_urls:
+            self.media_ids["cover_url"] = self._tencent_cover_urls[0]
+            if len(self._tencent_cover_urls) > 1:
+                self.media_ids["share_cover_url"] = self._tencent_cover_urls[1]
+            else:
+                self.media_ids.setdefault("share_cover_url", self._tencent_cover_urls[0])
+        try:
+            duration = int(self.media_ids.get("duration"))
+        except (TypeError, ValueError):
+            duration = 0
+        if duration > 0:
+            self.media_ids["duration_ms"] = duration * 1000
+
+    def _tencent_attempt_values(self) -> dict[str, Any]:
+        values = render_values(self.title, self.desc, self.tags)
+        for key, value in self.media_ids.items():
+            values[f"{{{{media:{key}}}}}"] = value
+        values["{{tencent:tags}}"] = [tag.lstrip("#") for tag in self.tags]
+        values["{{tencent:short_title_list}}"] = [
+            {"shortTitle": self.short_title or self.title}
+        ]
+        values["{{tencent:timestamp}}"] = str(int(time.time() * 1000))
+        values["{{tencent:client_id}}"] = str(uuid.uuid4())
+        return values
+
+    def _tencent_requirements_match(self, template: dict) -> tuple[bool, str]:
+        requirements = template.get("requirements")
+        if not isinstance(requirements, dict):
+            return True, ""
+        expected_shape = requirements.get("isFullPost")
+        actual_shape = _tencent_is_full_post(
+            self.media_ids.get("video_width"), self.media_ids.get("video_height"),
+        )
+        if expected_shape in (0, 1) and actual_shape != expected_shape:
+            return False, "视频横竖形态与模板不一致，回落 RPA"
+        expected_tags = requirements.get("tagCount")
+        if isinstance(expected_tags, int) and len(self.tags) != expected_tags:
+            return False, "话题数量与模板不一致，回落 RPA"
+        try:
+            duration = int(self.media_ids.get("duration"))
+        except (TypeError, ValueError):
+            duration = 0
+        expected_long = bool(requirements.get("longVideo"))
+        if duration > 0 and (duration > 60) != expected_long:
+            return False, "视频时长跨过模板阈值，回落 RPA"
+        return True, ""
+
     # -- 直发 ----------------------------------------------------------
 
     async def attempt(self, page) -> dict:
@@ -719,6 +1151,12 @@ class HybridPublisher:
         template = load_template(self.cookie_path, self.platform_type)
         if not template:
             return {"status": "not_attempted", "reason": "尚未录制发布模板"}
+        await self._refresh_media_file_facts()
+        if self.platform_type == 2:
+            self._refresh_tencent_derived_values()
+            matches, reason = self._tencent_requirements_match(template)
+            if not matches:
+                return {"status": "not_attempted", "reason": reason}
         template_signature = str(template.get("signature") or "")
         if template_signature and self.signature and template_signature != self.signature:
             # 模板里带着上次的表单选项（商品链接/合集/声明/封面/定时），
@@ -734,9 +1172,12 @@ class HybridPublisher:
                 "status": "not_attempted",
                 "reason": f"素材 ID 尚未就绪（缺少 {'、'.join(missing)}）",
             }
-        values = render_values(self.title, self.desc, self.tags)
-        for key, value in self.media_ids.items():
-            values[f"{{{{media:{key}}}}}"] = value
+        if self.platform_type == 2:
+            values = self._tencent_attempt_values()
+        else:
+            values = render_values(self.title, self.desc, self.tags)
+            for key, value in self.media_ids.items():
+                values[f"{{{{media:{key}}}}}"] = value
         body = render_body(template, values)
         text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
         leftover = [
@@ -778,3 +1219,11 @@ def submitted_result(platform_type: int, reason: str = "") -> dict:
         "transport": "hybrid",
         "note": reason,
     }
+
+
+def _file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

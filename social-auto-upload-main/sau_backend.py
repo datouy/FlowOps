@@ -1050,20 +1050,16 @@ def api_v2_account_publish_transport(account_id: int):
     if request.method == 'DELETE':
         from publish_transport import clear_template
 
-        for candidate in (platform_type, 1, 3):
-            if candidate:
-                clear_template(cookie_path, candidate)
+        if platform_type:
+            clear_template(cookie_path, platform_type)
         return jsonify({
             "code": 200, "msg": "已清除直发模板，下次发布将重新录制",
             "data": {"cleared": True},
         }), 200
     from publish_transport import transport_status
 
-    statuses = [
-        transport_status(candidate, cookie_path)
-        for candidate in sorted({platform_type, 1, 3})
-    ]
-    return jsonify({"code": 200, "msg": None, "data": statuses}), 200
+    status = [transport_status(platform_type, cookie_path)] if platform_type else []
+    return jsonify({"code": 200, "msg": None, "data": status}), 200
 
 
 @app.route('/api/v2/proxy-pool', methods=['GET', 'PUT'])

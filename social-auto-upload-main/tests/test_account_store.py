@@ -456,7 +456,8 @@ def test_api_v2_publish_transport_reports_and_clears_templates(client, monkeypat
     payload = http.get(
         f"/api/v2/accounts/{account['id']}/publish-transport"
     ).get_json()["data"]
-    douyin_row = next(row for row in payload if row["platformType"] == 3)
+    assert [row["platformType"] for row in payload] == [3]
+    douyin_row = payload[0]
     assert douyin_row["hybridEnabled"] is True
     assert douyin_row["templateReady"] is True
 
@@ -468,7 +469,7 @@ def test_api_v2_publish_transport_reports_and_clears_templates(client, monkeypat
     payload = http.get(
         f"/api/v2/accounts/{account['id']}/publish-transport"
     ).get_json()["data"]
-    douyin_row = next(row for row in payload if row["platformType"] == 3)
+    douyin_row = payload[0]
     assert douyin_row["templateReady"] is False
 
 

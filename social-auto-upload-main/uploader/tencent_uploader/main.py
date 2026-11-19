@@ -1747,6 +1747,30 @@ class TencentVideo(TencentBaseUploader):
         # 上传中选的合集会被重置/不绑定（"日志说选了、后台没加"的根因）。
         # 改到 wait_for_upload_complete 之后再选，见 upload()。
 
+    def hybrid_block_reason(self) -> str:
+        """返回视频号直发的禁用原因；空字符串表示允许 API 优先。"""
+        if self.is_draft:
+            return "草稿模式保留页面发布"
+        if self.publish_strategy != TENCENT_PUBLISH_STRATEGY_IMMEDIATE:
+            return "定时发布保留页面发布"
+        if any((
+            self.collection_name,
+            self.mentions,
+            self.location_name,
+            self.poi_id,
+            self.bgm_name,
+            self.product_link,
+            self.product_title,
+            self.shop_product_id,
+        )):
+            return "合集、定位、配乐、提及或商品等高级选项保留页面发布"
+        if self.thumbnail_landscape_path or self.thumbnail_portrait_path:
+            return "自定义封面保留页面发布"
+        label = self.content_label or "含AI生成内容"
+        if label != "含AI生成内容":
+            return "非默认视频标注保留页面发布"
+        return ""
+
     async def upload(self, playwright: Playwright) -> None:
         tencent_logger.info(_msg("🧍", "小人先检查 cookie、视频文件和发布时间"))
         await self.validate_upload_args()
@@ -1759,12 +1783,81 @@ class TencentVideo(TencentBaseUploader):
 
         try:
             page = await context.new_page()
+
+            from publish_transport import (
+                HybridPublisher, form_signature, hybrid_enabled, submitted_result,
+            )
+
+            hybrid = None
+            block_reason = self.hybrid_block_reason()
+            if hybrid_enabled(2) and not block_reason:
+                label = self.content_label or "含AI生成内容"
+                hybrid = HybridPublisher(
+                    2, self.account_file, self.title, self.desc, self.tags,
+                    signature=form_signature(
+                        declaration=label,
+                        scheduled=False,
+                    ),
+                    media_file=self.file_path,
+                    short_title=format_str_for_short_title(self.short_title or self.title),
+                )
+                hybrid.attach(page)
+            elif block_reason:
+                tencent_logger.info(_msg("🧭", f"视频号直发未启用（{block_reason}）"))
+
             await self.open_upload_page(page)
             tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
 
             await self.upload_video_file(page, self.file_path)
             await self.prepare_video_for_publish(page)
             await self.wait_for_upload_complete(page)
+
+            if hybrid is not None:
+                direct = await hybrid.attempt(page)
+                direct_status = str(direct.get("status") or "")
+                if direct_status in {"accepted", "unknown"}:
+                    captured_responses = []
+
+                    def capture_post_list(response):
+                        try:
+                            if "/post/post_list" in response.url:
+                                captured_responses.append(response)
+                        except Exception:
+                            pass
+
+                    page.on("response", capture_post_list)
+                    result = None
+                    try:
+                        result = await self._verify_published_post(
+                            page, self.title, captured_responses,
+                        )
+                    except Exception as exc:
+                        if direct_status == "accepted":
+                            tencent_logger.warning(
+                                _msg("⚠️", f"平台接口已接受，但作品列表暂未回查到：{exc}")
+                            )
+                            result = submitted_result(
+                                2, f"平台接口已接受，作品列表暂未回查到：{exc}",
+                            )
+                    if result is not None:
+                        if result.get("state") in {"failed", "removed"}:
+                            raise RuntimeError(
+                                "视频号作品状态为 "
+                                f"{result.get('state')}（{result.get('remote_status') or '平台未返回原因'}）"
+                            )
+                        await save_account_storage_state(context, self.account_file)
+                        return result
+                    tencent_logger.warning(
+                        _msg("⚠️", "平台接口结果不确定，停止重复提交，请到作品管理人工确认")
+                    )
+                    await save_account_storage_state(context, self.account_file)
+                    return submitted_result(
+                        2, str(direct.get("error") or direct.get("reason") or ""),
+                    )
+                reason = str(direct.get("reason") or direct.get("raw_status") or "")
+                if reason:
+                    tencent_logger.info(_msg("🧍", f"直发未启用（{reason}），改用页面发布"))
+
             # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
             await self.apply_collection(page)
             await self.apply_location(page)
