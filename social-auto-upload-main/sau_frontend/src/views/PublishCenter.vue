@@ -403,6 +403,9 @@
                   class="topic-tag"
                 >
                   #{{ topic }}
+                  <span v-if="topicPlayText(tab, topic)" class="topic-tag-count">
+                    {{ topicPlayText(tab, topic) }}
+                  </span>
                 </el-tag>
               </div>
               <el-button 
@@ -422,22 +425,52 @@
             title="添加话题"
             width="600px"
             class="topic-dialog"
+            @closed="handleTopicDialogClosed"
           >
             <div class="topic-dialog-content">
               <!-- 自定义话题输入 -->
               <div class="custom-topic-input">
                 <el-input
                   v-model="customTopic"
-                  placeholder="输入自定义话题"
+                  :placeholder="isDouyinTopicTab ? '搜索抖音话题，例如：旅行攻略' : '输入自定义话题'"
                   class="custom-input"
+                  @input="scheduleDouyinTopicSearch"
+                  @keyup.enter="addCustomTopic"
                 >
                   <template #prepend>#</template>
                 </el-input>
                 <el-button type="primary" @click="addCustomTopic">添加</el-button>
               </div>
 
-              <!-- 推荐话题 -->
-              <div class="recommended-topics">
+              <div v-if="isDouyinTopicTab" class="douyin-topic-results" v-loading="douyinTopicsLoading">
+                <div class="topic-results-heading">
+                  <h4>抖音联想话题</h4>
+                  <span>播放量由抖音官方实时返回</span>
+                </div>
+                <div v-if="douyinTopicResults.length" class="topic-result-list">
+                  <button
+                    v-for="item in douyinTopicResults"
+                    :key="item.cid || item.name"
+                    type="button"
+                    class="topic-result-item"
+                    :class="{ 'is-selected': currentTab?.selectedTopics?.includes(item.name) }"
+                    :aria-pressed="currentTab?.selectedTopics?.includes(item.name)"
+                    @click="toggleDouyinTopic(item)"
+                  >
+                    <span class="topic-result-name">#{{ item.name }}</span>
+                    <span class="topic-result-count">{{ formatTopicPlayCount(item.viewCount) }}次播放</span>
+                  </button>
+                </div>
+                <div v-else-if="douyinTopicError" class="topic-search-state is-error">
+                  {{ douyinTopicError }}
+                </div>
+                <div v-else-if="!douyinTopicsLoading" class="topic-search-state">
+                  {{ douyinTopicSearched ? '没有找到匹配话题，可直接输入完整名称添加' : '输入关键词后显示抖音官方话题及播放次数' }}
+                </div>
+              </div>
+
+              <!-- 其它平台仍使用通用推荐话题 -->
+              <div v-else class="recommended-topics">
                 <h4>推荐话题</h4>
                 <div class="topic-grid">
                   <el-button
@@ -711,6 +744,7 @@ const defaultTabInit = {
   productLink: '', // 商品链接
   productTitle: '', // 商品名称
   selectedTopics: [], // 话题列表（不带#号）
+  topicStats: {}, // 平台返回的话题播放量，仅用于界面展示
   scheduleEnabled: false, // 定时发布开关
   videosPerDay: 1, // 每天发布视频数量
   dailyTimes: ['10:00'], // 每天发布时间点列表
@@ -774,6 +808,14 @@ const clearFiltered = () => {
 // 话题相关状态
 const topicDialogVisible = ref(false)
 const customTopic = ref('')
+const douyinTopicResults = ref([])
+const douyinTopicsLoading = ref(false)
+const douyinTopicError = ref('')
+const douyinTopicSearched = ref(false)
+let douyinTopicSearchTimer = null
+let douyinTopicSearchRequest = 0
+
+const isDouyinTopicTab = computed(() => Number(currentTab.value?.selectedPlatform) === 3)
 
 // 推荐话题列表
 const recommendedTopics = [
@@ -781,6 +823,99 @@ const recommendedTopics = [
   '科技', '生活', '娱乐', '体育', '教育', '艺术',
   '健康', '时尚', '美妆', '摄影', '宠物', '汽车'
 ]
+
+function normalizeTopicName(value) {
+  return String(value || '').replace(/^#+/, '').trim()
+}
+
+function formatTopicPlayCount(value) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count < 0) return '0'
+  const compact = (number) => String(Math.round(number * 10) / 10)
+  if (count >= 1000000000000) return `${compact(count / 1000000000000)}万亿`
+  if (count >= 100000000) return `${compact(count / 100000000)}亿`
+  if (count >= 10000) return `${compact(count / 10000)}万`
+  return Math.round(count).toLocaleString('zh-CN')
+}
+
+function topicPlayText(tab, topic) {
+  if (Number(tab?.selectedPlatform) !== 3) return ''
+  const count = tab?.topicStats?.[topic]
+  if (count === undefined || count === null) return ''
+  return `${formatTopicPlayCount(count)}次播放`
+}
+
+function rememberTopicStat(tab, name, viewCount) {
+  if (!tab || !name) return
+  if (!tab.topicStats || typeof tab.topicStats !== 'object') tab.topicStats = {}
+  tab.topicStats[name] = Number(viewCount) || 0
+}
+
+function selectedDouyinAccount(tab) {
+  const selectedIds = new Set((tab?.selectedAccounts || []).map(id => String(id)))
+  const douyinAccounts = accountStore.accounts.filter(account => account.platform === '抖音')
+  return douyinAccounts.find(account => selectedIds.has(String(account.id)))
+    || douyinAccounts.find(account => account.status === '正常')
+    || douyinAccounts[0]
+    || null
+}
+
+function stopDouyinTopicSearch() {
+  douyinTopicSearchRequest += 1
+  if (douyinTopicSearchTimer) {
+    clearTimeout(douyinTopicSearchTimer)
+    douyinTopicSearchTimer = null
+  }
+}
+
+async function loadDouyinTopics(keyword, requestId) {
+  if (!isDouyinTopicTab.value || requestId !== douyinTopicSearchRequest) return
+  douyinTopicsLoading.value = true
+  douyinTopicError.value = ''
+  try {
+    const response = await publishApi.searchDouyinTopics(
+      keyword,
+      selectedDouyinAccount(currentTab.value)?.id,
+    )
+    if (requestId !== douyinTopicSearchRequest) return
+    douyinTopicResults.value = response.data?.items || []
+    douyinTopicSearched.value = true
+  } catch (error) {
+    if (requestId !== douyinTopicSearchRequest) return
+    douyinTopicResults.value = []
+    douyinTopicSearched.value = true
+    douyinTopicError.value = error.response?.data?.msg || error.message || '抖音话题查询失败'
+  } finally {
+    if (requestId === douyinTopicSearchRequest) douyinTopicsLoading.value = false
+  }
+}
+
+function scheduleDouyinTopicSearch() {
+  if (!isDouyinTopicTab.value) return
+  stopDouyinTopicSearch()
+  const keyword = normalizeTopicName(customTopic.value)
+  douyinTopicResults.value = []
+  douyinTopicError.value = ''
+  douyinTopicSearched.value = false
+  if (!keyword) {
+    douyinTopicsLoading.value = false
+    return
+  }
+  const requestId = douyinTopicSearchRequest
+  douyinTopicSearchTimer = setTimeout(() => {
+    douyinTopicSearchTimer = null
+    loadDouyinTopics(keyword, requestId)
+  }, 450)
+}
+
+function handleTopicDialogClosed() {
+  stopDouyinTopicSearch()
+  douyinTopicsLoading.value = false
+  douyinTopicResults.value = []
+  douyinTopicError.value = ''
+  douyinTopicSearched.value = false
+  customTopic.value = ''
+}
 
 // 添加新tab
 const addTab = () => {
@@ -858,23 +993,48 @@ const removeFile = (tab, index) => {
 // 话题相关方法
 // 打开添加话题弹窗
 const openTopicDialog = (tab) => {
+  stopDouyinTopicSearch()
   currentTab.value = tab
+  customTopic.value = ''
+  douyinTopicsLoading.value = false
+  douyinTopicResults.value = []
+  douyinTopicError.value = ''
+  douyinTopicSearched.value = false
   topicDialogVisible.value = true
 }
 
 // 添加自定义话题
 const addCustomTopic = () => {
-  if (!customTopic.value.trim()) {
+  const topic = normalizeTopicName(customTopic.value)
+  if (!topic) {
     ElMessage.warning('请输入话题内容')
     return
   }
-  if (currentTab.value && !currentTab.value.selectedTopics.includes(customTopic.value.trim())) {
-    currentTab.value.selectedTopics.push(customTopic.value.trim())
+  if (currentTab.value && !currentTab.value.selectedTopics.includes(topic)) {
+    currentTab.value.selectedTopics.push(topic)
+    const matchedTopic = douyinTopicResults.value.find(item => item.name === topic)
+    if (matchedTopic) rememberTopicStat(currentTab.value, topic, matchedTopic.viewCount)
+    stopDouyinTopicSearch()
     customTopic.value = ''
     ElMessage.success('话题添加成功')
   } else {
     ElMessage.warning('话题已存在')
   }
+}
+
+// 选择抖音官方联想话题，并保存该话题的播放量
+const toggleDouyinTopic = (item) => {
+  if (!currentTab.value || !item?.name) return
+  const topic = normalizeTopicName(item.name)
+  if (!topic) return
+  const index = currentTab.value.selectedTopics.indexOf(topic)
+  if (index > -1) {
+    currentTab.value.selectedTopics.splice(index, 1)
+    if (currentTab.value.topicStats) delete currentTab.value.topicStats[topic]
+    return
+  }
+  currentTab.value.selectedTopics.push(topic)
+  rememberTopicStat(currentTab.value, topic, item.viewCount)
 }
 
 // 切换推荐话题
@@ -884,6 +1044,7 @@ const toggleRecommendedTopic = (topic) => {
   const index = currentTab.value.selectedTopics.indexOf(topic)
   if (index > -1) {
     currentTab.value.selectedTopics.splice(index, 1)
+    if (currentTab.value.topicStats) delete currentTab.value.topicStats[topic]
   } else {
     currentTab.value.selectedTopics.push(topic)
   }
@@ -891,11 +1052,14 @@ const toggleRecommendedTopic = (topic) => {
 
 // 删除话题
 const removeTopic = (tab, index) => {
+  const topic = tab.selectedTopics[index]
   tab.selectedTopics.splice(index, 1)
+  if (topic && tab.topicStats) delete tab.topicStats[topic]
 }
 
 // 确认添加话题
 const confirmTopicSelection = () => {
+  stopDouyinTopicSearch()
   topicDialogVisible.value = false
   customTopic.value = ''
   currentTab.value = null
@@ -1016,6 +1180,7 @@ const confirmPublish = async (tab) => {
     tab.title = ''
     tab.desc = ''
     tab.selectedTopics = []
+    tab.topicStats = {}
     tab.selectedAccounts = []
     tab.scheduleEnabled = false
   } catch (error) {
@@ -1321,8 +1486,14 @@ const startVerifyPoll = () => {
 
 onMounted(startVerifyPoll)
 onActivated(startVerifyPoll)
-onDeactivated(stopVerifyPoll)
-onUnmounted(stopVerifyPoll)
+onDeactivated(() => {
+  stopVerifyPoll()
+  stopDouyinTopicSearch()
+})
+onUnmounted(() => {
+  stopVerifyPoll()
+  stopDouyinTopicSearch()
+})
 </script>
 
 <style lang="scss" scoped>
@@ -1631,6 +1802,12 @@ onUnmounted(stopVerifyPoll)
             
             .topic-tag {
               font-size: 14px;
+
+              .topic-tag-count {
+                margin-left: 6px;
+                color: $text-secondary;
+                font-size: 12px;
+              }
             }
           }
           
@@ -1758,6 +1935,111 @@ onUnmounted(stopVerifyPoll)
         
         .custom-input {
           flex: 1;
+        }
+      }
+
+      .douyin-topic-results {
+        min-height: 192px;
+
+        .topic-results-heading {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+
+          h4 {
+            margin: 0;
+            color: $text-primary;
+            font-size: 16px;
+            font-weight: 600;
+          }
+
+          span {
+            color: $text-secondary;
+            font-size: 12px;
+          }
+        }
+
+        .topic-result-list {
+          max-height: 320px;
+          overflow-y: auto;
+          border: 1px solid $border-lighter;
+          border-radius: 10px;
+        }
+
+        .topic-result-item {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          width: 100%;
+          min-height: 48px;
+          padding: 10px 14px;
+          border: 0;
+          border-bottom: 1px solid $border-lighter;
+          background: $paper;
+          color: $text-primary;
+          cursor: pointer;
+          font: inherit;
+          text-align: left;
+          transition: background-color $duration-fast $ease-out, color $duration-fast $ease-out;
+
+          &:last-child {
+            border-bottom: 0;
+          }
+
+          &:hover {
+            background: $bg-color-raised;
+          }
+
+          &:focus-visible {
+            outline: 2px solid $ink-850;
+            outline-offset: -2px;
+          }
+
+          &.is-selected {
+            background: $ink-850;
+            color: $paper;
+
+            .topic-result-count {
+              color: rgba(255, 255, 255, 0.72);
+            }
+          }
+        }
+
+        .topic-result-name {
+          min-width: 0;
+          overflow: hidden;
+          font-size: 14px;
+          font-weight: 500;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .topic-result-count {
+          flex: none;
+          color: $text-secondary;
+          font-size: 12px;
+        }
+
+        .topic-search-state {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          min-height: 160px;
+          padding: 24px;
+          border: 1px dashed $border-lighter;
+          border-radius: 10px;
+          color: $text-secondary;
+          font-size: 13px;
+          line-height: 1.6;
+          text-align: center;
+
+          &.is-error {
+            border-color: $danger-color-soft;
+            color: $danger-color;
+          }
         }
       }
       
@@ -1960,6 +2242,27 @@ onUnmounted(stopVerifyPoll)
         .action-buttons {
           margin-inline: -16px;
           padding: 14px 16px 18px;
+        }
+      }
+    }
+
+    .topic-dialog .topic-dialog-content {
+      .custom-topic-input {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .douyin-topic-results {
+        .topic-results-heading {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 4px;
+        }
+
+        .topic-result-item {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 4px;
         }
       }
     }

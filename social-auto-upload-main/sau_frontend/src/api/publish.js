@@ -9,4 +9,8 @@ export const publishApi = {
     code,
   }),
   resendVerify: requestId => http.post('/verify/resend', { request_id: requestId }),
+  searchDouyinTopics: (keyword, accountId = null) => http.get('/douyin/topic-suggest', {
+    keyword,
+    ...(accountId ? { account_id: accountId } : {}),
+  }, { silent: true }),
 }

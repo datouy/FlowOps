@@ -132,6 +132,8 @@ import media_ops
 media_ops.register(app)
 import schedule_suggest
 schedule_suggest.register(app)
+import douyin_topics
+douyin_topics.register(app)
 import material_ops
 material_ops.register(app)
 import p0p1_ops
