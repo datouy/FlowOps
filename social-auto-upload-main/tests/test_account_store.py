@@ -470,3 +470,37 @@ def test_api_v2_publish_transport_reports_and_clears_templates(client, monkeypat
     ).get_json()["data"]
     douyin_row = next(row for row in payload if row["platformType"] == 3)
     assert douyin_row["templateReady"] is False
+
+
+def test_api_v2_proxy_verify_reports_both_exits(client, monkeypatch):
+    be, http = client
+    account = be.get_store(be.BASE_DIR).upsert(
+        2, cookie_name=TENCENT_COOKIE, name="频道A", identity="finder-A"
+    )
+    import utils.proxy_egress as proxy_egress
+
+    monkeypatch.setattr(
+        proxy_egress,
+        "verify_dual_egress",
+        lambda *_args, **_kwargs: {
+            "ip": "1.2.3.4",
+            "httpIp": "1.2.3.4",
+            "browserIp": "1.2.3.4",
+            "match": True,
+            "error": "",
+            "httpError": "",
+            "browserError": "",
+        },
+    )
+
+    result = http.post(
+        f"/api/v2/accounts/{account['id']}/proxy/verify"
+    ).get_json()["data"]
+    saved = http.get(
+        f"/api/v2/accounts/{account['id']}/proxy/egress"
+    ).get_json()["data"]
+
+    assert result["match"] is True
+    assert result["httpIp"] == result["browserIp"] == "1.2.3.4"
+    assert saved["match"] is True
+    assert saved["httpIp"] == "1.2.3.4"

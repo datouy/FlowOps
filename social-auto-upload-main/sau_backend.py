@@ -1228,11 +1228,20 @@ def api_v2_account_proxy_verify(account_id: int):
         return access_scope.forbidden("无权访问该账号")
     cookie_path = Path(BASE_DIR / "cookiesFile" / item["cookie"]["name"])
     from utils.account_environment import load_environment
-    from utils.proxy_egress import detect_egress_ip, record_egress
+    from utils.proxy_egress import record_egress, verify_dual_egress
     proxy = (load_environment(cookie_path) or {}).get("proxy") or {}
-    ip, err = detect_egress_ip(proxy)
-    record_egress(cookie_path, ip, err)
-    return jsonify({"code": 200, "msg": None, "data": {"ip": ip, "error": err}}), 200
+    result = verify_dual_egress(cookie_path, proxy)
+    record_egress(
+        cookie_path,
+        result["ip"],
+        result["error"],
+        http_ip=result["httpIp"],
+        browser_ip=result["browserIp"],
+        http_error=result["httpError"],
+        browser_error=result["browserError"],
+        match=result["match"],
+    )
+    return jsonify({"code": 200, "msg": None, "data": result}), 200
 
 
 @app.route('/api/v2/accounts/<int:account_id>/proxy/egress', methods=['GET'])

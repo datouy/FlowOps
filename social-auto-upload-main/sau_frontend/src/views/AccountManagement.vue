@@ -473,16 +473,46 @@
           show-icon
           title="代理只作用于该账号的登录、巡检和发布会话；留空代理地址表示直连。"
         />
-        <el-form-item label="出口 IP">
-          <span v-if="egressForm.ip" class="egress-ip">{{ egressForm.ip }}</span>
-          <span v-else class="egress-muted">尚未验证</span>
-          <el-button
-            size="small"
-            style="margin-left: 12px"
-            :loading="egressVerifying"
-            @click="verifyProxyEgress"
-          >验证出口</el-button>
-          <span v-if="egressForm.error" class="egress-error" :title="egressForm.error">（验证失败）</span>
+        <el-form-item label="出口验证">
+          <div class="egress-panel">
+            <div class="egress-grid">
+              <span>HTTP 私信</span>
+              <span :class="egressForm.httpIp ? 'egress-ip' : 'egress-muted'">
+                {{ egressForm.httpIp || '尚未验证' }}
+              </span>
+              <span>浏览器</span>
+              <span :class="egressForm.browserIp ? 'egress-ip' : 'egress-muted'">
+                {{ egressForm.browserIp || '尚未验证' }}
+              </span>
+            </div>
+            <div class="egress-actions">
+              <el-tag
+                v-if="egressForm.httpIp && egressForm.browserIp"
+                :type="egressForm.match ? 'success' : 'danger'"
+                effect="plain"
+                size="small"
+              >
+                {{ egressForm.match ? '两个通道同出口' : '两个通道出口不一致' }}
+              </el-tag>
+              <el-tag v-else type="info" effect="plain" size="small">待完整验证</el-tag>
+              <el-button
+                size="small"
+                :loading="egressVerifying"
+                @click="verifyProxyEgress"
+              >验证双出口</el-button>
+            </div>
+            <span
+              v-if="egressForm.httpError"
+              class="egress-error"
+              :title="egressForm.httpError"
+            >HTTP：{{ egressForm.httpError }}</span>
+            <span
+              v-if="egressForm.browserError"
+              class="egress-error"
+              :title="egressForm.browserError"
+            >浏览器：{{ egressForm.browserError }}</span>
+            <span class="egress-hint">浏览器验证使用该账号持久 Profile、指纹与代理；环境被占用时会单独提示。</span>
+          </div>
         </el-form-item>
         <el-divider content-position="left">发布通道</el-divider>
         <div class="transport-list" v-loading="environmentLoading">
@@ -767,7 +797,15 @@ const environmentForm = reactive({
 })
 const transportRows = ref([])
 const egressVerifying = ref(false)
-const egressForm = reactive({ ip: '', error: '' })
+const egressForm = reactive({
+  ip: '',
+  httpIp: '',
+  browserIp: '',
+  match: false,
+  error: '',
+  httpError: '',
+  browserError: '',
+})
 
 const transportHasTemplate = computed(() =>
   transportRows.value.some((item) => item.templateReady)
@@ -1036,10 +1074,20 @@ const loadProxyEgress = async (accountId) => {
     const res = await accountApi.getProxyEgress(accountId)
     const data = res?.data || {}
     egressForm.ip = data.ip || ''
+    egressForm.httpIp = data.httpIp || ''
+    egressForm.browserIp = data.browserIp || ''
+    egressForm.match = Boolean(data.match)
     egressForm.error = data.error || ''
+    egressForm.httpError = data.httpError || ''
+    egressForm.browserError = data.browserError || ''
   } catch (error) {
     egressForm.ip = ''
+    egressForm.httpIp = ''
+    egressForm.browserIp = ''
+    egressForm.match = false
     egressForm.error = ''
+    egressForm.httpError = ''
+    egressForm.browserError = ''
   }
 }
 
@@ -1050,11 +1098,18 @@ const verifyProxyEgress = async () => {
     const res = await accountApi.verifyProxyEgress(environmentAccount.value.id)
     const data = res?.data || {}
     egressForm.ip = data.ip || ''
+    egressForm.httpIp = data.httpIp || ''
+    egressForm.browserIp = data.browserIp || ''
+    egressForm.match = Boolean(data.match)
     egressForm.error = data.error || ''
-    if (data.ip) {
-      ElMessage.success('出口 IP：' + data.ip)
+    egressForm.httpError = data.httpError || ''
+    egressForm.browserError = data.browserError || ''
+    if (data.match) {
+      ElMessage.success('HTTP 与浏览器使用同一出口：' + data.httpIp)
+    } else if (data.httpIp && data.browserIp) {
+      ElMessage.warning(`出口不一致：HTTP ${data.httpIp} / 浏览器 ${data.browserIp}`)
     } else {
-      ElMessage.warning(data.error || '未能获取出口 IP')
+      ElMessage.warning(data.error || '未能完成双出口验证')
     }
   } catch (error) {
     ElMessage.error(error?.message || '验证出口失败')
