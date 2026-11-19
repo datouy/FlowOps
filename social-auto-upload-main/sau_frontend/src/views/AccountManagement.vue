@@ -130,6 +130,9 @@
                             <el-dropdown-item command="upload">上传 Cookie</el-dropdown-item>
                             <el-dropdown-item command="environment">发布环境</el-dropdown-item>
                             <el-dropdown-item v-if="scope.row.platform === '视频号'" command="seed">补登频道</el-dropdown-item>
+                            <el-dropdown-item v-if="INTERACTIVE_PLATFORMS[scope.row.platform]" command="relogin">
+                              {{ scope.row.platform === '小红书' ? '重新登录主站' : '重新登录' }}
+                            </el-dropdown-item>
                             <el-dropdown-item command="delete" divided class="danger-item">删除账号</el-dropdown-item>
                           </el-dropdown-menu>
                         </template>
@@ -1428,6 +1431,7 @@ const handleMoreCommand = (command, row) => {
   else if (command === 'upload') handleUploadCookie(row)
   else if (command === 'environment') openAccountEnvironment(row)
   else if (command === 'seed') handleSeedChannels(row)
+  else if (command === 'relogin') handleReLogin(row)
   else if (command === 'delete') handleDelete(row)
 }
 

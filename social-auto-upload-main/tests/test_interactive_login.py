@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import time
+
+import pytest
 
 from interactive_login import (
     ABANDONED_SESSION_SECONDS,
@@ -444,6 +447,120 @@ def test_xhs_user_info_is_read_from_creator_local_storage():
         "user_id": "607d32",
         "nickname": "大头",
     }
+
+
+def test_xhs_user_probe_caches_identity_for_account_binding():
+    class _Response:
+        ok = True
+
+        def json(self):
+            return {
+                "data": {
+                    "guest": False,
+                    "user_id": "607d32",
+                    "nickname": "大头",
+                }
+            }
+
+    class _Request:
+        def get(self, *_args, **_kwargs):
+            return _Response()
+
+    class _Context:
+        request = _Request()
+
+        @staticmethod
+        def cookies():
+            return [{"name": "web_session", "value": "session"}]
+
+    xhs = InteractivePlatformLogin("s", "a", None, platform="xiaohongshu")
+
+    assert xhs._probe_xhs_user(_Context()) is True
+    assert xhs._xhs_user_info == {"user_id": "607d32", "nickname": "大头"}
+
+
+def _write_tencent_storage(path, identity="finder-A"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "sessionid",
+                        "value": "session",
+                        "domain": "channels.weixin.qq.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [
+                    {
+                        "origin": "https://channels.weixin.qq.com",
+                        "localStorage": [
+                            {"name": "finder_username", "value": identity}
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_tencent_saved_session_requires_matching_auth_api(monkeypatch, tmp_path):
+    import channels_dm
+
+    mod = pytest.importorskip("interactive_login")
+    cookie_name = "saved.json"
+    _write_tencent_storage(tmp_path / "cookiesFile" / cookie_name)
+    monkeypatch.setattr(mod, "BASE_DIR", tmp_path)
+
+    class _WrongIdentityClient:
+        def __init__(self, _account):
+            self.session = None
+
+        def get_finder_username(self):
+            return "finder-B"
+
+    monkeypatch.setattr(channels_dm, "ChannelsClient", _WrongIdentityClient)
+    session = mod.InteractivePlatformLogin("s", "频道A", None, platform="tencent")
+    session._run_coro_in_new_thread = lambda _factory: True
+
+    assert session._verify_tencent_cookie(cookie_name, identity="finder-A") is False
+    assert session._tencent_validation_steps == {
+        "storage": True,
+        "api": False,
+        "browser": False,
+    }
+    assert "另一个视频号" in session._tencent_validation_error
+
+
+def test_tencent_saved_session_passes_all_three_checks(monkeypatch, tmp_path):
+    import channels_dm
+
+    mod = pytest.importorskip("interactive_login")
+    cookie_name = "saved.json"
+    _write_tencent_storage(tmp_path / "cookiesFile" / cookie_name)
+    monkeypatch.setattr(mod, "BASE_DIR", tmp_path)
+
+    class _Client:
+        def __init__(self, _account):
+            self.session = None
+
+        def get_finder_username(self):
+            return "finder-A"
+
+    monkeypatch.setattr(channels_dm, "ChannelsClient", _Client)
+    session = mod.InteractivePlatformLogin("s", "频道A", None, platform="tencent")
+    session._run_coro_in_new_thread = lambda _factory: True
+
+    assert session._verify_tencent_cookie(cookie_name, identity="finder-A") is True
+    assert session._tencent_validation_steps == {
+        "storage": True,
+        "api": True,
+        "browser": True,
+    }
+    assert session._tencent_validation_error == ""
 
 
 def test_is_logged_in_false_without_any_auth_cookie():

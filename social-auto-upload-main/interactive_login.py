@@ -5,13 +5,14 @@ to the account-management dialog.  Mouse and keyboard commands are replayed in
 that browser, so the user works with the platform's official login panel and
 the server can still persist the resulting cookie.
 
-抖音和小红书共用这套机制：抖音走创作者中心官方表单，小红书走创作服务平台
-官方登录页。视频号的扫码页结构与两者都不同（微信跨域 iframe + long-poll），
+抖音和小红书共用这套机制：抖音走创作者中心官方表单，小红书走主站登录页，
+以同步私信会话。视频号的扫码页结构与两者都不同（微信跨域 iframe + long-poll），
 见 myUtils/login.py 里专门的实现。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -40,6 +41,7 @@ from utils.account_fingerprint import (
 )
 from utils.account_browser import (
     account_fingerprint,
+    merge_storage_states,
     open_persistent_account_context_sync,
 )
 from utils.account_environment import (
@@ -126,8 +128,10 @@ PLATFORM_LOGIN_TARGETS = {
     },
     "xiaohongshu": {
         "type": 1,
-        "url": "https://creator.xiaohongshu.com/login?source=&redirectReason=401",
-        "login_form": 'input[placeholder*="手机号"]',
+        # 从主站登录页进入：一次扫码后主站私信会话会同步到创作平台。
+        # 只登录创作平台不会得到 web_session，账号看似正常但私信始终不可用。
+        "url": "https://www.xiaohongshu.com/explore",
+        "login_form": "",
     },
     "tencent": {
         "type": 2,
@@ -222,8 +226,19 @@ class InteractivePlatformLogin:
         )
         # 视频号会话探测的节流时间戳：避免登录窗口轮询时频繁开新页面。
         self._last_tencent_probe = 0.0
+        # 保存后的三路校验结果。失败原因直接回传登录窗口，避免只有
+        # “校验未通过”却不知道是身份、Cookie 还是接口失效。
+        self._tencent_validation_error = ""
+        self._tencent_validation_steps: dict[str, bool] = {}
         # 小红书官方 user 接口返回的登录用户信息（登录成功后缓存）
         self._xhs_user: dict | None = None
+        self._last_xhs_user_probe = 0.0
+        # 主站是否已从登录按钮页切到真实用户态。主站接口需要页面签名，
+        # 直接 request 在有效会话下也可能返回游客态，因此保留界面证据。
+        self._xhs_web_logged_in = False
+        # 主站登录会新写 web_session + id_token，但页面偶尔仍保留旧的
+        # “登录”按钮。记录会话开始时的凭据摘要，只在值确实变化时才认登录。
+        self._xhs_auth_baseline: tuple[str, str] | None = None
         # 小红书创作平台 localStorage.USER_INFO 里的用户身份（登录成功后缓存）
         self._xhs_user_info: dict = {}
         self.commands: queue.Queue = queue.Queue(maxsize=256)
@@ -323,7 +338,19 @@ class InteractivePlatformLogin:
             return self.frame, self.frame_version
 
     @staticmethod
-    def _save_storage_state(context, cookie_path: Path) -> bool:
+    def _merge_xhs_storage_state(previous: dict, current: dict) -> dict:
+        """合并主站新会话与账号原有创作平台会话。
+
+        主站重登只会更新 web_session/id_token。直接覆盖整份 storage_state
+        会清掉创作平台 Cookie 和 localStorage.USER_INFO，表现为私信好了、
+        发布却突然失效。
+        """
+        return merge_storage_states(previous, current)
+
+    @staticmethod
+    def _save_storage_state(
+        context, cookie_path: Path, merge_from: Path | None = None
+    ) -> bool:
         """把登录态加密保存（同步 Playwright）。
 
         ``interactive_login`` 用的是 ``sync_playwright``，异步版
@@ -339,6 +366,14 @@ class InteractivePlatformLogin:
         if not isinstance(state, dict):
             logger.warning("登录态格式异常，未保存: {}", cookie_path.name)
             return False
+        if merge_from is not None and credential_exists(merge_from):
+            try:
+                previous = credential_crypto.read_storage_state(merge_from)
+            except Exception as exc:
+                logger.warning("读取旧小红书登录态失败（{}）: {}", merge_from.name, exc)
+                return False
+            if isinstance(previous, dict):
+                state = InteractivePlatformLogin._merge_xhs_storage_state(previous, state)
         try:
             credential_crypto.write_storage_state(cookie_path, state)
         except Exception as exc:
@@ -373,6 +408,26 @@ class InteractivePlatformLogin:
                     return str(item.get("value") or "").strip()
         return ""
 
+    def _existing_xhs_account_state(self) -> tuple[Path | None, str]:
+        """返回目标账号原来的凭据路径和平台身份。"""
+        if self.platform != "xiaohongshu" or not self.account_id:
+            return None, ""
+        try:
+            with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+                row = conn.execute(
+                    "SELECT filePath, platform_user_id FROM user_info WHERE id=?",
+                    (int(self.account_id),),
+                ).fetchone()
+        except Exception as exc:
+            logger.warning("读取小红书原账号凭据失败: {}", exc)
+            return None, ""
+        if row is None:
+            return None, ""
+        cookie_name = str(row["filePath"] or "").strip()
+        identity = str(row["platform_user_id"] or "").strip()
+        path = Path(BASE_DIR / "cookiesFile" / cookie_name) if cookie_name else None
+        return path, identity
+
     def _find_tencent_account_by_identity(
         self, identity: str
     ) -> tuple[int, str, str] | None:
@@ -404,14 +459,18 @@ class InteractivePlatformLogin:
         cookie_name = f"{uuid.uuid4().hex}.json"
         cookie_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
-        # 登录态加密落盘：明文 cookie 文件等同于账号密码。
-        self._save_storage_state(context, cookie_path)
-        if self.fingerprint and self.platform != "tencent":
-            save_fingerprint(cookie_path, self.fingerprint)
-
         platform_type = self._platform_type
         saved_name = (account_name or self.account_name)[:64]
         target_id = self.account_id
+        existing_cookie_path, existing_identity = self._existing_xhs_account_state()
+        # 登录态加密落盘：明文 cookie 文件等同于账号密码。
+        if not self._save_storage_state(
+            context, cookie_path, merge_from=existing_cookie_path
+        ):
+            raise RuntimeError("登录态保存失败，原账号凭据未被覆盖")
+        if self.fingerprint and self.platform != "tencent":
+            save_fingerprint(cookie_path, self.fingerprint)
+
         identity_value = identity
         identity_source = "localStorage:finder_username" if identity else ""
         if not identity_value:
@@ -427,6 +486,9 @@ class InteractivePlatformLogin:
         ):
             identity_value = str(self._xhs_user_info["user_id"])
             identity_source = "localStorage:USER_INFO"
+        if not identity_value and existing_identity:
+            identity_value = existing_identity
+            identity_source = "account_store:preserved"
         nickname = ""
         if self.platform == "xiaohongshu":
             nickname = str(self._xhs_user_info.get("nickname") or "").strip()
@@ -571,12 +633,69 @@ class InteractivePlatformLogin:
         self,
         cookie_name: str | None = None,
         context=None,
+        identity: str = "",
     ) -> bool:
-        """Verify the saved channel through its own isolated environment."""
+        """Verify the saved channel identity, cookie and authenticated API.
+
+        A Channels page can render while the saved cookie is already invalid.
+        The account must only become healthy when the identity embedded in the
+        storage state and the identity returned by an authenticated API call
+        match the channel selected in the login window.
+        """
         target_name = str(cookie_name or self.cookie_name or "").strip()
+        self._tencent_validation_error = ""
+        self._tencent_validation_steps = {
+            "storage": False,
+            "api": False,
+            "browser": False,
+        }
         if not target_name:
+            self._tencent_validation_error = "未生成视频号凭据文件"
             return False
         cookie_path = Path(BASE_DIR / "cookiesFile" / target_name)
+
+        expected_identity = str(identity or "").strip()
+        stored_identity = self._storage_identity(cookie_path)
+        if not expected_identity:
+            expected_identity = stored_identity
+        if not stored_identity:
+            self._tencent_validation_error = "保存的登录态缺少视频号频道身份"
+            return False
+        if not expected_identity or stored_identity != expected_identity:
+            self._tencent_validation_error = "当前频道与已保存的视频号身份不一致"
+            return False
+        self._tencent_validation_steps["storage"] = True
+
+        # 认证接口使用刚保存的 Cookie、账号代理和账号 UA。这里读取的是
+        # 私信 API 的 finderUsername，而不是页面 URL 或按钮文案。
+        client = None
+        try:
+            from channels_dm import ChannelsClient
+
+            client = ChannelsClient({
+                "cookie_path": str(cookie_path),
+                "userName": self.account_name,
+            })
+            api_identity = str(client.get_finder_username() or "").strip()
+        except Exception as exc:
+            self._tencent_validation_error = (
+                f"视频号认证接口校验失败：{str(exc).strip()[:160]}"
+            )
+            api_identity = ""
+        finally:
+            session = getattr(client, "session", None) if client is not None else None
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                try:
+                    close_session()
+                except Exception:
+                    pass
+        if not api_identity:
+            return False
+        if api_identity != expected_identity:
+            self._tencent_validation_error = "认证接口返回了另一个视频号，已拒绝入库"
+            return False
+        self._tencent_validation_steps["api"] = True
 
         target_profile = load_environment(cookie_path).get("profileKey")
         source_profile = (
@@ -590,7 +709,11 @@ class InteractivePlatformLogin:
             # environment check.
             pages = getattr(context, "pages", None) or []
             page = pages[-1] if pages else None
-            return bool(page and self._is_logged_in(context, page))
+            browser_ok = bool(page and self._is_logged_in(context, page))
+            self._tencent_validation_steps["browser"] = browser_ok
+            if not browser_ok:
+                self._tencent_validation_error = "保存后的浏览器 Cookie 复验未通过"
+            return browser_ok
 
         async def _check():
             from myUtils.auth import cookie_auth_tencent
@@ -600,7 +723,11 @@ class InteractivePlatformLogin:
         # The saved channel uses a newly derived profile, so it does not hold
         # the interactive discovery profile's lock.  Validate a real launch of
         # that target environment instead of trusting the shared QR context.
-        return self._run_coro_in_new_thread(_check)
+        browser_ok = bool(self._run_coro_in_new_thread(_check))
+        self._tencent_validation_steps["browser"] = browser_ok
+        if not browser_ok:
+            self._tencent_validation_error = "保存后的浏览器 Cookie 复验未通过"
+        return browser_ok
 
     @staticmethod
     def _run_coro_in_new_thread(coro_factory):
@@ -886,12 +1013,18 @@ class InteractivePlatformLogin:
         }
 
         if self.platform == "xiaohongshu":
-            return self._xhs_logged_in(context, names, page)
+            return self._xhs_logged_in(context, names, page, cookies)
         if not (names & self._auth_cookie_names):
             return False
         return True
 
-    def _xhs_logged_in(self, context, names: set[str], page=None) -> bool:
+    def _xhs_logged_in(
+        self,
+        context,
+        names: set[str],
+        page=None,
+        cookies: list[dict] | None = None,
+    ) -> bool:
         """判断小红书是否已真正登录。
 
         两套会话、两种口径，必须分开处理：
@@ -910,6 +1043,31 @@ class InteractivePlatformLogin:
         ``localStorage.USER_INFO``；因此同时接受“创作平台页面 + userId”的
         正面证据。主站游客态不会生成这段带 userId 的创作者信息。
         """
+        web_ready = self._xhs_web_session_ready(
+            context, names, page, cookies=cookies
+        )
+        if web_ready:
+            self._xhs_web_logged_in = True
+            # 主站登录成功后，官方 user 接口常常能直接返回稳定 userId。
+            # 即使主站页面还没有跳进创作平台，也要把它写进 _xhs_user_info，
+            # 后续保存账号时才能绑定平台身份并支持按身份去重。
+            if not self._xhs_user_info.get("user_id"):
+                self._probe_xhs_user(context)
+                if self._xhs_user:
+                    user_id = str(
+                        self._xhs_user.get("user_id")
+                        or self._xhs_user.get("userId")
+                        or ""
+                    ).strip()
+                    if user_id:
+                        self._xhs_user_info = {
+                            "user_id": user_id,
+                            "nickname": str(
+                                self._xhs_user.get("nickname")
+                                or self._xhs_user.get("userName")
+                                or ""
+                            ).strip(),
+                        }
         # 新版创作平台把登录用户写到 localStorage.USER_INFO，并且可能只保留
         # 主站 web_session，不再下发 customer-sso-sid 等旧版创作 Cookie。
         # 页面已经进入创作平台且 USER_INFO 有 userId，就是可靠的正面证据。
@@ -926,10 +1084,94 @@ class InteractivePlatformLogin:
             # 后面保存账号时用它做身份识别。
             self._xhs_user_info = self._read_xhs_user_info(page)
             return True
-        # 只有主站口径的 cookie：必须靠官方接口确认不是游客态。
+        # 主站登录成功会新下发 web_session + id_token。平台页面偶尔仍
+        # 保留旧的“登录”按钮，因此以凭据是否更新为主，页面状态为辅。
+        # 小红书接口依赖页面生成的签名，直接 request 在有效会话下也会
+        # 返回游客态或 406，不能作为唯一判据。
+        if web_ready:
+            return True
+        # 接口确认保留为补充证据，兼容仍能正常签名的平台版本。
         if self._xhs_user is not None:
             return True
-        return self._probe_xhs_user(context)
+        if self._probe_xhs_user(context):
+            self._xhs_web_logged_in = True
+            return True
+        return False
+
+    @staticmethod
+    def _xhs_login_prompt_visible(page) -> bool:
+        """主站是否仍显示“登录”按钮。
+
+        游客访问 explore 也会得到 web_session，所以不能只看 Cookie。登录
+        完成后按钮会被头像取代；读取页面的可见状态既不触发平台动作，也不
+        依赖接口签名。
+        """
+        if page is None:
+            return True
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                      const visible = (node) => {
+                        const rect = node.getBoundingClientRect();
+                        const style = getComputedStyle(node);
+                        return rect.width > 0 && rect.height > 0
+                          && style.display !== 'none'
+                          && style.visibility !== 'hidden';
+                      };
+                      return Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                        .some((node) => visible(node)
+                          && (node.textContent || '').trim() === '登录');
+                    }"""
+                )
+            )
+        except Exception:
+            # 页面正在导航时不能因为读不到就判成功。
+            return True
+
+    @staticmethod
+    def _xhs_auth_signature(cookies: list[dict]) -> tuple[str, str]:
+        """返回主站凭据摘要，不把 Cookie 值写入日志或会话状态。"""
+        values = {
+            str(cookie.get("name") or ""): str(cookie.get("value") or "")
+            for cookie in cookies or []
+            if isinstance(cookie, dict)
+            and cookie.get("name") in {"web_session", "id_token"}
+            and "xiaohongshu.com" in str(cookie.get("domain") or "")
+        }
+        return tuple(
+            hashlib.sha256(values[name].encode("utf-8")).hexdigest()
+            if values.get(name)
+            else ""
+            for name in ("web_session", "id_token")
+        )
+
+    def _xhs_web_session_ready(
+        self,
+        context,
+        names: set[str],
+        page=None,
+        cookies: list[dict] | None = None,
+    ) -> bool:
+        if not {"web_session", "id_token"}.issubset(names):
+            return False
+        if page is None:
+            return False
+        try:
+            if "xiaohongshu.com" not in str(page.url or ""):
+                return False
+        except Exception:
+            return False
+        signature = self._xhs_auth_signature(
+            cookies if cookies is not None else context.cookies()
+        )
+        if not all(signature):
+            return False
+        # 扫码成功会产生全新的主站凭据。平台前端有时没有清掉旧登录按钮，
+        # 此时仍应结束登录会话；游客 Cookie 因摘要没有变化不会误判。
+        if signature != self._xhs_auth_baseline:
+            return True
+        return not self._xhs_login_prompt_visible(page)
 
     def _read_xhs_user_info(self, page=None) -> dict:
         """读创作平台的 ``localStorage.USER_INFO``（含 userId / 昵称）。
@@ -1195,6 +1437,10 @@ class InteractivePlatformLogin:
 
     def _probe_xhs_user(self, context) -> bool:
         """调用小红书官方 user 接口确认登录态，返回是否已登录。"""
+        now = time.monotonic()
+        if now - self._last_xhs_user_probe < 2.0:
+            return False
+        self._last_xhs_user_probe = now
         try:
             response = context.request.get(
                 "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
@@ -1209,6 +1455,14 @@ class InteractivePlatformLogin:
             data = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(data, dict) and not data.get("guest") and data.get("user_id"):
                 self._xhs_user = data
+                self._xhs_user_info = {
+                    "user_id": str(
+                        data.get("user_id") or data.get("userId") or ""
+                    ).strip(),
+                    "nickname": str(
+                        data.get("nickname") or data.get("userName") or ""
+                    ).strip(),
+                }
                 return True
         except Exception:
             return False
@@ -1258,6 +1512,11 @@ class InteractivePlatformLogin:
                     context.add_init_script(path=str(stealth_path))
                 page = context.new_page()
                 page.on("dialog", lambda dialog: dialog.dismiss())
+
+                if self.platform == "xiaohongshu":
+                    self._xhs_auth_baseline = self._xhs_auth_signature(
+                        context.cookies()
+                    )
 
                 target = PLATFORM_LOGIN_TARGETS[self.platform]
                 seeded = bool(self.platform == "tencent" and self.seed_storage)
@@ -1329,7 +1588,13 @@ class InteractivePlatformLogin:
                 time.sleep(0.8)
                 if not seeded:
                     self._set_state(
-                        "running", f"请在上方{self._platform_label}官方窗口完成登录"
+                        "running",
+                        (
+                            "请点击上方页面中的「登录」并用小红书 App 扫码；"
+                            "完成后窗口会自动关闭"
+                            if self.platform == "xiaohongshu"
+                            else f"请在上方{self._platform_label}官方窗口完成登录"
+                        ),
                     )
                 last_frame_at = 0.0
 
@@ -1357,6 +1622,18 @@ class InteractivePlatformLogin:
                         )
 
                     if self._is_logged_in(context, page):
+                        if self.platform == "xiaohongshu" and not self._xhs_web_logged_in:
+                            # 创作平台会话不等于主站私信会话。停在这里等待
+                            # 用户扫主站二维码，避免保存“能发布但不能收私信”
+                            # 的半套账号后又在账号页显示为正常。
+                            self._set_state(
+                                "running",
+                                "主站私信登录尚未确认：请点击窗口中的「登录」并扫码；"
+                                "完成后窗口会自动关闭",
+                            )
+                            self._publish_frame_safe(page)
+                            self.stop_event.wait(0.8)
+                            continue
                         identity = (
                             self._tencent_account_identity(page)
                             if self.platform == "tencent"
@@ -1409,12 +1686,13 @@ class InteractivePlatformLogin:
                             # 所以这里保存成功后**不关窗口**，进入 collecting 状态继续等待
                             # 下一个频道；用户点「完成并关闭」才结束。
                             if not self._verify_tencent_cookie(
-                                saved_cookie_name, context
+                                saved_cookie_name, context, identity or ""
                             ):
                                 self._rollback_account()
                                 self._set_state(
                                     "failed",
-                                    "视频号独立环境校验未通过，请重新扫码登录",
+                                    self._tencent_validation_error
+                                    or "视频号独立环境校验未通过，请重新扫码登录",
                                 )
                                 logger.warning(
                                     "视频号独立环境校验失败，已回滚: {}",

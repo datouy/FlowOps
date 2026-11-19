@@ -15,7 +15,12 @@ from utils.account_browser import persistent_account_context
 from utils.log import tencent_logger, kuaishou_logger, douyin_logger, xiaohongshu_logger
 
 
-async def _persist_storage_state(context, account_file) -> bool:
+async def _persist_storage_state(
+    context,
+    account_file,
+    *,
+    merge_existing: bool = False,
+) -> bool:
     """Atomically save a refreshed Playwright state after a valid probe.
 
     WeChat can rotate cookies while the account is being checked. Closing the
@@ -32,7 +37,11 @@ async def _persist_storage_state(context, account_file) -> bool:
     path = Path(account_file)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        saved = await save_account_storage_state(context, path)
+        saved = await save_account_storage_state(
+            context,
+            path,
+            merge_existing=merge_existing,
+        )
         if not saved:
             tencent_logger.warning("[+] 保存刷新后的视频号 Cookie 失败")
         return saved
@@ -48,6 +57,7 @@ async def browser_session(
     locale=None,
     timezone_id=None,
     stable_fingerprint=False,
+    merge_storage=False,
 ):
     """Open one Chromium session and always tear it down.
 
@@ -82,7 +92,11 @@ async def browser_session(
                 # Keep the portable JSON bundle current for legacy consumers,
                 # while Chromium completes the authoritative IndexedDB/cache
                 # update when the persistent context closes.
-                await _persist_storage_state(context, account_file)
+                await _persist_storage_state(
+                    context,
+                    account_file,
+                    merge_existing=merge_storage,
+                )
 
 
 async def cookie_auth_douyin(account_file):
@@ -183,7 +197,10 @@ async def cookie_auth_ks(account_file):
 
 
 async def cookie_auth_xhs(account_file):
-    async with browser_session(account_file) as (_browser, _context, page):
+    async with browser_session(
+        account_file,
+        merge_storage=True,
+    ) as (_browser, _context, page):
         # 访问指定的 URL
         await page.goto("https://creator.xiaohongshu.com/creator-micro/content/upload")
         try:

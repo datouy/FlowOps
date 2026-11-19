@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -247,6 +248,28 @@ def _iter_cookies(state: dict[str, Any]) -> Iterable[tuple[str, str]]:
             yield str(cookie.get("name") or ""), str(cookie.get("value") or "")
 
 
+def _xhs_identity_from_user_info(value: str) -> str:
+    """Extract the stable user id from Xiaohongshu's nested USER_INFO JSON."""
+    try:
+        payload = json.loads(str(value or ""))
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    user = payload.get("user")
+    user_value = user.get("value") if isinstance(user, dict) else None
+    if not isinstance(user_value, dict):
+        user_value = payload
+    return _normalize_identity(
+        str(
+            user_value.get("userId")
+            or user_value.get("user_id")
+            or user_value.get("USER_ID")
+            or ""
+        )
+    )
+
+
 def extract_identity(
     storage_state: dict[str, Any] | None, platform_type: int | str | None
 ) -> tuple[str, str]:
@@ -266,6 +289,14 @@ def extract_identity(
         identity = _normalize_identity(value)
         if identity:
             return identity, f"localStorage:{key}"
+
+    # 小红书新版把身份藏在 localStorage.USER_INFO 的
+    # ``{"user":{"value":{"userId":"..."}}}`` 结构里。普通顶层键扫描
+    # 只能看到整段 JSON，无法识别账号，导致登录成功但账号页显示未绑定。
+    if platform_type_of(platform_type) == 1:
+        identity = _xhs_identity_from_user_info(storage_values.get("USER_INFO", ""))
+        if identity:
+            return identity, "localStorage:USER_INFO"
 
     cookie_values = {name: value for name, value in _iter_cookies(storage_state) if value}
     for key in meta["id_cookies"]:

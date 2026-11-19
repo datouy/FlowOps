@@ -556,7 +556,59 @@ def open_persistent_account_context_sync(playwright, cookie_path: str | Path, **
 # 这里统一收口成"先取明文 dict → 加密 → 写 secrets/*.enc"，
 # 平台代码只调用 ``save_account_storage_state(context, path)``。
 
-async def save_account_storage_state(context, cookie_path: str | Path) -> bool:
+def merge_storage_states(previous: dict, current: dict) -> dict:
+    """合并新旧 storage_state，当前值优先，未出现的旧值保留。
+
+    小红书主站重登与创作平台巡检打开的是不同页面，单次导出的 storage_state
+    可能只有其中一部分 localStorage。直接覆盖会丢掉 ``USER_INFO``，使发布
+    登录看似正常、实际无法进入发布后台。
+    """
+    merged = dict(current)
+    cookies: dict[tuple[str, str, str], dict] = {}
+    for source in (previous, current):
+        for cookie in source.get("cookies", []):
+            if not isinstance(cookie, dict):
+                continue
+            key = (
+                str(cookie.get("domain") or ""),
+                str(cookie.get("path") or "/"),
+                str(cookie.get("name") or ""),
+            )
+            if all(key):
+                cookies[key] = cookie
+    merged["cookies"] = list(cookies.values())
+
+    origins: dict[str, dict[str, str]] = {}
+    for source in (previous, current):
+        for origin in source.get("origins", []):
+            if not isinstance(origin, dict):
+                continue
+            name = str(origin.get("origin") or "")
+            if not name:
+                continue
+            values = origins.setdefault(name, {})
+            for item in origin.get("localStorage", []):
+                if isinstance(item, dict) and item.get("name"):
+                    values[str(item["name"])] = str(item.get("value") or "")
+    merged["origins"] = [
+        {
+            "origin": name,
+            "localStorage": [
+                {"name": key, "value": value}
+                for key, value in sorted(values.items())
+            ],
+        }
+        for name, values in sorted(origins.items())
+    ]
+    return merged
+
+
+async def save_account_storage_state(
+    context,
+    cookie_path: str | Path,
+    *,
+    merge_existing: bool = False,
+) -> bool:
     """把浏览器当前的登录态加密保存。
 
     返回 ``True`` 表示密文已落盘；``False`` 表示保存失败（调用方应保留
@@ -572,6 +624,10 @@ async def save_account_storage_state(context, cookie_path: str | Path) -> bool:
         logger.warning("浏览器登录态格式异常，未保存: {}", target.name)
         return False
     try:
+        if merge_existing:
+            previous = credential_crypto.read_storage_state(target)
+            if isinstance(previous, dict):
+                state = merge_storage_states(previous, state)
         credential_crypto.write_storage_state(target, state)
     except Exception as exc:
         logger.warning("加密保存凭据失败（{}）: {}", target.name, exc)

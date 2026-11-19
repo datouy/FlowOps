@@ -91,6 +91,22 @@ def test_identity_ignores_session_only_cookies():
     assert source == ""
 
 
+def test_identity_reads_nested_xiaohongshu_user_info():
+    state = _storage_state(
+        storage=[
+            (
+                "USER_INFO",
+                '{"user":{"value":{"userId":"607d32","nickname":"大头"}}}',
+            )
+        ]
+    )
+
+    identity, source = extract_identity(state, 1)
+
+    assert identity == "607d32"
+    assert source == "localStorage:USER_INFO"
+
+
 def test_identity_handles_bare_cookie_list_file(base):
     path = base / "cookiesFile" / TENCENT_COOKIE
     path.parent.mkdir(parents=True, exist_ok=True)
