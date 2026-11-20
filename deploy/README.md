@@ -8,22 +8,24 @@
 
 | 事实 | 对部署的含义 |
 | --- | --- |
-| 后端是 Flask 单文件应用 `sau_backend.py`，端口 5409，`threaded=True` | 一个进程扛全部请求 |
+| Web 入口是 Flask 应用 `sau_backend.py`，生产由 Waitress 承载，端口 5409 | Web 进程负责 API、上传和 SSE；单机默认仍用一个 Web 进程 |
 | 后端自带静态路由：`/`、`/assets/<file>`、`/favicon.ico`、`/vite.svg` | 前端 `dist` 丢进后端目录 → **一个端口跑整站**，不需要 CORS |
 | 前端 Vue3 + Vite，路由是 **hash 模式** | 不需要 Nginx 做 SPA history fallback |
 | 前端 `src/config.js`：`VITE_API_BASE_URL` 为空/相对路径时**跟随当前域名** | 生产构建必须设 `VITE_API_BASE_URL=/`，否则打包进 `localhost:5409` |
 | 浏览器自动化用 Playwright（`channel="chromium"`） | 服务器必须 `playwright install chromium`，扫码登录/发布/私信同步全靠它 |
 | 状态全在文件里：`db/` 4 个 SQLite、`cookiesFile/`、`videoFile/`、`uploadFile/`、`logs/` | 这些目录**必须挂卷**，否则 `docker compose down` 就全丢 |
-| 进程内有内存队列 + 2 个发布 worker + 12h 巡检 + 24h 数据回流 + 3 条私信同步线程 + SSE | **只能单进程单副本**。多 worker/多副本会重复发布、重复回消息、SSE 断流 |
+| 发布任务以 SQLite 为事实来源，进程内 `queue.Queue` 只负责本地唤醒 | 默认 `all` 模式把 Web 与 worker 放在一起；也可用 `web` + `executor` 分进程运行 |
 | 安全闸门：监听非回环地址时，`YUNCE_ALLOW_REMOTE=1` 和 `YUNCE_ACCESS_TOKEN` 缺一个就直接拒绝启动 | 远程部署必须配令牌，这是设计如此不是 bug |
 | 上传上限 `MAX_CONTENT_LENGTH = 160MB` | Nginx `client_max_body_size` 要 ≥ 160m |
 
 **部署拓扑（推荐）**
 
 ```
-浏览器 ──HTTPS──> Nginx(443) ──HTTP──> 127.0.0.1:5409 ──> YunCe 容器/进程
-                                                        ├── db/  cookiesFile/  videoFile/  (卷)
-                                                        └── Chromium（扫码登录、发布、私信同步）
+浏览器 ──HTTPS──> Nginx(443) ──HTTP──> 127.0.0.1:5409 ──> yunce Web 容器/进程
+                                                        │
+                                                        ├── yunce-executor（可选，发布 worker/追踪/巡检）
+                                                        ├── db/  cookiesFile/  videoFile/  (共享卷)
+                                                        └── Chromium 分片（扫码登录、发布、私信同步）
 ```
 
 ---
@@ -116,6 +118,18 @@ docker compose up -d --build
 docker compose logs -f yunce        # 首次启动会跑库初始化 + 建默认配置
 ```
 
+需要让发布执行器离开 Web 进程时，使用覆盖文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.split.yml up -d --build
+docker compose logs -f yunce yunce-executor
+bash verify_split.sh
+```
+
+Web 会设置 `FLOWOPS_PROCESS_ROLE=web`，`yunce-executor` 运行 `publish_executor.py`。两者必须挂载同一份 `data/db`；当前建议一台主机只运行一个 executor。执行器不提供 HTTP 端口，所以 split 文件关闭了镜像继承的 5409 healthcheck；Web 的 `/health/ready` 会检查 `publish_executors` 心跳，executor 缺失时会进入阻塞状态。日志也由 `FLOWOPS_LOG_DIR` 分到 `data/logs/web/` 和 `data/logs/executor/`，避免两个进程同时轮转同一个文件。
+
+`verify_split.sh` 是只读验收：检查 compose 解析、两个容器、进程角色、同一镜像、就绪探针、executor 心跳和生产审计 gate，不创建任务也不强杀进程。真实平台发布、二维码登录、强杀和分片崩溃仍须按 `docs/production-acceptance-2026-11.md` 单独演练。
+
 镜像里做了四件事，知道就行：前端 `npm run build` → 产物摆到 `/app/index.html` + `/app/assets/`；Python 依赖按带哈希的 `requirements.lock` 安装；`playwright install --with-deps chromium`；启动前执行 `db/createTable.py` 建 `user_info`/`file_records`（其余库是模块导入时自建）。
 
 ### 3.4 验证
@@ -130,11 +144,14 @@ bash smoke.sh                              # 首页/静态资源/鉴权/业务�
 
 ```bash
 docker compose logs -f yunce                 # 实时日志
+docker compose logs -f yunce-executor        # split 模式下看发布执行器
 docker compose restart yunce                 # 重启（数据在 ./data，随便重启）
 docker compose down                          # 停（不删卷）
 docker compose up -d --build                 # 更新（见第 9 节）
 docker exec -it yunce sh                     # 进容器排查
-tail -f data/logs/app.log                    # 业务日志
+tail -f data/logs/app.log                   # 单容器 Web 应用日志
+tail -f data/logs/web/app.log               # split Web 应用日志
+tail -f data/logs/executor/douyin.log       # executor 业务日志（按平台取文件名）
 ```
 
 ---
@@ -203,7 +220,7 @@ certbot --nginx -d ops.example.com       # 自动改写 conf 里的 443 证书�
 | --- | --- |
 | `client_max_body_size 200m` + `proxy_request_buffering off` | 视频上传，后端上限 160MB，缓冲区先落盘会白等 |
 | `proxy_buffering off` | 扫码登录、私信同步是 **SSE** 长连接，缓冲会把二维码/进度卡死 |
-| `proxy_read_timeout 1800s` | 发布任务同步等待可能好几分钟，默认 60s 会 504 |
+| `proxy_read_timeout 1800s` | 大文件上传和 SSE 仍可能需要长时间连接；发布任务本身已改为入队返回 |
 
 没域名也能上：把 `server_name` 改成 `_`，只留 80 端口那段，访问 `http://[SERVER_IP]/`（令牌照样生效）。
 
@@ -313,6 +330,7 @@ bash smoke.sh
 - [ ] 浏览器写过 `yunce_access_token`，刷新后各页面有数据
 - [ ] 至少一个平台扫码登录成功，`data/cookiesFile/` 里出现对应 JSON
 - [ ] 发一条草稿/定时任务，`data/logs/app.log` 里能看到发布链路日志
+- [ ] split 模式下 `curl https://你的域名/health/ready` 返回 `ready: true`，且 checks 中 `publish-executor` 正常
 - [ ] 私信工作台能拉到会话（说明后台同步线程活着）
 - [ ] `bash backup.sh` 出了一份 tar.gz，且能解开
 - [ ] 服务器防火墙只放 22/80/443，5409 从公网打不开
@@ -336,8 +354,9 @@ bash smoke.sh
 | 发布中途 `Target page/browser closed` | `/dev/shm` 太小 | compose 里 `shm_size: "1gb"`（裸机给容器/机器足够内存） |
 | 截图/二维码里中文是方块 | 缺中文字体 | `apt-get install fonts-noto-cjk`（镜像已内置） |
 | 定时发布早/晚 8 小时 | 时区 | `TZ=Asia/Shanghai` 且容器内 `date` 校验 |
-| `database is locked` | 开了多进程/多副本/多 worker | 单进程单副本；SQLite 已开 WAL + busy_timeout |
-| 同一任务发了两遍 | 起了 2 个副本或 2 个 gunicorn worker | 见上 |
+| `database is locked` | 数据卷不在同一主机、磁盘/网络存储过慢，或启动了大量并发进程 | 保持单机本地卷、一个 Web 和一个 executor；SQLite 已开 WAL + busy_timeout |
+| split 模式 `/health/ready` 报 `publish-executor` | 执行器没启动、心跳超过 30 秒或连接了另一份数据库 | `docker compose logs yunce-executor`，确认两个服务挂载同一个 `data/db` |
+| 同一任务疑似执行两次 | 多份数据库、重复挂载或手工绕过租约 | 查 `jobs.executor_id/lease_token`、`publish_executors` 和 `account_leases`；不要直接复制运行中的 SQLite 文件 |
 | 服务器上登录抖音/小红书老弹验证 | 机房 IP 风控 | 换住宅/专线代理，或先在本地登录后把 `cookiesFile/*.json` 迁到服务器 |
 | 日志中文乱码 | 编码环境 | `PYTHONIOENCODING=utf-8`（镜像已设） |
 
@@ -345,8 +364,8 @@ bash smoke.sh
 
 ## 12. 这套部署的已知边界
 
-1. **单进程**：不能水平扩容、不能开多 worker。要上多实例得先把内存队列/线程/SSE 换成外部队列，那是改造不是部署。
-2. **没有多用户体系**：一个令牌 = 全权限。多人用就靠 Nginx Basic Auth 分账号，或者你们内部约定。
+1. **仅支持单机分进程**：当前已支持 Web + 一个独立 executor 共享本地 SQLite，但尚未验证多主机、多 executor 或跨机器共享 SQLite；不能据此宣称已经可以水平扩容。
+2. **团队权限仍有粒度缺口**：运行时已有 `admin` / `operator` / `viewer` 和账号 scope，但“剪辑只能做素材草稿、审核员只能审核”的独立权限点尚未形成完整四角色闭环，不能把现有内置角色直接当成最终企业权限模型。
 3. **机房 IP 风控**：平台侧对云服务器 IP 更敏感，扫码登录/发布可能比家里网络更容易触发验证，必要时走代理或迁 Cookie。
 4. **AI 端点必须显式配置**。默认不再使用第三方明文 HTTP 地址；生产只能使用 HTTPS，并把 Key 放在 `.env` / `.env.deploy` 中，禁止提交进仓库。
 5. **`uploader/xhs_uploader` 那套需要本地签名服务 `127.0.0.1:11901`**，Web 端的小红书流程走的是浏览器版 `xiaohongshu_uploader`，**不需要**这个服务，别被 `conf.py` 里的 `XHS_SERVER` 误导。
@@ -358,8 +377,9 @@ bash smoke.sh
 ```
 deploy/
 ├── README.md                  ← 本文件
-├── Dockerfile                 生产镜像（前端构建 + Playwright Chromium + 单进程启动）
-├── docker-compose.yml         单容器编排（含数据卷、healthcheck、shm_size）
+├── Dockerfile                 生产镜像（前端构建 + Playwright Chromium）
+├── docker-compose.yml         默认单容器 all 模式（兼容旧部署）
+├── docker-compose.split.yml   Web + 独立发布 executor 覆盖编排
 ├── .env.deploy.example        环境变量模板（复制成 .env.deploy）
 ├── nginx-yunce.conf           Nginx 反代（SSE / 大文件 / HTTPS）
 ├── yunce.service              裸机 systemd 单元

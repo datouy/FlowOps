@@ -58,7 +58,8 @@
 
 ### 🚀 发布与审核
 
-- **后台任务队列**：发布立即入队，不阻塞页面。
+- **持久化后台任务队列**：发布立即写入 SQLite 并返回 `job_id`，HTTP 请求不等待浏览器上传完成；Web 与发布执行器可拆成两个进程。
+- **统一批量入口**：`/postVideoBatch` 与单条发布会经过同一套 jobs、租约、账号级子任务和失败项重试，不再直发平台。
 - **失败自动重试**：失败自动重试一次，并记录完整失败原因。
 - **发布记录**：记录平台、账号、素材、状态、错误原因和时间。
 - **定时发布与发布日历**：按天查看排期，支持周历视图。
@@ -165,13 +166,18 @@ http://127.0.0.1:5409/dm/inbound
 
 回复规则支持两种生成方式：**固定模板**（支持 `{nickname}`、`{origin}`、`{travelers}` 等变量）和 **AI 智能回复**（按命中关键词调用 AI，可附加回复口径，例如"不要提价格，先要联系方式"）。未命中任何规则且开启 AI 兜底时，也会用 AI 生成回复。AI 生成会把已沉淀的线索（人数、出发地、日期、预算、来源内容）带入提示词，避免重复提问；AI 模式下生成失败会回退到规则里的固定文案。AI 生成的回复会做一次安全过滤，疑似编造手机号、微信号或绝对化承诺（如"保证""全网最低"）时自动改标「需人工」并保留草稿，不会直接发送。设置中的「AI 每日上限」按天统计全局 AI 回复数量，用于控制接口费用。
 
-## 🧩 支持平台
 ## 🛡️ 稳定性与性能加固
 
-- **共享浏览器并发上限**：共享 Chromium 实例的每个账号 context 也纳入 FLOWOPS_MAX_BROWSERS 全局槽位，槽位覆盖整个 context 生命周期，避免“创建时排队、使用时不设限”的密度失控。
+- **共享浏览器分片**：账号按 Cookie 路径稳定哈希分配到 `FLOWOPS_SHARED_BROWSER_SHARDS` 个 Chromium 分片；每个账号仍有独立 context、storage state、代理和指纹，单个分片崩溃不会同时带走全部账号容器。
+- **共享浏览器并发上限**：每个账号 context 纳入 `FLOWOPS_MAX_BROWSERS` 全局槽位，槽位覆盖整个 context 生命周期，避免“创建时排队、使用时不设限”的密度失控。
 - **有界关闭与超时重启**：共享浏览器关闭动作有硬超时，超时兜底可重启整代共享实例，卡死的连接会立刻失败，不再永久占用账号 Profile 锁。
-- **发布租约 token**：任务抢占改为单条原子 UPDATE，每次领取返回唯一 lease_token，同进程多 worker 可区分执行者；后台心跳线程持续续期，长任务不会因为单条素材超过租约期而被误回收。
+- **控制面与执行面分离**：`FLOWOPS_PROCESS_ROLE=web|executor|all` 控制进程职责；独立 `publish_executor.py` 独占发布 worker、排期扫描、追踪、租约回收和账号巡检。`all` 保留旧单进程部署兼容。
+- **发布租约 token**：任务抢占是单条原子 UPDATE，每次领取返回唯一 `leaseToken`；后台心跳持续续期，执行器协议只接受当前 token，失效租约返回 409。
+- **跨进程账号串行**：发布、私信、评论和账号健康检查共用 SQLite `account_leases`；进程内锁负责减少数据库竞争，跨进程租约负责同账号互斥，持有进程崩溃后按租约过期恢复。
+- **split 日志隔离**：Web 与 executor 通过 `FLOWOPS_LOG_DIR` 写入不同日志目录，避免两个进程对同一个 loguru 文件并发轮转。
+- **生产只读审计**：`production_audit.py` 用只读 SQLite 连接输出 backlog、完成吞吐、P50/P95、成功率、executor 心跳和账号租约状态，支持阈值 gate 与 before/after JSON 对比；完整验收步骤见 [`docs/production-acceptance-2026-11.md`](docs/production-acceptance-2026-11.md)。
 - **排期崩溃恢复**：到点后进程在入队前崩溃的 pending + scheduled_items.running 状态会在启动时重新入队，避免定时任务永久丢失。
+- **重启恢复隔离**：执行器启动只回收没有有效租约的 running 任务；另一个进程仍持有有效租约时不会被误判为崩溃任务。
 - **看门狗代际隔离**：后台任务卡死重启时递增代际，各循环每轮比对代际，不匹配即退出，杜绝新旧两个同名循环同时执行。
 - **数据库查询优化**：dm_reply_logs 增加 status 复合索引；任务事件时间轴改取最近 N 条再反转；未匹配作品与素材状态接口加 LIMIT；数据汇总增加进程内缓存。
 - **前端请求与轮询**：axios 默认 30 秒超时、上传 600 秒；健康卡片与发布日历改用可重入的 useLivePolling，同步轮询可清理，避免异常时定时器泄漏。
@@ -255,6 +261,8 @@ AI 生成、全量账号检查、评论同步、私信发送与 AI 草稿都通�
 
 也可以分别运行 `run_backend.bat` 和 `run_frontend.bat`。
 
+需要把发布执行器与 Web 分开时，在第一个终端设置 `FLOWOPS_PROCESS_ROLE=web` 后运行 `run_backend.bat`，在第二个终端运行 `run_executor.bat`。默认不设置时仍是兼容旧部署的 `all` 模式。
+
 ## 📁 目录结构
 
 ```text
@@ -266,6 +274,7 @@ FlowOps/
 ├─ social-auto-upload-main/      # 基于上游二次开发的主程序
 │  ├─ sau_backend.py             # Flask API（waitress 承载生产流量）
 │  ├─ publish_jobs.py            # 发布队列、重试、巡检
+│  ├─ publish_executor.py        # 独立发布执行器入口（调度/worker/追踪/巡检）
 │  ├─ stats_reflow.py            # 平台数据回流
 │  ├─ ops_center.py              # 消息中心、待办、周报
 │  ├─ dm_ops.py                  # 私信会话、自动回复、线索与 Webhook
@@ -299,7 +308,9 @@ FlowOps/
 - `deploy/backup.sh`：数据库每日备份脚本；
 - `deploy/smoke.sh`：部署后冒烟测试脚本。
 
-完整步骤和参数说明见 [deploy/README.md](./deploy/README.md)。生产部署使用 waitress 承载后端流量（仍在单进程模型内），不再是 Flask 开发服务器。
+完整步骤和参数说明见 [deploy/README.md](./deploy/README.md)。默认 `docker-compose.yml` 仍是单容器 `all` 模式；需要发布执行隔离时叠加 `docker-compose.split.yml`，由 Web 容器和 `yunce-executor` 容器共享 SQLite 与运行数据卷。当前支持单机共享 SQLite 的分进程部署，尚不能据此宣称可跨主机水平扩容。
+
+执行器隔离、租约语义、回退方式和性能指标采集见 [`docs/executor-separation-2026-11.md`](docs/executor-separation-2026-11.md)。
 
 ## 🔒 安全说明
 
