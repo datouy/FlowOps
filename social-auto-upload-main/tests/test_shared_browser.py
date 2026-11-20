@@ -58,6 +58,17 @@ class _FakePlaywright:
         return self._browser
 
 
+class _MultiBrowserPlaywright:
+    def __init__(self):
+        self.browsers: list[_FakeBrowser] = []
+        self.chromium = self
+
+    def launch(self, **opts):
+        browser = _FakeBrowser()
+        self.browsers.append(browser)
+        return browser
+
+
 @pytest.fixture()
 def shared(monkeypatch):
     module = pytest.importorskip("utils.shared_browser")
@@ -134,6 +145,45 @@ def test_browser_reused_across_contexts(shared):
     # 三个 context 共享同一个 browser 实例（单进程）
     assert len(browser.contexts) == 3
     assert shared.status()["syncConnected"] is True
+
+
+def test_account_mapping_is_stable_for_the_same_shard_count(shared, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_SHARED_BROWSER_SHARDS", "4")
+    first = shared.shard_for("cookies/account-a.json")
+    assert all(
+        shared.shard_for("cookies/account-a.json") == first
+        for _ in range(10)
+    )
+    assert 0 <= first < 4
+
+
+def test_accounts_on_two_shards_get_independent_browser_instances(shared, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_SHARED_BROWSER_SHARDS", "2")
+    playwright = _MultiBrowserPlaywright()
+    cookies_by_shard = {0: [], 1: []}
+    for index in range(100):
+        cookie = f"account-{index}.json"
+        cookies_by_shard[shared.shard_for(cookie)].append(cookie)
+        if all(cookies_by_shard.values()):
+            break
+    assert all(cookies_by_shard.values())
+
+    for shard, cookies in cookies_by_shard.items():
+        shared.get_browser_sync(
+            playwright,
+            headless=True,
+            args=[],
+            executable_path="",
+            channel="",
+            shard=shard,
+        )
+
+    assert len(playwright.browsers) == 2
+    status = shared.status()
+    assert status["shards"] == 2
+    assert status["syncConnectedShards"] == [0, 1]
+    assert shared.browser_id(0) and shared.browser_id(1)
+    assert shared.browser_id(0) != shared.browser_id(1)
 
 
 def test_use_shared_headless_and_flag(monkeypatch):

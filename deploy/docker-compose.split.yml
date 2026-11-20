@@ -1,0 +1,46 @@
+# 发布控制面 / 执行面分离覆盖文件
+#
+# 在 deploy/ 目录运行：
+#   docker compose -f docker-compose.yml -f docker-compose.split.yml up -d --build
+#
+# 回退到单进程兼容模式：
+#   docker compose -f docker-compose.yml up -d --build
+
+name: yunce
+
+services:
+  yunce:
+    environment:
+      TZ: Asia/Shanghai
+      FLOWOPS_PROCESS_ROLE: web
+      FLOWOPS_LOG_DIR: /app/logs/web
+
+  yunce-executor:
+    image: yunce:${YUNCE_TAG:-latest}
+    container_name: yunce-executor
+    restart: unless-stopped
+    env_file:
+      - ./.env.deploy
+    command: ["python", "publish_executor.py"]
+    volumes:
+      - ./data/db:/app/db
+      - ./data/cookies:/app/cookies
+      - ./data/cookiesFile:/app/cookiesFile
+      - ./data/videoFile:/app/videoFile
+      - ./data/uploadFile:/app/uploadFile
+      - ./data/logs:/app/logs
+    environment:
+      TZ: Asia/Shanghai
+      FLOWOPS_PROCESS_ROLE: executor
+      FLOWOPS_LOG_DIR: /app/logs/executor
+    shm_size: "1gb"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # Dockerfile 的 HEALTHCHECK 检查 5409 HTTP；executor 不监听 HTTP，
+    # 不能继承它，否则容器会稳定显示 unhealthy。Web 的就绪探针仍会检查
+    # publish_executors 心跳，从而发现 executor 缺失。
+    healthcheck:
+      disable: true

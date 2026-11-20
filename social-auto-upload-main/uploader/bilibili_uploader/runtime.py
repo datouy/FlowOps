@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import platform
 import shutil
 import stat
@@ -8,11 +11,17 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from pathlib import PurePosixPath
+from urllib.parse import quote
 
 import requests
 
 
 GITHUB_RELEASE_API = "https://api.github.com/repos/biliup/biliup/releases/latest"
+GITHUB_RELEASE_TAG_API = "https://api.github.com/repos/biliup/biliup/releases/tags/{tag}"
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_FILES = 5000
 
 
 def get_biliup_runtime_root() -> Path:
@@ -69,14 +78,20 @@ def _select_release_asset(assets: list[dict]) -> dict:
             return {
                 "asset_name": asset_name,
                 "asset_url": asset.get("browser_download_url", ""),
+                "digest": str(asset.get("digest") or ""),
             }
 
     raise RuntimeError(f"No matching biliup release asset found for platform: {platform_key}")
 
 
 def fetch_latest_release() -> dict:
+    release_tag = str(os.environ.get("FLOWOPS_BILIBUP_RELEASE_TAG") or "").strip()
+    api_url = (
+        GITHUB_RELEASE_TAG_API.format(tag=quote(release_tag, safe=""))
+        if release_tag else GITHUB_RELEASE_API
+    )
     response = requests.get(
-        GITHUB_RELEASE_API,
+        api_url,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": "social-auto-upload",
@@ -90,6 +105,7 @@ def fetch_latest_release() -> dict:
         "tag_name": payload.get("tag_name", ""),
         "asset_name": selected_asset["asset_name"],
         "asset_url": selected_asset["asset_url"],
+        "digest": selected_asset["digest"],
     }
 
 
@@ -120,26 +136,133 @@ def _pick_executable(extract_root: Path) -> Path:
     return candidates[0]
 
 
+def _archive_parts(name: str) -> tuple[str, ...]:
+    value = str(name or "").replace("\\", "/")
+    if not value or value.startswith("/") or (len(value) > 1 and value[1] == ":"):
+        raise RuntimeError("拒绝解压绝对路径条目")
+    parts = tuple(part for part in PurePosixPath(value).parts if part not in ("", "."))
+    if not parts or any(part == ".." for part in parts):
+        raise RuntimeError("拒绝解压包含路径穿越的条目")
+    return parts
+
+
+def _safe_destination(root: Path, name: str) -> Path:
+    target = root.joinpath(*_archive_parts(name)).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise RuntimeError("拒绝解压到目标目录之外")
+    return target
+
+
+def _copy_bounded(source, target: Path, remaining: int) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with target.open("wb") as output:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > remaining:
+                raise RuntimeError("压缩包解压后超过安全体积上限")
+            output.write(chunk)
+    return written
+
+
+def _extract_zip_safely(archive: Path, root: Path) -> None:
+    total = 0
+    with zipfile.ZipFile(archive) as handle:
+        members = handle.infolist()
+        if len(members) > MAX_ARCHIVE_FILES:
+            raise RuntimeError("压缩包文件数量超过安全上限")
+        for info in members:
+            target = _safe_destination(root, info.filename)
+            mode = (info.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(mode)
+            if stat.S_ISLNK(mode) or (
+                file_type and file_type not in (stat.S_IFREG, stat.S_IFDIR)
+            ):
+                raise RuntimeError("拒绝解压符号链接或特殊文件")
+            if info.flag_bits & 0x1:
+                raise RuntimeError("拒绝解压加密 ZIP 条目")
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if info.file_size > MAX_EXTRACTED_BYTES - total:
+                raise RuntimeError("压缩包声明体积超过安全上限")
+            with handle.open(info, "r") as source:
+                total += _copy_bounded(source, target, MAX_EXTRACTED_BYTES - total)
+
+
+def _extract_tar_safely(archive: Path, root: Path) -> None:
+    total = 0
+    with tarfile.open(archive, "r:xz") as handle:
+        members = handle.getmembers()
+        if len(members) > MAX_ARCHIVE_FILES:
+            raise RuntimeError("压缩包文件数量超过安全上限")
+        for member in members:
+            target = _safe_destination(root, member.name)
+            if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                raise RuntimeError("拒绝解压符号链接、硬链接或设备文件")
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise RuntimeError("压缩包包含不支持的特殊条目")
+            if member.size > MAX_EXTRACTED_BYTES - total:
+                raise RuntimeError("压缩包声明体积超过安全上限")
+            source = handle.extractfile(member)
+            if source is None:
+                raise RuntimeError("无法读取压缩包文件条目")
+            with source:
+                total += _copy_bounded(source, target, MAX_EXTRACTED_BYTES - total)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def download_biliup_asset(release: dict, destination: Path) -> Path:
+    asset_name = Path(str(release.get("asset_name") or "")).name
+    asset_url = str(release.get("asset_url") or "").strip()
+    expected_digest = str(release.get("digest") or "").strip().lower()
+    if not asset_name or not asset_url.startswith("https://github.com/"):
+        raise RuntimeError("Biliup 发布包地址或文件名不合法")
+    if not expected_digest.startswith("sha256:"):
+        if str(os.environ.get("FLOWOPS_BILIBUP_ALLOW_UNVERIFIED") or "").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            raise RuntimeError("Biliup 发布包缺少 SHA-256 摘要，已拒绝下载")
+        expected_digest = ""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="biliup-download-") as temp_dir:
         temp_root = Path(temp_dir)
-        archive_path = temp_root / release["asset_name"]
-        with requests.get(release["asset_url"], stream=True, timeout=120) as response:
+        archive_path = temp_root / asset_name
+        total = 0
+        with requests.get(asset_url, stream=True, timeout=(15, 120)) as response:
             response.raise_for_status()
             with archive_path.open("wb") as file_obj:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
+                        total += len(chunk)
+                        if total > MAX_ARCHIVE_BYTES:
+                            raise RuntimeError("Biliup 发布包超过 256MB 安全上限")
                         file_obj.write(chunk)
+        if expected_digest:
+            actual_digest = _hash_file(archive_path)
+            expected_hash = expected_digest.split(":", 1)[1]
+            if len(expected_hash) != 64 or not hmac.compare_digest(actual_digest, expected_hash):
+                raise RuntimeError("Biliup 发布包 SHA-256 校验失败")
 
         extract_root = temp_root / "extract"
         extract_root.mkdir(parents=True, exist_ok=True)
         if archive_path.suffix.lower() == ".zip":
-            with zipfile.ZipFile(archive_path) as zip_file:
-                zip_file.extractall(extract_root)
+            _extract_zip_safely(archive_path, extract_root)
         else:
-            with tarfile.open(archive_path, "r:xz") as tar_file:
-                tar_file.extractall(extract_root)
+            _extract_tar_safely(archive_path, extract_root)
 
         extracted_binary = _pick_executable(extract_root)
         temp_binary = destination.with_suffix(f"{destination.suffix}.tmp")

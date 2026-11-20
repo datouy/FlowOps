@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享 Chromium 实例池：单进程多 context，突破"一账号一进程"的密度天花板。
+"""共享 Chromium 分片池：少量 Chromium 实例承载多账号 context。
 
 **为什么要这个**：``account_browser`` 之前每次开账号都用
 ``launch_persistent_context``，一个账号一个 Chromium 进程（~300-500MB）。
@@ -26,19 +26,21 @@ storage_state，``hydrate_context`` 只是把它播种进 persistent profile。
 * 不保留 persistent profile 里的 IndexedDB / CacheStorage / ServiceWorker。
   这些**不是登录态**（登录态靠 cookie + localStorage），丢了顶多丢平台偏好/
   草稿，不影响发布与私信。
-* 单实例意味着硬件指纹（GPU 渲染器、audio 硬件）是所有 context 共享的。
+* 同一分片的 context 共享硬件指纹（GPU 渲染器、audio 硬件）。
   但这和现状没有区别——"一账号一进程"跑在同一台机器上，硬件指纹本来就相同，
   真正的隔离一直靠代理出口 + 独立 localStorage 指纹。
-* 单实例崩溃会波及所有 context。``get_browser`` 每次用 ``is_connected()``
-  探活，崩溃后下次调用自动重建。
+* 一个分片崩溃只波及该分片上的 context。账号按 Cookie 文件路径稳定哈希到
+  分片；``get_browser`` 每次用 ``is_connected()`` 探活，崩溃后自动重建。
 
 **开关**：``FLOWOPS_SHARED_BROWSER``（默认开，``0``/``off`` 回退到
 一账号一进程的 persistent 模式）。登录需要可见窗口（``headless=False``），
-仍走 persistent，不走共享——共享实例始终 headless。
+仍走 persistent，不走共享分片。``FLOWOPS_SHARED_BROWSER_SHARDS`` 控制
+每进程的分片数（默认 2，范围 1-16）。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import uuid
 import threading
@@ -55,14 +57,14 @@ def shared_enabled() -> bool:
     return raw not in ("0", "off", "false", "no")
 
 
-# ---------------------------------------------------------------- 异步单例
+# ---------------------------------------------------------------- 分片实例
 
-_async_browser: Any = None
-_async_lock = asyncio.Lock()
-_async_starting: asyncio.Future | None = None
-_sync_browser: Any = None
-_sync_lock = threading.Lock()
-_browser_id = ""
+_async_browsers: dict[int, Any] = {}
+_async_locks: dict[int, asyncio.Lock] = {}
+_sync_browsers: dict[int, Any] = {}
+_sync_locks: dict[int, threading.Lock] = {}
+_browser_ids: dict[int, str] = {}
+_REGISTRY_GUARD = threading.Lock()
 _CONTEXT_SLOTS: dict[int, object] = {}
 _CONTEXT_SLOTS_GUARD = threading.Lock()
 
@@ -71,33 +73,72 @@ def _new_browser_id() -> str:
     return f"shared-browser-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-def browser_id() -> str:
-    return _browser_id
+def shard_count() -> int:
+    try:
+        value = int(os.environ.get("FLOWOPS_SHARED_BROWSER_SHARDS", "2") or 2)
+    except ValueError:
+        value = 2
+    return max(1, min(value, 16))
+
+
+def shard_for(account: str | Path) -> int:
+    raw = str(account or "").encode("utf-8", errors="ignore")
+    digest = hashlib.sha256(raw).digest()
+    return int.from_bytes(digest[:8], "big") % shard_count()
+
+
+def _async_lock_for(shard: int) -> asyncio.Lock:
+    with _REGISTRY_GUARD:
+        lock = _async_locks.get(shard)
+        if lock is None:
+            lock = asyncio.Lock()
+            _async_locks[shard] = lock
+        return lock
+
+
+def _sync_lock_for(shard: int) -> threading.Lock:
+    with _REGISTRY_GUARD:
+        lock = _sync_locks.get(shard)
+        if lock is None:
+            lock = threading.Lock()
+            _sync_locks[shard] = lock
+        return lock
+
+
+def browser_id(shard: int | None = None) -> str:
+    if shard is None:
+        return ",".join(_browser_ids[key] for key in sorted(_browser_ids))
+    return _browser_ids.get(int(shard), "")
 
 
 async def get_browser(playwright, *, headless: bool, args: list[str],
-                      executable_path: str, channel: str) -> Any:
-    """取（或创建）共享 Chromium 实例。崩溃后自动重建。"""
-    global _async_browser
-    global _browser_id
-    if _async_browser is not None:
+                      executable_path: str, channel: str, shard: int = 0) -> Any:
+    """取（或创建）指定分片的 Chromium 实例。崩溃后自动重建。"""
+    shard = int(shard) % shard_count()
+    browser = _async_browsers.get(shard)
+    if browser is not None:
         try:
-            if _async_browser.is_connected():
-                return _async_browser
+            if browser.is_connected():
+                return browser
         except Exception:
-            _async_browser = None
-    async with _async_lock:
-        if _async_browser is not None and _async_browser.is_connected():
-            return _async_browser
+            _async_browsers.pop(shard, None)
+    async with _async_lock_for(shard):
+        browser = _async_browsers.get(shard)
+        if browser is not None and browser.is_connected():
+            return browser
         opts: dict[str, Any] = {"headless": bool(headless), "args": list(args or [])}
         if executable_path:
             opts["executable_path"] = executable_path
         elif channel:
             opts["channel"] = channel
-        logger.info("启动共享 Chromium 实例（headless={}）", headless)
-        _async_browser = await playwright.chromium.launch(**opts)
-        _browser_id = _new_browser_id()
-        return _async_browser
+        logger.info(
+            "启动共享 Chromium 分片 {}/{}（headless={}）",
+            shard + 1, shard_count(), headless,
+        )
+        browser = await playwright.chromium.launch(**opts)
+        _async_browsers[shard] = browser
+        _browser_ids[shard] = _new_browser_id()
+        return browser
 
 
 async def account_context(
@@ -120,12 +161,14 @@ async def account_context(
     """
     from utils.browser_pool import acquire_browser_slot, release_browser_slot
 
+    shard = shard_for(cookie_path)
     browser = await get_browser(
         playwright,
         headless=headless,
         args=args,
         executable_path=executable_path,
         channel=channel,
+        shard=shard,
     )
     slot = acquire_browser_slot(account=Path(cookie_path).name)
     try:
@@ -158,29 +201,35 @@ async def close_context_async(context: Any) -> None:
         release_browser_slot(slot)
 
 
-# ---------------------------------------------------------------- 同步单例
+# ---------------------------------------------------------------- 同步分片
 
 def get_browser_sync(playwright, *, headless: bool, args: list[str],
-                     executable_path: str, channel: str) -> Any:
-    global _sync_browser, _browser_id
-    if _sync_browser is not None:
+                     executable_path: str, channel: str, shard: int = 0) -> Any:
+    shard = int(shard) % shard_count()
+    browser = _sync_browsers.get(shard)
+    if browser is not None:
         try:
-            if _sync_browser.is_connected():
-                return _sync_browser
+            if browser.is_connected():
+                return browser
         except Exception:
-            _sync_browser = None
-    with _sync_lock:
-        if _sync_browser is not None and _sync_browser.is_connected():
-            return _sync_browser
+            _sync_browsers.pop(shard, None)
+    with _sync_lock_for(shard):
+        browser = _sync_browsers.get(shard)
+        if browser is not None and browser.is_connected():
+            return browser
         opts: dict[str, Any] = {"headless": bool(headless), "args": list(args or [])}
         if executable_path:
             opts["executable_path"] = executable_path
         elif channel:
             opts["channel"] = channel
-        logger.info("启动共享 Chromium 实例（headless={}，sync）", headless)
-        _sync_browser = playwright.chromium.launch(**opts)
-        _browser_id = _new_browser_id()
-        return _sync_browser
+        logger.info(
+            "启动共享 Chromium 分片 {}/{}（headless={}，sync）",
+            shard + 1, shard_count(), headless,
+        )
+        browser = playwright.chromium.launch(**opts)
+        _sync_browsers[shard] = browser
+        _browser_ids[shard] = _new_browser_id()
+        return browser
 
 
 def account_context_sync(
@@ -196,12 +245,14 @@ def account_context_sync(
     executable_path: str = "",
     channel: str = "",
 ) -> Any:
+    shard = shard_for(cookie_path)
     browser = get_browser_sync(
         playwright,
         headless=headless,
         args=args,
         executable_path=executable_path,
         channel=channel,
+        shard=shard,
     )
     from utils.browser_pool import acquire_browser_slot, release_browser_slot
 
@@ -239,34 +290,52 @@ def close_context_sync(context: Any) -> None:
 # ---------------------------------------------------------------- 状态与清理
 
 def status() -> dict[str, Any]:
+    async_connected = []
+    sync_connected = []
+    for shard, browser in list(_async_browsers.items()):
+        try:
+            if browser.is_connected():
+                async_connected.append(shard)
+        except Exception:
+            pass
+    for shard, browser in list(_sync_browsers.items()):
+        try:
+            if browser.is_connected():
+                sync_connected.append(shard)
+        except Exception:
+            pass
     return {
         "enabled": shared_enabled(),
-        "browserId": _browser_id,
-        "asyncConnected": bool(_async_browser is not None and _async_browser.is_connected()),
-        "syncConnected": bool(_sync_browser is not None and _sync_browser.is_connected()),
+        "shards": shard_count(),
+        "browserIds": dict(_browser_ids),
+        "browserId": browser_id(),
+        "asyncConnected": bool(async_connected),
+        "syncConnected": bool(sync_connected),
+        "asyncConnectedShards": sorted(async_connected),
+        "syncConnectedShards": sorted(sync_connected),
     }
 
 
 async def close_all_async() -> None:
-    global _async_browser
-    browser, _async_browser = _async_browser, None
-    if browser is not None:
+    browsers = list(_async_browsers.values())
+    _async_browsers.clear()
+    for browser in browsers:
         await browser_timeout.close_async_resource_async(
-            browser, label="关闭共享 Chromium 实例",
+            browser, label="关闭共享 Chromium 分片",
         )
 
 
 def close_all_sync() -> None:
-    global _sync_browser
-    browser, _sync_browser = _sync_browser, None
-    if browser is not None:
+    browsers = list(_sync_browsers.values())
+    _sync_browsers.clear()
+    for browser in browsers:
         browser_timeout.close_async_resource(
-            browser, label="关闭共享 Chromium 实例（sync）",
+            browser, label="关闭共享 Chromium 分片（sync）",
         )
 
 
 def terminate_all() -> dict[str, bool]:
-    logger.warning("重启共享 Chromium 实例（当前代 {}）", _browser_id)
+    logger.warning("重启全部共享 Chromium 分片（当前代 {}）", browser_id())
     close_all_sync()
     closed_async = False
 
@@ -281,14 +350,16 @@ def terminate_all() -> dict[str, bool]:
         closed_async = True
     except Exception as exc:
         logger.warning("关闭异步共享 Chromium 实例失败: {}", exc)
-    return {"sync": _sync_browser is None, "async": closed_async}
+    return {"sync": not _sync_browsers, "async": closed_async}
 
 
 def reset_for_tests() -> None:
     """只给测试用。同步实例如果开着会先关掉（避免泄漏真实 Chromium）。"""
     close_all_sync()
-    global _async_browser, _async_starting
-    _async_browser = None
-    _async_starting = None
+    _async_browsers.clear()
+    _browser_ids.clear()
+    with _REGISTRY_GUARD:
+        _async_locks.clear()
+        _sync_locks.clear()
     with _CONTEXT_SLOTS_GUARD:
         _CONTEXT_SLOTS.clear()

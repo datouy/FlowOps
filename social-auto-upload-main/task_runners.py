@@ -46,6 +46,8 @@ def run_ai_pack(params, progress, cancelled):
 def run_account_check(params, progress, cancelled):
     from account_store import get_store
     from myUtils.auth import check_cookies_concurrently
+    from utils.account_serial import account_key
+    import account_safety
 
     base_dir = Path(str(params.get("baseDir")))
     store = get_store(base_dir)
@@ -63,6 +65,17 @@ def run_account_check(params, progress, cancelled):
         for item in batch:
             account_id = int(item.get("id") or 0)
             cookie_name = str(item.get("cookie") or "")
+            live_account = store.get(account_id) or item
+            if account_safety.is_paused(live_account):
+                results.append({
+                    "id": account_id,
+                    "name": item.get("name") or live_account.get("name") or "",
+                    "alive": False,
+                    "status": live_account.get("status"),
+                    "reason": "自动动作已暂停，未访问平台",
+                    "paused": True,
+                })
+                continue
             if not item.get("cookieExists"):
                 store.mark_status(account_id, 0, "凭据文件缺失，请重新扫码授权")
                 bad += 1
@@ -75,15 +88,32 @@ def run_account_check(params, progress, cancelled):
                     "reason": fresh.get("failReason") or "凭据文件缺失",
                 })
                 continue
-            pending.append((account_id, int(item.get("type") or 0), cookie_name, item))
+            platform_type = int(item.get("type") or 0)
+            pending.append((
+                account_id,
+                platform_type,
+                cookie_name,
+                item,
+                account_key(
+                    platform_type,
+                    live_account.get("name") or item.get("name"),
+                    account_id,
+                    cookie_name,
+                ),
+            ))
         if not pending:
             progress(int(len(results) * 100 / total), "账号检查中")
             continue
         flags = asyncio.run(check_cookies_concurrently(
-            [(platform_type, cookie) for _id, platform_type, cookie, _item in pending],
+            [
+                (platform_type, cookie, lease_key)
+                for _id, platform_type, cookie, _item, lease_key in pending
+            ],
             max_concurrent=4,
         ))
-        for index, (account_id, _platform_type, _cookie, item) in enumerate(pending):
+        for index, (
+            account_id, _platform_type, _cookie, item, _lease_key,
+        ) in enumerate(pending):
             alive = bool(flags.get(index, False))
             store.mark_checked(
                 account_id,

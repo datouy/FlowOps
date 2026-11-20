@@ -132,6 +132,26 @@ def test_recover_pending_jobs_picks_up_stuck_schedule(env):
     assert job_id in recovered
 
 
+def test_absolute_schedule_uses_the_selected_minute(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A, COOKIE_B])
+    with pj.get_conn() as c:
+        c.execute(
+            "UPDATE jobs SET status='scheduled', extra=? WHERE id=?",
+            (json.dumps({
+                "enableTimer": True, "scheduledAt": "2026-11-22 09:30",
+                "contentType": "video",
+            }), job_id),
+        )
+
+    pj._expand_schedule(job_id)
+    with pj.get_conn() as c:
+        rows = c.execute(
+            "SELECT scheduled_at FROM scheduled_items WHERE job_id=? ORDER BY id", (job_id,)
+        ).fetchall()
+    assert [row[0] for row in rows] == ["2026-11-22 09:30", "2026-11-22 09:30"]
+
+
 def _patch_dispatcher(monkeypatch, behaviour):
     """behaviour(cookie) -> None 表示成功，抛异常表示失败。"""
     import myUtils.platform_registry as registry

@@ -115,23 +115,29 @@ def _account_rows():
         return []
     conn = connect(MAIN_DB)
     try:
-        return [dict(r) for r in conn.execute(
-            'SELECT id,type,userName,filePath,status FROM user_info ORDER BY id'
+        import account_safety
+        if not account_safety.ensure_schema(BASE_DIR):
+            logger.warning('账号表结构不可用，跳过数据回流账号读取')
+            return []
+        rows = [dict(r) for r in conn.execute(
+            'SELECT id,type,userName,filePath,status,automation_paused,pause_until,'
+            'pause_reason,pause_updated_at FROM user_info ORDER BY id'
         ).fetchall()]
+        return rows
     finally:
         conn.close()
 
 
 def _account_cookie(account: dict | None, platform: int) -> Path | None:
-    if account and account.get('filePath'):
-        path = resolve_credential_path(COOKIE_DIR / str(account['filePath']))
-        if path:
-            return path
-    for row in _account_rows():
-        if int(row.get('type') or 0) == int(platform):
-            path = resolve_credential_path(COOKIE_DIR / str(row.get('filePath') or ''))
-            if path:
-                return path
+    import account_safety
+
+    if not account or not account.get('filePath') or account_safety.is_paused(account):
+        return None
+    if int(account.get('type') or platform or 0) != int(platform):
+        return None
+    path = resolve_credential_path(COOKIE_DIR / str(account['filePath']))
+    if path:
+        return path
     return None
 
 
@@ -940,8 +946,10 @@ def run_stats_reflow_once() -> dict:
         # 即使还没有发布记录，也先回流账号下的历史作品，让看板立即可用。
         # 失效账号不再回流：Cookie 已失效，抓到的数据也是错的，还会污染看板。
         sources = {}
+        import account_safety
+
         for account in _account_rows():
-            if not _is_alive_account(account):
+            if not _is_alive_account(account) or account_safety.is_paused(account):
                 continue
             platform = int(account.get('type') or 0)
             cookie = COOKIE_DIR / str(account.get('filePath') or '')
@@ -955,7 +963,10 @@ def run_stats_reflow_once() -> dict:
                 continue
             for account in _record_accounts(record):
                 source_key = (platform, int((account or {}).get('id') or 0))
-                if account:
+                if (
+                    account and _is_alive_account(account)
+                    and not account_safety.is_paused(account)
+                ):
                     sources[source_key] = account
                 record_sources.append((record, source_key, account))
 
@@ -964,8 +975,16 @@ def run_stats_reflow_once() -> dict:
             platform = source_key[0]
             try:
                 cache[source_key] = asyncio.run(FETCHERS[platform](account, platform))
-            except Exception:
+            except Exception as exc:
                 traceback.print_exc()
+                if account and int(account.get('id') or 0):
+                    try:
+                        account_safety.pause_on_risk(
+                            int(account.get('id') or 0), str(exc),
+                            base_dir=BASE_DIR,
+                        )
+                    except Exception:
+                        pass
                 cache[source_key] = []
             platform_result = result['platforms'].setdefault(str(platform), {
                 'name': PLATFORM_NAMES.get(platform, str(platform)),

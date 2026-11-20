@@ -239,7 +239,7 @@ def _shared_storage_state(cookie_path: str | Path) -> dict[str, Any] | None:
 
 
 def _use_shared(options: dict[str, Any]) -> bool:
-    """是否走共享单实例：headless 且开关开。
+    """是否走共享 Chromium 分片：headless 且开关开。
 
     登录需要可见窗口（headless=False），仍走 persistent 独立进程——共享实例
     始终 headless，避免一个可见窗口把所有账号的上下文都拖成可见。
@@ -332,7 +332,7 @@ async def persistent_account_context(
     )
     context = None
     if _use_shared(options):
-        # 共享单实例模式：一个 Chromium 进程承载多个账号的 context。
+        # 共享分片模式：少量 Chromium 进程分批承载多个账号的 context。
         # 登录态直接来自 storage_state（权威），不走 persistent profile。
         from utils import shared_browser
 

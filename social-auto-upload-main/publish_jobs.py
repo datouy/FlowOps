@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # 发布任务队列 + 发布记录 + 账号巡检
 import os
+import socket
 import threading
 import time
 import traceback
@@ -14,6 +15,7 @@ import job_events
 import publish_preflight
 import runtime_guard
 import verify_codes
+import account_safety
 from db_utils import connect, record_schema_version
 from utils.credential_crypto import credential_exists
 from utils.errors import (
@@ -56,8 +58,67 @@ def _ensure_columns(c, table: str, columns: tuple[tuple[str, str], ...]) -> None
 # P0-1：控制面与执行面分离的第一步 —— jobs 表持有租约字段，
 # worker 用“租约抢占 + 心跳续期”代替内存 Queue 的“拿走即拥有”。
 # 单机 SQLite 够用，不引入 Redis/Celery。
-EXECUTOR_ID = f"worker-{os.getpid()}"
-EXECUTOR_LEASE_SECONDS = int(os.environ.get("FLOWOPS_EXECUTOR_LEASE", "120") or 120)
+EXECUTOR_ID = (
+    f"worker-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+)
+try:
+    EXECUTOR_LEASE_SECONDS = int(os.environ.get("FLOWOPS_EXECUTOR_LEASE", "120") or 120)
+except (TypeError, ValueError):
+    EXECUTOR_LEASE_SECONDS = 120
+EXECUTOR_LEASE_SECONDS = max(30, EXECUTOR_LEASE_SECONDS)
+
+
+def process_role() -> str:
+    """Return ``web``, ``executor`` or the backward-compatible ``all``."""
+    value = str(os.environ.get("FLOWOPS_PROCESS_ROLE", "all") or "all").strip().lower()
+    return value if value in {"web", "executor", "all"} else "all"
+
+
+def can_run_publish_workers() -> bool:
+    return process_role() in {"executor", "all"}
+
+
+def beat_executor() -> None:
+    """Persist the independent executor heartbeat for the web health page."""
+    try:
+        with get_conn() as c:
+            c.execute(
+                """INSERT INTO publish_executors
+                   (executor_id,host,pid,role,worker_count,started_at,heartbeat_at)
+                   VALUES (?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                   ON CONFLICT(executor_id) DO UPDATE SET
+                     worker_count=excluded.worker_count,
+                     heartbeat_at=CURRENT_TIMESTAMP""",
+                (EXECUTOR_ID, socket.gethostname(), os.getpid(), process_role(),
+                 _worker_count() if can_run_publish_workers() else 0),
+            )
+    except Exception:
+        pass
+
+
+def executor_status(stale_seconds: int = 60) -> dict:
+    try:
+        with get_conn() as c:
+            rows = [dict(row) for row in c.execute(
+                """SELECT executor_id,host,pid,role,worker_count,started_at,heartbeat_at,
+                          CAST((julianday(CURRENT_TIMESTAMP)-julianday(heartbeat_at))*86400 AS INTEGER)
+                            AS age_seconds
+                   FROM publish_executors ORDER BY heartbeat_at DESC LIMIT 50"""
+            ).fetchall()]
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200], "executors": []}
+    for row in rows:
+        row["healthy"] = int(row.get("age_seconds") or 0) <= max(15, int(stale_seconds))
+    return {"ok": any(row["healthy"] for row in rows), "executors": rows}
+
+
+def unregister_executor() -> None:
+    """Remove this process from the executor registry during graceful shutdown."""
+    try:
+        with get_conn() as c:
+            c.execute("DELETE FROM publish_executors WHERE executor_id=?", (EXECUTOR_ID,))
+    except Exception:
+        pass
 
 
 def claim_job(job_id: int) -> bool:
@@ -67,7 +128,8 @@ def claim_job(job_id: int) -> bool:
 
 def claim_job_token(job_id: int, executor_id=None) -> str | None:
     """原子抢占 pending/过期租约任务，返回本次唯一租约 token。"""
-    token = f"{executor_id or EXECUTOR_ID}-{uuid.uuid4().hex}"
+    executor_identity = str(executor_id or EXECUTOR_ID)
+    token = f"{executor_identity}-{uuid.uuid4().hex}"
     with get_conn() as c:
         _ensure_columns(c, 'jobs', (
             ('executor_id', "TEXT DEFAULT ''"),
@@ -82,7 +144,7 @@ def claim_job_token(job_id: int, executor_id=None) -> str | None:
             "WHERE id=? AND (status='pending' OR "
             "(status='running' AND lease_until IS NOT NULL "
             " AND lease_until<=CURRENT_TIMESTAMP))",
-            (EXECUTOR_ID, token, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
+            (executor_identity, token, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
         )
         return token if int(cur.rowcount or 0) else None
 
@@ -306,6 +368,15 @@ def init_db():
             alive INTEGER,
             checked_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS publish_executors (
+            executor_id TEXT PRIMARY KEY,
+            host TEXT DEFAULT '',
+            pid INTEGER DEFAULT 0,
+            role TEXT DEFAULT 'executor',
+            worker_count INTEGER DEFAULT 0,
+            started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            heartbeat_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
         c.execute('''CREATE TABLE IF NOT EXISTS scheduled_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id INTEGER NOT NULL,
@@ -366,6 +437,10 @@ def init_db():
             ON publish_records(status)''')
         c.execute('''CREATE INDEX IF NOT EXISTS idx_jobs_status
             ON jobs(status)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_jobs_pending
+            ON jobs(status, created_at)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_publish_executors_heartbeat
+            ON publish_executors(heartbeat_at)''')
         c.execute('''CREATE INDEX IF NOT EXISTS idx_publish_items_job
             ON publish_items(job_id, status)''')
         # 任务事件流：把一次发布的每一步落成可回放的时间轴。
@@ -640,17 +715,21 @@ def _load_accounts(cookies) -> dict:
     db_main = Path(BASE_DIR / 'db' / 'database.db')
     if not db_main.exists():
         return {}
+    if not account_safety.ensure_schema(BASE_DIR):
+        raise RuntimeError('账号表结构初始化失败，发布安全门禁不可用')
     marks = ','.join('?' for _ in names)
     try:
         with connect(db_main, timeout=15) as conn:
             rows = conn.execute(
-                f"SELECT id, userName, filePath, status, fail_reason FROM user_info "
+                f"SELECT id, userName, filePath, status, fail_reason, "
+                f"automation_paused, pause_until, pause_reason, pause_updated_at "
+                f"FROM user_info "
                 f"WHERE filePath IN ({marks})",
                 names,
             ).fetchall()
-    except Exception:
+    except Exception as exc:
         logger.exception("读取账号健康状态失败")
-        return {}
+        raise RuntimeError('读取账号健康状态失败，已拒绝继续发布') from exc
     return {str(row['filePath']): dict(row) for row in rows}
 
 
@@ -860,6 +939,9 @@ def _throttle_account(cookie: str, reason: str) -> None:
         # 账号本身不算失效——只写风控原因，健康状态保持不变。
         store.mark_throttled(account_id, reason)
         set_throttle(account_id, THROTTLE_COOLDOWN, reason)
+        account_safety.pause_on_risk(
+            account_id, reason, base_dir=BASE_DIR,
+        )
         logger.warning(
             "账号 {} 触发平台风控，{} 秒内降速: {}",
             cookie, THROTTLE_COOLDOWN, (reason or '')[:200],
@@ -1393,7 +1475,8 @@ def cancel_job(job_id: int) -> dict:
         )
         cancelled = cur.rowcount or 0
         c.execute(
-            "UPDATE jobs SET status='cancelled', finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP)"
+            "UPDATE jobs SET status='cancelled', finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP),"
+            " executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL"
             " WHERE id=? AND status IN ('pending','running','pending_review','scheduled')",
             (int(job_id),),
         )
@@ -1453,11 +1536,12 @@ def publish_draft_items(job_id: int) -> dict:
     if queued:
         with get_conn() as c:
             c.execute(
-                "UPDATE jobs SET status='pending', finished_at=NULL WHERE id=?",
+                "UPDATE jobs SET status='pending', finished_at=NULL,"
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                "WHERE id=?",
                 (int(job_id),),
             )
-        _start_workers()
-        _q.put(int(job_id))
+        _queue_job(int(job_id))
     return {"jobId": int(job_id), "queued": queued, **job_progress(job_id)}
 
 
@@ -1474,12 +1558,13 @@ def retry_failed_items(job_id: int) -> dict:
         retried = cur.rowcount or 0
         if retried:
             c.execute(
-                "UPDATE jobs SET status='pending', finished_at=NULL WHERE id=?",
+                "UPDATE jobs SET status='pending', finished_at=NULL,"
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                "WHERE id=?",
                 (int(job_id),),
             )
     if retried:
-        _start_workers()
-        _q.put(int(job_id))
+        _queue_job(int(job_id))
     return {"jobId": int(job_id), "retried": retried, **job_progress(job_id)}
 
 
@@ -1537,11 +1622,12 @@ def resolve_uncertain_item(
         )
         with get_conn() as c:
             c.execute(
-                "UPDATE jobs SET status='pending', finished_at=NULL WHERE id=?",
+                "UPDATE jobs SET status='pending', finished_at=NULL,"
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                "WHERE id=?",
                 (int(job_id),),
             )
-        _start_workers()
-        _q.put(int(job_id))
+        _queue_job(int(job_id))
     elif action == 'mark_failed':
         _update_item(
             int(item_id),
@@ -1818,6 +1904,8 @@ _q = _queue.Queue()
 _workers_started = False
 _worker_threads: dict[int, threading.Thread] = {}
 _recovery_done = False
+_queued_job_ids: set[int] = set()
+_queued_guard = threading.Lock()
 
 def _worker_count() -> int:
     try:
@@ -1827,8 +1915,34 @@ def _worker_count() -> int:
     return max(1, min(value, 8))
 
 
+def _queue_job(job_id: int) -> bool:
+    """Queue one local wake-up without duplicating the same database job."""
+    if not can_run_publish_workers():
+        return False
+    _start_workers()
+    job_id = int(job_id)
+    with _queued_guard:
+        if job_id in _queued_job_ids:
+            return False
+        _queued_job_ids.add(job_id)
+    try:
+        _q.put_nowait(job_id)
+        return True
+    except Exception:
+        with _queued_guard:
+            _queued_job_ids.discard(job_id)
+        raise
+
+
+def _dequeue_job(job_id: int) -> None:
+    with _queued_guard:
+        _queued_job_ids.discard(int(job_id))
+
+
 def _start_workers(n=None):
     global _workers_started
+    if not can_run_publish_workers():
+        return False
     desired = int(n or _worker_count())
     desired = max(1, min(desired, 8))
     with _lock:
@@ -1842,18 +1956,18 @@ def _start_workers(n=None):
             )
             _worker_threads[index] = thread
             thread.start()
+    return True
 
 
 def _recover_interrupted_jobs() -> list[int]:
     """把上次进程退出时卡在 running 的任务回滚成 pending。
 
-    后端是单进程模型：任务状态、发布 worker 都在内存里。进程被 kill 或
-    机器重启时，`jobs.status='running'` 和 `publish_records.status='running'`
-    永远不会自己收尾——旧版本只恢复 `status='pending'` 的任务，于是这些
-    僵尸记录会永远挂在前端"发布记录"页面上。
+    只处理租约已经过期（或旧数据没有租约）的 running 任务。独立 executor
+    启动时不能把另一个进程仍持有的有效租约当成“上次进程遗留”而重置，否则
+    控制面拆分后会出现两个执行器互相抢跑。
 
     这里做三件事：
-    1. `publish_records` 里卡住的 running 行标成 failed，写明是进程中断，
+    1. 把没有有效执行租约的 running 发布记录标成 failed，写明是进程中断，
        避免前端一直显示"发布中"。
     2. 子任务分两类：
        - 还没提交到平台的（没有 submitted_at）→ 回到 pending，重跑安全；
@@ -1866,45 +1980,57 @@ def _recover_interrupted_jobs() -> list[int]:
     """
     recovered: list[int] = []
     with get_conn() as c:
-        # 先收尾所有卡住的发布记录（含孤儿：其 job 已不存在或已结束）
+        rows = c.execute(
+            """SELECT id,retry_count FROM jobs
+               WHERE status='running'
+                 AND (lease_until IS NULL OR lease_until<=CURRENT_TIMESTAMP)
+               ORDER BY id"""
+        ).fetchall()
+        job_ids = [int(row['id']) for row in rows]
+        # 没有有效执行租约的发布记录（含孤儿）都需要收尾；仍被其他 executor
+        # 持有有效租约的记录保持 running。
         c.execute("""UPDATE publish_records
                      SET status='failed',
                          error=COALESCE(NULLIF(error,''),'进程重启，发布中断，请重新发布'),
                          finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP)
-                     WHERE status='running'""")
+                     WHERE status='running'
+                       AND job_id NOT IN (
+                         SELECT id FROM jobs
+                         WHERE status='running' AND lease_until>CURRENT_TIMESTAMP
+                       )""")
+        if not job_ids:
+            return recovered
+        marks = ",".join("?" for _ in job_ids)
         # 子任务分两类：未提交的可以安全重跑，已提交但结果未知的不能重发。
-        c.execute("""UPDATE publish_items
+        c.execute(f"""UPDATE publish_items
                      SET status='pending',
                          error=COALESCE(NULLIF(error,''),'进程重启，等待重新执行')
-                     WHERE status='running' AND (submitted_at IS NULL OR submitted_at='')""")
-        c.execute("""UPDATE publish_items
+                     WHERE job_id IN ({marks}) AND status='running'
+                       AND (submitted_at IS NULL OR submitted_at='')""", job_ids)
+        c.execute(f"""UPDATE publish_items
                      SET status='uncertain',
                          error=COALESCE(NULLIF(error,''),'进程重启时已提交到平台但结果未写入，状态未知，为避免重复发布已暂停自动重发，请人工确认后处理'),
                          error_kind='unverified',
                          publish_stage='push',
                          stage_status='doing',
                          next_check_at=NULL
-                     WHERE status='running'""")
-        rows = c.execute(
-            "SELECT id FROM jobs WHERE status='running' ORDER BY id"
-        ).fetchall()
+                     WHERE job_id IN ({marks}) AND status='running'""", job_ids)
         for row in rows:
             job_id = int(row['id'])
-            job = c.execute(
-                "SELECT retry_count FROM jobs WHERE id=?", (job_id,)
-            ).fetchone()
-            retry_count = int(job['retry_count'] or 0) if job else 0
+            retry_count = int(row['retry_count'] or 0)
             if retry_count >= 1:
                 # 已经自动重试过一次还被打断，说明任务本身有问题，
                 # 直接落 failed，避免重启后反复执行同一个坏任务。
                 c.execute("""UPDATE jobs SET status='failed',
                              result='进程重启导致发布中断',
+                             executor_id='',lease_until=NULL,lease_token='',
                              finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP)
                              WHERE id=?""", (job_id,))
                 continue
             c.execute("""UPDATE jobs SET status='pending',
                          retry_count=retry_count+1,
-                         progress='recovered after restart'
+                         progress='recovered after restart',
+                         executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL
                          WHERE id=?""", (job_id,))
             recovered.append(job_id)
     return recovered
@@ -1939,7 +2065,7 @@ def recover_pending_jobs():
     if job_ids:
         _start_workers()
         for job_id in job_ids:
-            _q.put(job_id)
+            _queue_job(job_id)
         logger.info(
             "recovered {} pending job(s): {}",
             len(job_ids), ", ".join(map(str, job_ids)),
@@ -1949,6 +2075,7 @@ def recover_pending_jobs():
 def _worker(worker_id):
     while True:
         job_id = _q.get()
+        _dequeue_job(job_id)
         token = None
         _heartbeat_stop = threading.Event()
         def _heartbeat_loop():
@@ -1970,13 +2097,16 @@ def _worker(worker_id):
                 with get_conn() as c:
                     if token:
                         c.execute(
-                            "UPDATE jobs SET status='failed', result=? "
+                            "UPDATE jobs SET status='failed', result=?, "
+                            "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
                             "WHERE id=? AND lease_token=?",
                             (str(e)[:500], job_id, token),
                         )
                     else:
                         c.execute(
-                            "UPDATE jobs SET status='failed', result=? WHERE id=?",
+                            "UPDATE jobs SET status='failed', result=?,"
+                            "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                            "WHERE id=?",
                             (str(e)[:500], job_id),
                         )
             except Exception:
@@ -2082,6 +2212,22 @@ def _run_job(job_id, token=None):
                 continue
 
             account = _load_accounts([cookie]).get(cookie) or {}
+            if account and account_safety.is_paused(account):
+                pause = account_safety.automation_state(account)
+                reason = str(pause.get('reason') or '自动动作已暂停')
+                until = str(pause.get('pauseUntil') or '')
+                _update_item(
+                    item_id, status=ITEM_PENDING, error_kind='automation_paused',
+                    error=(f"{reason}（恢复时间：{until}）" if until else reason)[:300],
+                )
+                job_events.record(
+                    job_id, job_events.STAGE_SKIPPED,
+                    f"账号自动动作已暂停，跳过发布：{reason[:180]}",
+                    item_id=item_id, account_id=account_id,
+                    level=job_events.LEVEL_WARN,
+                    code='automation_paused',
+                )
+                continue
             if account and int(account.get('status') or 0) != 1:
                 _update_item(
                     item_id, status=ITEM_SKIPPED, error_kind=KIND_ACCOUNT_EXPIRED,
@@ -2175,9 +2321,11 @@ def _run_job(job_id, token=None):
                     # 顺序是"先令牌、再信号量"：反过来的话任务会占着并发
                     # 额度干等令牌，把平台并发浪费在什么都没干的任务上。
                     # P0-3：外层再套同账号全局串行 + 人类节律（publish/DM/评论统一入口）。
-                    from utils.account_serial import account_serial as _serial
-                    _acct_key = str(cookie or account_id or "unknown")
-                    with _serial(f"account:{_acct_key}", timeout=600):
+                    from utils.account_serial import account_key, account_serial as _serial
+                    _acct_key = account_key(
+                        type, item.get('account_name'), account_id, cookie,
+                    )
+                    with _serial(_acct_key, timeout=600):
                         heartbeat_token(int(job_id), token or "")
                         with publish_guard(account_id, type):
                             # 先落"已提交"标记，再调用平台。这样进程在发布过程中崩溃时，
@@ -2265,8 +2413,37 @@ def _run_job(job_id, token=None):
         verify_codes.clear_job_context()
         verify_codes.cancel_job_requests(job_id, first_error)
 
-    _finalize_job(job_id, rec_id, job, first_error)
-    _finalize_replacement(job_id, extra)
+    with get_conn() as c:
+        paused_open = c.execute(
+            "SELECT 1 FROM publish_items WHERE job_id=? AND status=? "
+            "AND error_kind='automation_paused' LIMIT 1",
+            (job_id, ITEM_PENDING),
+        ).fetchone()
+    if paused_open:
+        summary = _summarize_items(job_id)
+        with get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET status='paused', result=?, progress=?, "
+                "finished_at=NULL, executor_id='', lease_token='', lease_until=NULL "
+                "WHERE id=?",
+                ('账号自动动作暂停，未完成子任务已保留，恢复后继续',
+                 json_dumps(job_progress(job_id)), job_id),
+            )
+            if rec_id is not None:
+                c.execute(
+                    "UPDATE publish_records SET status='paused', error=? WHERE id=?",
+                    ('账号自动动作暂停，尚未访问对应平台', rec_id),
+                )
+        job_events.record(
+            job_id, job_events.STAGE_THROTTLED,
+            '账号自动动作已暂停；未完成子任务保留，恢复后继续',
+            payload={'counts': summary}, level=job_events.LEVEL_WARN,
+            code='automation_paused',
+        )
+        logger.info("任务 {} 因账号自动动作暂停而挂起", job_id)
+    else:
+        _finalize_job(job_id, rec_id, job, first_error)
+        _finalize_replacement(job_id, extra)
     job_events.clear_job_start(job_id)
 
 
@@ -2302,7 +2479,8 @@ def _finalize_job(
         with get_conn() as c:
             c.execute(
                 "UPDATE jobs SET status='pending', retry_count=retry_count+1, "
-                "progress=?, finished_at=NULL WHERE id=?",
+                "progress=?, finished_at=NULL,executor_id='',lease_until=NULL,"
+                "lease_token='',heartbeat_at=NULL WHERE id=?",
                 (json_dumps(progress), job_id),
             )
             if rec_id is not None:
@@ -2312,16 +2490,18 @@ def _finalize_job(
                     ('部分子任务失败，已自动重试（只重跑失败项）', now, rec_id),
                 )
         logger.info("任务 {} 有 {} 个子任务待重试，已重新入队", job_id, pending)
-        _q.put(job_id)
+        _queue_job(job_id)
         return
 
     if pending and not first_error:
         with get_conn() as c:
             c.execute(
-                "UPDATE jobs SET status='pending', progress=?, finished_at=NULL WHERE id=?",
+                "UPDATE jobs SET status='pending', progress=?, finished_at=NULL,"
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                "WHERE id=?",
                 (json_dumps(job_progress(job_id)), job_id),
             )
-        _q.put(job_id)
+        _queue_job(job_id)
         return
 
     if pending:
@@ -2356,7 +2536,8 @@ def _finalize_job(
         status = 'processing' if processing else 'scheduled'
         with get_conn() as c:
             c.execute(
-                "UPDATE jobs SET status=?, result=?, progress=?, finished_at=NULL "
+                "UPDATE jobs SET status=?, result=?, progress=?, finished_at=NULL,"
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
                 "WHERE id=?",
                 (status, summary, json_dumps(job_progress(job_id)), job_id),
             )
@@ -2390,7 +2571,9 @@ def _finalize_job(
 
     with get_conn() as c:
         c.execute(
-            "UPDATE jobs SET status=?, result=?, progress=?, finished_at=? WHERE id=?",
+            "UPDATE jobs SET status=?, result=?, progress=?, finished_at=?,"
+            "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+            "WHERE id=?",
             (
                 status, 'ok' if status == 'success' else summary,
                 json_dumps(job_progress(job_id)), now, job_id,
@@ -2580,16 +2763,6 @@ def _expand_schedule(job_id):
     account_list = json_loads(job['account_list'])
     image_text = extra.get('contentType') == 'image-text'
     task_count = len(account_list) if image_text else len(file_list) * len(account_list)
-    try:
-        from utils.files_times import generate_schedule_time_next_day
-        videos_per_day = int(extra.get('videosPerDay') or 1)
-        daily_times = extra.get('dailyTimes') or ['10:00']
-        start_days = int(extra.get('startDays') or 0)
-        dts = generate_schedule_time_next_day(
-            max(1, task_count), videos_per_day, daily_times, start_days=start_days
-        )
-    except Exception as exc:
-        raise RuntimeError("生成定时排期失败，未写入无法执行的空计划") from exc
     units = []
     if image_text:
         first_file = str(file_list[0]) if file_list else ''
@@ -2601,6 +2774,23 @@ def _expand_schedule(job_id):
         ]
     if not units:
         raise RuntimeError("定时任务缺少可发布的素材或账号")
+    try:
+        absolute_time = _parse_time(extra.get('scheduledAt'))
+        if absolute_time is not None:
+            # The unified composer schedules the exact moment the operator chose.
+            # Repeating the same moment is intentional when one post fans out to
+            # several accounts in the same platform group.
+            dts = [absolute_time] * len(units)
+        else:
+            from utils.files_times import generate_schedule_time_next_day
+            videos_per_day = int(extra.get('videosPerDay') or 1)
+            daily_times = extra.get('dailyTimes') or ['10:00']
+            start_days = int(extra.get('startDays') or 0)
+            dts = generate_schedule_time_next_day(
+                max(1, task_count), videos_per_day, daily_times, start_days=start_days
+            )
+    except Exception as exc:
+        raise RuntimeError("生成定时排期失败，未写入无法执行的空计划") from exc
     if len(dts) < len(units):
         raise RuntimeError(
             f"定时排期数量不足：需要 {len(units)} 个时间点，仅生成 {len(dts)} 个"
@@ -2618,8 +2808,78 @@ def _expand_schedule(job_id):
             )
 
 
+def _job_account_cookies(job: dict) -> list[str]:
+    try:
+        value = json_loads(job.get('account_list') or '[]')
+    except Exception:
+        value = []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def resume_paused_jobs_for_account(account_id: int | None = None) -> list[int]:
+    """Queue paused jobs again once every referenced account is unpaused."""
+    if not account_safety.ensure_schema(BASE_DIR):
+        logger.warning("账号表结构不可用，跳过暂停任务恢复")
+        return []
+    target_cookie = ''
+    if account_id is not None:
+        with connect(Path(BASE_DIR / 'db' / 'database.db'), timeout=15) as c:
+            row = c.execute(
+                'SELECT filePath FROM user_info WHERE id=?', (int(account_id),)
+            ).fetchone()
+        if not row:
+            return []
+        target_cookie = str(row['filePath'] or '')
+    with get_conn() as c:
+        rows = [dict(row) for row in c.execute(
+            "SELECT id,account_list FROM jobs WHERE status='paused' ORDER BY id"
+        ).fetchall()]
+    candidates = []
+    cookies = set()
+    for job in rows:
+        refs = _job_account_cookies(job)
+        if not refs or (target_cookie and target_cookie not in refs):
+            continue
+        candidates.append(int(job['id']))
+        cookies.update(refs)
+    if not candidates:
+        return []
+    marks = ','.join('?' for _ in cookies)
+    with connect(Path(BASE_DIR / 'db' / 'database.db'), timeout=15) as c:
+        account_rows = [dict(row) for row in c.execute(
+            f"SELECT filePath,automation_paused,pause_until,pause_reason,pause_updated_at "
+            f"FROM user_info WHERE filePath IN ({marks})", tuple(sorted(cookies)),
+        ).fetchall()]
+    by_cookie = {str(row.get('filePath') or ''): row for row in account_rows}
+    if set(by_cookie) != cookies or any(account_safety.is_paused(row) for row in by_cookie.values()):
+        return []
+    resumed = []
+    with get_conn() as c:
+        for job_id in candidates:
+            c.execute(
+                "UPDATE publish_items SET status=?, error='', error_kind='', finished_at=NULL "
+                "WHERE job_id=? AND status=? AND error_kind='automation_paused'",
+                (ITEM_PENDING, job_id, ITEM_PENDING),
+            )
+            changed = c.execute(
+                "UPDATE jobs SET status='pending', result='', progress=NULL, finished_at=NULL, "
+                "executor_id='', lease_token='', lease_until=NULL, heartbeat_at=NULL "
+                "WHERE id=? AND status='paused'",
+                (job_id,),
+            ).rowcount
+            if changed:
+                resumed.append(job_id)
+    if resumed:
+        _start_workers()
+        for job_id in resumed:
+            _queue_job(job_id)
+        logger.info("账号暂停解除，重新入队任务: {}", ", ".join(map(str, resumed)))
+    return resumed
+
+
 def run_schedule_once(now: datetime | None = None) -> list[int]:
     """Move due local schedule rows into the publish queue."""
+    resume_paused_jobs_for_account()
     current = now or datetime.now()
     cutoff = current.strftime('%Y-%m-%d %H:%M:%S')
     with get_conn() as c:
@@ -2672,7 +2932,7 @@ def run_schedule_once(now: datetime | None = None) -> list[int]:
     if claimed_jobs:
         _start_workers()
         for job_id in sorted(claimed_jobs):
-            _q.put(job_id)
+            _queue_job(job_id)
         logger.info("本地排期到点，已入队任务: {}", ", ".join(map(str, sorted(claimed_jobs))))
     return sorted(claimed_jobs)
 
@@ -2710,16 +2970,37 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
                     (str(exc)[:500] or "定时排期生成失败", int(job_id)),
                 )
     if not review_required and not timer_enabled:
-        _start_workers()
-        _q.put(job_id)
+        _queue_job(job_id)
     return job_id
 
 
-def approve_job(job_id):
+def _record_review(job_id, note='', decision='') -> None:
+    with get_conn() as c:
+        _ensure_columns(c, 'jobs', (
+            ('review_note', "TEXT DEFAULT ''"),
+            ('reviewed_at', 'DATETIME'),
+            ('review_decision', "TEXT DEFAULT ''"),
+        ))
+        c.execute(
+            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, review_decision=? WHERE id=?",
+            (str(note or '')[:1000], str(decision or ''), int(job_id)),
+        )
+
+
+def approve_job(job_id, note=''):
     with get_conn() as c:
         row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
         if row is None:
             return
+        _ensure_columns(c, 'jobs', (
+            ('review_note', "TEXT DEFAULT ''"),
+            ('reviewed_at', 'DATETIME'),
+            ('review_decision', "TEXT DEFAULT ''"),
+        ))
+        c.execute(
+            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, review_decision='approved' WHERE id=?",
+            (str(note or '')[:1000], int(job_id)),
+        )
         extra = json_loads(row['extra'] or '{}')
         timer_enabled = isinstance(extra, dict) and bool(extra.get('enableTimer'))
         c.execute(
@@ -2735,10 +3016,11 @@ def approve_job(job_id):
         run_schedule_once()
     else:
         _start_workers()
-        _q.put(int(job_id))
+        _queue_job(int(job_id))
 
 
-def reject_job(job_id):
+def reject_job(job_id, note=''):
+    _record_review(job_id, note=note, decision='rejected')
     with get_conn() as c:
         c.execute("UPDATE jobs SET status='rejected', finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_review'", (job_id,))
         c.execute(
@@ -2751,6 +3033,28 @@ def reject_job(job_id):
 _scheduler_started = False
 _tracker_started = False
 _lease_reclaimer_started = False
+_dispatcher_started = False
+
+
+def poll_pending_jobs(limit: int = 100) -> list[int]:
+    """Wake local workers for jobs created by another process.
+
+    SQLite remains the source of truth. The in-memory queue is only a wake-up
+    path, so a web process can enqueue without sharing memory with executor.
+    """
+    if not can_run_publish_workers():
+        return []
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT id FROM jobs WHERE status='pending' ORDER BY id LIMIT ?",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+    queued = []
+    for row in rows:
+        job_id = int(row['id'])
+        if _queue_job(job_id):
+            queued.append(job_id)
+    return queued
 
 
 def _start_lease_reclaimer(interval_seconds: int = 30) -> None:
@@ -2780,7 +3084,7 @@ def _start_lease_reclaimer(interval_seconds: int = 30) -> None:
                             ).fetchall()
                         for r in rows:
                             try:
-                                _q.put_nowait(int(r['id']))
+                                _queue_job(int(r['id']))
                             except Exception:
                                 pass
                     except Exception:
@@ -2803,16 +3107,43 @@ def restart_lease_reclaimer(interval_seconds: int = 30) -> None:
 def start_publish_runtime(
     schedule_interval_seconds: int = 20,
     tracking_interval_seconds: int = 60,
+    dispatcher_interval_seconds: int = 2,
 ) -> None:
-    """Start the local schedule scanner and post-submit status tracker."""
-    global _scheduler_started, _tracker_started
+    """Start the schedule scanner, pending dispatcher and status tracker."""
+    global _scheduler_started, _tracker_started, _dispatcher_started
+    if not can_run_publish_workers():
+        logger.info("FLOWOPS_PROCESS_ROLE=web，本进程不启动发布执行器")
+        return
     _start_workers()
     _start_lease_reclaimer()
+    beat_executor()
     with _lock:
+        start_dispatcher = not _dispatcher_started
         start_scheduler = not _scheduler_started
         start_tracker = not _tracker_started
+        _dispatcher_started = True
         _scheduler_started = True
         _tracker_started = True
+
+    if start_dispatcher:
+        def _dispatcher_loop():
+            runtime_guard.beat('publish-dispatcher')
+            generation = runtime_guard.current_generation('publish-dispatcher')
+            while True:
+                if not runtime_guard.is_current('publish-dispatcher', generation):
+                    return
+                try:
+                    beat_executor()
+                    poll_pending_jobs()
+                    runtime_guard.beat('publish-dispatcher')
+                except Exception as exc:
+                    runtime_guard.beat('publish-dispatcher', ok=False, error=str(exc))
+                    traceback.print_exc()
+                time.sleep(max(1, int(dispatcher_interval_seconds)))
+
+        threading.Thread(
+            target=_dispatcher_loop, daemon=True, name='publish-dispatcher',
+        ).start()
 
     if start_scheduler:
         def _schedule_loop():
@@ -2853,18 +3184,23 @@ def start_publish_runtime(
 
 
 def restart_publish_runtime(schedule_interval_seconds: int = 30,
-                            tracking_interval_seconds: int = 60) -> None:
+                            tracking_interval_seconds: int = 60,
+                            dispatcher_interval_seconds: int = 2) -> None:
     """线程死掉后重新拉起调度/追踪（看门狗用）。
 
     ``start_publish_runtime`` 是幂等的——幂等在这里是缺点：线程没了它也不
     会重建。所以重启必须先把 ``_started`` 标志打回 False。
     """
-    global _scheduler_started, _tracker_started
+    global _scheduler_started, _tracker_started, _dispatcher_started
     with _lock:
+        _dispatcher_started = False
         _scheduler_started = False
         _tracker_started = False
-    logger.warning("重新拉起发布调度/追踪线程")
-    start_publish_runtime(schedule_interval_seconds, tracking_interval_seconds)
+    logger.warning("重新拉起发布调度/分发/追踪线程")
+    start_publish_runtime(
+        schedule_interval_seconds, tracking_interval_seconds,
+        dispatcher_interval_seconds,
+    )
 
 # ---------- account patrol ----------
 _patrol_started = False
@@ -2910,14 +3246,19 @@ def restart_patrol(interval_hours: int = 12) -> None:
 def run_patrol_once():
     import asyncio
     from myUtils.auth import check_cookies_concurrently
+    from utils.account_serial import account_key
     db_main = Path(BASE_DIR / 'db' / 'database.db')
     if not db_main.exists():
+        return []
+    if not account_safety.ensure_schema(BASE_DIR):
+        logger.warning("账号表结构不可用，跳过账号巡检")
         return []
     results = []
     conn = connect(db_main)
     rows = conn.execute('SELECT * FROM user_info').fetchall()
     conn.close()
     rows = [dict(r) for r in rows]
+    rows = account_safety.filter_active_accounts(rows)
     if not rows:
         return []
 
@@ -2927,7 +3268,16 @@ def run_patrol_once():
     asyncio.set_event_loop(loop)
     try:
         alive_flags = loop.run_until_complete(check_cookies_concurrently(
-            [(row['type'], row['filePath']) for row in rows],
+            [
+                (
+                    row['type'], row['filePath'],
+                    account_key(
+                        row['type'], row.get('userName'), row.get('id'),
+                        row.get('filePath'),
+                    ),
+                )
+                for row in rows
+            ],
             max_concurrent=4,
         ))
     finally:

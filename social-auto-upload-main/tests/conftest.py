@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 # tests/test_runtime_stability.py 直接调函数验证。真实运行默认开启。
 os.environ.setdefault("FLOWOPS_PUBLISH_PREFLIGHT", "0")
 
-# 同理：共享浏览器（单实例多 context）默认开，但既有测试的 fake playwright 只有
+# 同理：共享浏览器（分片实例多 context）默认开，但既有测试的 fake playwright 只有
 # ``launch_persistent_context`` 没有 ``chromium.launch``，会走不进共享分支。测试
 # 默认回退到 persistent 老路径；共享分支由 tests/test_shared_browser.py 显式开启验证。
 os.environ.setdefault("FLOWOPS_SHARED_BROWSER", "0")

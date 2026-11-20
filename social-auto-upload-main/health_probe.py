@@ -248,6 +248,41 @@ def check_queue(base: Path | None = None) -> dict[str, Any]:
     return _check("queue", True, CHECK_OK, f"排队中 {pending} 个", pending=pending)
 
 
+def check_publish_executor(base: Path | None = None) -> dict[str, Any]:
+    """Web-only deployments must have a live independent executor."""
+    role = str(os.environ.get("FLOWOPS_PROCESS_ROLE", "all") or "all").strip().lower()
+    if role != "web":
+        return _check("publish-executor", True, CHECK_OK, f"进程角色 {role}，执行器内嵌")
+    base = base or _base_dir()
+    path = base / "db" / "publish_jobs.db"
+    if not path.exists():
+        return _check("publish-executor", False, CHECK_BLOCKING, "发布任务库尚未创建")
+    try:
+        with connect(path, timeout=5) as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN heartbeat_at >= datetime('now','-30 seconds')
+                            THEN 1 ELSE 0 END) AS healthy
+                   FROM publish_executors"""
+            ).fetchone()
+        total = int(row["total"] or 0)
+        healthy = int(row["healthy"] or 0)
+    except Exception as exc:
+        return _check(
+            "publish-executor", False, CHECK_BLOCKING,
+            f"执行器心跳表不可用：{exc}"[:200],
+        )
+    if healthy:
+        return _check(
+            "publish-executor", True, CHECK_OK,
+            f"{healthy}/{total} 个独立执行器心跳正常", healthy=healthy, total=total,
+        )
+    return _check(
+        "publish-executor", False, CHECK_BLOCKING,
+        "Web 已配置外置执行器，但 30 秒内没有 executor 心跳", healthy=0, total=total,
+    )
+
+
 # ---------------------------------------------------------------- 汇总
 
 def readiness(base: Path | None = None) -> dict[str, Any]:
@@ -262,6 +297,7 @@ def readiness(base: Path | None = None) -> dict[str, Any]:
         ("disk", lambda: check_disk(base)),
         ("accounts", lambda: check_accounts(base)),
         ("queue", lambda: check_queue(base)),
+        ("publish-executor", lambda: check_publish_executor(base)),
         ("reflow", check_reflow),
         ("ai", check_ai),
     ):

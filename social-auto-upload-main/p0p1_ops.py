@@ -10,6 +10,44 @@ from flask import jsonify, request
 import access_scope
 
 
+def _ensure_post_schema(conn) -> None:
+    """Create the additive columns used by the unified content model.
+
+    Existing installations may predate the post contract. Keep this helper
+    idempotent so read-only calls on an older database remain safe.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS contents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL, body TEXT DEFAULT '', files TEXT DEFAULT '[]',
+        created_by TEXT DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS content_variants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, content_id INTEGER NOT NULL,
+        platform TEXT NOT NULL, title TEXT DEFAULT '', body TEXT DEFAULT '',
+        status TEXT DEFAULT 'draft', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(content_id, platform)
+    )""")
+    content_cols = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(contents)").fetchall()
+    }
+    for name, ddl in (
+        ("review_required", "INTEGER DEFAULT 1"),
+        ("updated_at", "DATETIME"),
+    ):
+        if name not in content_cols:
+            conn.execute(f"ALTER TABLE contents ADD COLUMN {name} {ddl}")
+    _ensure_variant_tags(conn)
+    variant_cols = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(content_variants)").fetchall()
+    }
+    for name, ddl in (
+        ("scheduled_at", "TEXT DEFAULT ''"),
+        ("updated_at", "DATETIME"),
+    ):
+        if name not in variant_cols:
+            conn.execute(f"ALTER TABLE content_variants ADD COLUMN {name} {ddl}")
+
+
 def _ensure_variant_tags(conn) -> None:
     """content_variants 表补 tags 列。
 
@@ -33,6 +71,70 @@ def _infer_content_type(files: list) -> str:
     return "video"
 
 
+PLATFORM_KEY_BY_TYPE = {
+    1: "xiaohongshu",
+    2: "channels",
+    3: "douyin",
+    4: "kuaishou",
+    5: "weibo",
+    6: "baijiahao",
+}
+PLATFORM_TYPE_BY_KEY = {value: key for key, value in PLATFORM_KEY_BY_TYPE.items()}
+PLATFORM_TYPE_BY_KEY.update({"tencent": 2})
+
+
+def _json_value(value, fallback):
+    if isinstance(value, (list, dict)):
+        return value
+    if not value:
+        return fallback
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if isinstance(parsed, type(fallback)) else fallback
+
+
+def _normalize_tags(value) -> list[str]:
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip().lstrip("#") for item in value if str(item).strip()]
+
+
+def _ensure_jobs_content_link(conn) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    for name, ddl in (
+        ("content_id", "INTEGER"),
+        ("review_note", "TEXT DEFAULT ''"),
+        ("reviewed_at", "DATETIME"),
+        ("review_decision", "TEXT DEFAULT ''"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_content ON jobs(content_id)")
+
+
+def _derive_post_status(jobs: list[dict]) -> str:
+    statuses = {str(item.get("status") or "").lower() for item in jobs}
+    if not statuses:
+        return "draft"
+    if statuses & {"failed", "rejected", "partial"}:
+        return "attention"
+    if "pending_review" in statuses:
+        return "review"
+    if statuses & {"running", "processing"}:
+        return "publishing"
+    if "scheduled" in statuses:
+        return "scheduled"
+    if statuses and statuses <= {"success", "published"}:
+        return "published"
+    if statuses & {"pending", "queued"}:
+        return "publishing"
+    return "draft"
+
+
 def register(app):
     # ---------- P0-1 执行层 ----------
     @app.route('/api/v2/executors', methods=['GET'])
@@ -48,6 +150,8 @@ def register(app):
             rows = []
         return jsonify({"code": 200, "msg": None, "data": {
             "executorId": publish_jobs.EXECUTOR_ID,
+            "processRole": publish_jobs.process_role(),
+            "registry": publish_jobs.executor_status(),
             "running": rows,
             "pool": browser_pool.status(),
         }}), 200
@@ -56,18 +160,34 @@ def register(app):
     def executors_claim():
         import publish_jobs
         payload = request.get_json(silent=True) or {}
-        job_id = int(payload.get("jobId") or 0)
+        try:
+            job_id = int(payload.get("jobId") or 0)
+        except (TypeError, ValueError):
+            job_id = 0
         if not job_id:
             return jsonify({"code": 400, "msg": "缺少 jobId", "data": None}), 400
-        ok = bool(publish_jobs.claim_job(job_id))
-        return jsonify({"code": 200, "msg": None, "data": {"claimed": ok}}), 200
+        executor_id = str(
+            payload.get("executorId") or publish_jobs.EXECUTOR_ID
+        ).strip()[:200] or publish_jobs.EXECUTOR_ID
+        token = publish_jobs.claim_job_token(job_id, executor_id=executor_id)
+        return jsonify({"code": 200, "msg": None, "data": {
+            "claimed": bool(token), "leaseToken": token or "",
+        }}), 200
 
     @app.route('/api/v2/executors/heartbeat', methods=['POST'])
     def executors_heartbeat():
         import publish_jobs
         payload = request.get_json(silent=True) or {}
-        job_id = int(payload.get("jobId") or 0)
-        publish_jobs.heartbeat_job(job_id)
+        try:
+            job_id = int(payload.get("jobId") or 0)
+        except (TypeError, ValueError):
+            job_id = 0
+        token = str(payload.get("leaseToken") or payload.get("token") or "").strip()
+        if not job_id or not token:
+            return jsonify({"code": 400, "msg": "缺少 jobId 或 leaseToken", "data": None}), 400
+        ok = bool(publish_jobs.heartbeat_token(job_id, token))
+        if not ok:
+            return jsonify({"code": 409, "msg": "租约已失效或不属于该执行器", "data": None}), 409
         return jsonify({"code": 200, "msg": None, "data": {"ok": True}}), 200
 
     @app.route('/api/v2/executors/release-stale', methods=['POST'])
@@ -204,6 +324,143 @@ def register(app):
             cid = int(cur.lastrowid)
         return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
 
+    def _post_payload(cid: int) -> dict | None:
+        import publish_jobs
+        from db_utils import connect
+        from conf import BASE_DIR
+        db = Path(BASE_DIR / "db" / "database.db")
+        with connect(db, timeout=15) as c:
+            _ensure_post_schema(c)
+            row = c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone()
+            if row is None:
+                return None
+            content = dict(row)
+            variants = [dict(item) for item in c.execute(
+                "SELECT * FROM content_variants WHERE content_id=? ORDER BY platform", (cid,)
+            ).fetchall()]
+        content["files"] = _json_value(content.get("files"), [])
+        for variant in variants:
+            variant["tags"] = _normalize_tags(_json_value(variant.get("tags"), []))
+        with publish_jobs.get_conn() as c:
+            _ensure_jobs_content_link(c)
+            jobs = [dict(item) for item in c.execute(
+                "SELECT id,type,title,status,extra,created_at,finished_at,"
+                "review_note,reviewed_at,review_decision FROM jobs "
+                "WHERE content_id=? ORDER BY id", (cid,)
+            ).fetchall()]
+        for job in jobs:
+            try:
+                job["extra"] = json.loads(str(job.get("extra") or "{}"))
+            except (TypeError, ValueError):
+                job["extra"] = {}
+        content["review_required"] = bool(content.get("review_required", 1))
+        content.update({
+            "variants": variants,
+            "jobs": jobs,
+            "status": _derive_post_status(jobs),
+            "updated_at": max(
+                [str(content.get("created_at") or "")]
+                + [str(content.get("updated_at") or "")]
+                + [str(item.get("created_at") or "") for item in jobs]
+                + [str(item.get("updated_at") or "") for item in variants]
+            ),
+        })
+        return content
+
+    def _upsert_variants(conn, cid: int, variants: dict) -> None:
+        _ensure_post_schema(conn)
+        for platform, value in (variants or {}).items():
+            if not isinstance(value, dict) or not platform:
+                continue
+            conn.execute("""INSERT INTO content_variants
+                (content_id, platform, title, body, tags, status, scheduled_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(content_id, platform) DO UPDATE SET
+                title=excluded.title, body=excluded.body, tags=excluded.tags,
+                scheduled_at=excluded.scheduled_at, updated_at=CURRENT_TIMESTAMP""",
+                (cid, str(platform), str(value.get("title") or ""),
+                 str(value.get("body") or ""),
+                 json.dumps(_normalize_tags(value.get("tags")), ensure_ascii=False),
+                 str(value.get("status") or "draft"),
+                 str(value.get("scheduledAt") or value.get("scheduled_at") or "")))
+
+    @app.route('/api/v2/posts', methods=['GET', 'POST'])
+    def posts():
+        from db_utils import connect
+        from conf import BASE_DIR
+        db = Path(BASE_DIR / "db" / "database.db")
+        if request.method == "GET":
+            try:
+                limit = max(1, min(int(request.args.get("limit", 100)), 200))
+            except (TypeError, ValueError):
+                limit = 100
+            with connect(db, timeout=15) as c:
+                _ensure_post_schema(c)
+                ids = [int(row[0]) for row in c.execute(
+                    "SELECT id FROM contents ORDER BY COALESCE(updated_at, created_at) DESC, id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()]
+            items = [item for item in (_post_payload(cid) for cid in ids) if item]
+            return jsonify({"code": 200, "msg": None, "data": {"items": items, "total": len(items)}}), 200
+
+        payload = request.get_json(silent=True) or {}
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+        files = payload.get("files") if isinstance(payload.get("files"), list) else []
+        review_required = 1 if payload.get("reviewRequired", True) else 0
+        with connect(db, timeout=15) as c:
+            _ensure_post_schema(c)
+            cur = c.execute(
+                "INSERT INTO contents (title, body, files, review_required, updated_at) "
+                "VALUES (?,?,?,?,CURRENT_TIMESTAMP)",
+                (title, str(payload.get("body") or ""),
+                 json.dumps(files, ensure_ascii=False), review_required),
+            )
+            cid = int(cur.lastrowid)
+            _upsert_variants(c, cid, payload.get("variants") or {})
+        return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
+
+    @app.route('/api/v2/posts/<int:cid>', methods=['GET', 'PATCH'])
+    def post_detail(cid: int):
+        if request.method == "GET":
+            item = _post_payload(cid)
+            if item is None:
+                return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
+            return jsonify({"code": 200, "msg": None, "data": item}), 200
+
+        from db_utils import connect
+        from conf import BASE_DIR
+        payload = request.get_json(silent=True) or {}
+        db = Path(BASE_DIR / "db" / "database.db")
+        with connect(db, timeout=15) as c:
+            _ensure_post_schema(c)
+            row = c.execute("SELECT id FROM contents WHERE id=?", (cid,)).fetchone()
+            if row is None:
+                return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
+            if any(key in payload for key in ("title", "body", "files", "reviewRequired")):
+                current = dict(c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone())
+                title = str(payload.get("title", current.get("title")) or "").strip()
+                if not title:
+                    return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+                body = str(payload.get("body", current.get("body")) or "")
+                files = payload.get("files", _json_value(current.get("files"), []))
+                review_required = 1 if payload.get(
+                    "reviewRequired", bool(current.get("review_required", 1))
+                ) else 0
+                c.execute(
+                    "UPDATE contents SET title=?, body=?, files=?, review_required=?, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (title, body, json.dumps(files or [], ensure_ascii=False),
+                     review_required, cid),
+                )
+            _upsert_variants(c, cid, payload.get("variants") or {})
+        return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
+
+    @app.route('/api/v2/posts/<int:cid>/submit', methods=['POST'])
+    def post_submit(cid: int):
+        return content_submit(cid)
+
     @app.route('/api/v2/contents/<int:cid>/variants', methods=['GET', 'POST'])
     def content_variants(cid: int):
         import rbac_audit
@@ -247,39 +504,86 @@ def register(app):
         db = Path(BASE_DIR / "db" / "database.db")
         payload = request.get_json(silent=True) or {}
         account_map = payload.get("accounts") or {}
+        if not isinstance(account_map, dict):
+            account_map = {}
+        override_map = payload.get("variants") or payload.get("overrides") or {}
+        review_required = bool(payload.get("reviewRequired", True))
+        global_scheduled_at = str(payload.get("scheduledAt") or "").strip()
         with connect(db, timeout=15) as c:
-            _ensure_variant_tags(c)
+            _ensure_post_schema(c)
             content = c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone()
             variants = [dict(r) for r in c.execute(
                 "SELECT * FROM content_variants WHERE content_id=?", (cid,)).fetchall()]
         if not content:
             return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
-        files = json.loads(str(dict(content).get("files") or "[]") or "[]") if isinstance(dict(content).get("files"), str) else (dict(content).get("files") or [])
-        content_type = _infer_content_type(files)
-        job_ids = []
-        type_map = {"douyin": 3, "xiaohongshu": 1, "channels": 2, "tencent": 2,
-                    "kuaishou": 4, "weibo": 5, "baijiahao": 6}
-        for v in variants:
-            plat = str(v.get("platform") or "")
-            ptype = type_map.get(plat.lower(), int(payload.get("type") or 3))
+        # Validate every target before creating any job. A later scope failure
+        # must not leave half of a multi-platform submission queued.
+        for variant in variants:
+            plat = str(variant.get("platform") or "")
+            ptype = PLATFORM_TYPE_BY_KEY.get(plat.lower(), int(payload.get("type") or 3))
             accounts = account_map.get(plat) or account_map.get(str(ptype)) or []
             if not accounts:
                 continue
+            outside = access_scope.out_of_scope_account_refs(accounts)
+            if outside:
+                return jsonify({
+                    "code": 403,
+                    "msg": f"{plat or ptype} 账号不存在或不在当前身份范围内："
+                           + ", ".join(outside[:5]),
+                    "data": None,
+                }), 403
+        files = _json_value(dict(content).get("files"), [])
+        content_type = _infer_content_type(files)
+        job_ids = []
+        for v in variants:
+            plat = str(v.get("platform") or "")
+            ptype = PLATFORM_TYPE_BY_KEY.get(plat.lower(), int(payload.get("type") or 3))
+            accounts = account_map.get(plat) or account_map.get(str(ptype)) or []
+            if not accounts:
+                continue
+            override = override_map.get(plat) if isinstance(override_map, dict) else None
+            override = override if isinstance(override, dict) else {}
             tags = v.get("tags") or []
-            if isinstance(tags, str):
-                try:
-                    tags = json.loads(tags)
-                except ValueError:
-                    tags = [item.strip() for item in tags.split(",") if item.strip()]
-            if not isinstance(tags, list):
-                tags = []
+            tags = _normalize_tags(_json_value(tags, []) if isinstance(tags, str) else tags)
+            if override.get("tags") is not None:
+                tags = _normalize_tags(override.get("tags"))
+            variant_title = str(override.get("title") or v.get("title") or dict(content).get("title") or "")
+            variant_body = str(override.get("body") or v.get("body") or "")
+            scheduled_at = str(override.get("scheduledAt") or global_scheduled_at or "").strip()
+            extra = {
+                "desc": variant_body,
+                "contentType": content_type,
+                "contentId": cid,
+            }
+            if scheduled_at:
+                extra.update({"enableTimer": True, "scheduledAt": scheduled_at})
             jid = publish_jobs.enqueue_job(
-                ptype, str(v.get("title") or dict(content).get("title") or ""),
+                ptype, variant_title,
                 tags, files if isinstance(files, list) else [], accounts,
-                {"desc": str(v.get("body") or ""), "contentType": content_type},
-                review_required=False)
+                extra,
+                review_required=review_required)
+            with publish_jobs.get_conn() as job_conn:
+                _ensure_jobs_content_link(job_conn)
+                job_conn.execute("UPDATE jobs SET content_id=? WHERE id=?", (cid, int(jid)))
+            with connect(db, timeout=15) as c:
+                _ensure_post_schema(c)
+                c.execute(
+                    "UPDATE content_variants SET title=?, body=?, tags=?, status=?, "
+                    "scheduled_at=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE content_id=? AND platform=?",
+                    (variant_title, variant_body,
+                     json.dumps(tags, ensure_ascii=False),
+                     "pending_review" if review_required else ("scheduled" if scheduled_at else "pending"),
+                     scheduled_at, cid, plat),
+                )
             job_ids.append({"platform": plat, "jobId": jid})
-        return jsonify({"code": 200, "msg": None, "data": {"jobs": job_ids}}), 200
+        with connect(db, timeout=15) as c:
+            _ensure_post_schema(c)
+            c.execute(
+                "UPDATE contents SET review_required=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (1 if review_required else 0, cid),
+            )
+        return jsonify({"code": 200, "msg": None, "data": {"jobs": job_ids, "reviewRequired": review_required}}), 200
 
     # ---------- P1-2 驾驶舱 ----------
     @app.route('/api/v2/dashboard/cockpit', methods=['GET'])
@@ -354,6 +658,13 @@ def register(app):
         if not sid or not new_time:
             return jsonify({"code": 400, "msg": "缺少 scheduledId/scheduledAt", "data": None}), 400
         with publish_jobs.get_conn() as c:
+            row = c.execute(
+                "SELECT * FROM scheduled_items WHERE id=?", (sid,)
+            ).fetchone()
+            if row is None:
+                return jsonify({"code": 404, "msg": "排期不存在", "data": None}), 404
+            if not access_scope.job_in_scope(dict(row)):
+                return access_scope.forbidden("无权修改该账号的排期")
             c.execute("UPDATE scheduled_items SET scheduled_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                       (new_time, sid))
         conflicts = schedule_suggest.suggestions().get("conflicts") or []
@@ -414,6 +725,15 @@ def register(app):
         if not cid:
             return jsonify({"code": 400, "msg": "缺少 contactId", "data": None}), 400
         with dm_ops.get_conn() as c:
+            contact = c.execute(
+                "SELECT platform,account FROM dm_contacts WHERE id=?", (cid,)
+            ).fetchone()
+            if contact is None:
+                return jsonify({"code": 404, "msg": "联系人不存在", "data": None}), 404
+            if not access_scope.dm_account_in_scope(
+                str(contact["platform"] or ""), str(contact["account"] or "")
+            ):
+                return access_scope.forbidden("无权修改该联系人的成交记录")
             cols = {r["name"] for r in c.execute("PRAGMA table_info(dm_contacts)").fetchall()}
             if "deal_amount" not in cols:
                 c.execute("ALTER TABLE dm_contacts ADD COLUMN deal_amount REAL DEFAULT 0")
@@ -449,11 +769,22 @@ def register(app):
                 rows = []
         with dm_ops.get_conn() as c:
             try:
-                deals = [dict(r) for r in c.execute(
-                    "SELECT campaign_id, COUNT(*) n, COALESCE(SUM(deal_amount),0) amt "
-                    "FROM dm_contacts WHERE deal_amount>0 GROUP BY campaign_id").fetchall()]
+                deal_rows = [dict(r) for r in c.execute(
+                    "SELECT campaign_id,platform,account,COALESCE(deal_amount,0) amount "
+                    "FROM dm_contacts WHERE deal_amount>0").fetchall()]
             except Exception:
-                deals = []
+                deal_rows = []
+        deal_totals = {}
+        for row in deal_rows:
+            if not access_scope.dm_account_in_scope(
+                str(row.get("platform") or ""), str(row.get("account") or "")
+            ):
+                continue
+            campaign_id = int(row.get("campaign_id") or 0)
+            total = deal_totals.setdefault(campaign_id, {"campaign_id": campaign_id, "n": 0, "amt": 0.0})
+            total["n"] += 1
+            total["amt"] += float(row.get("amount") or 0)
+        deals = list(deal_totals.values())
         deal_map = {int(r.get("campaign_id") or 0): r for r in deals}
         enriched = []
         for r in rows:
@@ -556,12 +887,20 @@ def register(app):
     def open_jobs():
         import publish_jobs
         payload = request.get_json(silent=True) or {}
+        accounts = payload.get("accounts") or []
+        outside = access_scope.out_of_scope_account_refs(accounts)
+        if outside:
+            return jsonify({
+                "code": 403,
+                "msg": "账号不存在或不在当前身份范围内：" + ", ".join(outside[:5]),
+                "data": None,
+            }), 403
         try:
             jid = publish_jobs.enqueue_job(
                 int(payload.get("type") or 3), str(payload.get("title") or "开放API任务"),
                 payload.get("tags") or [], payload.get("files") or [],
-                payload.get("accounts") or [], payload.get("extra") or {},
-                review_required=False)
+                accounts, payload.get("extra") or {},
+                review_required=bool(payload.get("reviewRequired", True)))
         except Exception as exc:
             return jsonify({"code": 400, "msg": str(exc)[:300], "data": None}), 400
         try:
@@ -578,6 +917,8 @@ def register(app):
             row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             return jsonify({"code": 404, "msg": "job not found", "data": None}), 404
+        if not access_scope.job_in_scope(dict(row)):
+            return access_scope.forbidden("无权读取该发布任务")
         return jsonify({"code": 200, "msg": None,
                         "data": {"job": dict(row),
                                  "progress": publish_jobs.job_progress(job_id)}}), 200
@@ -590,7 +931,10 @@ def register(app):
         url = str(payload.get("url") or "").strip()
         if not event or not url:
             return jsonify({"code": 400, "msg": "缺少 event/url", "data": None}), 400
-        event_bus.subscribe(event, url, str(payload.get("secret") or ""))
+        try:
+            event_bus.subscribe(event, url, str(payload.get("secret") or ""))
+        except ValueError as exc:
+            return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
         return jsonify({"code": 200, "msg": None, "data": {"ok": True}}), 200
 
     @app.route('/api/v2/webhooks/emit', methods=['POST'])

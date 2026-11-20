@@ -9,8 +9,7 @@ from contextvars import ContextVar
 
 from flask import g, request
 
-from conf import BASE_DIR
-from utils.log import logger
+from utils.log import log_directory, logger
 
 _REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="-")
 _configured = False
@@ -41,8 +40,7 @@ def configure_app_logging() -> None:
     _configured = True
     level = str(os.environ.get("YUNCE_LOG_LEVEL", "INFO") or "INFO").upper()
     logger.configure(patcher=_inject_context)
-    log_dir = BASE_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = log_directory()
     logger.add(
         log_dir / "app.log",
         level=level,

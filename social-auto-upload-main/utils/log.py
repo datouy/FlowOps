@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 from loguru import logger
@@ -48,6 +49,21 @@ BUSINESS_LOGGERS = (
 )
 
 
+def log_directory() -> Path:
+    """Return the process log root.
+
+    Split deployments set this per process so Web and executor never rotate the
+    same file concurrently. Single-process deployments keep the historical
+    ``BASE_DIR/logs`` location when the variable is unset.
+    """
+    configured = str(os.environ.get("FLOWOPS_LOG_DIR") or "").strip()
+    root = Path(configured).expanduser() if configured else Path(BASE_DIR / "logs")
+    if not root.is_absolute():
+        root = Path(BASE_DIR) / root
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def create_logger(log_name: str, file_path: str):
     """
     Create custom logger for different business modules.
@@ -58,8 +74,11 @@ def create_logger(log_name: str, file_path: str):
     def filter_record(record):
         return record["extra"].get("business_name") == log_name
 
-    Path(BASE_DIR / file_path).parent.mkdir(exist_ok=True)
-    logger.add(Path(BASE_DIR / file_path), filter=filter_record, level="INFO", rotation="10 MB", retention="14 days", backtrace=True, diagnose=True)
+    target = log_directory() / Path(file_path).name
+    logger.add(
+        target, filter=filter_record, level="INFO", rotation="10 MB",
+        retention="14 days", backtrace=True, diagnose=True,
+    )
     return logger.bind(business_name=log_name)
 
 

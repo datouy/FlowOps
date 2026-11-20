@@ -80,6 +80,43 @@ def test_empty_input(monkeypatch):
     assert asyncio.run(auth.check_cookies_concurrently([])) == {}
 
 
+def test_same_account_probes_share_cross_process_lease(tmp_path, monkeypatch):
+    auth = pytest.importorskip("myUtils.auth")
+    from utils import account_serial
+
+    monkeypatch.setenv("FLOWOPS_ACCOUNT_LEASE_DB", str(tmp_path / "account_leases.db"))
+    monkeypatch.setenv("FLOWOPS_ACCOUNT_MIN_INTERVAL", "0")
+    monkeypatch.setenv("FLOWOPS_ACCOUNT_JITTER", "0")
+    account_serial.reset_for_tests()
+
+    state = {"current": 0, "max": 0, "loops": set()}
+
+    async def fake_check(platform_type, file_path):
+        state["loops"].add(id(asyncio.get_running_loop()))
+        state["current"] += 1
+        state["max"] = max(state["max"], state["current"])
+        await asyncio.sleep(0.15)
+        state["current"] -= 1
+        return True
+
+    monkeypatch.setattr(auth, "check_cookie", fake_check)
+    lease_key = account_serial.account_key(3, "douyin-a", 7, "same.enc")
+    rows = [(3, "same.enc", lease_key), (3, "same.enc", lease_key)]
+
+    async def scenario():
+        main_loop_id = id(asyncio.get_running_loop())
+        return (
+            await auth.check_cookies_concurrently(rows, max_concurrent=2),
+            main_loop_id,
+        )
+
+    result, main_loop_id = asyncio.run(scenario())
+
+    assert result == {0: True, 1: True}
+    assert state["max"] == 1
+    assert state["loops"] == {main_loop_id}
+
+
 def test_valid_probe_persists_rotated_cookie_without_touching_fingerprint(tmp_path, monkeypatch):
     """校验通过后要保存轮换后的凭据，且不能碰指纹文件。
 

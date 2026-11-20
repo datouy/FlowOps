@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import threading
 import time
 from collections import defaultdict, deque
@@ -11,6 +12,9 @@ from flask import g, request
 
 _LOCK = threading.Lock()
 _BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_ALLOW_CALLS = 0
+_LAST_FULL_SWEEP = 0.0
+DEFAULT_MAX_BUCKETS = 20_000
 
 
 def _env_int(name: str, default: int) -> int:
@@ -21,14 +25,61 @@ def _env_int(name: str, default: int) -> int:
     return value if value >= 0 else default
 
 
+def _ip(value: str):
+    try:
+        return ipaddress.ip_address(str(value or '').strip())
+    except ValueError:
+        return None
+
+
+def _trusted_proxy(remote_addr: str) -> bool:
+    if str(os.environ.get('FLOWOPS_TRUST_PROXY_HEADERS') or '').strip().lower() not in {
+        '1', 'true', 'yes', 'on',
+    }:
+        return False
+    address = _ip(remote_addr)
+    if address is None:
+        return False
+    for raw in str(os.environ.get('FLOWOPS_TRUSTED_PROXIES') or '127.0.0.1,::1').split(','):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            if address in ipaddress.ip_network(value, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validated_header_ip(value: str) -> str:
+    address = _ip(str(value or '').split(',', 1)[0].strip())
+    return str(address) if address is not None else ''
+
+
 def request_key() -> str:
     identity = getattr(g, "identity", None)
     if isinstance(identity, dict):
         user = str(identity.get("user") or "").strip()
         if user:
             return "user:" + user
-    forwarded = str(request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
-    return "ip:" + (forwarded or str(request.remote_addr or "unknown"))
+    remote = str(request.remote_addr or "unknown").strip()
+    if _trusted_proxy(remote):
+        forwarded = _validated_header_ip(request.headers.get("X-Real-IP") or "")
+        if not forwarded:
+            forwarded = _validated_header_ip(request.headers.get("X-Forwarded-For") or "")
+        if forwarded:
+            return "ip:" + forwarded
+    return "ip:" + (remote or "unknown")
+
+
+def _cleanup_locked(now: float) -> None:
+    stale = []
+    for key, bucket in _BUCKETS.items():
+        if not bucket or now - bucket[-1] > 6 * 3600:
+            stale.append(key)
+    for key in stale:
+        _BUCKETS.pop(key, None)
 
 
 def allow(category: str, *, limit: int, window_seconds: int) -> tuple[bool, int]:
@@ -38,7 +89,20 @@ def allow(category: str, *, limit: int, window_seconds: int) -> tuple[bool, int]
     now = time.monotonic()
     key = (str(category), request_key())
     cutoff = now - window_seconds
+    global _ALLOW_CALLS, _LAST_FULL_SWEEP
     with _LOCK:
+        max_buckets = max(100, _env_int("FLOWOPS_RATE_LIMIT_MAX_BUCKETS", DEFAULT_MAX_BUCKETS))
+        _ALLOW_CALLS += 1
+        full_sweep_due = (
+            len(_BUCKETS) >= max_buckets
+            and now - _LAST_FULL_SWEEP >= 60
+        )
+        if _ALLOW_CALLS % 256 == 0 or full_sweep_due:
+            _cleanup_locked(now)
+            if full_sweep_due:
+                _LAST_FULL_SWEEP = now
+        if key not in _BUCKETS and len(_BUCKETS) >= max_buckets:
+            return False, 60
         bucket = _BUCKETS[key]
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
@@ -77,5 +141,8 @@ def check_route_limit(method: str, path: str) -> tuple[bool, int]:
 
 
 def reset_for_tests() -> None:
+    global _ALLOW_CALLS, _LAST_FULL_SWEEP
     with _LOCK:
         _BUCKETS.clear()
+        _ALLOW_CALLS = 0
+        _LAST_FULL_SWEEP = 0.0

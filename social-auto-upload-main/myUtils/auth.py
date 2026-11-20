@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -252,6 +253,63 @@ async def check_cookie(type, file_path):
             return False
 
 
+@asynccontextmanager
+async def _account_probe_lease(lease_key: str):
+    """Acquire the blocking SQLite account lease without stalling asyncio.
+
+    The worker only waits for and owns the lease. The platform check itself
+    stays on the caller's event loop so all shared Chromium shards and browser
+    objects continue to be used from one consistent asyncio runtime.
+    """
+    if not lease_key:
+        yield
+        return
+
+    from utils.account_serial import account_serial
+
+    loop = asyncio.get_running_loop()
+    acquired = loop.create_future()
+    release = threading.Event()
+
+    def _complete(result=None, error: BaseException | None = None) -> None:
+        try:
+            loop.call_soon_threadsafe(
+                _set_future, acquired, result, error,
+            )
+        except RuntimeError:
+            # The caller event loop has already closed during shutdown.
+            pass
+
+    def _hold_lease() -> None:
+        try:
+            with account_serial(lease_key, timeout=600):
+                _complete()
+                release.wait()
+        except BaseException as exc:
+            _complete(error=exc)
+
+    worker = threading.Thread(
+        target=_hold_lease,
+        name=f"account-probe-lease-{lease_key[-12:]}",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        await acquired
+        yield
+    finally:
+        release.set()
+
+
+def _set_future(future, result=None, error: BaseException | None = None) -> None:
+    if future.done():
+        return
+    if error is not None:
+        future.set_exception(error)
+    else:
+        future.set_result(result)
+
+
 async def check_cookies_concurrently(
     accounts, max_concurrent: int = 4, serial_platforms=(2,)
 ) -> dict:
@@ -262,7 +320,13 @@ async def check_cookies_concurrently(
     blocks a waitress worker thread the whole time. Running them concurrently
     caps the wait at roughly one account's duration.
 
-    ``accounts`` is an iterable of ``(platform_type, file_path)`` pairs.
+    ``accounts`` accepts ``(platform_type, file_path)`` pairs for compatibility,
+    or ``(platform_type, file_path, lease_key)`` triples. Application callers
+    pass the same account key used by publishing, DM and comments so a health
+    probe cannot rewrite credentials while that account is publishing. The
+    blocking SQLite lease wait runs in a worker thread and therefore does not
+    stall the caller's event loop.
+
     Returns ``{index: bool}`` with one entry per input row.
 
     例外：``serial_platforms``（默认视频号）**串行**校验。
@@ -270,22 +334,33 @@ async def check_cookies_concurrently(
     "环境异常"并把会话挤下线——现象就是三个视频号同时校验时互相判死，
     刷新一次又变正常（状态来回跳）。串行后每个会话独占，判定才稳定。
     """
-    rows = list(accounts)
-    if not rows:
+    source_rows = list(accounts)
+    if not source_rows:
         return {}
+    rows = []
+    for row in source_rows:
+        platform_type, file_path = row[0], row[1]
+        lease_key = str(row[2] or "").strip() if len(row) > 2 else ""
+        rows.append((platform_type, file_path, lease_key))
     serial = set(serial_platforms or ())
     limit = max(1, min(int(max_concurrent or 1), len(rows)))
     semaphore = asyncio.Semaphore(limit)
 
-    async def _one(index: int, platform_type, file_path) -> tuple[int, bool]:
+    async def _check_once(platform_type, file_path, lease_key):
+        async with _account_probe_lease(lease_key):
+            return await check_cookie(platform_type, file_path)
+
+    async def _one(
+        index: int, platform_type, file_path, lease_key
+    ) -> tuple[int, bool]:
         async with semaphore:
             try:
-                alive = await check_cookie(platform_type, file_path)
+                alive = await _check_once(platform_type, file_path, lease_key)
             except Exception:
                 # 校验过程异常（浏览器启动失败、页面加载超时）时重试一次，
                 # 避免把服务器临时繁忙当成账号失效。
                 try:
-                    alive = await check_cookie(platform_type, file_path)
+                    alive = await _check_once(platform_type, file_path, lease_key)
                 except Exception:
                     alive = False
             return index, bool(alive)
@@ -296,12 +371,15 @@ async def check_cookies_concurrently(
     results: dict[int, bool] = {}
     # 串行组：一次只开一个浏览器，绝不并发同平台会话
     for index, row in serial_rows:
-        index, alive = await _one(index, row[0], row[1])
+        index, alive = await _one(index, row[0], row[1], row[2])
         results[index] = alive
 
     if parallel_rows:
         done = await asyncio.gather(
-            *(_one(index, row[0], row[1]) for index, row in parallel_rows),
+            *(
+                _one(index, row[0], row[1], row[2])
+                for index, row in parallel_rows
+            ),
             return_exceptions=False,
         )
         results.update({index: alive for index, alive in done})
