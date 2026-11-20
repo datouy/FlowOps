@@ -98,7 +98,8 @@ _PERMISSION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
       "/api/v2/maintenance", "/notify/"), runtime_config.PERM_TEAM),
     (("/api/v2/accounts", "/accounts/slots", "/interactiveLogin/",
       "/login", "/loginPrepare", "/loginVerify", "/uploadCookie",
-      "/deleteAccount", "/patrol/run", "/api/v2/credentials"), runtime_config.PERM_ACCOUNT),
+      "/deleteAccount", "/getValidAccounts", "/patrol/run",
+      "/api/v2/credentials"), runtime_config.PERM_ACCOUNT),
     (("/api/v2/tasks/accounts",), runtime_config.PERM_ACCOUNT),
     (("/dm/", "/messages", "/message-templates", "/comments"), runtime_config.PERM_MESSAGE),
     (("/api/v2/tasks/dm", "/api/v2/tasks/comments"), runtime_config.PERM_MESSAGE),
@@ -107,9 +108,6 @@ _PERMISSION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
       "/compliance/", "/ai/", "/upload", "/uploadSave", "/deleteFile",
       "/open/", "/api/v2/schedule/"), runtime_config.PERM_PUBLISH),
 )
-
-_DESTRUCTIVE_GET_PATHS = frozenset({"/deleteFile", "/deleteAccount"})
-
 
 def permission_for_request(method: str, path: str) -> str | None:
     """返回接口所需权限点；只读接口返回 ``None``。
@@ -121,7 +119,9 @@ def permission_for_request(method: str, path: str) -> str | None:
     path = urlsplit(str(path or "")).path
     if path == "/dm/inbound":
         return None  # 该接口使用独立 Webhook 密钥/HMAC。
-    mutating = method in {"POST", "PUT", "PATCH", "DELETE"} or path in _DESTRUCTIVE_GET_PATHS
+    # 兼容历史上用 GET + query 调删除素材的客户端。该路径无论如何都会
+    # 删除文件和数据库记录，不能因为动词是 GET 被当成只读接口。
+    mutating = method in {"POST", "PUT", "PATCH", "DELETE"} or path == "/deleteFile"
     if not mutating:
         return None
     for prefixes, permission in _PERMISSION_RULES:
@@ -438,6 +438,39 @@ def _resolve_account_refs(refs: Sequence[Any]) -> list[dict]:
                     resolved.append(row)
                 break
     return resolved
+
+
+def out_of_scope_account_refs(refs: Sequence[Any]) -> list[str]:
+    """Return account references that are unknown or outside the token scope."""
+    if unrestricted():
+        return []
+    if isinstance(refs, str):
+        text = refs.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = []
+            refs = parsed if isinstance(parsed, list) else []
+        else:
+            refs = [part.strip() for part in text.replace("，", ",").split(",")]
+    outside: list[str] = []
+    for ref in refs or []:
+        value = str(ref or "").strip()
+        if not value:
+            continue
+        targets = _resolve_account_refs([value])
+        allowed = bool(targets) and all(
+            account_in_scope(
+                account_id=target.get("id"),
+                account_name=str(target.get("userName") or ""),
+                cookie_file=str(target.get("filePath") or ""),
+            )
+            for target in targets
+        )
+        if not allowed:
+            outside.append(value)
+    return outside
 
 
 def _job_refs(row: Any) -> list[str]:

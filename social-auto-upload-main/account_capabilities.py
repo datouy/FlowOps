@@ -121,4 +121,11 @@ def build_account_capabilities(
             else "尚未绑定平台侧稳定身份，请重新登录或回填身份"
         ),
     )
+    automation = account.get("automation") or {}
+    if bool(automation.get("paused")):
+        reason = str(
+            automation.get("reason") or "自动动作已暂停，请在账号管理中恢复"
+        )[:300]
+        for key in ("publish", "verification", "comments", "dm"):
+            capabilities[key] = _item(False, "blocked", reason)
     return capabilities

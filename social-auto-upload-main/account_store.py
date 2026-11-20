@@ -54,7 +54,7 @@ from utils.account_environment import public_environment
 # ---------------------------------------------------------------------------
 
 SCHEMA_SCOPE = "user_info"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: 连续多少次校验失败才把账号判为异常。视频号校验要开浏览器访问平台后台，
 #: 平台限流/网络抖动都会让单次校验失败；一次就拉红会让状态来回跳。
@@ -121,6 +121,10 @@ ACCOUNT_COLUMNS: dict[str, str] = {
     "fail_streak": "INTEGER NOT NULL DEFAULT 0",
     "created_at": "TEXT NOT NULL DEFAULT ''",
     "updated_at": "TEXT NOT NULL DEFAULT ''",
+    "automation_paused": "INTEGER NOT NULL DEFAULT 0",
+    "pause_until": "TEXT NOT NULL DEFAULT ''",
+    "pause_reason": "TEXT NOT NULL DEFAULT ''",
+    "pause_updated_at": "TEXT NOT NULL DEFAULT ''",
 }
 
 AUTH_SESSION_DDL = """
@@ -391,7 +395,11 @@ class AccountStore:
                                cookie_size INTEGER NOT NULL DEFAULT 0,
                                fail_streak INTEGER NOT NULL DEFAULT 0,
                                created_at TEXT NOT NULL DEFAULT '',
-                               updated_at TEXT NOT NULL DEFAULT ''
+                               updated_at TEXT NOT NULL DEFAULT '',
+                               automation_paused INTEGER NOT NULL DEFAULT 0,
+                               pause_until TEXT NOT NULL DEFAULT '',
+                               pause_reason TEXT NOT NULL DEFAULT '',
+                               pause_updated_at TEXT NOT NULL DEFAULT ''
                            )"""
                     )
                 else:
@@ -452,6 +460,8 @@ class AccountStore:
                         break
         status = int(data.get("status") if data.get("status") is not None else STATUS_EXPIRED)
         identity = str(data.get("platform_user_id") or "")
+        from account_safety import automation_state
+
         return {
             "id": int(data.get("id") or 0),
             "platform": {"type": int(pid or 0), "key": meta["key"], "label": meta["label"]},
@@ -487,6 +497,7 @@ class AccountStore:
                     "proxyConfigured": False,
                 }
             ),
+            "automation": automation_state(data),
             "createdAt": str(data.get("created_at") or ""),
             "updatedAt": str(data.get("updated_at") or ""),
         }
