@@ -14,6 +14,9 @@ import ai_usage  # noqa: E402
 
 
 def test_ai_requires_explicit_https_endpoint(monkeypatch):
+    # Importing the backend loads the deployment .env into os.environ. This
+    # case verifies the default fail-closed rule, so opt-out must be explicit.
+    monkeypatch.delenv("FLOWOPS_AI_ALLOW_INSECURE", raising=False)
     monkeypatch.setattr(ai_content, "_load_env", lambda: {
         "WB_API_KEY": "key",
         "WB_BASE_URL": "http://public.example/v1",

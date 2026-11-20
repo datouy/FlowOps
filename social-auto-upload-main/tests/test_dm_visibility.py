@@ -1,6 +1,8 @@
 """私信工作台只展示真实可读消息的回归测试。"""
 from __future__ import annotations
 
+import json
+
 import pytest
 from flask import Flask
 
@@ -53,6 +55,33 @@ def test_douyin_conversation_hides_video_and_share_messages(client):
     assert conversation["last_message_id"] == image["message_id"]
     assert conversation["last_content"] == "[图片]"
     assert conversation["unread_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            json.dumps({
+                "smileId": "emoji-1",
+                "url": "https://cdn.example/emoji.webp",
+                "thumb": {"still": "https://cdn.example/emoji-still.webp"},
+            }),
+            "[表情]",
+        ),
+        ('{"contentType":"BRAND_APPRAISE_CARD","ms', "[品牌合作卡片]"),
+        ('{"contentType":"TRADE_BUSINESS_CARD","ms', "[交易卡片]"),
+    ],
+)
+def test_protocol_messages_are_readable_in_inbox_surfaces(client, content, expected):
+    item = _ingest("抖音", "抖音测试号", f"protocol-{expected}", content)
+
+    detail = client.get(f"/dm/conversations/{item['contact_id']}").get_json()["data"]
+    listing = client.get("/dm/conversations").get_json()["data"]
+    priority = client.get("/dm/priority-leads").get_json()["data"]
+
+    assert detail["messages"][0]["content"] == expected
+    assert next(row for row in listing if row["id"] == item["contact_id"])["last_content"] == expected
+    assert next(row for row in priority if row["id"] == item["contact_id"])["last_content"] == expected
 
 
 def test_douyin_hidden_messages_do_not_count_as_pending(client):

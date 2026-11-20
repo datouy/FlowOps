@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import urllib.request
 from pathlib import Path
 
 from flask import jsonify
+
+from utils.safe_outbound import post_json
 
 BASE = Path(__file__).parent.resolve()
 
@@ -43,11 +44,8 @@ def notify(title: str, content: str, level: str = "error", url: str | None = Non
         payload = {"msg_type": "text", "content": {"text": text}}
     else:
         payload = {"title": title, "text": content, "level": level}
-    req = urllib.request.Request(webhook, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
+        post_json(webhook, payload, timeout=15)
         return True
     except Exception:
         return False

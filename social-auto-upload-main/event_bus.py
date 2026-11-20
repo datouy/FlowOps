@@ -10,8 +10,9 @@ import hashlib
 import hmac as hmac_lib
 import json
 import threading
-import urllib.request
 from typing import Callable
+
+from utils.safe_outbound import post_body, validate_outbound_url
 
 _SUBSCRIBERS: dict[str, list[dict]] = {}
 _GUARD = threading.Lock()
@@ -19,6 +20,7 @@ _LOCAL: dict[str, list[Callable]] = {}
 
 
 def subscribe(event: str, url: str, secret: str = "") -> None:
+    validate_outbound_url(url)
     with _GUARD:
         _SUBSCRIBERS.setdefault(event, []).append({"url": url, "secret": secret or ""})
 
@@ -45,16 +47,11 @@ def emit(event: str, payload: dict, timeout: float = 8.0) -> dict:
             pass
     for sub in subs:
         url = sub.get("url") or ""
-        if not (url.startswith("http://") or url.startswith("https://")):
-            failed.append(url)
-            continue
         headers = {"Content-Type": "application/json", "X-FlowOps-Event": event}
         if sub.get("secret"):
             headers["X-FlowOps-Signature"] = sign(body, sub["secret"])
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                resp.read()
+            post_body(url, body, timeout=timeout, headers=headers)
             delivered += 1
         except Exception as exc:
             failed.append(f"{url}: {str(exc)[:120]}")

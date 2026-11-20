@@ -49,6 +49,7 @@ from datetime import datetime
 from typing import Any
 
 
+import account_safety
 from utils.credential_crypto import credential_exists
 from utils import browser_timeout
 
@@ -479,6 +480,8 @@ def run_comment_action(
         raise CommentActionError(f"不支持的评论操作：{action}")
     if action == ACTION_REPLY and not str(text or "").strip():
         raise CommentActionError("回复内容不能为空")
+    if account_safety.is_paused(account):
+        raise CommentActionError("账号自动动作已暂停，已阻止评论操作")
     validate_comment(comment, action)
 
     platform_type = platform_type_of(
@@ -495,9 +498,12 @@ def run_comment_action(
 
     # P0-3：评论腿同样走同账号全局串行 + 人类节律（publish/DM/评论统一入口）。
     try:
-        from utils.account_serial import account_serial as _serial
-        _acct_key = str(account.get("id") or account.get("cookie_path") or account.get("cookie") or "unknown")
-        _serial_ctx = _serial(f"account:{_acct_key}", timeout=600)
+        from utils.account_serial import account_key, account_serial as _serial
+        _acct_key = account_key(
+            platform_type, account.get("userName") or account.get("name"),
+            account.get("id"), account.get("cookie_path") or account.get("cookie"),
+        )
+        _serial_ctx = _serial(_acct_key, timeout=600)
     except Exception:
         _serial_ctx = None
     if _serial_ctx is None:

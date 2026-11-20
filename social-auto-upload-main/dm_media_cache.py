@@ -12,6 +12,7 @@ import requests
 
 from conf import BASE_DIR
 from utils.account_http import account_headers, account_proxies, cookie_path_of
+from utils.safe_outbound import validate_outbound_url
 
 MAX_MESSAGE_MEDIA_BYTES = 80 * 1024 * 1024
 NON_MEDIA_CONTENT_TYPES = {
@@ -48,6 +49,9 @@ def download_media(
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("媒体地址格式不正确")
+    # Validate the original host before requesting; redirects are rejected below
+    # so an allowed CDN URL cannot bounce the downloader into an internal service.
+    validate_outbound_url(url)
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
     headers = account_headers(cookie_path, {
@@ -59,7 +63,11 @@ def download_media(
     try:
         response = requests.get(
             url, headers=headers, timeout=60, stream=True, proxies=proxies or None,
+            allow_redirects=False,
         )
+        if 300 <= int(response.status_code) < 400:
+            response.close()
+            raise RuntimeError("媒体地址返回重定向，已拒绝跨站跳转")
         response.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(f"下载媒体失败：{str(exc)[:200]}") from exc

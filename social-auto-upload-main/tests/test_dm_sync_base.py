@@ -54,7 +54,11 @@ def sync_app(tmp_path, monkeypatch):
         "cookie_path": str(tmp_path / "fake.json"),
         "has_cookie": True,
     }]
-    monkeypatch.setattr(common, "account_rows", lambda _account_type: accounts)
+    monkeypatch.setattr(
+        common,
+        "account_rows",
+        lambda _account_type, **_kwargs: accounts,
+    )
     blueprint = Blueprint("fake_dm_sync", __name__)
     manager = FakeDmSync(blueprint)
     manager.init_db()
@@ -136,7 +140,11 @@ def no_account_app(tmp_path, monkeypatch):
     """一个没有任何可用账号的同步管理器。"""
     monkeypatch.setattr(dm_ops, "DB", tmp_path / "ops_center.db")
     dm_ops.init_db()
-    monkeypatch.setattr(common, "account_rows", lambda _account_type: [])
+    monkeypatch.setattr(
+        common,
+        "account_rows",
+        lambda _account_type, **_kwargs: [],
+    )
     blueprint = Blueprint("fake_dm_sync_empty", __name__)
     manager = FakeDmSync(blueprint)
     manager.init_db()
@@ -199,9 +207,9 @@ def test_run_sync_when_all_accounts_skipped_is_not_a_failure(sync_app, monkeypat
         "dm_cursor.is_due", lambda _platform, _key: False,
     )
 
-    response = client.post("/dm/fake/run")
-    assert response.status_code == 200, response.get_json()
-    data = response.get_json()["data"]
+    # 手动同步会明确绕过冷账号频率限制；这里验证的是后台定时轮询
+    # 恰好把全部账号推迟时的聚合结果。
+    data = manager.run_sync("scheduled")
     assert data["ok"] is True
     assert data["skipped_all"] is True
     assert data["error"] == ""

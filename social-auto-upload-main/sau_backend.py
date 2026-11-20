@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import json
 import os
 os.environ.setdefault("FLOWOPS_BACKEND", "1")
 import re
@@ -12,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
+from urllib.parse import urlsplit
 from flask_cors import CORS
 from myUtils.auth import check_cookies_concurrently
 from flask import Flask, request, jsonify, Response, send_from_directory, g
@@ -30,12 +32,13 @@ from account_store import (
     read_storage_state,
 )
 from account_capabilities import build_account_capabilities
+import account_safety
 import runtime_config
 import access_scope
 import comment_ops
 from app_logging import logger, setup_request_logging
 from utils.keep_awake import hold_system_awake
-from utils.credential_crypto import resolve_credential_path
+from utils.credential_crypto import resolve_credential_path, write_storage_state
 from utils.media_validation import MEDIA_SUFFIXES, UploadValidationError, validate_media_upload
 from utils.request_limiter import check_route_limit
 from utils.pagination import page_args, page_meta
@@ -53,6 +56,7 @@ from utils.proxy_pool import (
     save_proxy_pool,
     shared_proxy_warnings,
 )
+from utils.account_serial import account_key
 from interactive_login import PLATFORM_LOGIN_TARGETS, interactive_login_manager
 from myUtils.login import (get_tencent_cookie, douyin_cookie_gen, get_ks_cookie,
                            xiaohongshu_cookie_gen, weibo_cookie_gen_sse, baijiahao_cookie_gen_sse)
@@ -100,11 +104,11 @@ def _account_check_store_cache(rows) -> None:
     _ACCOUNT_CHECK_CACHE["at"] = time.monotonic()
 app = Flask(__name__)
 setup_request_logging(app)
+import openapi_spec
+openapi_spec.register(app)
 import schedule_ops
 schedule_ops.register(app)
 import publish_jobs
-publish_jobs.backfill_scheduled_items()
-publish_jobs.recover_pending_jobs()
 try:
     import rbac_audit
     rbac_audit.init_rbac()
@@ -150,7 +154,7 @@ CORS(
         "Content-Type", "Authorization", "X-YunCe-Token",
         "X-YunCe-Secret", "X-YunCe-Signature", "X-YunCe-Timestamp",
     ],
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 
 # 限制上传文件大小（与 runtime_config.MAX_CONTENT_LENGTH、Nginx 的 200m 一致）
@@ -167,6 +171,30 @@ def _guard_access_token():
     校验通过后把身份（用户名、角色、账号范围）挂到 ``g``，
     后面的接口可以按角色和范围做细粒度控制。
     """
+    if request.method == "OPTIONS":
+        return None
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        fetch_site = str(request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if fetch_site == "cross-site":
+            return jsonify({"code": 403, "msg": "拒绝跨站写请求", "data": None}), 403
+        claimed_origin = str(request.headers.get("Origin") or "").strip()
+        if not claimed_origin:
+            claimed_origin = str(request.headers.get("Referer") or "").strip()
+        if claimed_origin:
+            origin_parts = urlsplit(claimed_origin)
+            claimed = (
+                f"{origin_parts.scheme.lower()}://{origin_parts.netloc.lower()}"
+                if origin_parts.scheme and origin_parts.netloc else ""
+            )
+            own_parts = urlsplit(request.host_url)
+            own = f"{own_parts.scheme.lower()}://{own_parts.netloc.lower()}"
+            allowed_origins = {
+                str(item or "").strip().rstrip("/").lower()
+                for item in runtime_config.CORS_ORIGINS
+                if str(item or "").strip()
+            }
+            if not claimed or (claimed != own and claimed not in allowed_origins):
+                return jsonify({"code": 403, "msg": "写请求来源不受信任", "data": None}), 403
     if runtime_config.access_allowed(
         request.method, request.path, request.headers, request.args
     ):
@@ -339,11 +367,21 @@ def local_publish():
     files = data.get("fileList") or ([data.get("file")] if data.get("file") else [])
     if not files:
         return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
+    accounts = data.get("accountList") or []
+    if not accounts:
+        return jsonify({"code": 400, "msg": "账号列表不能为空", "data": None}), 400
+    outside = _accounts_out_of_scope(accounts)
+    if outside:
+        return jsonify({
+            "code": 403,
+            "msg": "账号不存在或不在当前身份范围内：" + ", ".join(outside[:5]),
+            "data": None,
+        }), 403
     try:
         dispatch_publish(
             data.get("type"),
             title=data.get("title", "本地投递"), files=files,
-            tags=data.get("tags") or [], account_list=data.get("accountList") or [],
+            tags=data.get("tags") or [], account_list=accounts,
             category=data.get("category"), enableTimer=data.get("enableTimer"),
             videosPerDay=data.get("videosPerDay"), dailyTimes=data.get("dailyTimes"),
             startDays=data.get("startDays", 0), desc=data.get("desc", ""),
@@ -767,6 +805,81 @@ def api_v2_account(account_id: int):
     return jsonify({"code": 200, "msg": None, "data": item}), 200
 
 
+def _audit_automation_change(action: str, account_id: int, detail: str = "") -> None:
+    try:
+        import rbac_audit
+
+        identity = getattr(g, "identity", None) or {}
+        actor = str(identity.get("user") or os.environ.get("YUNCE_USER") or "system")
+        with rbac_audit.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO audit_logs (user,action,target,detail,ok) VALUES (?,?,?,?,1)",
+                (actor, action, str(account_id), str(detail or "")[:1000]),
+            )
+    except Exception as exc:
+        logger.warning("记录账号自动动作审计失败: {}", exc)
+
+
+@app.route('/api/v2/accounts/<int:account_id>/automation-pause', methods=['POST'])
+def api_v2_account_automation_pause(account_id: int):
+    """Stop every automatic platform action for one account."""
+    store = get_store(BASE_DIR)
+    item = store.get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权暂停该账号")
+    payload = request.get_json(silent=True) or {}
+    reason = str(payload.get("reason") or "人工暂停自动动作").strip()
+    until = str(payload.get("until") or "").strip()
+    try:
+        fresh = account_safety.pause_account(
+            account_id, reason, until=until,
+            actor=str((getattr(g, "identity", None) or {}).get("user") or ""),
+            base_dir=BASE_DIR,
+        )
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
+    if fresh is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    _audit_automation_change("account.automation.pause", account_id, reason)
+    _apply_account_capabilities([fresh])
+    return jsonify({"code": 200, "msg": "自动动作已暂停", "data": fresh}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/automation-resume', methods=['POST'])
+def api_v2_account_automation_resume(account_id: int):
+    """Resume automatic platform actions after an operator review."""
+    store = get_store(BASE_DIR)
+    item = store.get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权恢复该账号")
+    fresh = account_safety.resume_account(
+        account_id,
+        actor=str((getattr(g, "identity", None) or {}).get("user") or ""),
+        base_dir=BASE_DIR,
+    )
+    if fresh is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    resumed_jobs = publish_jobs.resume_paused_jobs_for_account(account_id)
+    _audit_automation_change("account.automation.resume", account_id)
+    _apply_account_capabilities([fresh])
+    return jsonify({
+        "code": 200, "msg": "自动动作已恢复",
+        "data": {**fresh, "resumedJobIds": resumed_jobs},
+    }), 200
+
+
 @app.route('/api/v2/accounts/<int:account_id>/credentials', methods=['GET'])
 def api_v2_account_credentials(account_id: int):
     """凭据脱敏预览：只回 Cookie 名称/域名与 localStorage 键名，绝不回值。"""
@@ -941,6 +1054,18 @@ async def api_v2_account_check(account_id: int):
         cookie_file=str((item.get("cookie") or {}).get("name") or ""),
     ):
         return access_scope.forbidden("无权访问该账号")
+    if account_safety.is_paused(item):
+        return jsonify({
+            "code": 200, "msg": None,
+            "data": {
+                "alive": False,
+                "paused": True,
+                "status": item["status"],
+                "statusText": item["statusText"],
+                "reason": item["automation"]["reason"] or "自动动作已暂停，未访问平台",
+                "errorKind": "automation_paused",
+            },
+        }), 200
     if not item["cookie"]["exists"]:
         store.mark_status(account_id, 0, "凭据文件缺失，请重新扫码授权")
         fresh = store.get(account_id) or item
@@ -955,7 +1080,15 @@ async def api_v2_account_check(account_id: int):
             },
         }), 200
     flags = await check_cookies_concurrently(
-        [(item["platform"]["type"], item["cookie"]["name"])], max_concurrent=1
+        [(
+            item["platform"]["type"],
+            item["cookie"]["name"],
+            account_key(
+                item["platform"]["type"], item.get("name"), item.get("id"),
+                item["cookie"]["name"],
+            ),
+        )],
+        max_concurrent=1,
     )
     alive = bool(flags.get(0, False))
     store.mark_checked(
@@ -1145,8 +1278,22 @@ async def _api_v2_accounts_check_all_sync():
     results = []
     ok = 0
     bad = 0
+    skipped = 0
     for item in accounts:
         aid = int(item["id"])
+        if account_safety.is_paused(item):
+            skipped += 1
+            results.append({
+                "id": aid,
+                "name": item["name"],
+                "alive": False,
+                "paused": True,
+                "status": item["status"],
+                "statusText": item["statusText"],
+                "reason": item["automation"]["reason"] or "自动动作已暂停，未访问平台",
+                "errorKind": "automation_paused",
+            })
+            continue
         if not item["cookie"]["exists"]:
             store.mark_status(aid, 0, "凭据文件缺失，请重新扫码授权")
             bad += 1
@@ -1162,7 +1309,15 @@ async def _api_v2_accounts_check_all_sync():
             })
             continue
         flags = await check_cookies_concurrently(
-            [(item["platform"]["type"], item["cookie"]["name"])], max_concurrent=1
+            [(
+                item["platform"]["type"],
+                item["cookie"]["name"],
+                account_key(
+                    item["platform"]["type"], item.get("name"), item.get("id"),
+                    item["cookie"]["name"],
+                ),
+            )],
+            max_concurrent=1,
         )
         alive = bool(flags.get(0, False))
         store.mark_checked(
@@ -1185,7 +1340,8 @@ async def _api_v2_accounts_check_all_sync():
     return jsonify({
         "code": 200,
         "msg": None,
-        "data": {"ok": ok, "bad": bad, "total": len(results), "accounts": results},
+        "data": {"ok": ok, "bad": bad, "skipped": skipped,
+                 "total": len(results), "accounts": results},
     }), 200
 
 
@@ -1645,7 +1801,7 @@ def getAccounts():
         }), 500
 
 
-@app.route("/getValidAccounts",methods=['GET'])
+@app.route("/getValidAccounts", methods=['POST'])
 async def getValidAccounts():
     """校验所有账号的登录状态并回写健康度。
 
@@ -1692,19 +1848,35 @@ async def getValidAccounts():
 
         pending = []
         for index, account in enumerate(accounts):
+            if account_safety.is_paused(account):
+                logger.info("账号 {} 自动动作已暂停，跳过平台登录态校验", account["id"])
+                continue
             if not account["cookie"]["exists"]:
                 store.mark_status(
                     account["id"], 0, "凭据文件缺失，请重新扫码授权"
                 )
                 continue
-            pending.append((index, account["platform"]["type"], account["cookie"]["name"]))
+            pending.append((
+                index,
+                account["platform"]["type"],
+                account["cookie"]["name"],
+                account_key(
+                    account["platform"]["type"], account.get("name"),
+                    account.get("id"), account["cookie"]["name"],
+                ),
+            ))
 
         alive_flags = await check_cookies_concurrently(
-            [(platform_type, cookie_name) for _index, platform_type, cookie_name in pending],
+            [
+                (platform_type, cookie_name, lease_key)
+                for _index, platform_type, cookie_name, lease_key in pending
+            ],
             max_concurrent=ACCOUNT_CHECK_CONCURRENCY,
         )
         dead = 0
-        for position, (index, _platform_type, _cookie_name) in enumerate(pending):
+        for position, (
+            index, _platform_type, _cookie_name, _lease_key,
+        ) in enumerate(pending):
             alive = bool(alive_flags.get(position, False))
             if not alive:
                 dead += 1
@@ -1726,9 +1898,10 @@ async def getValidAccounts():
     finally:
         _ACCOUNT_CHECK_LOCK.release()
 
-@app.route('/deleteFile', methods=['GET'])
+@app.route('/deleteFile', methods=['POST'])
 def delete_file():
-    file_id = request.args.get('id')
+    payload = request.get_json(silent=True) or {}
+    file_id = str(payload.get('id', request.args.get('id')) or '').strip()
 
     if not file_id or not file_id.isdigit():
         return jsonify({
@@ -1736,6 +1909,8 @@ def delete_file():
             "msg": "Invalid or missing file ID",
             "data": None
         }), 400
+
+    file_id = int(file_id)
 
     try:
         # 获取数据库连接
@@ -1755,8 +1930,15 @@ def delete_file():
 
             record = dict(record)
 
-            # 获取文件路径并删除实际文件
-            file_path = Path(BASE_DIR / "videoFile" / record['file_path'])
+            # Resolve user-controlled database paths before deleting. A stored
+            # ``../`` value must never turn this endpoint into an arbitrary file
+            # deletion primitive.
+            video_root = Path(BASE_DIR / "videoFile").resolve()
+            file_path = (video_root / str(record['file_path'] or '')).resolve()
+            if file_path == video_root or not file_path.is_relative_to(video_root):
+                return jsonify({
+                    "code": 400, "msg": "非法素材路径", "data": None,
+                }), 400
             if file_path.exists():
                 try:
                     file_path.unlink()  # 删除文件
@@ -1787,9 +1969,10 @@ def delete_file():
             "data": None
         }), 500
 
-@app.route('/deleteAccount', methods=['GET'])
+@app.route('/deleteAccount', methods=['POST'])
 def delete_account():
-    account_id = request.args.get('id')
+    payload = request.get_json(silent=True) or {}
+    account_id = str(payload.get('id', request.args.get('id')) or '').strip()
 
     if not account_id or not account_id.isdigit():
         return jsonify({
@@ -1834,15 +2017,18 @@ def delete_account():
 
             # 删除关联的cookie文件
             if record.get('filePath'):
-                cookie_file_path = Path(BASE_DIR / "cookiesFile" / record['filePath'])
+                cookie_file_path = Path(
+                    BASE_DIR / "cookiesFile" / Path(str(record['filePath'])).name
+                )
                 try:
                     remove_environment(cookie_file_path, account_id)
                 except Exception as env_err:
                     logger.warning("删除账号持久浏览器目录失败: {}", env_err)
-                if cookie_file_path.exists():
+                cookie_paths = {cookie_file_path, resolve_credential_path(cookie_file_path)}
+                for candidate in (path for path in cookie_paths if path is not None):
                     try:
-                        cookie_file_path.unlink()
-                        logger.info("Cookie 文件已删除: {}", cookie_file_path)
+                        candidate.unlink(missing_ok=True)
+                        logger.info("Cookie 文件已删除: {}", candidate)
                     except Exception as e:
                         logger.warning("删除 Cookie 文件失败: {}", e)
 
@@ -2005,7 +2191,8 @@ def review_approve(job_id):
     denied = _guard_publish_job(job_id, "approve")
     if denied is not None:
         return denied
-    publish_jobs.approve_job(job_id)
+    payload = request.get_json(silent=True) or {}
+    publish_jobs.approve_job(job_id, note=payload.get('note') or '')
     return jsonify({'code': 200, 'msg': 'approved'}), 200
 
 
@@ -2014,7 +2201,8 @@ def review_reject(job_id):
     denied = _guard_publish_job(job_id, "reject")
     if denied is not None:
         return denied
-    publish_jobs.reject_job(job_id)
+    payload = request.get_json(silent=True) or {}
+    publish_jobs.reject_job(job_id, note=payload.get('note') or '')
     return jsonify({'code': 200, 'msg': 'rejected'}), 200
 
 @app.route('/publish-records', methods=['GET'])
@@ -2067,12 +2255,15 @@ def publish_job_detail(job_id: int):
         row = c.execute('SELECT * FROM jobs WHERE id=?', (int(job_id),)).fetchone()
     if row is None:
         return jsonify({'code': 404, 'data': None, 'msg': '任务不存在'}), 404
-    if not access_scope.job_in_scope(dict(row)):
+    job = dict(row)
+    if not access_scope.job_in_scope(job):
         return access_scope.forbidden("无权访问该发布任务")
+    # 租约 token 只属于执行器协议，不能随普通任务详情暴露给前端。
+    job.pop('lease_token', None)
     return jsonify({
         'code': 200,
         'data': {
-            'job': dict(row),
+            'job': job,
             'progress': publish_jobs.job_progress(job_id),
             'items': _scoped_publish_items(job_id),
         },
@@ -2356,6 +2547,10 @@ def dm_sync_health():
             item for item in payload["accounts"]
             if item.get("errorKind") == "account_expired"
         ]
+        paused = [
+            item for item in payload["accounts"]
+            if item.get("paused")
+        ]
         if expired:
             names = "、".join(str(item.get("name") or "") for item in expired)[:120]
             problems.append({
@@ -2364,6 +2559,16 @@ def dm_sync_health():
                 "message": (
                     f"{payload['platform']}：{len(expired)} 个账号登录失效"
                     f"（{names}），请重新扫码登录后再同步"
+                ),
+            })
+        if paused:
+            names = "、".join(str(item.get("name") or "") for item in paused)[:120]
+            problems.append({
+                "platform": payload["platform"],
+                "kind": "automation_paused",
+                "message": (
+                    f"{payload['platform']}：{len(paused)} 个账号的自动动作已暂停"
+                    f"（{names}），请先在账号管理确认平台限制已解除"
                 ),
             })
         elif payload.get("errorKind"):
@@ -2491,9 +2696,12 @@ def _comment_account(account_name: str, platform: str = ""):
     db_path = base / "db" / "database.db"
     if not db_path.is_file():
         return None
+    if not account_safety.ensure_schema(BASE_DIR):
+        raise ValueError("账号安全状态不可用，已阻止评论操作")
     with db_connect(db_path) as conn:
         rows = [dict(row) for row in conn.execute(
-            "SELECT id,type,userName,filePath,status FROM user_info ORDER BY id"
+            "SELECT id,type,userName,filePath,status,automation_paused,pause_until,"
+            "pause_reason,pause_updated_at FROM user_info ORDER BY id"
         ).fetchall()]
     target = str(account_name or "").strip()
     matched = [
@@ -2505,6 +2713,8 @@ def _comment_account(account_name: str, platform: str = ""):
     if platform:
         platform_type = comment_ops.platform_type_of(platform)
         matched = [row for row in matched if int(row.get("type") or 0) == platform_type]
+    if any(account_safety.is_paused(row) for row in matched):
+        raise ValueError(f"账号“{target}”的自动动作已暂停，已阻止评论操作")
     if len(matched) > 1:
         raise ValueError(f"存在多个同名账号“{target}”，请先重命名再操作评论")
     row = matched[0]
@@ -2955,39 +3165,7 @@ def _accounts_out_of_scope(account_list) -> list[str]:
     还原成账号行后逐一核对范围——直接拿文件名比对是不够的，因为令牌里的
     scope 可能写的是账号 id 或账号名。
     """
-    refs = [str(item).strip() for item in (account_list or []) if str(item).strip()]
-    if not refs:
-        return []
-    if access_scope.unrestricted():
-        return []
-    out: list[str] = []
-    table = {
-        str(row.get("id") or ""): row for row in access_scope._account_table()
-    }
-    for ref in refs:
-        row = table.get(ref)
-        if row is None:
-            for candidate in access_scope._account_table():
-                if str(candidate.get("userName") or "").strip() == ref:
-                    row = candidate
-                    break
-                file_path = str(candidate.get("filePath") or "")
-                if file_path and (
-                    file_path == ref or Path(file_path).name == ref
-                ):
-                    row = candidate
-                    break
-        if row is None:
-            # 账号不存在：不属于任何人的范围，直接拒绝，避免静默发布到未知目标。
-            out.append(ref)
-            continue
-        if not access_scope.account_in_scope(
-            account_id=row.get("id"),
-            account_name=str(row.get("userName") or ""),
-            cookie_file=str(row.get("filePath") or ""),
-        ):
-            out.append(ref)
-    return out
+    return access_scope.out_of_scope_account_refs(account_list or [])
 
 
 @app.route('/postVideo', methods=['POST'])
@@ -3153,7 +3331,6 @@ def updateUserinfo():
 
 @app.route('/postVideoBatch', methods=['POST'])
 def postVideoBatch():
-    from myUtils.platform_registry import dispatch_publish
     data_list = request.get_json()
 
     if not isinstance(data_list, list):
@@ -3176,7 +3353,12 @@ def postVideoBatch():
                 + "、".join(out_of_scope)
             )
 
-    for data in data_list:
+    prepared = []
+    for index, data in enumerate(data_list):
+        if not isinstance(data, dict):
+            return jsonify({
+                "code": 400, "msg": f"第 {index + 1} 条任务必须是对象", "data": None,
+            }), 400
         # 从JSON数据中提取fileList和accountList
         file_list = data.get('fileList', [])
         account_list = data.get('accountList', [])
@@ -3210,42 +3392,59 @@ def postVideoBatch():
             return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
         if content_type == 'article' and not str(desc or '').strip():
             return jsonify({"code": 400, "msg": "长文正文(desc)不能为空", "data": None}), 400
+        check_result = compliance.check_content(data)
+        if not check_result["passed"]:
+            return jsonify({
+                "code": 400,
+                "msg": f"第 {index + 1} 条发布前检查未通过："
+                       + str(check_result.get("message") or "请查看明细")[:300],
+                "data": check_result,
+            }), 400
 
         videos_per_day = data.get('videosPerDay')
         daily_times = data.get('dailyTimes')
         start_days = data.get('startDays')
-        # 打印获取到的数据（仅作为示例）
         logger.debug("File List: {}", file_list)
         logger.debug("Account List: {}", account_list)
-        # 统一走平台注册表分发，避免各平台参数错位（历史上漏传 publish_strategy
-        # 导致定时发布被静默降级成立即发布）。
-        dispatch_publish(
-            type,
-            title=title, files=file_list, tags=tags, account_list=account_list,
-            category=category, enableTimer=enableTimer,
-            videosPerDay=videos_per_day, dailyTimes=daily_times, startDays=start_days,
-            desc=desc, isDraft=is_draft,
-            productLink=productLink, productTitle=productTitle,
-            contentType=content_type,
-            collection=data.get('collection') or data.get('collectionName') or '',
-            mentions=data.get('mentions') or [],
-            locationName=data.get('locationName') or data.get('location') or '',
-            poiId=data.get('poiId') or '',
-            bgmName=data.get('bgmName') or data.get('music') or '',
-            shopProductId=data.get('shopProductId') or '',
-            contentLabel=data.get('contentLabel') or data.get('declaration') or '',
-        )
+        extra = {
+            'category': category, 'enableTimer': enableTimer,
+            'videosPerDay': videos_per_day, 'dailyTimes': daily_times,
+            'startDays': start_days, 'isDraft': is_draft,
+            'productLink': productLink, 'productTitle': productTitle,
+            'desc': desc, 'contentType': content_type,
+            'collection': data.get('collection') or data.get('collectionName') or '',
+            'mentions': data.get('mentions') or [],
+            'locationName': data.get('locationName') or data.get('location') or '',
+            'poiId': data.get('poiId') or '',
+            'bgmName': data.get('bgmName') or data.get('music') or '',
+            'shopProductId': data.get('shopProductId') or '',
+            'contentLabel': data.get('contentLabel') or data.get('declaration') or '',
+        }
+        prepared.append({
+            'type': batch_platform, 'title': title, 'tags': tags,
+            'files': file_list, 'accounts': account_list, 'extra': extra,
+            'review_required': bool(data.get('reviewRequired')),
+        })
+
+    job_ids = []
+    for item in prepared:
+        job_ids.append(enqueue_job(
+            item['type'], item['title'], item['tags'], item['files'],
+            item['accounts'], item['extra'],
+            review_required=item['review_required'],
+        ))
     # 返回响应给客户端
     return jsonify(
         {
             "code": 200,
-            "msg": None,
-            "data": None
+            "msg": "批量发布任务已加入队列",
+            "data": {"job_ids": job_ids}
         }), 200
 
 # Cookie文件上传API
 @app.route('/uploadCookie', methods=['POST'])
 def upload_cookie():
+    """Validate, scope-check and encrypt a manually uploaded storage state."""
     try:
         denied = access_scope.require_permission(
             runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
@@ -3275,43 +3474,146 @@ def upload_cookie():
                 "data": None
             }), 400
 
-        # 获取账号信息
-        account_id = request.form.get('id')
-        platform = request.form.get('platform')
+        account_id_raw = str(request.form.get('id') or '').strip()
+        platform = str(request.form.get('platform') or '').strip()
 
-        if not account_id or not platform:
+        if not account_id_raw.isdigit() or not platform:
             return jsonify({
                 "code": 400,
                 "msg": "缺少账号ID或平台信息",
                 "data": None
             }), 400
+        account_id = int(account_id_raw)
 
-        # 从数据库获取账号的文件路径
+        # Read the target account before touching credentials. Both the token
+        # scope and the declared platform must match the account being replaced.
         with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT filePath FROM user_info WHERE id = ?', (account_id,))
+            cursor.execute(
+                'SELECT id,type,filePath,userName FROM user_info WHERE id=?',
+                (account_id,),
+            )
             result = cursor.fetchone()
 
         if not result:
             return jsonify({
-                "code": 500,
+                "code": 404,
                 "msg": "账号不存在",
                 "data": None
             }), 404
+        target = dict(result)
+        if not access_scope.account_in_scope(
+            account_id=account_id,
+            account_name=str(target.get('userName') or ''),
+            cookie_file=str(target.get('filePath') or ''),
+        ):
+            return access_scope.forbidden("无权替换该账号的 Cookie")
+        declared_platform = platform_type_of(platform)
+        if declared_platform is None or int(target.get('type') or 0) != declared_platform:
+            return jsonify({
+                "code": 400,
+                "msg": "上传平台与目标账号不一致",
+                "data": None,
+            }), 400
 
-        # 保存上传的Cookie文件到对应路径
-        cookie_file_path = Path(BASE_DIR / "cookiesFile" / result['filePath'])
-        cookie_file_path.parent.mkdir(parents=True, exist_ok=True)
+        max_cookie_bytes = 2 * 1024 * 1024
+        raw = file.stream.read(max_cookie_bytes + 1)
+        if len(raw) > max_cookie_bytes:
+            return jsonify({
+                "code": 413, "msg": "Cookie 文件超过 2MB", "data": None,
+            }), 413
+        try:
+            state = json.loads(raw.decode('utf-8-sig'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return jsonify({
+                "code": 400, "msg": "Cookie 文件不是有效 JSON", "data": None,
+            }), 400
+        if isinstance(state, list):
+            state = {"cookies": state, "origins": []}
+        if not isinstance(state, dict):
+            return jsonify({
+                "code": 400, "msg": "Cookie 必须是 Playwright storage_state 对象", "data": None,
+            }), 400
+        cookies = state.get("cookies")
+        origins = state.get("origins", [])
+        if not isinstance(cookies, list) or not isinstance(origins, list):
+            return jsonify({
+                "code": 400, "msg": "storage_state 的 cookies/origins 必须是数组", "data": None,
+            }), 400
+        if len(cookies) > 2000 or len(origins) > 200:
+            return jsonify({
+                "code": 400, "msg": "Cookie 条目数量超过安全上限", "data": None,
+            }), 400
 
-        file.save(str(cookie_file_path))
+        text_budget = 0
+        normalized_cookies = []
+        for cookie in cookies:
+            if not isinstance(cookie, dict):
+                return jsonify({"code": 400, "msg": "Cookie 条目结构不合法", "data": None}), 400
+            item = {}
+            for key in ("name", "value", "domain", "path", "sameSite", "partitionKey"):
+                if key not in cookie:
+                    continue
+                value = cookie.get(key)
+                if key == "partitionKey" and isinstance(value, dict):
+                    item[key] = value
+                    continue
+                if not isinstance(value, str) or len(value) > 64 * 1024:
+                    return jsonify({"code": 400, "msg": " Cookie 字段结构不合法", "data": None}), 400
+                item[key] = value
+                text_budget += len(value)
+            for key in ("expires", "httpOnly", "secure"):
+                if key not in cookie:
+                    continue
+                value = cookie.get(key)
+                if key == "expires" and not isinstance(value, (int, float)):
+                    return jsonify({"code": 400, "msg": "Cookie expires 字段不合法", "data": None}), 400
+                if key != "expires" and not isinstance(value, bool):
+                    return jsonify({"code": 400, "msg": "Cookie 布尔字段不合法", "data": None}), 400
+                item[key] = value
+            normalized_cookies.append(item)
 
-        # 更新数据库中的账号信息（可选，比如更新更新时间）
-        # 这里可以根据需要添加额外的处理逻辑
+        normalized_origins = []
+        localStorage_count = 0
+        for origin in origins:
+            if not isinstance(origin, dict) or not isinstance(origin.get("localStorage"), list):
+                return jsonify({"code": 400, "msg": "origin 条目结构不合法", "data": None}), 400
+            origin_name = origin.get("origin")
+            if origin_name is not None and not isinstance(origin_name, str):
+                return jsonify({"code": 400, "msg": "origin 字段结构不合法", "data": None}), 400
+            entries = []
+            for entry in origin.get("localStorage") or []:
+                if not isinstance(entry, dict):
+                    return jsonify({"code": 400, "msg": "localStorage 条目结构不合法", "data": None}), 400
+                name, value = entry.get("name"), entry.get("value")
+                if not isinstance(name, str) or not isinstance(value, str):
+                    return jsonify({"code": 400, "msg": "localStorage 键值必须是字符串", "data": None}), 400
+                text_budget += len(name) + len(value)
+                localStorage_count += 1
+                entries.append({"name": name, "value": value})
+            normalized_origins.append({"origin": str(origin_name or ""), "localStorage": entries})
+        if localStorage_count > 20000 or text_budget > max_cookie_bytes:
+            return jsonify({"code": 413, "msg": "Cookie 内容超过安全上限", "data": None}), 413
+
+        cookie_name = Path(str(target.get('filePath') or '')).name
+        if not cookie_name:
+            return jsonify({"code": 400, "msg": "账号缺少凭据槽位", "data": None}), 400
+        logical_path = Path(BASE_DIR / "cookiesFile" / cookie_name)
+        normalized_state = {"cookies": normalized_cookies, "origins": normalized_origins}
+        encrypted_path = write_storage_state(logical_path, normalized_state, base_dir=BASE_DIR)
+        if logical_path.is_file():
+            logical_path.unlink(missing_ok=True)
+        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            conn.execute(
+                "UPDATE user_info SET cookie_size=?, fail_reason='', updated_at=? WHERE id=?",
+                (encrypted_path.stat().st_size, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), account_id),
+            )
+            conn.commit()
 
         return jsonify({
             "code": 200,
-            "msg": "Cookie文件上传成功",
-            "data": None
+            "msg": "Cookie文件已校验并加密保存",
+            "data": {"encrypted": True, "cookies": len(normalized_cookies), "origins": len(normalized_origins)}
         }), 200
 
     except Exception as e:
@@ -3327,6 +3629,11 @@ def upload_cookie():
 @app.route('/downloadCookie', methods=['GET'])
 def download_cookie():
     try:
+        denied = access_scope.require_permission(
+            runtime_config.PERM_ACCOUNT, "当前身份没有账号管理权限",
+        )
+        if denied is not None:
+            return denied
         file_path = request.args.get('filePath')
         if not file_path:
             return jsonify({
@@ -3335,11 +3642,10 @@ def download_cookie():
                 "data": None
             }), 400
 
-        # 验证文件路径的安全性，防止路径遍历攻击
-        cookie_file_path = Path(BASE_DIR / "cookiesFile" / file_path).resolve()
+        logical_path = Path(BASE_DIR / "cookiesFile" / Path(file_path).name).resolve()
         base_path = Path(BASE_DIR / "cookiesFile").resolve()
 
-        if not cookie_file_path.is_relative_to(base_path):
+        if not logical_path.is_relative_to(base_path):
             return jsonify({
                 "code": 500,
                 "msg": "非法文件路径",
@@ -3351,18 +3657,23 @@ def download_cookie():
         if not access_scope.account_in_scope(cookie_file=file_path):
             return access_scope.forbidden("无权下载该账号的 Cookie")
 
-        if not cookie_file_path.exists():
+        cookie_file_path = resolve_credential_path(logical_path)
+        if cookie_file_path is None:
             return jsonify({
                 "code": 500,
                 "msg": "Cookie文件不存在",
                 "data": None
             }), 404
 
-        # 返回文件
-        return send_from_directory(
-            directory=str(cookie_file_path.parent),
-            path=cookie_file_path.name,
-            as_attachment=True
+        state = read_storage_state(logical_path)
+        if state is None:
+            return jsonify({"code": 404, "msg": "Cookie文件无法解析", "data": None}), 404
+        payload = json.dumps(state, ensure_ascii=False, indent=2).encode('utf-8')
+        download_name = secure_filename(logical_path.name) or "storage_state.json"
+        return Response(
+            payload,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
 
     except Exception as e:
@@ -3451,7 +3762,6 @@ def sse_stream(status_queue, queue_id=None, max_wait_seconds=360):
             active_verify_submissions.pop(queue_id, None)
             logger.debug("清理队列: {}", queue_id)
 
-import publish_jobs
 import runtime_guard
 
 
@@ -3487,18 +3797,32 @@ def _start_background_tasks() -> None:
         )
         return
 
-    runtime_guard.register(
-        "publish-scheduler", description="发布调度扫描（本地定时触发器）",
-        interval=20, launcher=publish_jobs.restart_publish_runtime,
-    )
-    runtime_guard.register(
-        "publish-tracker", description="发布后状态追踪与回填",
-        interval=60, launcher=publish_jobs.restart_publish_runtime,
-    )
-    runtime_guard.register(
-        "account-patrol", description="账号登录态巡检",
-        interval=12 * 3600, launcher=publish_jobs.restart_patrol,
-    )
+    role = publish_jobs.process_role()
+    owns_publish_runtime = role in ("all", "executor")
+    if owns_publish_runtime:
+        publish_jobs.backfill_scheduled_items()
+        publish_jobs.recover_pending_jobs()
+
+        runtime_guard.register(
+            "publish-dispatcher", description="跨进程待发布任务分发",
+            interval=10, launcher=publish_jobs.restart_publish_runtime,
+        )
+        runtime_guard.register(
+            "publish-scheduler", description="发布调度扫描（本地定时触发器）",
+            interval=20, launcher=publish_jobs.restart_publish_runtime,
+        )
+        runtime_guard.register(
+            "publish-tracker", description="发布后状态追踪与回填",
+            interval=60, launcher=publish_jobs.restart_publish_runtime,
+        )
+        runtime_guard.register(
+            "account-patrol", description="账号登录态巡检",
+            interval=12 * 3600, launcher=publish_jobs.restart_patrol,
+        )
+    else:
+        logger.info(
+            "FLOWOPS_PROCESS_ROLE=web：发布 worker/调度/追踪由独立 executor 提供"
+        )
     runtime_guard.register(
         "stats-reflow", description="作品数据回流",
         interval=24 * 3600, launcher=stats_reflow.restart_stats_loop,
@@ -3521,7 +3845,8 @@ def _start_background_tasks() -> None:
             launcher=dm_module.restart_background,
         )
 
-    publish_jobs.start_publish_runtime()
+    if owns_publish_runtime:
+        publish_jobs.start_publish_runtime()
     try:
         task_jobs.start_runtime()
     except Exception:
@@ -3536,7 +3861,8 @@ def _start_background_tasks() -> None:
         maintenance.start()
     except Exception:
         logger.exception("数据维护线程启动失败")
-    start_patrol()
+    if owns_publish_runtime:
+        start_patrol()
     stats_reflow.start_stats_loop(24)
     douyin_dm_sync.start_background()
     xiaohongshu_dm_sync.start_background()
@@ -3550,9 +3876,6 @@ def _start_background_tasks() -> None:
 
     # 所有后台任务都起来之后再开看门狗，避免启动阶段的正常空窗被判成卡死。
     runtime_guard.start_watchdog()
-
-
-_start_background_tasks()
 
 
 def _dm_storage_maintenance():
@@ -3588,21 +3911,51 @@ def _dm_storage_shutdown():
         pass
 
 
-_dm_storage_maintenance()
-threading.Thread(
-    target=_dm_storage_loop, name="dm-storage-checkpoint", daemon=True,
-).start()
-atexit.register(_dm_storage_shutdown)
-for _signal in ("SIGINT", "SIGTERM", "SIGBREAK"):
-    handler = getattr(signal, _signal, None)
-    if handler is None:
-        continue
-    try:
-        signal.signal(handler, lambda *_args: (_dm_storage_shutdown(), sys.exit(0)))
-    except (ValueError, OSError):
-        continue
+_RUNTIME_LOCK = threading.Lock()
+_RUNTIME_STARTED = False
+
+
+def _start_dm_storage_runtime() -> None:
+    _dm_storage_maintenance()
+    threading.Thread(
+        target=_dm_storage_loop, name="dm-storage-checkpoint", daemon=True,
+    ).start()
+    atexit.register(_dm_storage_shutdown)
+    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        handler = getattr(signal, signal_name, None)
+        if handler is None:
+            continue
+        try:
+            signal.signal(
+                handler,
+                lambda *_args: (_dm_storage_shutdown(), sys.exit(0)),
+            )
+        except (ValueError, OSError):
+            continue
+
+
+def start_runtime() -> None:
+    """Start background platform automation exactly once for this process.
+
+    Importing this module must remain side-effect free: tests, CLI tooling and
+    WSGI introspection import apps without intending to launch browsers or
+    send platform requests.  The executable entry point calls this explicitly.
+    """
+    global _RUNTIME_STARTED
+    with _RUNTIME_LOCK:
+        if _RUNTIME_STARTED:
+            return
+        _RUNTIME_STARTED = True
+    # The pause columns are read by background workers before the first HTTP
+    # request, so apply the additive account migration at the explicit runtime
+    # boundary.
+    if not get_store(BASE_DIR).ensure_schema():
+        raise RuntimeError("账号暂停安全表初始化失败，已拒绝启动自动动作")
+    _start_dm_storage_runtime()
+    _start_background_tasks()
 
 if __name__ == '__main__':
+    start_runtime()
     if hold_system_awake():
         logger.info("Windows 防休眠锁已启用：后台运行期间系统不会自动休眠")
     elif os.name == "nt":
@@ -3614,7 +3967,9 @@ if __name__ == '__main__':
         )
     # 用 waitress 承载生产流量：Flask 自带的开发服务器没有超时/线程治理，
     # 大文件上传和 SSE 长连接下容易出现连接堆积。
-    # 仍然保持单进程模型——内存队列、发布 worker、巡检线程、SSE 都在进程内。
+    # Web 进程承载 HTTP/SSE；发布任务以 SQLite 为事实来源。默认 all 模式把
+    # worker 内嵌在这里，拆分部署时设置 FLOWOPS_PROCESS_ROLE=web，并由
+    # publish_executor.py 独立运行调度、worker、追踪与账号巡检。
     try:
         from waitress import serve
     except ImportError:

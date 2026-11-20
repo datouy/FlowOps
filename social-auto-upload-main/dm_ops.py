@@ -12,7 +12,6 @@ import shutil
 import threading
 import time
 import uuid
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -71,6 +70,10 @@ DOUYIN_HIDDEN_MEDIA_TYPES = {"video", "share"}
 DOUYIN_HIDDEN_CONTENT = {
     "[视频]", "[分享视频]", "分享[视频]",
     "视频无法查看，请浏览其他内容",
+}
+MESSAGE_PROTOCOL_LABELS = {
+    "BRAND_APPRAISE_CARD": "[品牌合作卡片]",
+    "TRADE_BUSINESS_CARD": "[交易卡片]",
 }
 
 HIGH_INTENT_WORDS = [
@@ -1458,9 +1461,12 @@ def _deliver_outbound(out_id: int, payload: dict, settings: dict) -> dict:
     # key 统一为 account:<账号标识>，与 publish_jobs/comment_ops 同一命名空间，
     # 否则三条腿各玩各的，串行等于没做。
     try:
-        from utils.account_serial import account_serial as _serial
+        from utils.account_serial import account_key, account_serial as _serial
         _acct = str(payload.get("account") or payload.get("cookie") or "unknown")
-        _serial_ctx = _serial(f"account:{_acct}", timeout=600)
+        _serial_ctx = _serial(
+            account_key(payload.get("platform"), _acct, payload.get("account_id"), payload.get("cookie")),
+            timeout=600,
+        )
     except Exception:
         _serial_ctx = None
     if _serial_ctx is None:
@@ -1559,15 +1565,13 @@ def _deliver_outbound_inner(out_id: int, payload: dict, settings: dict) -> dict:
                 WHERE outbound_message_id=?""", (out_id,))
         return {"delivery_status": "ready",
                 "delivery_error": "未配置发送连接器，回复已生成，可在会话中复制"}
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return {"delivery_status": "failed", "delivery_error": "连接器地址格式不正确"}
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json", "X-FlowOps-Event": "dm.reply"}
     try:
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            if resp.status >= 300:
-                raise RuntimeError(f"HTTP {resp.status}")
+        from utils.safe_outbound import post_json
+
+        post_json(
+            url, payload, timeout=8,
+            headers={"X-FlowOps-Event": "dm.reply"},
+        )
         status, error = "sent", ""
     except Exception as exc:
         status, error = "failed", str(exc)[:300]
@@ -1790,6 +1794,30 @@ def _apply_auto_reply(c, result: dict, settings: dict, force_draft: bool) -> Non
         return
     if not _as_bool(item.get("auto_reply"), True):
         return
+    try:
+        import account_safety
+
+        paused = account_safety.is_named_account_paused(
+            ctx.get("account") or "", ctx.get("platform") or "",
+            base_dir=BASE_DIR,
+        )
+    except Exception as exc:
+        logger.warning("读取账号自动动作状态失败，已阻止自动回复: {}", exc)
+        reason = "账号安全状态不可用，已阻止生成和发送自动回复"
+    else:
+        reason = (
+            "账号自动动作已暂停，未生成或发送自动回复" if paused else ""
+        )
+    if reason:
+        _log_reply(
+            c, ctx["contact"]["id"], ctx["inbound_id"], None, None,
+            "skipped", reason, "",
+        )
+        result["auto_reply"] = {
+            "status": "skipped", "reason": reason, "reply": "",
+            "outbound_message_id": None, "send": False,
+        }
+        return
     auto = _prepare_auto_reply(
         c, ctx["contact"],
         {"id": ctx["inbound_id"], "content": ctx["content"], "msg_type": ctx["msg_type"]},
@@ -1816,6 +1844,36 @@ def _finish_delivery(result: dict) -> None:
     inbound_id = ctx["inbound_id"]
     settings = ctx.get("settings") or {}
     force_draft = ctx.get("force_draft", False)
+    try:
+        import account_safety
+
+        if account_safety.is_named_account_paused(
+            account, platform, base_dir=BASE_DIR,
+        ):
+            with get_conn() as delivery_conn:
+                delivery_conn.execute(
+                    "UPDATE messages SET delivery_status='ready' WHERE id=?",
+                    (auto["outbound_message_id"],),
+                )
+            auto.update({
+                "delivery_status": "ready",
+                "delivery_error": "账号自动动作已暂停，回复保留待人工处理",
+                "status": "ready",
+            })
+            return
+    except Exception as exc:
+        logger.warning("读取账号自动动作状态失败，已阻止私信投递: {}", exc)
+        with get_conn() as delivery_conn:
+            delivery_conn.execute(
+                "UPDATE messages SET delivery_status='ready' WHERE id=?",
+                (auto["outbound_message_id"],),
+            )
+        auto.update({
+            "delivery_status": "ready",
+            "delivery_error": "账号安全状态不可用，回复保留待人工处理",
+            "status": "ready",
+        })
+        return
     if auto.get("send"):
         payload = {
             "event": "dm.reply", "source": "flowops", "platform": platform,
@@ -1835,6 +1893,16 @@ def _finish_delivery(result: dict) -> None:
                      "delivery_error": auto.get("reason") or "待人工发送"})
     if auto.get("delivery_status"):
         auto["status"] = auto["delivery_status"]
+    if auto.get("delivery_status") == "failed":
+        try:
+            import account_safety
+
+            account_safety.pause_named_on_risk(
+                account, platform, auto.get("delivery_error") or "",
+                base_dir=BASE_DIR,
+            )
+        except Exception:
+            pass
 
 
 def ingest_message(item: dict, allow_auto_reply: bool = True,
@@ -2050,6 +2118,48 @@ def _decorate_contact(data: dict) -> dict:
     return data
 
 
+def _friendly_message_content(content, media_type: str = "") -> str:
+    """Turn platform protocol payloads into labels people can read."""
+    text = str(content or "").strip()
+    if not text.startswith("{"):
+        return text
+
+    payload = None
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        # Old Douyin scans sometimes stored a truncated card payload.
+        pass
+
+    card_type = ""
+    if isinstance(payload, dict):
+        card_type = str(payload.get("contentType") or payload.get("cardType") or "").strip()
+        if card_type in MESSAGE_PROTOCOL_LABELS:
+            return MESSAGE_PROTOCOL_LABELS[card_type]
+        if any(key in payload for key in ("smileId", "emojiId", "stickerId")):
+            return "[表情]"
+    else:
+        match = re.search(r'"(?:contentType|cardType)"\s*:\s*"([A-Z0-9_]+)"', text)
+        if match:
+            card_type = match.group(1)
+            if card_type in MESSAGE_PROTOCOL_LABELS:
+                return MESSAGE_PROTOCOL_LABELS[card_type]
+        if re.search(r'"(?:smileId|emojiId|stickerId)"\s*:', text):
+            return "[表情]"
+
+    if media_type in ("emotion", "emoji", "sticker"):
+        return "[表情]"
+    return "[卡片]" if payload is not None or card_type else "[非文本消息]"
+
+
+def _friendly_message_item(item: dict) -> dict:
+    if "last_content" in item:
+        item["last_content"] = _friendly_message_content(item["last_content"])
+    if "content" in item:
+        item["content"] = _friendly_message_content(item["content"], item.get("media_type"))
+    return item
+
+
 def _parse_datetime(value) -> datetime | None:
     if not value:
         return None
@@ -2169,7 +2279,10 @@ def priority_leads(limit: int = 8) -> list[dict]:
         WHERE c.stage NOT IN ('converted','lost') AND COALESCE(c.account_deleted,0)=0"""
     sql += scope_sql + " ORDER BY COALESCE(c.last_inbound_at,c.last_message_at) DESC, c.id DESC LIMIT 200"
     with get_conn() as c:
-        rows = [_decorate_contact(dict(r)) for r in c.execute(sql, scope_args).fetchall()]
+        rows = [
+            _decorate_contact(_friendly_message_item(dict(r)))
+            for r in c.execute(sql, scope_args).fetchall()
+        ]
     ranked = [_score_priority_lead(row) for row in rows]
     ranked.sort(key=lambda row: (row["lead_score"], row.get("last_message_time") or ""), reverse=True)
     return ranked[:limit]
@@ -2220,7 +2333,7 @@ def list_conversations():
         total = int(c.execute(count_sql, args).fetchone()[0] or 0)
         rows = []
         for row in c.execute(sql, [*args, page_size, offset]).fetchall():
-            item = dict(row)
+            item = _friendly_message_item(dict(row))
             # dm_contacts 上的历史计数包含视频占位，列表必须按可见消息重算。
             item["unread_count"] = int(item.pop("visible_unread_count", 0) or 0)
             rows.append(_decorate_contact(item))
@@ -2266,7 +2379,7 @@ def conversation_detail(cid: int):
         else:
             page_sql = "contact_id=? AND id>? AND " + visible_sql
             page_args = (cid, after)
-        messages = [dict(r) for r in c.execute("""SELECT * FROM (
+        messages = [_friendly_message_item(dict(r)) for r in c.execute("""SELECT * FROM (
             SELECT * FROM messages m WHERE """ + page_sql + """
             ORDER BY created_at DESC, id DESC LIMIT 200
         ) ORDER BY created_at ASC, id ASC""", page_args).fetchall()]

@@ -37,11 +37,16 @@ class _FakePlatform(common.BaseDmSync):
         self.threads: list[int] = []
         self.quicks: list[bool] = []
         self.fail_ids: set[int] = set()
+        self.barrier: threading.Barrier | None = None
         self._supports_quick = supports_quick
 
     def scan_account(self, settings, account, quick=False):  # noqa: ARG002
         self.threads.append(threading.get_ident())
         self.quicks.append(quick)
+        if self.barrier:
+            # All workers must meet before any can finish, proving overlap
+            # without depending on wall-clock timing under load.
+            self.barrier.wait(timeout=3)
         time.sleep(self.delay)
         if int(account["id"]) in self.fail_ids:
             raise common.SyncError(f"账号 {account['id']} 登录失效")
@@ -107,7 +112,11 @@ def make_manager(tmp_path, monkeypatch):
     dm_ops.init_db()
 
     def factory(cls, accounts: int = 3, **kwargs):
-        monkeypatch.setattr(common, "account_rows", lambda _type: _accounts(accounts))
+        monkeypatch.setattr(
+            common,
+            "account_rows",
+            lambda _type, **_kwargs: _accounts(accounts),
+        )
         blueprint = Blueprint(f"bp_{cls.__name__}_{accounts}_{len(kwargs)}", __name__)
         manager = cls(blueprint, **kwargs) if kwargs else cls(blueprint)
         manager.init_db()
@@ -121,16 +130,13 @@ def make_manager(tmp_path, monkeypatch):
 
 def test_accounts_are_scanned_in_parallel(make_manager):
     manager, _ = make_manager(_FakePlatform, accounts=3, delay=0.15)
-    started = time.monotonic()
+    manager.barrier = threading.Barrier(3)
     result = manager.run_sync("manual")
-    elapsed = time.monotonic() - started
 
     assert result["ok"] is True
     assert result["parallel_workers"] == 3
     assert len(result["accounts"]) == 3
-    # 并行：总耗时明显小于串行的 3×0.15s
-    assert elapsed < 0.40
-    assert len(set(manager.threads)) >= 2
+    assert len(set(manager.threads)) == 3
 
 
 def test_results_keep_account_order(make_manager):

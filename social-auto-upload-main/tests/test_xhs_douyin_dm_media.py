@@ -147,6 +147,7 @@ def test_media_cache_downloads_video_cover_without_original(tmp_path, monkeypatc
 
 def test_media_cache_rejects_html_error_page(tmp_path, monkeypatch):
     class FakeResponse:
+        status_code = 200
         headers = {"Content-Type": "text/html; charset=utf-8"}
         closed = False
 
@@ -157,6 +158,7 @@ def test_media_cache_rejects_html_error_page(tmp_path, monkeypatch):
             self.closed = True
 
     response = FakeResponse()
+    monkeypatch.setattr(dm_media_cache, "validate_outbound_url", lambda _url: None)
     monkeypatch.setattr(dm_media_cache.requests, "get", lambda *_a, **_k: response)
 
     with pytest.raises(RuntimeError, match="非媒体内容"):

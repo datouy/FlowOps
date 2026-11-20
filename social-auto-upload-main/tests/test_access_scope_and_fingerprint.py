@@ -306,6 +306,7 @@ def test_dm_media_cache_download_uses_account_headers(tmp_path, monkeypatch):
         return Response()
 
     monkeypatch.setattr(dm_media_cache.requests, "get", fake_get)
+    monkeypatch.setattr(dm_media_cache, "validate_outbound_url", lambda _url: None)
     monkeypatch.setattr(
         dm_media_cache,
         "account_proxies",

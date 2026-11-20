@@ -259,21 +259,28 @@ def _to_int(value: Any) -> int:
 
 def _account_rows(platform_type: int) -> list[dict]:
     from db_utils import connect
+    import account_safety
 
     db_main = Path(BASE_DIR) / "db" / "database.db"
     if not db_main.exists():
         return []
+    if not account_safety.ensure_schema(BASE_DIR):
+        logger.warning("账号表结构不可用，跳过评论同步账号读取")
+        return []
     with connect(db_main, timeout=15) as conn:
         rows = [
             dict(row) for row in conn.execute(
-                "SELECT id,type,userName,filePath,status FROM user_info "
+                "SELECT id,type,userName,filePath,status,automation_paused,pause_until,"
+                "pause_reason,pause_updated_at FROM user_info "
                 "WHERE type=? ORDER BY id",
                 (int(platform_type),),
             ).fetchall()
         ]
     cookie_dir = Path(BASE_DIR) / "cookiesFile"
     result = []
-    for row in rows:
+    for row in account_safety.filter_active_accounts(rows):
+        if row.get("status") is not None and int(row.get("status") or 0) == 0:
+            continue
         cookie_path = cookie_dir / Path(str(row.get("filePath") or "")).name
         # 凭据可能是明文也可能是密文，两种都要认。
         resolved = resolve_credential_path(cookie_path)
@@ -358,6 +365,15 @@ def run_comment_sync_once() -> dict:
                     )
                 except Exception as exc:
                     message = str(exc)[:300] or exc.__class__.__name__
+                    try:
+                        import account_safety
+
+                        account_safety.pause_on_risk(
+                            int(account.get("id") or 0), message,
+                            base_dir=BASE_DIR,
+                        )
+                    except Exception:
+                        pass
                     logger.warning(
                         "评论同步失败（{} / {}）: {}", platform_type,
                         account.get("userName"), message,

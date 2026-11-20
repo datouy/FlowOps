@@ -13,6 +13,7 @@ from loguru import logger
 
 from conf import BASE_DIR
 from db_utils import connect
+import account_safety
 from utils.credential_crypto import resolve_credential_path
 from utils.account_browser import open_persistent_account_context_sync
 
@@ -49,11 +50,17 @@ def _send_lock_for(account) -> threading.Lock:
 def _account_by_type(account_type: int, account_name: str):
     if not MAIN_DB.exists():
         return None
+    if not account_safety.ensure_schema(BASE_DIR):
+        raise RuntimeError("账号安全状态不可用，已阻止私信发送")
     with connect(MAIN_DB, timeout=15) as conn:
         rows = [dict(row) for row in conn.execute(
-            "SELECT id,type,userName,filePath,status FROM user_info WHERE type=? ORDER BY id",
+            "SELECT id,type,userName,filePath,status,automation_paused,pause_until,"
+            "pause_reason,pause_updated_at FROM user_info WHERE type=? ORDER BY id",
             (int(account_type),),
         ).fetchall()]
+    all_rows = rows
+    paused = [row for row in rows if account_safety.is_paused(row)]
+    rows = [row for row in rows if not account_safety.is_paused(row)]
     available = []
     for row in rows:
         cookie = COOKIE_DIR / Path(str(row.get("filePath") or "")).name
@@ -64,20 +71,32 @@ def _account_by_type(account_type: int, account_name: str):
             available.append(row)
     target = str(account_name or "").strip()
     if target:
+        named = [
+            row for row in all_rows
+            if str(row.get("userName") or "").strip() == target
+        ]
+        if len(named) > 1:
+            labels = {1: "小红书", 2: "视频号", 3: "抖音"}
+            label = labels.get(int(account_type), "平台")
+            raise RuntimeError(
+                f"存在多个同名{label}账号“{target}”，请先修改账号名称后再发送"
+            )
         matches = [
             row for row in available
             if str(row.get("userName") or "").strip() == target
         ]
         if len(matches) == 1:
             return matches[0]
-        if len(matches) > 1:
-            labels = {1: "小红书", 2: "视频号", 3: "抖音"}
-            label = labels.get(int(account_type), "平台")
-            raise RuntimeError(
-                f"存在多个同名{label}账号“{target}”，请先修改账号名称后再发送"
-            )
+        if any(str(row.get("userName") or "").strip() == target for row in paused):
+            raise RuntimeError(f"账号“{target}”的自动动作已暂停，已阻止私信发送")
         return None
-    return available[0] if available else None
+    if not available and paused:
+        raise RuntimeError("可用于发送的账号均已暂停自动动作，已阻止私信发送")
+    if len(available) == 1:
+        return available[0]
+    if len(available) > 1:
+        raise RuntimeError("私信发送未指定账号，检测到多个可用账号；已阻止以避免串号")
+    return None
 
 
 def _account(account_name: str):

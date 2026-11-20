@@ -140,7 +140,11 @@ def window_app(dm_db, monkeypatch):
         "id": 7, "type": 99, "userName": "测试账号", "filePath": "fake.json",
         "status": 1, "cookie_path": str(dm_db / "fake.json"), "has_cookie": True,
     }]
-    monkeypatch.setattr(common, "account_rows", lambda _account_type: accounts)
+    monkeypatch.setattr(
+        common,
+        "account_rows",
+        lambda _account_type, **_kwargs: accounts,
+    )
     blueprint = Blueprint("fake_window_sync", __name__)
     manager = _FakeSync(blueprint)
     manager.init_db()

@@ -20,6 +20,7 @@ from conf import BASE_DIR
 import dm_cursor
 import dm_ops
 import runtime_guard
+import account_safety
 from db_utils import apply_migrations, connect
 from utils.credential_crypto import resolve_credential_path
 
@@ -167,14 +168,41 @@ def cookie_path(value: Any) -> Path | None:
     return resolved
 
 
-def account_rows(account_type: int) -> list[dict]:
+def account_rows(account_type: int, *, include_paused: bool = False) -> list[dict]:
     if not ACCOUNT_DB.exists():
         return []
-    with connect(ACCOUNT_DB, timeout=15) as conn:
-        rows = [dict(row) for row in conn.execute(
-            "SELECT id,type,userName,filePath,status FROM user_info "
-            "WHERE type=? ORDER BY id", (int(account_type),),
-        ).fetchall()]
+    try:
+        with connect(ACCOUNT_DB, timeout=15) as conn:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(user_info)").fetchall()
+            }
+            if not columns:
+                return []
+            optional = (
+                "automation_paused", "pause_until", "pause_reason",
+                "pause_updated_at",
+            )
+            selected = [
+                name for name in (
+                    "id", "type", "userName", "filePath", "status", *optional,
+                ) if name in columns
+            ]
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT {','.join(selected)} FROM user_info "
+                "WHERE type=? ORDER BY id",
+                (int(account_type),),
+            ).fetchall()]
+    except sqlite3.Error as exc:
+        logger.warning("读取私信账号表失败: {}", exc)
+        return []
+    for row in rows:
+        row.setdefault("automation_paused", 0)
+        row.setdefault("pause_until", "")
+        row.setdefault("pause_reason", "")
+        row.setdefault("pause_updated_at", "")
+    if not include_paused:
+        rows = account_safety.filter_active_accounts(rows)
     for row in rows:
         path = cookie_path(row.get("filePath"))
         row["cookie_path"] = str(path) if path else ""
@@ -662,8 +690,8 @@ class BaseDmSync:
                 tuple(fields.values()),
             )
 
-    def list_accounts(self) -> list[dict]:
-        rows = account_rows(self.account_type)
+    def list_accounts(self, *, include_paused: bool = False) -> list[dict]:
+        rows = account_rows(self.account_type, include_paused=include_paused)
         if self.prefer_active_accounts:
             rows.sort(key=lambda row: (
                 0 if int(row.get("status") or 0) == 1 else 1,
@@ -1010,6 +1038,13 @@ class BaseDmSync:
                 )
         except Exception as exc:
             self.log.warning("记录账号同步健康度失败: {}", exc)
+        if not state_success:
+            try:
+                account_id = int(account.get("id") or 0)
+                if account_id:
+                    account_safety.pause_on_risk(account_id, error, base_dir=BASE_DIR)
+            except Exception as exc:
+                self.log.warning("记录私信平台风险暂停失败: {}", exc)
 
     def health_payload(self) -> dict:
         """同步健康度：给"为什么没有新消息"一个可读的答案。
@@ -1018,7 +1053,9 @@ class BaseDmSync:
         账号级看每个账号各自的状态（有些号好好的、个别号失效是最常见的情况）。
         """
         settings = self.load_settings()
-        accounts = self.resolve_accounts(self.list_accounts(), settings)
+        accounts = self.resolve_accounts(
+            self.list_accounts(include_paused=True), settings,
+        )
         states: dict[str, dict] = {}
         try:
             with dm_ops.get_conn() as conn:
@@ -1049,6 +1086,8 @@ class BaseDmSync:
             items.append({
                 "id": account.get("id"),
                 "name": self.account_name(account),
+                "automation": account_safety.automation_state(account),
+                "paused": account_safety.is_paused(account),
                 "lastSuccessAt": last_success,
                 "lastError": str(state.get("last_error") or ""),
                 "errorKind": str(state.get("last_error_kind") or ""),
@@ -1066,6 +1105,9 @@ class BaseDmSync:
             "lastError": last_error,
             "errorKind": classify_dm_error(last_error),
             "accountCount": len(accounts),
+            "activeAccountCount": sum(
+                1 for account in accounts if not account_safety.is_paused(account)
+            ),
             "noAccounts": not accounts,
             "accounts": items,
             "nextRunAt": self.next_run_text(),
