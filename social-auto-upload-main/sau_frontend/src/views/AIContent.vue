@@ -1,6 +1,6 @@
 <template>
   <div class="ai-content">
-    <div class="page-head">
+    <div v-if="!embedded" class="page-head">
       <div>
         <h2>AI 文案生成</h2>
         <p class="sub">适用于产品、服务、门店、课程或活动。填写名称、受众和卖点，即可按平台风格生成内容。</p>
@@ -93,6 +93,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { http } from '@/utils/request'

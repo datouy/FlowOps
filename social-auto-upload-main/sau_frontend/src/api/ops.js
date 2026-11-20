@@ -12,6 +12,12 @@ export const opsApi = {
   auditLogs: (limit = 200) => http.get('/api/v2/audit/logs', { limit }),
   migrationsRun: (dryRun = true) => http.post('/api/v2/migrations/run', { dryRun }),
   contents: () => http.get('/api/v2/contents'),
+  posts: (params = {}) => http.get('/api/v2/posts', params),
+  post: (id) => http.get(`/api/v2/posts/${id}`),
+  postSave: (id, payload) => id
+    ? http.patch(`/api/v2/posts/${id}`, payload)
+    : http.post('/api/v2/posts', payload),
+  postSubmit: (id, payload) => http.post(`/api/v2/posts/${id}/submit`, payload),
   contentCreate: (payload) => http.post('/api/v2/contents', payload),
   variants: (cid) => http.get(`/api/v2/contents/${cid}/variants`),
   variantSave: (cid, payload) => http.post(`/api/v2/contents/${cid}/variants`, payload),

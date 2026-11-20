@@ -1,6 +1,6 @@
 <template>
   <div class="content-pack">
-    <div class="page-head">
+    <div v-if="!embedded" class="page-head">
       <div>
         <h2>多平台内容包</h2>
         <p class="sub">输入一次产品或服务信息，生成 6 个平台的差异化标题、正文和话题，并可生成 3:4 / 9:16 封面。</p>
@@ -92,6 +92,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { http } from '@/utils/request'

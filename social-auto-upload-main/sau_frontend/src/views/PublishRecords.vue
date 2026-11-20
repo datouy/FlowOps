@@ -562,6 +562,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, computed, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { http } from '@/utils/request'

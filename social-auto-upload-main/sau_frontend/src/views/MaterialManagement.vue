@@ -1,6 +1,6 @@
 <template>
   <div class="material-management">
-    <div class="page-header">
+    <div v-if="!embedded" class="page-header">
       <h1>素材管理</h1>
     </div>
     
@@ -8,7 +8,7 @@
       <div class="material-search">
         <el-input
           v-model="searchKeyword"
-          placeholder="输入文件名搜索"
+          placeholder="搜索素材"
           prefix-icon="Search"
           clearable
           @clear="handleSearch"
@@ -199,6 +199,10 @@
 </template>
 
 <script setup>
+const props = defineProps({
+  embedded: Boolean,
+  initialSearch: { type: String, default: '' }
+})
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { Refresh, Upload } from '@element-plus/icons-vue'
 import { materialApi } from '@/api/material'
@@ -209,7 +213,7 @@ import { http } from '@/utils/request'
 const appStore = useAppStore()
 
 // 搜索和状态控制
-const searchKeyword = ref('')
+const searchKeyword = ref(props.initialSearch)
 const tagKeyword = ref('')
 const statusFilter = ref('all')
 const tagDialog = ref(false)
@@ -251,6 +255,12 @@ watch(fileList, (newList) => {
     // customFilename.value = ''
   }
 });
+
+watch(() => props.initialSearch, value => {
+  searchKeyword.value = value || ''
+  materialPage.value = 1
+  fetchMaterials(1)
+})
 
 
 // 获取素材列表
@@ -545,7 +555,8 @@ onMounted(() => {
 }
 
 .material-search {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(180px, 320px) minmax(150px, 180px) auto minmax(0, 1fr);
   align-items: center;
   gap: 14px;
   margin-bottom: 16px;
@@ -554,15 +565,23 @@ onMounted(() => {
 .status-filter {
   display: flex;
   align-items: center;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .material-search .el-input {
-  width: 320px;
+  width: 100%;
 }
 
 .action-buttons {
   display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 10px;
+}
+
+.action-buttons :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 .material-list-container {
@@ -594,4 +613,40 @@ onMounted(() => {
 }
 .cleanup-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .cleanup-total { color: #909399; margin: 6px 0 10px; }
+
+@media (max-width: 1100px) {
+  .material-search {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .status-filter,
+  .action-buttons {
+    grid-column: 1 / -1;
+  }
+
+  .action-buttons {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .material-search {
+    grid-template-columns: 1fr;
+  }
+
+  .status-filter,
+  .action-buttons {
+    grid-column: auto;
+  }
+
+  .status-filter :deep(.el-radio-group) {
+    display: flex;
+    width: 100%;
+  }
+
+  .status-filter :deep(.el-radio-button) {
+    flex: 1;
+  }
+}
 </style>

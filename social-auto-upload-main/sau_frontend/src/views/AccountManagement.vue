@@ -1,9 +1,8 @@
 <template>
   <div class="account-management">
-    <header class="page-heading">
+    <header v-if="!embedded" class="page-heading">
       <div class="page-heading__copy">
-      <h1>账号管理</h1>
-        <p>每个账号分别校验登录、发布、作品回查、评论、主站私信和身份绑定。</p>
+        <h1>账号</h1>
       </div>
     </header>
     
@@ -20,7 +19,7 @@
               <div class="account-search">
               <el-input
                 v-model="searchKeyword"
-                  placeholder="搜索账号名称"
+                placeholder="搜索账号"
                 prefix-icon="Search"
                 clearable
                 @clear="handleSearch"
@@ -28,6 +27,11 @@
               />
               </div>
               <div class="action-buttons">
+                <el-switch
+                  v-model="attentionOnly"
+                  active-text="只看异常"
+                  inline-prompt
+                />
                 <el-button type="primary" @click="handleAddAccount">
                   <el-icon><Plus /></el-icon>
                   添加账号
@@ -41,7 +45,6 @@
             </div>
 
             <div v-if="activeAccounts.length > 0" class="account-list">
-              <p class="table-scroll-hint">左右滑动查看健康度、状态与操作</p>
               <div class="table-wrap">
               <el-table :data="activeAccounts" class="account-table">
                 <el-table-column label="账号" width="210">
@@ -112,11 +115,33 @@
                     </button>
                   </template>
                 </el-table-column>
-                <el-table-column label="账号能力" width="390">
+                <el-table-column label="自动动作" width="145">
                   <template #default="scope">
-                    <div class="capability-grid">
+                    <el-tooltip
+                      :disabled="!scope.row.automation?.reason"
+                      :content="scope.row.automation?.reason || '自动动作正常'"
+                      placement="top"
+                    >
+                      <div class="automation-cell">
+                        <el-tag
+                          :type="scope.row.automation?.paused ? 'danger' : 'success'"
+                          effect="plain"
+                          size="small"
+                        >
+                          {{ scope.row.automation?.paused ? '已暂停' : '运行中' }}
+                        </el-tag>
+                        <span v-if="scope.row.automation?.pauseUntil" class="automation-until">
+                          {{ scope.row.automation.pauseUntil }}
+                        </span>
+                      </div>
+                    </el-tooltip>
+                  </template>
+                </el-table-column>
+                <el-table-column label="账号能力" width="280">
+                  <template #default="scope">
+                    <div v-if="attentionCapabilities(scope.row).length" class="capability-grid">
                       <el-tooltip
-                        v-for="capability in accountCapabilities(scope.row)"
+                        v-for="capability in attentionCapabilities(scope.row)"
                         :key="capability.key"
                         :content="capability.reason || capability.label"
                         placement="top"
@@ -130,6 +155,7 @@
                         </span>
                       </el-tooltip>
                     </div>
+                    <span v-else class="capability-summary">{{ accountCapabilities(scope.row).length }} 项正常</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="操作" width="190" align="right">
@@ -149,6 +175,11 @@
                             <el-dropdown-item command="download">下载 Cookie</el-dropdown-item>
                             <el-dropdown-item command="upload">上传 Cookie</el-dropdown-item>
                             <el-dropdown-item command="environment">发布环境</el-dropdown-item>
+                            <el-dropdown-item
+                              :command="scope.row.automation?.paused ? 'resume-automation' : 'pause-automation'"
+                            >
+                              {{ scope.row.automation?.paused ? '恢复自动动作' : '暂停自动动作' }}
+                            </el-dropdown-item>
                             <el-dropdown-item v-if="scope.row.platform === '视频号'" command="seed">补登频道</el-dropdown-item>
                             <el-dropdown-item v-if="INTERACTIVE_PLATFORMS[scope.row.platform]" command="relogin">
                               {{ scope.row.platform === '小红书' ? '重新登录主站' : '重新登录' }}
@@ -548,7 +579,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import {
   ArrowDown,
   CircleCheckFilled,
@@ -564,6 +595,11 @@ import { waitForTask } from '@/api/task'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'
 import { API_BASE, withToken, authHeaders } from '@/config'
+
+const props = defineProps({
+  embedded: Boolean,
+  initialFilter: { type: String, default: '' }
+})
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -602,7 +638,15 @@ const accountTabs = [
 const activeTab = ref('all')
 
 // 搜索关键词
-const searchKeyword = ref('')
+const initialAccountFilter = props.initialFilter === 'attention' ? '' : props.initialFilter
+const searchKeyword = ref(initialAccountFilter)
+const attentionOnly = ref(props.initialFilter === 'attention' || (props.embedded && !initialAccountFilter))
+
+watch(() => props.initialFilter, value => {
+  const keyword = value === 'attention' ? '' : value
+  searchKeyword.value = keyword || ''
+  attentionOnly.value = value === 'attention' || (props.embedded && !keyword)
+})
 
 // 获取账号数据（快速，不验证）
 const fetchAccountsQuick = async () => {
@@ -707,6 +751,12 @@ const accountCapabilities = (row) => {
   })
 }
 
+const attentionCapabilities = (row) => accountCapabilities(row).filter(item => item.state !== 'ready')
+
+const accountNeedsAttention = (row) => row.status === '异常'
+  || Boolean(row.automation?.paused)
+  || attentionCapabilities(row).some(item => item.state === 'blocked')
+
 const handleCheckAccount = async (row) => {
   checkingAccountId.value = row.id
   try {
@@ -749,10 +799,11 @@ const handleStatusClick = (row) => {
 
 // 过滤后的账号列表
 const filteredAccounts = computed(() => {
-  if (!searchKeyword.value) return accountStore.accounts
-  return accountStore.accounts.filter(account =>
-    account.name.includes(searchKeyword.value)
-  )
+  const keyword = searchKeyword.value.trim()
+  return accountStore.accounts
+    .filter(account => !keyword || account.name.includes(keyword))
+    .filter(account => !attentionOnly.value || accountNeedsAttention(account))
+    .sort((left, right) => Number(accountNeedsAttention(right)) - Number(accountNeedsAttention(left)))
 })
 
 // 当前标签页对应的账号列表
@@ -763,6 +814,7 @@ const activeAccounts = computed(() => {
 })
 
 const tabEmptyText = (tab) => {
+  if (attentionOnly.value && !searchKeyword.value) return '账号状态正常'
   return tab.name === 'all' ? '暂无账号数据' : `暂无${tab.label}账号数据`
 }
 
@@ -1217,6 +1269,50 @@ const handleDelete = async (row) => {
   }
 }
 
+const handleAutomationCommand = async (row) => {
+  if (row.automation?.paused) {
+    try {
+      await ElMessageBox.confirm(
+        `恢复 ${row.name} 的自动发布、私信、评论与巡检？请先确认平台侧限制已经解除。`,
+        '恢复自动动作',
+        { confirmButtonText: '确认恢复', cancelButtonText: '取消', type: 'warning' }
+      )
+    } catch (error) {
+      return
+    }
+    try {
+      await accountApi.resumeAutomation(row.id)
+      ElMessage.success('自动动作已恢复')
+    } catch (error) {
+      return
+    }
+  } else {
+    let reason = ''
+    try {
+      const result = await ElMessageBox.prompt(
+        '暂停后，发布、私信、评论、巡检和数据回流都不会访问该平台账号。留空原因将长期暂停，直到手动恢复。',
+        '暂停自动动作',
+        {
+          confirmButtonText: '确认暂停',
+          cancelButtonText: '取消',
+          inputPlaceholder: '例如：平台收到账号限制通知，等待人工复核',
+          inputValidator: value => String(value || '').length <= 300,
+        }
+      )
+      reason = String(result.value || '').trim()
+    } catch (error) {
+      return
+    }
+    try {
+      await accountApi.pauseAutomation(row.id, reason || '人工暂停，等待复核')
+      ElMessage.success('自动动作已暂停')
+    } catch (error) {
+      return
+    }
+  }
+  await accountStore.loadAccounts(true)
+}
+
 // 下载Cookie文件
 const handleDownloadCookie = (row) => {
   // 从后端获取Cookie文件
@@ -1549,6 +1645,7 @@ const handleMoreCommand = (command, row) => {
   if (command === 'download') handleDownloadCookie(row)
   else if (command === 'upload') handleUploadCookie(row)
   else if (command === 'environment') openAccountEnvironment(row)
+  else if (command === 'pause-automation' || command === 'resume-automation') handleAutomationCommand(row)
   else if (command === 'seed') handleSeedChannels(row)
   else if (command === 'relogin') handleReLogin(row)
   else if (command === 'delete') handleDelete(row)
@@ -2028,6 +2125,19 @@ onBeforeUnmount(() => {
   }
   
   // 健康度列：最后校验时间 + 失效原因 + 单账号复检
+  .automation-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .automation-until {
+    color: var(--el-text-color-secondary);
+    font-size: 11px;
+    line-height: 1.2;
+  }
+
   .health-cell {
     display: flex;
     align-items: center;
@@ -2177,6 +2287,11 @@ onBeforeUnmount(() => {
     flex-wrap: wrap;
     gap: 4px;
     max-width: 360px;
+  }
+
+  .capability-summary {
+    color: $text-secondary;
+    font-size: 12px;
   }
 
   .capability-pill {

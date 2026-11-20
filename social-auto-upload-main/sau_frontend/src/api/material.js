@@ -16,7 +16,7 @@ export const materialApi = {
   
   // 删除素材
   deleteMaterial: (id) => {
-    return http.get(`/deleteFile?id=${id}`)
+    return http.post('/deleteFile', { id })
   },
   
   // 下载素材

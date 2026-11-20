@@ -27,19 +27,10 @@
       :closable="false"
       style="margin-bottom: 14px;"
     />
-    <el-alert
-      v-else-if="report.coverage && report.coverage.daysWithData < report.coverage.days"
-      :title="`数据覆盖 ${report.coverage.daysWithData}/${report.coverage.days} 天`"
-      :description="`缺少 ${report.coverage.missingDays.length} 天的快照，未回流的日子增量按 0 计，不是「没涨」。`"
-      type="info"
-      show-icon
-      :closable="false"
-      style="margin-bottom: 14px;"
-    />
-    <div class="page-head">
+    <div class="page-head" :class="{ embedded }">
       <div>
-        <h2>运营周报</h2>
-        <p class="sub">
+        <h2 v-if="!embedded">运营周报</h2>
+        <p v-if="!embedded" class="sub">
           主口径为「本期增量」（本期涨了多少）；累计值单独标注，仅作参考。
           <template v-if="report.snapshotAt">
             数据快照时间：{{ report.snapshotAt }}<template v-if="report.snapshotDate">（{{ report.snapshotDate }}）</template>
@@ -49,7 +40,14 @@
           </template>
         </p>
       </div>
-      <div>
+      <div class="page-controls">
+        <span
+          v-if="deltaAvailable && report.hasBaseline
+            && report.coverage && report.coverage.daysWithData < report.coverage.days"
+          class="coverage-status"
+        >
+          覆盖 {{ report.coverage.daysWithData }}/{{ report.coverage.days }} 天
+        </span>
         <el-select v-model="days" style="width:120px" @change="load">
           <el-option label="近 7 天" :value="7" />
           <el-option label="近 14 天" :value="14" />
@@ -86,7 +84,7 @@
         </div>
       </template>
       <div v-if="!trendPoints.length" class="empty-hint">
-        还没有每日快照。数据回流后会每天自动留一份快照，届时这里会显示趋势曲线。
+        暂无趋势数据
       </div>
       <svg v-else class="trend" :viewBox="`0 0 ${trendWidth} ${trendHeight}`" preserveAspectRatio="none">
         <polyline :points="trendLine" fill="none" stroke="#409eff" stroke-width="2" />
@@ -150,6 +148,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, computed, onMounted } from 'vue'
 import { http } from '@/utils/request'
 import { useAccountStore } from '@/stores/account'
@@ -303,6 +302,8 @@ onMounted(async () => {
 <style scoped>
 .report-page { padding: 8px 4px; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+.page-controls { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.coverage-status { color: #909399; font-size: 12px; white-space: nowrap; }
 .page-head h2 { margin: 0 0 6px; }
 .sub { color: #909399; font-size: 13px; margin: 0; }
 .stale { color: #e6a23c; margin-left: 6px; }
@@ -317,5 +318,9 @@ onMounted(async () => {
 .trend-axis { display: flex; justify-content: space-between; color: #909399; font-size: 12px; margin-top: 4px; }
 .empty-hint { color: #909399; font-size: 13px; padding: 24px 0; text-align: center; }
 .table-note { color: #909399; font-size: 12px; margin: 8px 0 0; line-height: 1.6; }
-@media (max-width: 900px) { .metric-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 900px) {
+  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+  .page-head { gap: 12px; flex-wrap: wrap; }
+  .page-controls { width: 100%; justify-content: flex-end; }
+}
 </style>

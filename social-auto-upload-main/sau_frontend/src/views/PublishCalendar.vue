@@ -1,7 +1,7 @@
 <template>
   <div class="publish-calendar">
     <div class="cal-header">
-      <h2>发布日历</h2>
+      <h2 v-if="!embedded">发布日历</h2>
       <div class="cal-actions">
         <el-button @click="shiftWeek(-1)">上一周</el-button>
         <el-button @click="shiftWeek(0)">本周</el-button>
@@ -9,7 +9,7 @@
         <el-button @click="loadAll" :loading="loading">刷新</el-button>
       </div>
     </div>
-    <el-alert type="info" :closable="false" style="margin-bottom:14px"
+    <el-alert v-if="!embedded" type="info" :closable="false" style="margin-bottom:14px"
       title="显示已排期的定时发布任务（在发布中心开启「定时发布」后自动出现在这里）。拖拽卡片到其他日期即可改期，撞车会自动告警。" />
     <el-alert v-if="moveConflict" type="warning" :closable="false" style="margin-bottom:14px"
       :title="'改期撞车：' + moveConflict" />
@@ -57,6 +57,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, computed } from 'vue'
 import { opsApi } from '@/api/ops'
 import { useLivePolling } from '@/composables/useLivePolling'

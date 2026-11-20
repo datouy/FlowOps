@@ -17,7 +17,6 @@
             <div class="brand-mark" aria-hidden="true">云</div>
             <div v-show="!isCollapse || isMobile" class="brand-copy">
               <strong>云策</strong>
-              <span>内容运营台</span>
             </div>
           </div>
           <button
@@ -29,33 +28,50 @@
           </button>
         </div>
 
+        <button
+          v-show="!isCollapse || isMobile"
+          class="new-content-action"
+          type="button"
+          @click="openComposer"
+        >
+          <el-icon><Plus /></el-icon>
+          <span>新建内容</span>
+        </button>
+
+        <button class="command-trigger" type="button" aria-label="搜索工作台" @click="paletteOpen = true">
+          <el-icon><Search /></el-icon>
+          <span v-show="!isCollapse || isMobile">搜索</span>
+          <kbd v-show="!isCollapse || isMobile">Ctrl K</kbd>
+        </button>
+
         <el-menu
           :default-active="route.path"
           class="sidebar-menu"
           :router="true"
           :collapse="isCollapse && !isMobile"
         >
-          <el-menu-item-group
-            v-for="group in navigationGroups"
-            :key="group.label"
-            :title="group.label"
+          <el-menu-item
+            v-for="item in navigationItems"
+            :key="item.path"
+            :index="item.path"
+            @click="mobileNavOpen = false"
           >
-            <el-menu-item
-              v-for="item in group.items"
-              :key="item.path"
-              :index="item.path"
-              @click="mobileNavOpen = false"
-            >
-              <el-icon><component :is="item.icon" /></el-icon>
-              <template #title>{{ item.label }}</template>
-            </el-menu-item>
-          </el-menu-item-group>
+            <el-icon><component :is="item.icon" /></el-icon>
+            <template #title>{{ item.label }}</template>
+          </el-menu-item>
         </el-menu>
 
-        <div v-show="!isCollapse || isMobile" class="sidebar-foot">
-          <span class="status-key is-good">工作台在线</span>
-          <span class="mono">FlowOps</span>
-        </div>
+        <el-menu
+          :default-active="route.path"
+          class="sidebar-menu sidebar-menu--secondary"
+          :router="true"
+          :collapse="isCollapse && !isMobile"
+        >
+          <el-menu-item index="/settings" @click="mobileNavOpen = false">
+            <el-icon><Setting /></el-icon>
+            <template #title>设置</template>
+          </el-menu-item>
+        </el-menu>
       </el-aside>
 
       <el-container class="content-shell">
@@ -67,6 +83,9 @@
             <span>云策</span>
             <strong>{{ pageTitle }}</strong>
           </div>
+          <button class="mobile-search-button" aria-label="搜索工作台" @click="paletteOpen = true">
+            <el-icon :size="18"><Search /></el-icon>
+          </button>
         </header>
         <el-main class="main-content">
           <div class="content-frame">
@@ -80,6 +99,8 @@
       </el-container>
     </el-container>
   </div>
+
+  <CommandPalette v-model="paletteOpen" />
 
   <el-dialog
     v-model="accessDialog"
@@ -115,33 +136,28 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { getAccessToken, setAccessToken } from '@/config'
 import { http } from '@/utils/request'
 import {
-  Bell,
-  Calendar,
   ChatDotRound,
-  ChatLineSquare,
-  Checked,
-  DataAnalysis,
   DataLine,
-  EditPen,
   Expand,
   Files,
   Fold,
   HomeFilled,
-  InfoFilled,
-  List,
   Menu as MenuIcon,
-  Picture,
-  Upload,
-  User,
+  Plus,
+  Search,
+  Setting,
 } from '@element-plus/icons-vue'
+import CommandPalette from '@/components/CommandPalette.vue'
 
 const route = useRoute()
+const router = useRouter()
 const isCollapse = ref(false)
 const mobileNavOpen = ref(false)
+const paletteOpen = ref(false)
 const isMobile = ref(typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches)
 const accessReady = ref(false)
 const accessDialog = ref(false)
@@ -150,65 +166,27 @@ const checking = ref(false)
 let mediaQuery = null
 let syncViewport = null
 
-const navigationGroups = [
-  {
-    label: '运营',
-    items: [
-      { path: '/', label: '首页', icon: HomeFilled },
-      { path: '/todo', label: '今日待办', icon: Bell },
-      { path: '/messages', label: '私信中心', icon: ChatDotRound },
-      { path: '/comments', label: '评论运营', icon: ChatLineSquare },
-    ],
-  },
-  {
-    label: '内容',
-    items: [
-      { path: '/account-management', label: '账号管理', icon: User },
-      { path: '/material-management', label: '素材管理', icon: Picture },
-      { path: '/publish-center', label: '发布中心', icon: Upload },
-      { path: '/ai-content', label: 'AI 文案', icon: EditPen },
-      { path: '/content-pack', label: '内容包', icon: Files },
-      { path: '/review', label: '审核中心', icon: Checked },
-    ],
-  },
-  {
-    label: '数据',
-    items: [
-      { path: '/weekly-report', label: '运营周报', icon: DataLine },
-      { path: '/publish-records', label: '发布记录', icon: List },
-      { path: '/publish-calendar', label: '发布日历', icon: Calendar },
-      { path: '/roi', label: '线索 ROI', icon: DataLine },
-    ],
-  },
-  {
-    label: '系统',
-    items: [
-      { path: '/ops', label: '运维台面', icon: DataAnalysis },
-      { path: '/about', label: '关于', icon: InfoFilled },
-    ],
-  },
+const navigationItems = [
+  { path: '/today', label: '今天', icon: HomeFilled },
+  { path: '/content', label: '内容', icon: Files },
+  { path: '/inbox', label: '收件箱', icon: ChatDotRound },
+  { path: '/insights', label: '洞察', icon: DataLine },
 ]
 
 const pageTitles = {
-  '/': '运营总览',
-  '/todo': '今日待办',
-  '/messages': '私信中心',
-  '/comments': '评论运营',
-  '/account-management': '账号管理',
-  '/material-management': '素材管理',
-  '/publish-center': '发布中心',
-  '/ai-content': 'AI 文案',
-  '/content-pack': '内容包',
-  '/review': '审核中心',
-  '/weekly-report': '运营周报',
-  '/publish-records': '发布记录',
-  '/publish-calendar': '发布日历',
-  '/roi': '线索 ROI',
-  '/ops': '运维台面',
-  '/about': '关于',
+  '/today': '今天',
+  '/content': '内容',
+  '/inbox': '收件箱',
+  '/insights': '洞察',
+  '/settings': '设置',
 }
 
 const pageTitle = computed(() => pageTitles[route.path] || '云策工作台')
+
+function openComposer() {
+  mobileNavOpen.value = false
+  router.push('/content?view=compose')
+}
 
 async function verifyAccess() {
   try {
@@ -246,10 +224,19 @@ const toggleSidebar = () => {
 
 watch(() => route.fullPath, () => {
   mobileNavOpen.value = false
+  paletteOpen.value = false
 })
+
+function handleGlobalKeydown(event) {
+  if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === 'k') {
+    event.preventDefault()
+    paletteOpen.value = true
+  }
+}
 
 onMounted(() => {
   verifyAccess()
+  window.addEventListener('keydown', handleGlobalKeydown)
   mediaQuery = window.matchMedia('(max-width: 900px)')
   syncViewport = (event) => {
     isMobile.value = event.matches
@@ -260,6 +247,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   mediaQuery?.removeEventListener('change', syncViewport)
+  window.removeEventListener('keydown', handleGlobalKeydown)
 })
 </script>
 
@@ -355,7 +343,8 @@ body,
 }
 
 .sidebar-toggle,
-.mobile-menu-button {
+.mobile-menu-button,
+.mobile-search-button {
   display: grid;
   place-items: center;
   flex: none;
@@ -371,7 +360,8 @@ body,
 }
 
 .sidebar-toggle:hover,
-.mobile-menu-button:hover {
+.mobile-menu-button:hover,
+.mobile-search-button:hover {
   color: #f2f3ef;
   border-color: rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.05);
@@ -380,21 +370,87 @@ body,
 .sidebar-menu {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 12px 16px;
+  padding: 8px 12px;
   border-right: 0;
   background: transparent;
 }
 
-.sidebar-menu:not(.el-menu--collapse) {
-  width: 100%;
+.sidebar-menu--secondary {
+  flex: none;
+  padding: 8px 12px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-.sidebar :deep(.el-menu-item-group__title) {
-  padding: 24px 10px 8px;
-  color: #747c75;
-  font-size: 11px;
-  line-height: 1;
-  letter-spacing: 0;
+.new-content-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px 4px;
+  min-height: 36px;
+  padding: 0 12px;
+  color: #fffaf5;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.07);
+  cursor: pointer;
+  transition: background-color $duration-base $ease-out;
+}
+
+.new-content-action:hover {
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.new-content-action span {
+  font-size: 13px;
+}
+
+.command-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 12px 6px;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #aeb5af;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.command-trigger:hover {
+  color: #eef0ec;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.command-trigger .el-icon {
+  flex: none;
+  font-size: 16px;
+}
+
+.command-trigger span {
+  flex: 1;
+  font-size: 12px;
+  text-align: left;
+}
+
+.command-trigger kbd {
+  padding: 2px 5px;
+  color: #7f8780;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 9px;
+}
+
+.sidebar.is-collapsed .command-trigger {
+  justify-content: center;
+  margin-inline: 8px;
+  padding: 0;
+}
+
+.sidebar-menu:not(.el-menu--collapse) {
+  width: 100%;
 }
 
 .sidebar :deep(.el-menu-item) {
@@ -464,23 +520,6 @@ body,
   margin-right: 0;
 }
 
-.sidebar-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 16px 20px;
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
-}
-
-.sidebar-foot .status-key {
-  color: #9ba39b;
-}
-
-.sidebar-foot .mono {
-  color: #6f776f;
-  font-size: 11px;
-}
 
 .content-shell {
   min-width: 0;
@@ -584,14 +623,23 @@ body,
     background: $paper;
   }
 
-  .mobile-menu-button:hover {
+  .mobile-menu-button:hover,
+  .mobile-search-button:hover {
     color: $text-primary;
     border-color: $border-light;
     background: $bg-color-raised;
   }
 
+  .mobile-search-button {
+    margin-left: auto;
+    color: $text-regular;
+    border-color: $border-lighter;
+    background: $paper;
+  }
+
   .mobile-context {
     display: flex;
+    flex: 1;
     align-items: baseline;
     gap: 8px;
     min-width: 0;

@@ -36,7 +36,8 @@ export const useAccountStore = defineStore('account', () => {
         failReason: '',
         identity: '',
         identityBound: false,
-        sessionGroup: ''
+        sessionGroup: '',
+        automation: { configured: false, paused: false, pauseUntil: '', reason: '', updatedAt: '' }
       }
     })
     accountsLoaded.value = true
@@ -61,7 +62,8 @@ export const useAccountStore = defineStore('account', () => {
       sessionGroup: item.cookie?.sessionGroup || '',
       cookie: item.cookie || {},
       environment: item.environment || {},
-      capabilities: item.capabilities || null
+      capabilities: item.capabilities || null,
+      automation: item.automation || { configured: false, paused: false, pauseUntil: '', reason: '', updatedAt: '' }
     }))
     accountsLoaded.value = true
     accountsLoadedAt = Date.now()

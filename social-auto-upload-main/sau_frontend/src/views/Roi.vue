@@ -1,7 +1,7 @@
 <template>
   <div class="roi-page">
-    <div class="page-head">
-      <div><h2>线索 ROI 闭环</h2><p class="sub">单线索成本 = 预算 / 成交数，一键导出 CSV/XLSX 并推送企微/飞书</p></div>
+    <div v-if="!embedded" class="page-head">
+      <div><h2>线索 ROI</h2></div>
       <div class="head-actions">
         <el-button @click="load" :loading="loading">刷新</el-button>
         <el-button @click="doExport('csv')">导出CSV</el-button>
@@ -28,22 +28,58 @@
         <el-table-column label="成交" width="220">
           <template #default="s">
             <el-input-number v-model="s.row._amount" :min="0" size="small" style="width:120px" />
-            <el-button size="small" @click="closeDeal(s.row)">记成交</el-button>
+            <el-button size="small" @click="openDeal(s.row)">记成交</el-button>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
+    <el-dialog v-model="dealDialog" title="记录成交" width="480px">
+      <el-form label-position="top">
+        <el-form-item label="成交线索">
+          <el-select
+            v-model="dealForm.contactId"
+            filterable
+            remote
+            :remote-method="searchContacts"
+            :loading="contactLoading"
+            placeholder="搜索联系人"
+            style="width:100%"
+          >
+            <el-option
+              v-for="contact in contacts"
+              :key="contact.id"
+              :label="contactLabel(contact)"
+              :value="contact.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="成交金额">
+          <el-input-number v-model="dealForm.amount" :min="0" controls-position="right" style="width:100%" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dealDialog = false">取消</el-button>
+        <el-button type="primary" :loading="dealSaving" @click="saveDeal">记录成交</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 <script setup>
+defineProps({ embedded: Boolean })
 import { ref, onMounted } from 'vue'
 import { opsApi } from '@/api/ops'
+import { dmApi } from '@/api/dm'
 import { API_BASE, withToken } from '@/config'
 
 const loading = ref(false)
 const pushing = ref(false)
 const rows = ref([])
-const form = ref({ name: '', budget: 0, contentId: 0 })
+const form = ref({ name: '', budget: 0 })
+const dealDialog = ref(false)
+const dealSaving = ref(false)
+const contactLoading = ref(false)
+const contacts = ref([])
+const dealForm = ref({ campaignId: null, contactId: null, amount: 0 })
 async function load() {
   loading.value = true
   try { const r = await opsApi.roiSummary(); rows.value = (r.data || []).map(x => ({ ...x, _amount: 0 })) }
@@ -62,12 +98,40 @@ async function create() {
   form.value.name = ''
   load()
 }
-async function closeDeal(r) {
-  const contactId = Number(prompt('成交线索 contactId（dm_contacts.id）:', '1') || 0)
-  if (!contactId) return
-  await opsApi.roiDealClose({ contactId, amount: Number(r._amount || 0), campaignId: r.id })
-  ElMessage.success('已记成交并归因')
-  load()
+function openDeal(row) {
+  dealForm.value = { campaignId: row.id, contactId: null, amount: Number(row._amount || 0) }
+  dealDialog.value = true
+  searchContacts('')
+}
+function contactLabel(contact) {
+  return [contact.nickname, contact.platform, contact.account].filter(Boolean).join(' · ') || `线索 #${contact.id}`
+}
+async function searchContacts(query) {
+  contactLoading.value = true
+  try {
+    const response = await dmApi.getConversations({ q: query || '', page: 1, page_size: 30 })
+    contacts.value = response.data?.items || response.data || []
+  } catch (error) {
+    console.warn('加载线索失败:', error)
+  } finally {
+    contactLoading.value = false
+  }
+}
+async function saveDeal() {
+  if (!dealForm.value.contactId) return ElMessage.warning('请选择成交线索')
+  dealSaving.value = true
+  try {
+    await opsApi.roiDealClose({
+      contactId: dealForm.value.contactId,
+      amount: Number(dealForm.value.amount || 0),
+      campaignId: dealForm.value.campaignId
+    })
+    ElMessage.success('已记成交并归因')
+    dealDialog.value = false
+    load()
+  } finally {
+    dealSaving.value = false
+  }
 }
 function doExport(fmt) {
   const url = withToken(API_BASE + opsApi.roiExport(fmt))

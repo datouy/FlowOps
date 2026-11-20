@@ -1,6 +1,6 @@
 <template>
   <div class="comment-page">
-    <div class="page-head">
+    <div v-if="!embedded" class="page-head">
       <div>
         <h2>评论运营</h2>
         <p class="sub">评论同步 · 回复 · 点赞 · 删除 · 置顶</p>
@@ -13,9 +13,8 @@
     </div>
 
     <el-alert
-      v-if="!hasComments && !loading"
-      title="还没有同步到评论"
-      description="点击右上角「同步评论」，系统会打开各平台创作者中心的评论管理页，把评论抓回来。同步之后才能回复、点赞、删除和置顶。"
+      v-if="!embedded && !hasComments && !loading"
+      title="还没有评论"
       type="info"
       show-icon
       :closable="false"
@@ -38,6 +37,7 @@
           @keyup.enter="loadComments"
         />
         <el-button @click="loadComments">查询</el-button>
+        <el-button v-if="embedded" type="primary" :loading="syncing" @click="runSync">同步</el-button>
       </div>
 
       <el-table :data="comments" v-loading="loading" style="width: 100%" stripe>
@@ -126,6 +126,7 @@
 </template>
 
 <script setup>
+defineProps({ embedded: Boolean })
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { commentApi } from '@/api/comment'

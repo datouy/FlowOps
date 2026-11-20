@@ -4,7 +4,7 @@ import { http } from '@/utils/request'
 export const accountApi = {
   // 获取有效账号列表（带验证）
   getValidAccounts() {
-    return http.get('/getValidAccounts')
+    return http.post('/getValidAccounts')
   },
 
   // 获取账号列表（不带验证，快速加载）
@@ -23,7 +23,15 @@ export const accountApi = {
 
   // 删除账号
   deleteAccount(id) {
-    return http.get(`/deleteAccount?id=${id}`)
+    return http.post('/deleteAccount', { id })
+  },
+
+  pauseAutomation(id, reason = '', until = '') {
+    return http.post(`/api/v2/accounts/${id}/automation-pause`, { reason, until })
+  },
+
+  resumeAutomation(id) {
+    return http.post(`/api/v2/accounts/${id}/automation-resume`)
   },
 
   // ---- 账号服务 v2（结构化账号 / 健康度 / 授权审计）----

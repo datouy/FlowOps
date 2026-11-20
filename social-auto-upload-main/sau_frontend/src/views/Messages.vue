@@ -1,6 +1,6 @@
 <template>
   <div class="dm-page">
-    <header class="page-heading dm-heading">
+    <header v-if="!embedded" class="page-heading dm-heading">
       <div class="page-heading__copy">
         <h1>私信中心</h1>
         <p>统一收件箱、意向识别、自动回复与线索沉淀</p>
@@ -20,7 +20,7 @@
       </div>
     </header>
 
-    <details v-if="hasNoAccounts || dmProblems.length" class="sync-notices" aria-label="私信同步提示">
+    <details v-if="!embedded && (hasNoAccounts || dmProblems.length)" class="sync-notices" aria-label="私信同步提示">
       <summary class="notice-summary">
         <span class="status-key is-warning">同步提示</span>
         <span class="notice-summary-text">{{ hasNoAccounts ? '当前没有可用的登录账号' : `${dmProblems.length} 个平台需要检查` }}</span>
@@ -48,7 +48,7 @@
       </div>
     </details>
 
-    <div class="metric-grid">
+    <div v-if="!embedded" class="metric-grid">
       <div class="metric-card is-interactive" role="button" tabindex="0" @click="jumpToPending" @keyup.enter="jumpToPending">
         <span>待人工处理</span>
         <strong>{{ analytics.pending || 0 }}</strong>
@@ -80,9 +80,14 @@
         >
           <aside class="conversation-pane">
             <div class="conversation-filters">
-              <el-input v-model="convFilters.q" clearable placeholder="搜索用户 ID / 昵称 / 群名 / 内容" @keyup.enter="loadConversations">
+              <el-input v-model="convFilters.q" clearable placeholder="搜索会话" @keyup.enter="loadConversations">
                 <template #prefix>搜</template>
               </el-input>
+              <div class="focus-filter">
+                <button type="button" :class="{ active: convFilters.status === 'pending' }" @click="setFocus('pending')">待回复</button>
+                <button type="button" :class="{ active: convFilters.status === 'high' }" @click="setFocus('high')">高意向</button>
+                <button type="button" :class="{ active: !convFilters.status }" @click="setFocus('')">全部</button>
+              </div>
               <div class="filter-row">
                 <el-select v-model="accountFilterKey" clearable filterable placeholder="全部账号" @change="handleAccountFilterChange">
                   <el-option v-for="account in allMessageAccounts" :key="account.key" :label="account.label" :value="account.key" />
@@ -98,7 +103,7 @@
                   <el-option label="老客户" value="existing" />
                   <el-option label="未分类" value="unknown" />
                 </el-select>
-                <el-select v-model="convFilters.status" clearable placeholder="全部状态" @change="loadConversations">
+                <el-select v-if="!embedded" v-model="convFilters.status" clearable placeholder="全部状态" @change="loadConversations">
                   <el-option label="待人工" value="pending" />
                   <el-option label="高意向" value="high" />
                 </el-select>
@@ -234,7 +239,7 @@
                     <div v-if="msg.direction === 'outbound' && msg.delivery_status === 'failed' && msg.delivery_error" class="message-error">
                       失败原因：{{ msg.delivery_error }}
                     </div>
-                    <div v-if="msg.source_content" class="message-source">来源内容：{{ msg.source_content }}</div>
+                    <div v-if="showMessageSource(msg)" class="message-source">{{ msg.source_content }}</div>
                   </div>
                 </div>
                 <el-empty v-if="!loadingMessages && !visibleMessages.length" description="还没有文字或图片消息" :image-size="70" />
@@ -756,7 +761,7 @@ X-YunCe-Secret: {{ settings.inbound_secret ? '你的接入密钥' : '（未设�
 </template>
 
 <script setup>
-import { ref, reactive, computed, onActivated, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onActivated, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { dmApi } from '@/api/dm'
 import { useAccountStore } from '@/stores/account'
@@ -767,6 +772,8 @@ import {
   segmentTagType, shortDateTime, shortTime,
 } from '@/utils/dm-format'
 import { useLivePolling } from '@/composables/useLivePolling'
+
+const props = defineProps({ embedded: Boolean })
 
 const route = useRoute()
 const router = useRouter()
@@ -824,7 +831,11 @@ const storageHealth = ref(null)
 const conversations = ref([])
 const conversationPagination = ref({ page: 1, page_size: 50, total: 0, pages: 0, has_next: false })
 const loadingMoreConversations = ref(false)
-const convFilters = reactive({ q: '', account: '', platform: '', segment: '', status: '' })
+const routedContactId = Number(route.query.contact || 0)
+const convFilters = reactive({
+  q: '', account: '', platform: '', segment: '',
+  status: routedContactId ? '' : String(route.query.status || (props.embedded ? 'pending' : ''))
+})
 const accountFilterKey = ref('')
 const loadingConversations = ref(false)
 const currentContact = ref(null)
@@ -839,6 +850,10 @@ const visibleMessages = computed(() => messages.value.filter(message => {
     && !text.startsWith('该内容为视频')
     && !text.startsWith('该内容为分享内容')
 }))
+const showMessageSource = (message) => {
+  const source = String(message.source_content || '').trim()
+  return Boolean(source) && !/(私信同步|未读\s*\d+)/.test(source)
+}
 const loadingMessages = ref(false)
 const loadingOlderMessages = ref(false)
 const hasOlderMessages = ref(false)
@@ -872,6 +887,28 @@ const importText = ref('')
 const importAutoReply = ref(false)
 const importing = ref(false)
 const helpDialog = ref(false)
+
+function setFocus(status) {
+  convFilters.status = status
+  loadConversations()
+}
+
+function draftKey(id) {
+  return id ? `yunce-dm-draft:${id}` : ''
+}
+
+function saveCurrentDraft() {
+  const key = draftKey(currentContact.value?.id)
+  if (!key) return
+  if (replyText.value.trim()) localStorage.setItem(key, replyText.value)
+  else localStorage.removeItem(key)
+}
+
+function restoreDraft(id) {
+  replyText.value = localStorage.getItem(draftKey(id)) || ''
+}
+
+watch(replyText, saveCurrentDraft)
 const webhookUrl = computed(() => `${apiBase}/dm/inbound`)
 const webhookExample = computed(() => `POST ${webhookUrl.value}
 Content-Type: application/json
@@ -1371,11 +1408,13 @@ async function loadLeads() {
 }
 
 async function selectConversation(item, markRead = true) {
+  if (currentContact.value?.id && currentContact.value.id !== item.id) saveCurrentDraft()
   currentContact.value = item
   templateId.value = null
   lastMessageId.value = 0
   hasOlderMessages.value = false
   await loadConversation(item.id)
+  restoreDraft(item.id)
   if (markRead && Number(item.unread_count || 0) > 0) {
     await markConversationRead(item.id)
   }
@@ -1424,7 +1463,10 @@ async function loadConversation(id, silent = false, incremental = false) {
     await nextTick()
     scrollToBottom()
   } catch (error) { console.error(error) }
-  finally { if (!silent) loadingMessages.value = false }
+  finally {
+    if (!silent) loadingMessages.value = false
+    if (!incremental && currentContact.value?.id === id) restoreDraft(id)
+  }
 }
 
 async function loadOlderMessages() {
@@ -1495,6 +1537,7 @@ async function sendReply() {
     if (status === 'sent') {
       const message = { '抖音': '回复已发送到抖音', '小红书': '回复已发送到小红书', '视频号': '回复已发送到视频号' }[currentContact.value?.platform]
       ElMessage.success(message || '回复已通过连接器发送')
+      localStorage.removeItem(draftKey(currentContact.value.id))
     }
     else if (status === 'failed') {
       replyText.value = text
@@ -1765,11 +1808,21 @@ async function openRoutedConversation() {
   // 从「今日优先跟进」跳转时携带 ?contact=<id>，直接打开对应会话。
   const contactId = Number(route.query.contact || 0)
   if (!contactId) return
-  const target = conversations.value.find(item => Number(item.id) === contactId)
-  if (target) {
-    activeTab.value = 'inbox'
-    await selectConversation(target, false)
+  let target = conversations.value.find(item => Number(item.id) === contactId)
+  if (!target) {
+    try {
+      const res = await dmApi.getConversation(contactId)
+      target = res.data?.contact
+      if (target) {
+        conversations.value = [target, ...conversations.value.filter(item => item.id !== contactId)]
+      }
+    } catch (error) {
+      console.warn('打开指定会话失败:', error)
+    }
   }
+  if (!target) return
+  activeTab.value = 'inbox'
+  await selectConversation(target, false)
 }
 
 onMounted(async () => {
@@ -1848,6 +1901,9 @@ onActivated(() => {
 .conversation-filters :deep(.el-select__selected-item),
 .conversation-filters :deep(.el-select__placeholder) { font-size: 12px; }
 .conversation-filters :deep(.el-button) { height: 28px; min-height: 28px; padding: 0 10px; font-size: 11px; }
+.focus-filter { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; padding: 3px; border-radius: 8px; background: #f4f3ef; }
+.focus-filter button { min-height: 28px; color: #697068; border: 0; border-radius: 6px; background: transparent; font-size: 11px; cursor: pointer; }
+.focus-filter button.active { color: #232621; background: #fffefb; box-shadow: inset 0 0 0 1px #e9ebe6; }
 .filter-row { display: flex; gap: 5px; align-items: center; }
 .filter-row .el-select { flex: 1; min-width: 0; }
 .filter-row.actions { justify-content: flex-end; }
