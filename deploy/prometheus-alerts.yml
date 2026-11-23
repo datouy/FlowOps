@@ -1,0 +1,103 @@
+groups:
+  - name: yunce-control-plane
+    rules:
+      - alert: YunCeScrapeDown
+        expr: up{job="yunce"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: YunCe metrics target is down
+          runbook: docs/operations-runbook.md#web-不可用
+
+      - alert: YunCeStuckPublishJobs
+        expr: yunce_jobs_stuck_pending > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Publish jobs have remained pending for over ten minutes
+          runbook: docs/operations-runbook.md#任务积压
+
+      - alert: YunCeExecutorMissing
+        expr: absent(yunce_executor_heartbeat_age_seconds) and on() yunce_info{role="web"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Web is running in split mode without a visible executor
+          runbook: docs/operations-runbook.md#执行器离线
+
+      - alert: YunCeExecutorHeartbeatStale
+        expr: yunce_executor_heartbeat_age_seconds > 30
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Publish executor heartbeat is stale
+          runbook: docs/operations-runbook.md#执行器离线
+
+      - alert: YunCeUncertainPublishRateHigh
+        expr: |
+          sum(yunce_publish_items_total{status="uncertain"})
+          / clamp_min(sum(yunce_publish_items_total), 1) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than five percent of publish items need manual reconciliation
+          runbook: docs/operations-runbook.md#uncertain-任务
+
+      - alert: YunCeNoActiveAccounts
+        expr: sum(yunce_accounts_total{status="1"}) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: No platform account is currently active
+          runbook: docs/operations-runbook.md#账号失效
+
+      - alert: YunCeNoActiveAdmin
+        expr: yunce_auth_users_total > 0 and on() yunce_auth_active_admins == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: No enabled administrator account remains
+          runbook: docs/operations-runbook.md#a-管理员不可用
+
+      - alert: YunCeDiskLow
+        expr: yunce_disk_free_bytes < 2 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: YunCe host has less than 2 GiB free
+          runbook: docs/operations-runbook.md#磁盘不足
+
+      - alert: YunCeAdminMfaMissing
+        expr: yunce_auth_users_total > 0 and on() yunce_auth_mfa_enabled_admins == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: No active administrator has TOTP MFA enabled
+          runbook: docs/operations-runbook.md#账号安全
+
+      - alert: YunCeDiskCritical
+        expr: yunce_disk_free_bytes < 500 * 1024 * 1024
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: YunCe host has less than 500 MiB free
+          runbook: docs/operations-runbook.md#磁盘不足
+
+      - alert: YunCeAIFailuresToday
+        expr: yunce_ai_failures_today >= 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AI calls are repeatedly failing today
+          runbook: docs/operations-runbook.md#ai-与第三方依赖异常

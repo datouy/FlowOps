@@ -197,6 +197,7 @@ _ROUTE_POLICIES: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], 
         "/api/v2/proxy-pool", "/api/v2/proxy-risks", "/api/v2/webhooks",
         "/api/v2/maintenance", "/api/v2/storage", "/api/v2/system/health",
         "/api/v2/serial/status", "/api/v2/fingerprint/probe", "/notify",
+        "/api/metrics",
     ), (runtime_config.PERM_TEAM_MANAGE,)),
 
     # 私信/评论。DM 媒体也归这里，不能借用素材读取权限。

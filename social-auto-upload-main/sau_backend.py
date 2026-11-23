@@ -35,6 +35,7 @@ from account_capabilities import build_account_capabilities
 import account_safety
 import runtime_config
 import access_scope
+import metrics
 import comment_ops
 from app_logging import logger, setup_request_logging
 from utils.keep_awake import hold_system_awake
@@ -171,6 +172,7 @@ def _guard_access_token():
     校验通过后把身份（用户名、角色、账号范围）挂到 ``g``，
     后面的接口可以按角色和范围做细粒度控制。
     """
+    g._metrics_started = time.monotonic()
     if request.method == "OPTIONS":
         return None
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
@@ -243,6 +245,12 @@ def _security_headers(response):
         "/dm", "/messages", "/publish-records", "/jobs",
     } or request.path.startswith(("/dm/", "/publish/", "/messages/", "/jobs/")):
         response.headers.setdefault("Cache-Control", "no-store")
+    started = getattr(g, "_metrics_started", None)
+    if started is not None:
+        metrics.observe_request(
+            request.method, request.path, response.status_code,
+            time.monotonic() - float(started),
+        )
     return response
 
 
@@ -298,6 +306,17 @@ def session_identity():
 def health():
     """启动探针：不返回任何业务数据，便于 start.bat 判断服务是否就绪。"""
     return jsonify({"code": 200, "msg": None, "data": {"status": "ok"}}), 200
+
+
+@app.route('/api/metrics', methods=['GET'])
+def api_metrics():
+    """Prometheus text exposition for infrastructure monitoring."""
+    return Response(
+        metrics.render(),
+        status=200,
+        mimetype="text/plain",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.route('/health/ready', methods=['GET'])
