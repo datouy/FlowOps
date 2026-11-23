@@ -85,7 +85,7 @@
                 </label>
               </div>
             </div>
-            <button v-if="!accountStore.accounts.length" type="button" class="add-account-link" @click="router.push('/settings?view=accounts')">
+            <button v-if="!accountStore.accounts.length && userStore.can('account.manage')" type="button" class="add-account-link" @click="router.push('/settings?view=accounts')">
               添加账号
             </button>
           </div>
@@ -138,7 +138,7 @@
 
         <section class="editor-block editor-block--compact">
           <div class="publish-options">
-            <el-switch v-model="draft.reviewRequired" active-text="发布前审核" />
+            <span class="policy-note">审核要求由服务端按角色和团队策略确定</span>
             <el-switch v-model="draft.scheduleEnabled" active-text="定时发布" />
             <el-date-picker
               v-if="draft.scheduleEnabled"
@@ -174,7 +174,7 @@
           </div>
         </article>
         <div class="lifecycle-note">
-          <span class="lifecycle-dot" :class="{ active: draft.reviewRequired || draft.scheduleEnabled }" />
+          <span class="lifecycle-dot" :class="{ active: reviewWillBeRequired || draft.scheduleEnabled }" />
           <span>{{ lifecycleText }}</span>
         </div>
       </aside>
@@ -186,7 +186,7 @@
       <div>
         <el-button :loading="saving" @click="saveDraft">保存草稿</el-button>
         <el-button type="primary" :loading="submitting" @click="submit">
-          {{ draft.reviewRequired ? '提交审核' : (draft.scheduleEnabled ? '安排发布' : '加入发布队列') }}
+          {{ reviewWillBeRequired ? '提交审核' : (draft.scheduleEnabled ? '安排发布' : '加入发布队列') }}
         </el-button>
       </div>
     </footer>
@@ -199,10 +199,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { materialApi } from '@/api/material'
 import { opsApi } from '@/api/ops'
 import { useAccountStore } from '@/stores/account'
+import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
 const router = useRouter()
 const accountStore = useAccountStore()
+const userStore = useUserStore()
 const platforms = [
   { key: 'douyin', type: 3, label: '抖音', accountLabel: '抖音' },
   { key: 'xiaohongshu', type: 1, label: '小红书', accountLabel: '小红书' },
@@ -229,10 +231,12 @@ const draft = reactive({
   body: '',
   tagsText: '',
   files: [],
-  reviewRequired: true,
+  reviewRequired: userStore.session.reviewMode === 'all_required' || userStore.session.role === 'cutter',
   scheduleEnabled: false,
   scheduledAt: ''
 })
+
+const reviewWillBeRequired = computed(() => Boolean(draft.reviewRequired))
 
 const accountGroups = computed(() => platforms.map(platform => ({
   ...platform,
@@ -412,7 +416,6 @@ async function persist(forSubmit = false) {
     title: draft.title.trim(),
     body: draft.body,
     files: draft.files,
-    reviewRequired: draft.reviewRequired,
     variants
   })
   contentId.value = Number(response.data?.id || contentId.value)
@@ -447,12 +450,13 @@ async function submit() {
     const response = await opsApi.postSubmit(contentId.value, {
       accounts,
       variants,
-      reviewRequired: draft.reviewRequired,
       scheduledAt: draft.scheduleEnabled ? draft.scheduledAt : ''
     })
     const count = response.data?.jobs?.length || 0
+    const requiresReview = Boolean(response.data?.reviewRequired)
+    draft.reviewRequired = requiresReview
     message.value = { text: `已创建 ${count} 个发布任务`, tone: 'success' }
-    ElMessage.success(draft.reviewRequired ? '已提交审核' : '已加入发布队列')
+    ElMessage.success(requiresReview ? '已提交审核' : '已加入发布队列')
     router.push('/insights?view=works')
   } catch (error) {
     message.value = { text: error.message || '提交失败', tone: 'danger' }
@@ -503,6 +507,7 @@ onMounted(load)
 .override-editor { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid $border-lighter; }
 .override-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: $text-secondary; font-size: 12px; }
 .publish-options { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+.policy-note { color: $text-secondary; font-size: 12px; }
 .preview-column { position: sticky; top: 0; }
 .preview-label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: $text-secondary; font-size: 12px; }
 .preview-label span:last-child { overflow: hidden; color: $text-placeholder; text-overflow: ellipsis; white-space: nowrap; }

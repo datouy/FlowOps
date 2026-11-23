@@ -497,8 +497,7 @@
           <!-- 定时发布 -->
           <div class="schedule-section review-section">
             <h3>团队审核</h3>
-            <el-switch v-model="tab.reviewRequired" active-text="提交审核后再发布" />
-            <span class="section-note">开启后任务进入「审核中心」，通过后才开始发布</span>
+            <span class="section-note">是否需要审核由服务端按当前角色和团队策略决定；客户端开关不参与授权判断。</span>
           </div>
           <div class="schedule-section">
             <h3>定时发布</h3>
@@ -752,8 +751,7 @@ const defaultTabInit = {
   publishStatus: null, // 发布状态，包含message和type
   publishing: false, // 发布状态，用于控制按钮loading效果
   isDraft: false, // 是否保存为草稿，仅视频号平台可见
-  isOriginal: false, // 是否标记为原创
-  reviewRequired: false
+  isOriginal: false // 是否标记为原创
 }
 
 // helper to create a fresh deep-copied tab from defaultTabInit
@@ -1152,8 +1150,7 @@ const confirmPublish = async (tab) => {
     productLink: tab.productLink.trim() || '',
     productTitle: tab.productTitle.trim() || '',
     isDraft: tab.isDraft,
-    contentType: isImageText(tab) ? tab.contentType : 'video',
-    reviewRequired: tab.reviewRequired
+    contentType: isImageText(tab) ? tab.contentType : 'video'
   }
 
   // 调用后端发布API（使用统一的http封装）
@@ -1169,9 +1166,12 @@ const confirmPublish = async (tab) => {
     if (check.data && check.data.warnings && check.data.warnings.length) {
       ElMessage.warning(check.data.warnings.join('；'))
     }
-    await publishApi.submit(publishData)
+    const submitted = await publishApi.submit(publishData)
+    const requiresReview = Boolean(submitted?.data?.reviewRequired)
     tab.publishStatus = {
-      message: '已加入发布队列，可在「发布记录」查看进度',
+      message: requiresReview
+        ? '已提交审核，通过后才会进入发布队列'
+        : '已加入发布队列，可在「发布记录」查看进度',
       type: 'success'
     }
     // 清空当前tab的数据

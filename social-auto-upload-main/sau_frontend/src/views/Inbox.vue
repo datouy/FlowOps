@@ -18,7 +18,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Messages from './Messages.vue'
 import Comments from './Comments.vue'

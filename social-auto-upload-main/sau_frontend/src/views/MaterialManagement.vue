@@ -56,6 +56,9 @@
             </template>
           </el-table-column>
           <el-table-column prop="upload_time" label="上传时间" width="180" />
+          <el-table-column prop="uploaded_by" label="上传人" width="150">
+            <template #default="scope">{{ scope.row.uploaded_by || '历史未记录' }}</template>
+          </el-table-column>
           <el-table-column label="操作">
             <template #default="scope">
               <el-button size="small" @click="handlePreview(scope.row)">预览</el-button>

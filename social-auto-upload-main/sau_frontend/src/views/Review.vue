@@ -39,7 +39,7 @@
             </div>
           </section>
         </div>
-        <section v-if="status === 'pending_review'" class="review-action">
+        <section v-if="status === 'pending_review' && userStore.can('review.decide')" class="review-action">
           <label for="review-note">审核意见</label>
           <el-input id="review-note" v-model="reviewNote" type="textarea" :rows="3" maxlength="1000" placeholder="写清需要调整的地方" />
           <div class="review-buttons">
@@ -47,8 +47,8 @@
             <el-button type="primary" :loading="submitting" @click="approve">通过</el-button>
           </div>
         </section>
-        <section v-else-if="selected.review_note" class="review-history">
-          <h3>审核意见</h3><p>{{ selected.review_note }}</p><span>{{ selected.reviewed_at || '' }}</span>
+        <section v-else-if="selected.review_note || selected.reviewed_at || selected.reviewed_by" class="review-history">
+          <h3>审核意见</h3><p>{{ selected.review_note || '未填写审核意见' }}</p><span>审核人：{{ selected.reviewed_by || '历史未记录' }} · {{ selected.reviewed_at || '' }}</span>
         </section>
       </article>
       <el-empty v-else description="选择一条内容" :image-size="80" />
@@ -60,8 +60,10 @@
 import { computed, onMounted, ref } from 'vue'
 import { http } from '@/utils/request'
 import { opsApi } from '@/api/ops'
+import { useUserStore } from '@/stores/user'
 
 defineProps({ embedded: Boolean })
+const userStore = useUserStore()
 const filters = [
   { value: 'pending_review', label: '待审核' },
   { value: 'pending', label: '已通过' },

@@ -32,26 +32,32 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { CircleCheck, DataAnalysis, InfoFilled, Picture, User } from '@element-plus/icons-vue'
+import { DataAnalysis, InfoFilled, Picture, User } from '@element-plus/icons-vue'
 import AccountManagement from './AccountManagement.vue'
 import MaterialManagement from './MaterialManagement.vue'
 import OpsConsole from './OpsConsole.vue'
 import About from './About.vue'
+import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
 const router = useRouter()
-const items = [
-  { value: 'accounts', label: '账号', icon: User },
-  { value: 'materials', label: '素材', icon: Picture },
-  { value: 'diagnostics', label: '运行状态', icon: DataAnalysis },
-  { value: 'about', label: '关于', icon: InfoFilled }
+const userStore = useUserStore()
+const itemDefinitions = [
+  { value: 'accounts', label: '账号', icon: User, permissions: ['account.manage'] },
+  { value: 'materials', label: '素材', icon: Picture, permissions: ['material.write'] },
+  { value: 'diagnostics', label: '运行状态', icon: DataAnalysis, permissions: ['team.manage', 'audit.read'] },
+  { value: 'about', label: '关于', icon: InfoFilled, permissions: [] }
 ]
+const items = computed(() => itemDefinitions.filter(item => !item.permissions.length || userStore.canAny(...item.permissions)))
 const components = { accounts: AccountManagement, materials: MaterialManagement, diagnostics: OpsConsole, about: About }
-const activeView = ref('accounts')
+const activeView = ref('about')
 const currentComponent = computed(() => components[activeView.value] || AccountManagement)
 
 function normalizeView(value) {
-  return Object.prototype.hasOwnProperty.call(components, value) ? value : 'accounts'
+  const allowed = items.value.some(item => item.value === value)
+  return Object.prototype.hasOwnProperty.call(components, value) && allowed
+    ? value
+    : (items.value[0]?.value || 'about')
 }
 
 function setView(value) {
@@ -59,11 +65,15 @@ function setView(value) {
 }
 
 watch(() => route.query.view, value => {
-  activeView.value = normalizeView(value)
+  const normalized = normalizeView(value)
+  activeView.value = normalized
+  if (value && value !== normalized) {
+    router.replace({ path: '/settings', query: { ...route.query, view: normalized } })
+  }
 }, { immediate: true })
 
 onMounted(() => {
-  if (!route.query.view) router.replace({ path: '/settings', query: { ...route.query, view: 'accounts' } })
+  if (!route.query.view) router.replace({ path: '/settings', query: { ...route.query, view: normalizeView() } })
 })
 </script>
 

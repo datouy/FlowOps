@@ -17,6 +17,7 @@
             <div class="brand-mark" aria-hidden="true">云</div>
             <div v-show="!isCollapse || isMobile" class="brand-copy">
               <strong>云策</strong>
+              <span>{{ identityLabel }}</span>
             </div>
           </div>
           <button
@@ -29,6 +30,7 @@
         </div>
 
         <button
+          v-if="userStore.can('content.edit')"
           v-show="!isCollapse || isMobile"
           class="new-content-action"
           type="button"
@@ -139,6 +141,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAccessToken, setAccessToken } from '@/config'
 import { http } from '@/utils/request'
+import { useUserStore } from '@/stores/user'
 import {
   ChatDotRound,
   DataLine,
@@ -155,6 +158,7 @@ import CommandPalette from '@/components/CommandPalette.vue'
 
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
 const isCollapse = ref(false)
 const mobileNavOpen = ref(false)
 const paletteOpen = ref(false)
@@ -166,12 +170,16 @@ const checking = ref(false)
 let mediaQuery = null
 let syncViewport = null
 
-const navigationItems = [
-  { path: '/today', label: '今天', icon: HomeFilled },
-  { path: '/content', label: '内容', icon: Files },
-  { path: '/inbox', label: '收件箱', icon: ChatDotRound },
-  { path: '/insights', label: '洞察', icon: DataLine },
+const allBusinessPermissions = [
+  'content.edit', 'material.write', 'review.decide', 'publish.execute',
+  'message.operate', 'account.manage', 'team.manage', 'audit.read'
 ]
+const navigationItems = computed(() => [
+  { path: '/today', label: '今天', icon: HomeFilled, visible: userStore.canAny(...allBusinessPermissions) },
+  { path: '/content', label: '内容', icon: Files, visible: userStore.canAny('content.edit', 'review.decide', 'publish.execute') },
+  { path: '/inbox', label: '收件箱', icon: ChatDotRound, visible: userStore.can('message.operate') },
+  { path: '/insights', label: '洞察', icon: DataLine, visible: userStore.can('publish.execute') },
+].filter(item => item.visible))
 
 const pageTitles = {
   '/today': '今天',
@@ -182,6 +190,16 @@ const pageTitles = {
 }
 
 const pageTitle = computed(() => pageTitles[route.path] || '云策工作台')
+const roleNames = {
+  admin: '管理员', operator: '运营', cutter: '剪辑', reviewer: '审核', viewer: '只读'
+}
+const identityLabel = computed(() => {
+  const role = userStore.session.role
+  const roleName = roleNames[role] || role || '未登录'
+  const user = userStore.session.user
+  if (userStore.session.localMode) return `${roleName} · 本机模式`
+  return user ? `${user} · ${roleName}` : roleName
+})
 
 function openComposer() {
   mobileNavOpen.value = false
@@ -191,10 +209,13 @@ function openComposer() {
 async function verifyAccess() {
   try {
     await http.get('/auth/check', null, { silent: true })
+    const response = await http.get('/api/v2/session', null, { silent: true })
+    userStore.setSession(response.data || {})
     accessReady.value = true
     accessDialog.value = false
     return true
   } catch {
+    userStore.reset()
     accessReady.value = false
     accessDialog.value = true
     return false

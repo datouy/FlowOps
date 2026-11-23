@@ -45,7 +45,7 @@
           <strong>{{ posts.length ? '没有匹配内容' : '还没有内容' }}</strong>
           <p v-if="!posts.length">从第一条草稿开始。</p>
         </div>
-        <el-button v-if="!posts.length" type="primary" @click="router.push('/content?view=compose')">新建内容</el-button>
+        <el-button v-if="!posts.length && userStore.can('content.edit')" type="primary" @click="router.push('/content?view=compose')">新建内容</el-button>
       </div>
     </div>
   </section>
@@ -56,8 +56,10 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowRight, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
+import { useUserStore } from '@/stores/user'
 
 const router = useRouter()
+const userStore = useUserStore()
 const loading = ref(false)
 const posts = ref([])
 const query = ref('')
@@ -103,7 +105,8 @@ function statusTone(value) {
 
 function summary(post) {
   const body = String(post.body || '').replace(/\s+/g, ' ').trim()
-  return body || (post.files || []).length + ' 个素材'
+  const content = body || (post.files || []).length + ' 个素材'
+  return `${content} · 创建人：${post.created_by || '历史未记录'}`
 }
 
 function shortDate(value) {

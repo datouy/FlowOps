@@ -5,7 +5,7 @@
         <h1>内容</h1>
       </div>
       <div class="page-heading__actions">
-        <el-button type="primary" @click="newPost">新建内容</el-button>
+        <el-button v-if="userStore.can('content.edit')" type="primary" @click="newPost">新建内容</el-button>
       </div>
     </header>
 
@@ -32,18 +32,21 @@ import PublishCalendar from './PublishCalendar.vue'
 import ContentPack from './ContentPack.vue'
 import AIContent from './AIContent.vue'
 import Review from './Review.vue'
+import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
 const activeView = ref('library')
 
-const views = [
-  { value: 'library', label: '内容库' },
-  { value: 'calendar', label: '日历' },
-  { value: 'pack', label: 'AI 内容包' },
-  { value: 'ai', label: 'AI 文案' },
-  { value: 'review', label: '审核' }
+const viewDefinitions = [
+  { value: 'library', label: '内容库', permissions: ['content.edit', 'publish.execute', 'review.decide'] },
+  { value: 'calendar', label: '日历', permissions: ['publish.execute'] },
+  { value: 'pack', label: 'AI 内容包', permissions: ['content.edit'] },
+  { value: 'ai', label: 'AI 文案', permissions: ['content.edit'] },
+  { value: 'review', label: '审核', permissions: ['review.decide'] }
 ]
+const views = computed(() => viewDefinitions.filter(item => userStore.canAny(...item.permissions)))
 
 const components = {
   library: ContentLibrary,
@@ -57,8 +60,22 @@ const components = {
 const currentComponent = computed(() => components[activeView.value] || ContentLibrary)
 const viewKey = computed(() => `${activeView.value}:${route.query.id || ''}`)
 
+function viewAllowed(value) {
+  if (value === 'compose') return userStore.can('content.edit')
+  const definition = viewDefinitions.find(item => item.value === value)
+  return Boolean(definition && userStore.canAny(...definition.permissions))
+}
+
+function defaultView() {
+  if (userStore.can('content.edit')) return 'library'
+  if (userStore.can('review.decide')) return 'review'
+  return views.value[0]?.value || 'library'
+}
+
 function normalizeView(value) {
-  return Object.prototype.hasOwnProperty.call(components, value) ? value : 'library'
+  return Object.prototype.hasOwnProperty.call(components, value) && viewAllowed(value)
+    ? value
+    : defaultView()
 }
 
 function setView(value) {
@@ -69,15 +86,20 @@ function setView(value) {
 }
 
 function newPost() {
+  if (!userStore.can('content.edit')) return
   router.push({ path: '/content', query: { view: 'compose' } })
 }
 
 watch(() => route.query.view, value => {
-  activeView.value = normalizeView(value)
+  const normalized = normalizeView(value)
+  activeView.value = normalized
+  if (value && value !== normalized) {
+    router.replace({ path: '/content', query: { ...route.query, view: normalized } })
+  }
 }, { immediate: true })
 
 onMounted(() => {
-  if (!route.query.view) router.replace({ path: '/content', query: { ...route.query, view: 'library' } })
+  if (!route.query.view) router.replace({ path: '/content', query: { ...route.query, view: defaultView() } })
 })
 </script>
 

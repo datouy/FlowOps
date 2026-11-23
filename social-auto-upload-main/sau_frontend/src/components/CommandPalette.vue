@@ -58,6 +58,7 @@ import { useRouter } from 'vue-router'
 import { ArrowRight, Search } from '@element-plus/icons-vue'
 import { http } from '@/utils/request'
 import { useAccountStore } from '@/stores/account'
+import { useUserStore } from '@/stores/user'
 
 const props = defineProps({
   modelValue: Boolean
@@ -65,6 +66,7 @@ const props = defineProps({
 const emit = defineEmits(['update:modelValue'])
 const router = useRouter()
 const accountStore = useAccountStore()
+const userStore = useUserStore()
 const inputRef = ref(null)
 const query = ref('')
 const loading = ref(false)
@@ -76,14 +78,15 @@ const conversations = ref([])
 let loadedAt = 0
 let previousOverflow = ''
 
-const actions = [
-  { key: 'action:new', kind: '操作', label: '新建内容', detail: '写一条内容并选择发布平台', search: '新建 发布 草稿 内容', to: '/content?view=compose' },
-  { key: 'action:today', kind: '操作', label: '今天', detail: '查看待处理事项', search: '今天 待办 审核 回复', to: '/today' },
-  { key: 'action:review', kind: '操作', label: '审核内容', detail: '处理等待审核的发布任务', search: '审核 通过 驳回', to: '/content?view=review' },
-  { key: 'action:calendar', kind: '操作', label: '发布日历', detail: '查看排期', search: '日历 排期 定时', to: '/content?view=calendar' },
-  { key: 'action:inbox', kind: '操作', label: '收件箱', detail: '回复私信和评论', search: '收件箱 私信 评论 回复', to: '/inbox?view=messages' },
-  { key: 'action:settings', kind: '操作', label: '设置', detail: '账号、素材和运行状态', search: '设置 账号 素材 运行状态', to: '/settings?view=accounts' }
+const actionDefinitions = [
+  { key: 'action:new', kind: '操作', label: '新建内容', detail: '写一条内容并选择发布平台', search: '新建 发布 草稿 内容', to: '/content?view=compose', permissions: ['content.edit'] },
+  { key: 'action:today', kind: '操作', label: '今天', detail: '查看待处理事项', search: '今天 待办 审核 回复', to: '/today', permissions: ['content.edit', 'review.decide', 'publish.execute', 'message.operate', 'account.manage', 'team.manage', 'audit.read'] },
+  { key: 'action:review', kind: '操作', label: '审核内容', detail: '处理等待审核的发布任务', search: '审核 通过 驳回', to: '/content?view=review', permissions: ['review.decide'] },
+  { key: 'action:calendar', kind: '操作', label: '发布日历', detail: '查看排期', search: '日历 排期 定时', to: '/content?view=calendar', permissions: ['publish.execute'] },
+  { key: 'action:inbox', kind: '操作', label: '收件箱', detail: '回复私信和评论', search: '收件箱 私信 评论 回复', to: '/inbox?view=messages', permissions: ['message.operate'] },
+  { key: 'action:settings', kind: '操作', label: '设置', detail: '账号、素材和运行状态', search: '设置 账号 素材 运行状态', to: '/settings', permissions: ['material.write', 'account.manage', 'team.manage', 'audit.read'] }
 ]
+const actions = computed(() => actionDefinitions.filter(item => userStore.canAny(...item.permissions)))
 
 const sourceItems = computed(() => [
   ...posts.value.map(post => ({
@@ -122,10 +125,10 @@ const sourceItems = computed(() => [
 
 const results = computed(() => {
   const keyword = query.value.trim().toLowerCase()
-  const source = [...actions, ...sourceItems.value]
+  const source = [...actions.value, ...sourceItems.value]
   if (!keyword) {
     return [
-      ...actions.slice(0, 4),
+      ...actions.value.slice(0, 4),
       ...posts.value.slice(0, 4).map(post => sourceItems.value.find(item => item.key === `post:${post.id}`)),
       ...accountStore.accounts.slice(0, 3).map(account => sourceItems.value.find(item => item.key === `account:${account.id}`))
     ].filter(Boolean)
@@ -140,10 +143,18 @@ async function loadSources(force = false) {
   loading.value = true
   error.value = ''
   const [postResult, materialResult, conversationResult, accountResult] = await Promise.allSettled([
-    http.get('/api/v2/posts', { limit: 50 }, { silent: true }),
-    http.get('/getFiles', { page: 1, page_size: 100 }, { silent: true }),
-    http.get('/dm/conversations', { page: 1, page_size: 50 }, { silent: true }),
-    accountStore.loadAccounts(true)
+    userStore.canAny('content.edit', 'review.decide', 'publish.execute')
+      ? http.get('/api/v2/posts', { limit: 50 }, { silent: true })
+      : Promise.resolve({ data: { items: [] } }),
+    userStore.canAny('content.edit', 'material.write', 'review.decide', 'publish.execute')
+      ? http.get('/getFiles', { page: 1, page_size: 100 }, { silent: true })
+      : Promise.resolve({ data: [] }),
+    userStore.can('message.operate')
+      ? http.get('/dm/conversations', { page: 1, page_size: 50 }, { silent: true })
+      : Promise.resolve({ data: [] }),
+    userStore.canAny('content.edit', 'publish.execute', 'message.operate', 'account.manage')
+      ? accountStore.loadAccounts(true)
+      : Promise.resolve()
   ])
   if (postResult.status === 'fulfilled') {
     const data = postResult.value.data || {}
