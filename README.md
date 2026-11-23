@@ -314,8 +314,10 @@ FlowOps/
 
 ## 🔒 安全说明
 
-- 后端和前端默认只监听 `127.0.0.1`，同局域网设备无法直接打开工作台。确需远程访问时，必须在 `.env` 中同时设置 `YUNCE_HOST`、`YUNCE_ALLOW_REMOTE=1` 和 `YUNCE_ACCESS_TOKEN`；缺少令牌时后端会拒绝启动。前端请求会自动携带 `X-YunCe-Token`。
-- 设置访问令牌后，在浏览器控制台执行 `localStorage.setItem('yunce_access_token', '你的令牌')` 即可让前端携带令牌；不要把令牌写进 `VITE_*` 变量，否则会被打包进前端代码。
+- 后端和前端默认只监听 `127.0.0.1`，同局域网设备无法直接打开工作台。确需远程访问时，必须在 `.env` 中设置 `YUNCE_HOST`、`YUNCE_ALLOW_REMOTE=1` 以及令牌或实名登录开关；缺少鉴权配置时后端会拒绝启动。
+- 企业协作建议设置 `YUNCE_PERSONAL_AUTH=1`，通过登录页使用个人账号；成员、角色和账号 scope 在「设置 → 团队」管理。禁用成员、重置密码或修改角色会撤销相关会话。全局 `YUNCE_ACCESS_TOKEN` 仅用于首次引导和应急，不应作为团队日常共享密码。
+- 个人会话默认 12 小时过期，数据库只保存会话令牌哈希；登录接口默认限制为每 5 分钟 10 次。不要把令牌写进 `VITE_*` 变量，否则会被打包进前端代码。
+- 管理员和成员可在「设置 → 安全」绑定标准 TOTP 双因素认证；密钥用 AES-256-GCM 加密落库，验证码不可重放。登录失败同时按用户名和 IP 持久锁定，管理员可在团队页重置 MFA 或解除封锁。
 - `.env`、数据库、Cookie、日志、上传素材、虚拟环境和前端构建产物均不进入仓库。
 - **账号登录态加密存储**：`cookiesFile/` 下的 Playwright `storage_state` 用 **AES-256-GCM** 加密落盘（文件后缀 `.enc`），不再有明文 cookie 文件。密文与账号绑定（AAD），跨账号搬运、篡改、用错主密钥都会被直接拒绝。
   - 主密钥来源优先级：`FLOWOPS_SECRET_KEY` 环境变量 → 系统凭据库（Windows DPAPI / macOS Keychain / Linux keyring）→ 本机降级文件 `db/.master_key`。
