@@ -6,12 +6,14 @@
 需要通过手机/另一台电脑访问时，显式设置 YUNCE_HOST=0.0.0.0，
 并建议同时设置 YUNCE_ACCESS_TOKEN。
 
-访问令牌分两级：
+访问令牌分三级：
 
 1. **全局令牌**（``YUNCE_ACCESS_TOKEN``）：一个人机共用的万能钥匙，
    等价于管理员权限；
 2. **用户令牌**（``YUNCE_TOKENS_FILE`` 指向的 JSON 文件）：带用户名、角色
    和账号范围（scope），用于多人协作。
+3. **实名会话**（``YUNCE_PERSONAL_AUTH=1``）：用户输入个人密码，服务端签发
+   可过期、可撤销的会话；数据库只保存会话令牌哈希。
 
 角色定义：
 
@@ -145,6 +147,10 @@ ACCESS_TOKEN = _env_text("YUNCE_ACCESS_TOKEN")
 # 用户令牌文件（JSON）。格式见 ``load_user_tokens``。
 TOKENS_FILE = _env_text("YUNCE_TOKENS_FILE")
 
+# 实名密码登录。关闭时保持旧令牌模式；开启后仍保留全局令牌和用户令牌，
+# 用于迁移期和应急引导管理员。
+PERSONAL_AUTH = _as_bool(_env_text("YUNCE_PERSONAL_AUTH"))
+
 REVIEW_MODE = _env_text("FLOWOPS_REVIEW_MODE", REVIEW_MODE_CUTTER_REQUIRED).lower()
 
 # 非回环地址必须显式打开远程访问，并且必须设置访问令牌。
@@ -159,6 +165,12 @@ PUBLIC_PATHS = frozenset({
     "/health/ready",
     "/favicon.ico",
     "/vite.svg",
+    "/api/v2/auth/config",
+    "/v2/auth/config",
+    "/api/v2/auth/login",
+    "/v2/auth/login",
+    "/api/v2/auth/mfa/verify",
+    "/v2/auth/mfa/verify",
     # Webhook 使用独立密钥/HMAC，不能要求外部系统持有后台管理 Token。
     "/dm/inbound",
 })
@@ -317,6 +329,16 @@ def authenticate(candidate: str) -> dict | None:
     candidate = str(candidate or "").strip()
     if not candidate:
         return None
+    if PERSONAL_AUTH:
+        try:
+            import user_auth
+
+            identity = user_auth.authenticate_session(candidate)
+            if identity is not None:
+                return identity
+        except Exception:
+            # An unreadable session store must not disable break-glass tokens.
+            pass
     if ACCESS_TOKEN and hmac.compare_digest(candidate, ACCESS_TOKEN):
         return {
             "user": "local-admin",
@@ -393,14 +415,14 @@ def scope_filter(identity: dict | None) -> list[str]:
 
 def token_ok(candidate: str) -> bool:
     """令牌是否有效（全局令牌或用户令牌都行）。"""
-    if not ACCESS_TOKEN and not TOKENS_FILE:
+    if not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH:
         return True
     return authenticate(candidate) is not None
 
 
 def access_allowed(method: str, path: str, headers, args) -> bool:
     """判断一次请求是否可以通过访问令牌校验。"""
-    if not ACCESS_TOKEN and not TOKENS_FILE:
+    if not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH:
         return True
     if str(method or "").upper() == "OPTIONS" or is_public_path(path):
         return True
@@ -413,18 +435,27 @@ def is_loopback_host(host: str) -> bool:
 
 def authorization_status() -> dict:
     """返回真实生效的令牌角色/权限状态，不把数据库占位表当成鉴权事实。"""
-    auth_configured = bool(ACCESS_TOKEN or TOKENS_FILE)
+    auth_configured = bool(ACCESS_TOKEN or TOKENS_FILE or PERSONAL_AUTH)
     token_error = ""
     try:
         validate_user_tokens()
     except TokenConfigError as exc:
         token_error = str(exc)
+    personal_auth = {}
+    if PERSONAL_AUTH:
+        try:
+            import user_auth
+
+            personal_auth = user_auth.auth_status()
+        except Exception as exc:
+            token_error = token_error or f"实名认证状态不可读：{exc}"
     return {
         "ready": bool(auth_configured and not token_error and REVIEW_MODE in REVIEW_MODES),
         "authConfigured": auth_configured,
         "tokenConfigValid": not bool(token_error),
         "tokenError": token_error,
         "source": "runtime-token-map",
+        "personalAuth": personal_auth,
         "roles": list(PRODUCTION_ROLES),
         "permissions": list(ALL_PERMISSIONS),
         "permissionsByRole": {
@@ -454,7 +485,16 @@ def validate_server_config() -> None:
             "如确需局域网访问，请显式开启远程访问并设置 YUNCE_ACCESS_TOKEN。"
         )
     if not ACCESS_TOKEN and not TOKENS_FILE:
-        raise RuntimeError(
-            "远程访问已开启，但未设置 YUNCE_ACCESS_TOKEN 或 YUNCE_TOKENS_FILE。"
-            "零鉴权的局域网工作台会暴露账号 Cookie 和私信，已拒绝启动。"
-        )
+        if not PERSONAL_AUTH:
+            raise RuntimeError(
+                "远程访问已开启，但未设置 YUNCE_ACCESS_TOKEN、YUNCE_TOKENS_FILE "
+                "或 YUNCE_PERSONAL_AUTH。"
+                "零鉴权的局域网工作台会暴露账号 Cookie 和私信，已拒绝启动。"
+            )
+        import user_auth
+
+        if user_auth.auth_status().get("activeAdmins", 0) < 1:
+            raise RuntimeError(
+                "远程访问仅启用了实名登录，但数据库中还没有有效管理员。"
+                "请先配置 YUNCE_ACCESS_TOKEN 完成首次引导，再移除应急令牌。"
+            )

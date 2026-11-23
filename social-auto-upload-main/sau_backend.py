@@ -143,6 +143,8 @@ import material_ops
 material_ops.register(app)
 import p0p1_ops
 p0p1_ops.register(app)
+import user_auth
+user_auth.register(app)
 import task_jobs
 import task_runners  # noqa: F401 - 注册异步任务执行器
 app.register_blueprint(task_jobs.bp)
@@ -205,6 +207,25 @@ def _guard_access_token():
         )
         if identity is not None:
             g.identity = identity
+            if identity.get("must_change_password"):
+                allowed_while_expired = {
+                    "/api/v2/session",
+                    "/v2/session",
+                    "/auth/check",
+                    "/api/v2/auth/logout",
+                    "/v2/auth/logout",
+                    "/api/v2/auth/password",
+                    "/v2/auth/password",
+                }
+                if access_scope.canonical_api_path(request.path) not in {
+                    access_scope.canonical_api_path(path)
+                    for path in allowed_while_expired
+                }:
+                    return jsonify({
+                        "code": 403,
+                        "msg": "首次登录必须修改密码",
+                        "data": {"passwordChangeRequired": True},
+                    }), 403
         allowed, retry_after = check_route_limit(request.method, request.path)
         if not allowed:
             response = jsonify({"code": 429, "msg": "请求过于频繁，请稍后重试", "data": None})
@@ -259,19 +280,25 @@ def session_identity():
     """当前访问身份：用户名、角色、权限点和账号范围。"""
     identity = getattr(g, 'identity', None)
     auth_required = bool(
-        runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE
+        runtime_config.ACCESS_TOKEN
+        or runtime_config.TOKENS_FILE
+        or runtime_config.PERSONAL_AUTH
     )
     if identity is None:
         return jsonify({
             'code': 200,
             'data': {
                 'user': 'local-admin',
+                'displayName': '本机管理员',
                 'role': runtime_config.ROLE_ADMIN,
                 'permissions': list(runtime_config.ALL_PERMISSIONS),
                 'scope': [],
                 'scopeMode': 'all',
                 'authRequired': auth_required,
                 'localMode': not auth_required,
+                'source': 'local' if not auth_required else '',
+                'mustChangePassword': False,
+                'mfaEnabled': False,
                 'reviewMode': runtime_config.REVIEW_MODE,
                 'roleRevocationPolicy': (
                     'new requests denied immediately; queued tasks continue '
@@ -284,6 +311,7 @@ def session_identity():
         'code': 200,
         'data': {
             'user': identity.get('user') or '',
+            'displayName': identity.get('display_name') or '',
             'role': identity.get('role') or '',
             'permissions': identity.get('permissions') or [],
             'scope': identity.get('scope') or [],
@@ -292,6 +320,9 @@ def session_identity():
             ),
             'authRequired': True,
             'localMode': False,
+            'source': identity.get('source') or '',
+            'mustChangePassword': bool(identity.get('must_change_password')),
+            'mfaEnabled': bool(identity.get('mfa_enabled')),
             'reviewMode': runtime_config.REVIEW_MODE,
             'roleRevocationPolicy': (
                 'new requests denied immediately; queued tasks continue '

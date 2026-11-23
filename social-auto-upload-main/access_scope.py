@@ -172,6 +172,18 @@ _ROUTE_POLICIES: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], 
         "/api/v2/session", "/auth/check", "/client-id",
         "/openapi.json", "/api/v2/runtime/status",
     ), ()),
+    # 未登录时也必须能读取登录配置和提交登录；退出和改密只要求有效身份。
+    (_ALL_METHODS, (
+        "/api/v2/auth/config", "/api/v2/auth/login",
+        "/api/v2/auth/mfa/verify",
+        "/api/v2/auth/logout", "/api/v2/auth/password",
+        "/api/v2/auth/mfa/setup", "/api/v2/auth/mfa/confirm",
+        "/api/v2/auth/mfa/disable",
+    ), ()),
+    (frozenset({"GET"}), ("/api/v2/auth/status",), (runtime_config.PERM_TEAM_MANAGE,)),
+
+    # 实名用户管理仅管理员。
+    (_ALL_METHODS, ("/api/v2/users",), (runtime_config.PERM_TEAM_MANAGE,)),
 
     # 账号管理面仅管理员；发布/私信所需的脱敏账号目录另行放行。
     (frozenset({"GET"}), ("/api/v2/audit/logs",), (runtime_config.PERM_AUDIT_READ,)),
@@ -292,7 +304,11 @@ def authorize_request(method: str, path: str) -> Any:
     permissions = permissions_for_request(method, path)
     if permissions == (UNMAPPED_PERMISSION,):
         identity = current_identity()
-        auth_required = bool(runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE)
+        auth_required = bool(
+            runtime_config.ACCESS_TOKEN
+            or runtime_config.TOKENS_FILE
+            or runtime_config.PERSONAL_AUTH
+        )
         if auth_required and identity is not None:
             return forbidden("该接口尚未登记权限策略，已按失败关闭拒绝")
         return None

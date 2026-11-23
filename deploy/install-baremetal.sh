@@ -65,6 +65,7 @@ YUNCE_HOST=0.0.0.0
 YUNCE_PORT=5409
 YUNCE_ALLOW_REMOTE=1
 YUNCE_ACCESS_TOKEN=$TOKEN
+YUNCE_PERSONAL_AUTH=1
 YUNCE_CORS_ORIGINS=
 YUNCE_LOG_LEVEL=INFO
 
@@ -76,7 +77,7 @@ WB_REALM=cn
 OPS_WEBHOOK_URL=
 OPS_WEBHOOK_TYPE=auto
 EOF
-  echo "   访问令牌（浏览器 localStorage 的 yunce_access_token 用它）：$TOKEN"
+  echo "   首次引导令牌（登录页选择“使用访问令牌”后创建个人管理员）：$TOKEN"
 else
   echo "   $APP_DIR/.env 已存在，保持不变"
 fi

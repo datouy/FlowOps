@@ -4,13 +4,17 @@ import { computed, ref } from 'vue'
 export const useUserStore = defineStore('user', () => {
   const session = ref({
     user: '',
+    displayName: '',
     role: '',
     permissions: [],
     scope: [],
     scopeMode: 'none',
     authRequired: true,
     localMode: false,
-    reviewMode: 'cutter_required'
+    reviewMode: 'cutter_required',
+    source: '',
+    mustChangePassword: false,
+    mfaEnabled: false
   })
 
   const loaded = ref(false)
@@ -32,13 +36,17 @@ export const useUserStore = defineStore('user', () => {
   const reset = () => {
     session.value = {
       user: '',
+      displayName: '',
       role: '',
       permissions: [],
       scope: [],
       scopeMode: 'none',
       authRequired: true,
       localMode: false,
-      reviewMode: 'cutter_required'
+      reviewMode: 'cutter_required',
+      source: '',
+      mustChangePassword: false,
+      mfaEnabled: false
     }
     loaded.value = false
   }

@@ -105,7 +105,8 @@ vi .env.deploy
 | --- | --- | --- |
 | `YUNCE_HOST` | `0.0.0.0` | 容器里必须监听全网卡，否则端口映射进不来 |
 | `YUNCE_ALLOW_REMOTE` | `1` | 少了它后端拒绝启动 |
-| `YUNCE_ACCESS_TOKEN` | `openssl rand -hex 24` 的输出 | 少了它后端拒绝启动 |
+| `YUNCE_ACCESS_TOKEN` | `openssl rand -hex 24` 的输出 | 首次引导和应急管理员令牌，日常用户使用个人会话 |
+| `YUNCE_PERSONAL_AUTH` | `1` | 启用个人账号登录、会话过期、撤权和团队管理 |
 | `YUNCE_CORS_ORIGINS` | 留空 | 前后端同源时不需要跨域 |
 | `WB_API_KEY` / `WB_BASE_URL` / `WB_MODEL` | 你的 AI 接口 | AI 文案、内容包用；不填就只是这些功能不可用 |
 
@@ -226,22 +227,22 @@ certbot --nginx -d ops.example.com       # 自动改写 conf 里的 443 证书�
 
 ---
 
-## 7. 首次登录（没有登录页，令牌靠 localStorage）
+## 7. 首次登录与团队成员
 
-后端校验方式：请求头 `X-YunCe-Token: <token>`，或 `?token=<token>`（源码 `runtime_config.py`）。前端从 `localStorage` 的 `yunce_access_token` 取值（源码 `sau_frontend/src/config.js`），**项目里没有登录界面**，所以要手动写一次：
+1. 浏览器打开 `https://你的域名/`。
+2. 首次部署还没有个人账号时，在登录页选择“使用访问令牌”，填入 `.env.deploy` 中的 `YUNCE_ACCESS_TOKEN`。
+3. 进入「设置 → 团队」，创建第一个实名管理员，为其配置个人密码。首个管理员建议取消“首次登录必须修改密码”或按企业流程立即改密。
+4. 退出令牌登录，改用个人账号登录。之后成员都用独立账号，不再共享管理员令牌。
+5. 人员离岗时在「设置 → 团队」禁用账号，现有会话会立即失效；重置密码或修改角色也会撤销相关会话。
 
-1. 浏览器打开 `https://你的域名/`
-2. F12 → Console，粘贴：
+个人会话令牌只保存在浏览器 `localStorage`，服务端数据库只保存哈希。默认 12 小时过期，登录接口默认 10 次/5 分钟限流。`YUNCE_ACCESS_TOKEN` 应作为应急引导入口离线保管，不应成为日常共享密码。
 
-```js
-localStorage.setItem('yunce_access_token', '把 /root/flowOps/deploy/.env.deploy 里的 YUNCE_ACCESS_TOKEN 粘这里')
-location.reload()
-```
+成员登录后可在「设置 → 安全」绑定 TOTP 认证器。管理员在「设置 → 团队」可重置丢失认证器的成员 MFA、解除持久登录锁定。至少一名管理员必须保留可用的认证器，或将全局引导令牌离线保管作为灾备入口。
 
-3. 页面正常出数据即可。换浏览器/清缓存后要重新写一次。
+> 不要用 Nginx 统一追加 `X-YunCe-Token` 头来做“自动登录”——那等于对所有人取消鉴权。
+> 想用 HTTP Basic Auth 外加一层：Nginx 加 `auth_basic` 即可，和内置鉴权不冲突。
 
-> 别用 Nginx 统一追加 `X-YunCe-Token` 头来做"自动登录"——那等于对所有人取消鉴权。
-> 想用 HTTP Basic Auth 外加一层：Nginx 加 `auth_basic` 即可，和令牌不冲突。
+管理员可从 `GET /api/metrics` 获取 Prometheus 文本指标；该接口需要 `team.manage` 权限。指标和告警阈值见 [`../docs/operations-runbook.md`](../docs/operations-runbook.md)。
 
 接着在「账号管理」里逐个平台**扫码登录**：二维码由服务器上的 Chromium 打开平台页面截取，经 SSE 推给前端。所以：
 

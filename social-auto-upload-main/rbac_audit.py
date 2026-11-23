@@ -9,7 +9,6 @@ migrations/00X.sql：幂等 SQL 文件 + --dry-run 预演。
 from __future__ import annotations
 
 import functools
-import hashlib
 import os
 from pathlib import Path
 
@@ -155,4 +154,13 @@ def run_migrations(dry_run: bool = False) -> list[dict]:
 
 
 def hash_password(raw: str) -> str:
-    return hashlib.sha256(f"yunce:{raw}".encode()).hexdigest()
+    """兼容旧调用名，实际使用 named-user 模块的版本化慢哈希。"""
+    from user_auth import _hash_password
+
+    return _hash_password(raw)
+
+
+def verify_password(raw: str, encoded: str) -> bool:
+    from user_auth import verify_password as _verify_password
+
+    return _verify_password(raw, encoded)

@@ -74,6 +74,13 @@
             <template #title>设置</template>
           </el-menu-item>
         </el-menu>
+
+        <div v-if="!userStore.session.localMode" class="sidebar-session">
+          <button type="button" :title="isCollapse ? '退出登录' : ''" @click="logout">
+            <el-icon><SwitchButton /></el-icon>
+            <span v-show="!isCollapse || isMobile">退出登录</span>
+          </button>
+        </div>
       </el-aside>
 
       <el-container class="content-shell">
@@ -117,21 +124,120 @@
       <div class="access-mark" aria-hidden="true">云</div>
       <div>
         <strong>云策内容运营台</strong>
-        <p>输入管理员提供的访问令牌，或直接打开邀请链接。</p>
+        <p v-if="mfaRequired">请输入认证器中的 6 位动态验证码。</p>
+        <p v-else-if="loginMode === 'password'">使用管理员分配的个人账号登录。</p>
+        <p v-else>输入管理员提供的访问令牌，或直接打开邀请链接。</p>
       </div>
     </div>
-    <label class="access-label" for="access-token">访问令牌</label>
+    <template v-if="mfaRequired">
+      <div class="mfa-account">{{ mfaUserLabel }}</div>
+      <label class="access-label" for="mfa-code">动态验证码</label>
+      <el-input
+        id="mfa-code"
+        v-model="mfaCode"
+        inputmode="numeric"
+        maxlength="6"
+        autocomplete="one-time-code"
+        placeholder="6 位数字"
+        @keyup.enter="submitMfaLogin"
+      />
+    </template>
+    <template v-else-if="loginMode === 'password'">
+      <label class="access-label" for="login-username">用户名</label>
+      <el-input
+        id="login-username"
+        v-model="usernameInput"
+        autocomplete="username"
+        clearable
+        placeholder="用户名或员工账号"
+      />
+      <label class="access-label" for="login-password">密码</label>
+      <el-input
+        id="login-password"
+        v-model="passwordInput"
+        type="password"
+        show-password
+        autocomplete="current-password"
+        placeholder="个人密码"
+        @keyup.enter="submitPasswordLogin"
+      />
+    </template>
+    <template v-else>
+      <label class="access-label" for="access-token">访问令牌</label>
+      <el-input
+        id="access-token"
+        v-model="tokenInput"
+        type="password"
+        show-password
+        clearable
+        placeholder="访问令牌"
+        @keyup.enter="submitToken"
+      />
+    </template>
+    <template #footer>
+      <div class="access-actions">
+        <el-button
+          v-if="mfaRequired"
+          text
+          @click="backToPasswordLogin"
+        >
+          返回账号登录
+        </el-button>
+        <el-button
+          v-else-if="authConfig.personalAuthEnabled && authConfig.tokenFallbackEnabled"
+          text
+          @click="toggleLoginMode"
+        >
+          {{ loginMode === 'password' ? '使用访问令牌' : '使用个人账号' }}
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="checking"
+          @click="mfaRequired ? submitMfaLogin() : loginMode === 'password' ? submitPasswordLogin() : submitToken()"
+        >
+          {{ mfaRequired ? '验证并进入' : '进入工作台' }}
+        </el-button>
+      </div>
+    </template>
+  </el-dialog>
+
+  <el-dialog
+    v-model="passwordDialog"
+    title="设置新密码"
+    width="min(440px, calc(100vw - 32px))"
+    :show-close="false"
+    :close-on-click-modal="false"
+    :close-on-press-escape="false"
+  >
+    <p class="password-help">首次登录或管理员重置密码后，需要先设置新密码。修改后所有会话都会失效。</p>
+    <label class="access-label" for="current-password">当前密码</label>
     <el-input
-      id="access-token"
-      v-model="tokenInput"
+      id="current-password"
+      v-model="passwordInput"
       type="password"
       show-password
-      clearable
-      placeholder="访问令牌"
-      @keyup.enter="submitToken"
+      autocomplete="current-password"
+    />
+    <label class="access-label" for="new-password">新密码</label>
+    <el-input
+      id="new-password"
+      v-model="newPasswordInput"
+      type="password"
+      show-password
+      autocomplete="new-password"
+      placeholder="至少 12 个字符"
+    />
+    <label class="access-label" for="confirm-password">确认新密码</label>
+    <el-input
+      id="confirm-password"
+      v-model="confirmPasswordInput"
+      type="password"
+      show-password
+      autocomplete="new-password"
+      @keyup.enter="submitPasswordChange"
     />
     <template #footer>
-      <el-button type="primary" :loading="checking" @click="submitToken">进入工作台</el-button>
+      <el-button type="primary" :loading="checking" @click="submitPasswordChange">保存并重新登录</el-button>
     </template>
   </el-dialog>
 </template>
@@ -141,6 +247,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAccessToken, setAccessToken } from '@/config'
 import { http } from '@/utils/request'
+import { userApi } from '@/api/user'
 import { useUserStore } from '@/stores/user'
 import {
   ChatDotRound,
@@ -153,6 +260,7 @@ import {
   Plus,
   Search,
   Setting,
+  SwitchButton,
 } from '@element-plus/icons-vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 
@@ -166,6 +274,21 @@ const isMobile = ref(typeof window !== 'undefined' && window.matchMedia('(max-wi
 const accessReady = ref(false)
 const accessDialog = ref(false)
 const tokenInput = ref(getAccessToken())
+const usernameInput = ref('')
+const passwordInput = ref('')
+const mfaRequired = ref(false)
+const mfaChallengeToken = ref('')
+const mfaCode = ref('')
+const mfaUserLabel = ref('')
+const newPasswordInput = ref('')
+const confirmPasswordInput = ref('')
+const passwordDialog = ref(false)
+const loginMode = ref('password')
+const authConfig = ref({
+  personalAuthEnabled: false,
+  tokenFallbackEnabled: true,
+  passwordMinLength: 12
+})
 const checking = ref(false)
 let mediaQuery = null
 let syncViewport = null
@@ -196,7 +319,7 @@ const roleNames = {
 const identityLabel = computed(() => {
   const role = userStore.session.role
   const roleName = roleNames[role] || role || '未登录'
-  const user = userStore.session.user
+  const user = userStore.session.displayName || userStore.session.user
   if (userStore.session.localMode) return `${roleName} · 本机模式`
   return user ? `${user} · ${roleName}` : roleName
 })
@@ -210,16 +333,98 @@ async function verifyAccess() {
   try {
     await http.get('/auth/check', null, { silent: true })
     const response = await http.get('/api/v2/session', null, { silent: true })
-    userStore.setSession(response.data || {})
+    const identity = response.data || {}
+    userStore.setSession(identity)
+    if (identity.mustChangePassword) {
+      accessReady.value = false
+      accessDialog.value = false
+      passwordDialog.value = true
+      return true
+    }
     accessReady.value = true
     accessDialog.value = false
+    passwordDialog.value = false
     return true
   } catch {
     userStore.reset()
     accessReady.value = false
     accessDialog.value = true
+    mfaRequired.value = false
+    mfaChallengeToken.value = ''
+    mfaCode.value = ''
     return false
   }
+}
+
+async function loadAuthConfig() {
+  try {
+    const response = await userApi.getAuthConfig()
+    authConfig.value = { ...authConfig.value, ...(response.data || {}) }
+  } catch {
+    authConfig.value = { ...authConfig.value, personalAuthEnabled: false, tokenFallbackEnabled: true }
+  }
+  loginMode.value = authConfig.value.personalAuthEnabled ? 'password' : 'token'
+}
+
+function toggleLoginMode() {
+  loginMode.value = loginMode.value === 'password' ? 'token' : 'password'
+}
+
+async function submitPasswordLogin() {
+  const username = String(usernameInput.value || '').trim()
+  const password = String(passwordInput.value || '')
+  if (!username || !password || checking.value) return
+  checking.value = true
+  try {
+    const response = await userApi.login({ username, password })
+    if (response.data?.mfaRequired) {
+      mfaRequired.value = true
+      mfaChallengeToken.value = response.data.challengeToken || ''
+      mfaUserLabel.value = response.data.user || username
+      mfaCode.value = ''
+      passwordInput.value = ''
+      return
+    }
+    setAccessToken(response.data?.token || '')
+    tokenInput.value = response.data?.token || ''
+    const ok = await verifyAccess()
+    if (!ok) ElMessage.error('登录状态校验失败')
+  } catch {
+    setAccessToken('')
+  } finally {
+    checking.value = false
+  }
+}
+
+async function submitMfaLogin() {
+  const code = String(mfaCode.value || '').replace(/\s+/g, '')
+  if (!/^\d{6}$/.test(code) || checking.value) {
+    if (!checking.value) ElMessage.error('请输入 6 位动态验证码')
+    return
+  }
+  checking.value = true
+  try {
+    const response = await userApi.verifyMfa({
+      challengeToken: mfaChallengeToken.value,
+      code
+    })
+    setAccessToken(response.data?.token || '')
+    mfaRequired.value = false
+    mfaChallengeToken.value = ''
+    mfaCode.value = ''
+    const ok = await verifyAccess()
+    if (!ok) ElMessage.error('双因素登录状态校验失败')
+  } catch {
+    mfaCode.value = ''
+  } finally {
+    checking.value = false
+  }
+}
+
+function backToPasswordLogin() {
+  mfaRequired.value = false
+  mfaChallengeToken.value = ''
+  mfaCode.value = ''
 }
 
 async function submitToken() {
@@ -233,6 +438,67 @@ async function submitToken() {
   } finally {
     checking.value = false
   }
+}
+
+async function submitPasswordChange() {
+  const newPassword = String(newPasswordInput.value || '')
+  const minimum = Number(authConfig.value.passwordMinLength || 12)
+  if (newPassword.length < minimum) {
+    ElMessage.error(`新密码至少需要 ${minimum} 个字符`)
+    return
+  }
+  if (newPassword !== String(confirmPasswordInput.value || '')) {
+    ElMessage.error('两次输入的新密码不一致')
+    return
+  }
+  checking.value = true
+  try {
+    await userApi.changePassword({
+      currentPassword: String(passwordInput.value || ''),
+      newPassword
+    })
+    setAccessToken('')
+    tokenInput.value = ''
+    passwordInput.value = ''
+    newPasswordInput.value = ''
+    confirmPasswordInput.value = ''
+    userStore.reset()
+    passwordDialog.value = false
+    accessReady.value = false
+    accessDialog.value = true
+    loginMode.value = 'password'
+    ElMessage.success('密码已修改，请重新登录')
+  } finally {
+    checking.value = false
+  }
+}
+
+async function logout() {
+  try {
+    await userApi.logout()
+  } catch {
+    // Local/expired sessions can already be invalid; clear the client either way.
+  }
+  setAccessToken('')
+  tokenInput.value = ''
+  passwordInput.value = ''
+  userStore.reset()
+  accessReady.value = false
+  accessDialog.value = true
+  mfaRequired.value = false
+  mfaChallengeToken.value = ''
+  mfaCode.value = ''
+  loginMode.value = authConfig.value.personalAuthEnabled ? 'password' : 'token'
+}
+
+function handleAuthExpired() {
+  setAccessToken('')
+  userStore.reset()
+  accessReady.value = false
+  accessDialog.value = true
+  mfaRequired.value = false
+  mfaChallengeToken.value = ''
+  mfaCode.value = ''
 }
 
 const toggleSidebar = () => {
@@ -256,8 +522,9 @@ function handleGlobalKeydown(event) {
 }
 
 onMounted(() => {
-  verifyAccess()
+  loadAuthConfig().finally(() => verifyAccess())
   window.addEventListener('keydown', handleGlobalKeydown)
+  window.addEventListener('yunce:auth-expired', handleAuthExpired)
   mediaQuery = window.matchMedia('(max-width: 900px)')
   syncViewport = (event) => {
     isMobile.value = event.matches
@@ -269,6 +536,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   mediaQuery?.removeEventListener('change', syncViewport)
   window.removeEventListener('keydown', handleGlobalKeydown)
+  window.removeEventListener('yunce:auth-expired', handleAuthExpired)
 })
 </script>
 
@@ -400,6 +668,39 @@ body,
   flex: none;
   padding: 8px 12px 16px;
   border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.sidebar-session {
+  flex: none;
+  padding: 0 12px 14px;
+}
+
+.sidebar-session button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #8f968f;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.sidebar-session button:hover {
+  color: #eef0ec;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar.is-collapsed .sidebar-session {
+  padding-inline: 8px;
+}
+
+.sidebar.is-collapsed .sidebar-session button {
+  justify-content: center;
+  padding: 0;
 }
 
 .new-content-action {
@@ -600,6 +901,33 @@ body,
   color: $text-regular;
   font-size: 13px;
   font-weight: 500;
+}
+
+.access-label:not(:first-of-type) {
+  margin-top: 16px;
+}
+
+.access-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mfa-account {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  color: $text-regular;
+  border-radius: 8px;
+  background: $bg-color-raised;
+  font-size: 13px;
+}
+
+.password-help {
+  margin: 0 0 18px;
+  color: $text-secondary;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 @media (max-width: 1100px) {

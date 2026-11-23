@@ -43,12 +43,23 @@ else
 fi
 
 # 4. 令牌鉴权：带令牌必须 200，不带必须 401
+code=$(curl -s -o /tmp/yunce_auth.$$ -w '%{http_code}' --max-time 10 "$BASE/api/v2/auth/config")
+if [[ "$code" == "200" ]] && grep -q '"personalAuthEnabled"' /tmp/yunce_auth.$$ && grep -q '"mfaAvailable"' /tmp/yunce_auth.$$; then
+  pass "/api/v2/auth/config" "200 登录配置可读"
+else
+  fail "/api/v2/auth/config" "HTTP $code（登录配置不可用）"
+fi
+rm -f /tmp/yunce_auth.$$
+
 if [[ -n "$TOKEN" ]]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-YunCe-Token: $TOKEN" "$BASE/todo/summary")
   [[ "$code" == "200" ]] && pass "带令牌访问业务接口" "200" || fail "带令牌访问业务接口" "HTTP $code"
 
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE/todo/summary")
   [[ "$code" == "401" ]] && pass "无令牌访问业务接口" "401 已拦截" || fail "无令牌访问业务接口" "HTTP $code（应该是 401）"
+
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "X-YunCe-Token: $TOKEN" "$BASE/api/metrics")
+  [[ "$code" == "200" ]] && pass "Prometheus 指标" "200" || fail "Prometheus 指标" "HTTP $code"
 else
   echo "   [跳过] 没给 TOKEN，跳过鉴权校验"
 fi

@@ -63,14 +63,19 @@ def request_key() -> str:
         user = str(identity.get("user") or "").strip()
         if user:
             return "user:" + user
+    return "ip:" + client_ip()
+
+
+def client_ip() -> str:
+    """Return a proxy header only when the direct peer is a configured proxy."""
     remote = str(request.remote_addr or "unknown").strip()
     if _trusted_proxy(remote):
         forwarded = _validated_header_ip(request.headers.get("X-Real-IP") or "")
         if not forwarded:
             forwarded = _validated_header_ip(request.headers.get("X-Forwarded-For") or "")
         if forwarded:
-            return "ip:" + forwarded
-    return "ip:" + (remote or "unknown")
+            return forwarded
+    return remote or "unknown"
 
 
 def _cleanup_locked(now: float) -> None:
@@ -82,12 +87,18 @@ def _cleanup_locked(now: float) -> None:
         _BUCKETS.pop(key, None)
 
 
-def allow(category: str, *, limit: int, window_seconds: int) -> tuple[bool, int]:
+def allow(
+    category: str,
+    *,
+    limit: int,
+    window_seconds: int,
+    key: str = "",
+) -> tuple[bool, int]:
     """固定窗口限流；返回 ``(是否允许, 建议等待秒数)``。"""
     if limit <= 0 or window_seconds <= 0:
         return True, 0
     now = time.monotonic()
-    key = (str(category), request_key())
+    bucket_key = (str(category), str(key or request_key()))
     cutoff = now - window_seconds
     global _ALLOW_CALLS, _LAST_FULL_SWEEP
     with _LOCK:
@@ -101,9 +112,9 @@ def allow(category: str, *, limit: int, window_seconds: int) -> tuple[bool, int]
             _cleanup_locked(now)
             if full_sweep_due:
                 _LAST_FULL_SWEEP = now
-        if key not in _BUCKETS and len(_BUCKETS) >= max_buckets:
+        if bucket_key not in _BUCKETS and len(_BUCKETS) >= max_buckets:
             return False, 60
-        bucket = _BUCKETS[key]
+        bucket = _BUCKETS[bucket_key]
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
         if len(bucket) >= limit:

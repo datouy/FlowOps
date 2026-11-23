@@ -32,10 +32,12 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataAnalysis, InfoFilled, Picture, User } from '@element-plus/icons-vue'
+import { DataAnalysis, InfoFilled, Lock, Picture, User, UserFilled } from '@element-plus/icons-vue'
 import AccountManagement from './AccountManagement.vue'
 import MaterialManagement from './MaterialManagement.vue'
 import OpsConsole from './OpsConsole.vue'
+import UserManagement from './UserManagement.vue'
+import AccountSecurity from './AccountSecurity.vue'
 import About from './About.vue'
 import { useUserStore } from '@/stores/user'
 
@@ -44,12 +46,21 @@ const router = useRouter()
 const userStore = useUserStore()
 const itemDefinitions = [
   { value: 'accounts', label: '账号', icon: User, permissions: ['account.manage'] },
+  { value: 'team', label: '团队', icon: UserFilled, permissions: ['team.manage'] },
+  { value: 'security', label: '安全', icon: Lock, permissions: [] },
   { value: 'materials', label: '素材', icon: Picture, permissions: ['material.write'] },
   { value: 'diagnostics', label: '运行状态', icon: DataAnalysis, permissions: ['team.manage', 'audit.read'] },
   { value: 'about', label: '关于', icon: InfoFilled, permissions: [] }
 ]
 const items = computed(() => itemDefinitions.filter(item => !item.permissions.length || userStore.canAny(...item.permissions)))
-const components = { accounts: AccountManagement, materials: MaterialManagement, diagnostics: OpsConsole, about: About }
+const components = {
+  accounts: AccountManagement,
+  team: UserManagement,
+  security: AccountSecurity,
+  materials: MaterialManagement,
+  diagnostics: OpsConsole,
+  about: About
+}
 const activeView = ref('about')
 const currentComponent = computed(() => components[activeView.value] || AccountManagement)
 

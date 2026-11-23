@@ -130,6 +130,77 @@ def build_spec(server_url: str) -> dict:
             "required": ["text"],
             "properties": {"text": {"type": "string", "maxLength": 2000}},
         },
+        "AuthLoginInput": {
+            "type": "object",
+            "required": ["username", "password"],
+            "properties": {
+                "username": {"type": "string", "minLength": 3, "maxLength": 64},
+                "password": {"type": "string", "minLength": 12, "maxLength": 256},
+            },
+        },
+        "PasswordChangeInput": {
+            "type": "object",
+            "required": ["currentPassword", "newPassword"],
+            "properties": {
+                "currentPassword": {"type": "string"},
+                "newPassword": {"type": "string", "minLength": 12, "maxLength": 256},
+            },
+        },
+        "PasswordResetInput": {
+            "type": "object",
+            "required": ["password"],
+            "properties": {
+                "password": {"type": "string", "minLength": 12, "maxLength": 256},
+                "mustChangePassword": {"type": "boolean", "default": True},
+            },
+        },
+        "MfaVerifyInput": {
+            "type": "object",
+            "required": ["challengeToken", "code"],
+            "properties": {
+                "challengeToken": {"type": "string"},
+                "code": {"type": "string", "pattern": "^[0-9]{6}$"},
+            },
+        },
+        "MfaSetupInput": {
+            "type": "object",
+            "required": ["currentPassword"],
+            "properties": {"currentPassword": {"type": "string"}},
+        },
+        "MfaConfirmInput": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
+        },
+        "MfaDisableInput": {
+            "type": "object",
+            "required": ["currentPassword", "code"],
+            "properties": {
+                "currentPassword": {"type": "string"},
+                "code": {"type": "string", "pattern": "^[0-9]{6}$"},
+            },
+        },
+        "NamedUserInput": {
+            "type": "object",
+            "required": ["username", "password", "role", "scope"],
+            "properties": {
+                "username": {"type": "string", "minLength": 3, "maxLength": 64},
+                "displayName": {"type": "string", "maxLength": 100},
+                "password": {"type": "string", "minLength": 12, "maxLength": 256},
+                "role": {"enum": ["cutter", "reviewer", "operator", "admin"]},
+                "scope": {"type": "array", "items": {"type": "string"}},
+                "mustChangePassword": {"type": "boolean", "default": True},
+            },
+        },
+        "NamedUserPatch": {
+            "type": "object",
+            "properties": {
+                "displayName": {"type": "string", "maxLength": 100},
+                "role": {"enum": ["cutter", "reviewer", "operator", "admin"]},
+                "scope": {"type": "array", "items": {"type": "string"}},
+                "disabled": {"type": "boolean"},
+            },
+        },
     }
     common_errors = {
         "400": _json_response("ErrorEnvelope", "Invalid request"),
@@ -213,6 +284,146 @@ def build_spec(server_url: str) -> dict:
                 "responses": {"200": _json_response("HealthEnvelope"), **common_errors},
             },
         },
+        "/api/v2/auth/config": {
+            "get": {
+                "operationId": "getAuthConfig",
+                "summary": "Read public login capabilities and password policy",
+                "security": [],
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/login": {
+            "post": {
+                "operationId": "loginNamedUser",
+                "summary": "Create a revocable named-user session",
+                "security": [],
+                "requestBody": _request_body("AuthLoginInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/logout": {
+            "post": {
+                "operationId": "logoutNamedUser",
+                "summary": "Revoke the current named-user session",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/mfa/verify": {
+            "post": {
+                "operationId": "verifyMfaLogin",
+                "summary": "Exchange a password challenge and TOTP code for a session",
+                "security": [],
+                "requestBody": _request_body("MfaVerifyInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/mfa/setup": {
+            "post": {
+                "operationId": "setupMfa",
+                "summary": "Generate an encrypted pending TOTP secret",
+                "requestBody": _request_body("MfaSetupInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/mfa/confirm": {
+            "post": {
+                "operationId": "confirmMfa",
+                "summary": "Confirm TOTP enrollment and revoke other sessions",
+                "requestBody": _request_body("MfaConfirmInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/mfa/disable": {
+            "post": {
+                "operationId": "disableMfa",
+                "summary": "Disable TOTP after password and code verification",
+                "requestBody": _request_body("MfaDisableInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/password": {
+            "post": {
+                "operationId": "changeOwnPassword",
+                "summary": "Change the current password and revoke all sessions",
+                "requestBody": _request_body("PasswordChangeInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/auth/status": {
+            "get": {
+                "operationId": "getAuthStatus",
+                "summary": "Read named-user and session totals",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users": {
+            "get": {
+                "operationId": "listNamedUsers",
+                "summary": "List named users and account scopes",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+            "post": {
+                "operationId": "createNamedUser",
+                "summary": "Create a named user with a production role",
+                "requestBody": _request_body("NamedUserInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}": {
+            "parameters": [_path_id()],
+            "patch": {
+                "operationId": "updateNamedUser",
+                "summary": "Change role, scope, display name or disabled state",
+                "requestBody": _request_body("NamedUserPatch"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}/password": {
+            "parameters": [_path_id()],
+            "post": {
+                "operationId": "resetNamedUserPassword",
+                "summary": "Reset a password and revoke all sessions",
+                "requestBody": _request_body("PasswordResetInput"),
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}/revoke-sessions": {
+            "parameters": [_path_id()],
+            "post": {
+                "operationId": "revokeNamedUserSessions",
+                "summary": "Force a named user offline",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}/mfa-reset": {
+            "parameters": [_path_id()],
+            "post": {
+                "operationId": "resetNamedUserMfa",
+                "summary": "Reset a user's MFA and revoke sessions",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}/unlock-login": {
+            "parameters": [_path_id()],
+            "post": {
+                "operationId": "unlockNamedUserLogin",
+                "summary": "Clear a user's persistent password login lock",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/metrics": {
+            "get": {
+                "operationId": "getPrometheusMetrics",
+                "summary": "Read Prometheus text metrics",
+                "responses": {
+                    "200": {
+                        "description": "Prometheus text exposition",
+                        "content": {"text/plain": {"schema": {"type": "string"}}},
+                    },
+                    **common_errors,
+                },
+            },
+        },
         "/api/v2/roi/summary": {
             "get": {
                 "operationId": "getLeadSummary",
@@ -239,7 +450,8 @@ def build_spec(server_url: str) -> dict:
         "servers": [{"url": str(server_url or "http://127.0.0.1:5409").rstrip("/")}],
         "security": [{"YunCeToken": []}],
         "tags": [
-            {"name": "Content"}, {"name": "Inbox"}, {"name": "Insights"}, {"name": "System"},
+            {"name": "Content"}, {"name": "Inbox"}, {"name": "Insights"},
+            {"name": "Auth"}, {"name": "System"},
         ],
         "paths": paths,
         "components": {

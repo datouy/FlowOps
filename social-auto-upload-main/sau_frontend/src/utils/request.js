@@ -50,6 +50,15 @@ request.interceptors.response.use(
       return Promise.reject(error)
     }
 
+    if (
+      error.response?.status === 401 &&
+      !String(error.config?.url || '').includes('/auth/login') &&
+      !String(error.config?.url || '').includes('/auth/mfa/verify') &&
+      typeof window !== 'undefined'
+    ) {
+      window.dispatchEvent(new CustomEvent('yunce:auth-expired'))
+    }
+
     const serverMessage = error.response?.data?.msg
     if (serverMessage) {
       ElMessage.error(serverMessage)
@@ -96,6 +105,10 @@ export const http = {
   
   put(url, data, config = {}) {
     return request.put(url, data, config)
+  },
+
+  patch(url, data, config = {}) {
+    return request.patch(url, data, config)
   },
   
   delete(url, params, config = {}) {
