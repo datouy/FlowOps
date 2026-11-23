@@ -47,6 +47,12 @@ chmod 600 "$TARGET"
 
 echo "已生成：$TARGET（$(du -h "$TARGET" | cut -f1)）"
 
+VERIFY_BACKUP="${VERIFY_BACKUP:-1}"
+if [[ "$VERIFY_BACKUP" != "0" && -f ./restore_verify.py ]] && command -v python3 >/dev/null 2>&1; then
+  echo "正在验证备份可恢复性..."
+  python3 ./restore_verify.py "$TARGET"
+fi
+
 find "$OUT_DIR" -name 'yunce-*.tar.gz' -type f -mtime "+$KEEP_DAYS" -print -delete \
   | sed 's/^/已清理过期备份：/'
 
