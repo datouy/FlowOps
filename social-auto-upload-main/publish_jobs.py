@@ -344,6 +344,11 @@ def init_db():
             lease_until DATETIME,
             heartbeat_at DATETIME,
             lease_token TEXT DEFAULT '',
+            review_required INTEGER DEFAULT 0,
+            review_note TEXT DEFAULT '',
+            reviewed_at DATETIME,
+            reviewed_by TEXT NOT NULL DEFAULT '',
+            review_decision TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
         )''')
@@ -447,6 +452,13 @@ def init_db():
         # 建表放在这里是为了跟主库同一个文件——事件和任务数据同生共死。
         job_events.ensure_schema(c)
         _ensure_columns(c, 'publish_records', (('result', "TEXT DEFAULT ''"),))
+        _ensure_columns(c, 'jobs', (
+            ('review_required', "INTEGER DEFAULT 0"),
+            ('review_note', "TEXT DEFAULT ''"),
+            ('reviewed_at', "DATETIME"),
+            ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
+            ('review_decision', "TEXT DEFAULT ''"),
+        ))
         _ensure_columns(c, 'publish_items', (
             ('remote_id', "TEXT DEFAULT ''"), ('remote_status', "TEXT DEFAULT ''"),
             ('verified_at', "DATETIME"), ('verification', "TEXT DEFAULT '{}'"),
@@ -473,7 +485,8 @@ def init_db():
         c.execute('''CREATE INDEX IF NOT EXISTS idx_publish_items_tracking
             ON publish_items(status, next_check_at)''')
         _reconcile_historical_item_stages(c)
-        record_schema_version(c, "publish_jobs", 5)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_review ON jobs(review_required,status)")
+        record_schema_version(c, "publish_jobs", 6)
 
 init_db()
 
@@ -2948,8 +2961,16 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
             'pending_review' if review_required
             else ('scheduled' if timer_enabled else 'pending')
         )
-        cur = c.execute('INSERT INTO jobs (type,title,tags,file_list,account_list,extra,status) VALUES (?,?,?,?,?,?,?)',
-            (type, title, json.dumps(tags, ensure_ascii=False), json.dumps(file_list), json.dumps(account_list), json.dumps(extra or {}), status))
+        cur = c.execute(
+            'INSERT INTO jobs '
+            '(type,title,tags,file_list,account_list,extra,status,review_required) '
+            'VALUES (?,?,?,?,?,?,?,?)',
+            (
+                type, title, json.dumps(tags, ensure_ascii=False),
+                json.dumps(file_list), json.dumps(account_list),
+                json.dumps(extra or {}), status, 1 if review_required else 0,
+            ),
+        )
         job_id = cur.lastrowid
     # 排期在任务创建时就算好并落库，之后不再重算，
     # 这样重启/重试/巡检都不会把发布时间顺延。
@@ -2974,39 +2995,47 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
     return job_id
 
 
-def _record_review(job_id, note='', decision='') -> None:
+def _record_review(job_id, note='', decision='', reviewed_by='') -> None:
     with get_conn() as c:
         _ensure_columns(c, 'jobs', (
             ('review_note', "TEXT DEFAULT ''"),
             ('reviewed_at', 'DATETIME'),
+            ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
             ('review_decision', "TEXT DEFAULT ''"),
         ))
         c.execute(
-            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, review_decision=? WHERE id=?",
-            (str(note or '')[:1000], str(decision or ''), int(job_id)),
+            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, "
+            "reviewed_by=?, review_decision=? WHERE id=?",
+            (str(note or '')[:1000], str(reviewed_by or ''), str(decision or ''), int(job_id)),
         )
 
 
-def approve_job(job_id, note=''):
+def approve_job(job_id, note='', reviewed_by='') -> bool:
     with get_conn() as c:
         row = c.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
         if row is None:
-            return
+            return False
+        if str(row['status'] or '') != 'pending_review':
+            return False
         _ensure_columns(c, 'jobs', (
             ('review_note', "TEXT DEFAULT ''"),
             ('reviewed_at', 'DATETIME'),
+            ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
             ('review_decision', "TEXT DEFAULT ''"),
         ))
-        c.execute(
-            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, review_decision='approved' WHERE id=?",
-            (str(note or '')[:1000], int(job_id)),
-        )
         extra = json_loads(row['extra'] or '{}')
         timer_enabled = isinstance(extra, dict) and bool(extra.get('enableTimer'))
-        c.execute(
-            "UPDATE jobs SET status=? WHERE id=? AND status='pending_review'",
-            ('scheduled' if timer_enabled else 'pending', int(job_id)),
+        cur = c.execute(
+            "UPDATE jobs SET review_note=?, reviewed_at=CURRENT_TIMESTAMP, "
+            "reviewed_by=?, review_decision='approved', status=? "
+            "WHERE id=? AND status='pending_review'",
+            (
+                str(note or '')[:1000], str(reviewed_by or ''),
+                'scheduled' if timer_enabled else 'pending', int(job_id),
+            ),
         )
+        if int(cur.rowcount or 0) != 1:
+            return False
         if timer_enabled:
             c.execute(
                 "UPDATE scheduled_items SET status='pending' WHERE job_id=? AND status='cancelled'",
@@ -3017,17 +3046,32 @@ def approve_job(job_id, note=''):
     else:
         _start_workers()
         _queue_job(int(job_id))
+    return True
 
 
-def reject_job(job_id, note=''):
-    _record_review(job_id, note=note, decision='rejected')
+def reject_job(job_id, note='', reviewed_by='') -> bool:
     with get_conn() as c:
-        c.execute("UPDATE jobs SET status='rejected', finished_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_review'", (job_id,))
+        _ensure_columns(c, 'jobs', (
+            ('review_note', "TEXT DEFAULT ''"),
+            ('reviewed_at', 'DATETIME'),
+            ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
+            ('review_decision', "TEXT DEFAULT ''"),
+        ))
+        cur = c.execute(
+            "UPDATE jobs SET status='rejected', review_note=?, "
+            "reviewed_at=CURRENT_TIMESTAMP, reviewed_by=?, "
+            "review_decision='rejected', finished_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='pending_review'",
+            (str(note or '')[:1000], str(reviewed_by or ''), int(job_id)),
+        )
+        if int(cur.rowcount or 0) != 1:
+            return False
         c.execute(
             "UPDATE scheduled_items SET status='cancelled', updated_at=CURRENT_TIMESTAMP "
             "WHERE job_id=? AND status IN ('pending','running')",
             (int(job_id),),
         )
+    return True
 
 
 _scheduler_started = False

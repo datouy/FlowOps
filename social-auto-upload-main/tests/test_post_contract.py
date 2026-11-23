@@ -51,7 +51,7 @@ def test_post_create_read_and_patch_preserve_contract(tmp_path, monkeypatch):
         "title": "桂林周末路线",
         "body": "主内容",
         "files": ["route.jpg"],
-        "reviewRequired": False,
+        "reviewRequired": True,
         "variants": {
             "douyin": {"title": "抖音版本", "body": "短视频文案", "tags": ["旅行", "桂林"]},
             "xiaohongshu": {"title": "小红书版本", "body": "图文攻略", "tags": ["攻略"]},
@@ -81,13 +81,13 @@ def test_post_create_read_and_patch_preserve_contract(tmp_path, monkeypatch):
     assert patched.status_code == 200
     updated = client.get(f"/api/v2/posts/{post_id}").get_json()["data"]
     assert updated["title"] == "桂林两日路线"
-    assert updated["review_required"] is True
+    assert updated["review_required"] is False
     douyin = next(item for item in updated["variants"] if item["platform"] == "douyin")
     assert douyin["scheduled_at"] == "2026-11-22 09:30"
     assert douyin["tags"] == ["周末"]
 
 
-def test_post_submit_links_jobs_and_defaults_to_review(tmp_path, monkeypatch):
+def test_post_submit_links_jobs_and_uses_server_review_policy(tmp_path, monkeypatch):
     app, jobs_db = _app(tmp_path, monkeypatch)
     client = app.test_client()
     post_id = client.post("/api/v2/posts", json={
@@ -126,19 +126,19 @@ def test_post_submit_links_jobs_and_defaults_to_review(tmp_path, monkeypatch):
     })
     assert response.status_code == 200
     assert len(response.get_json()["data"]["jobs"]) == 2
-    assert all(call["review"] is True for call in calls)
+    assert all(call["review"] is False for call in calls)
     douyin = next(call for call in calls if call["type"] == 3)
     assert douyin["extra"]["contentId"] == post_id
     assert douyin["extra"]["scheduledAt"] == "2026-11-23 10:00"
 
     detail = client.get(f"/api/v2/posts/{post_id}").get_json()["data"]
-    assert detail["status"] == "review"
+    assert detail["status"] == "publishing"
     assert len(detail["jobs"]) == 2
     assert all(job["review_decision"] == "" for job in detail["jobs"])
-    assert all(item["status"] == "pending_review" for item in detail["variants"])
+    assert {item["status"] for item in detail["variants"]} == {"pending", "scheduled"}
 
 
-def test_open_job_api_defaults_to_review(tmp_path, monkeypatch):
+def test_open_job_api_ignores_client_review_override(tmp_path, monkeypatch):
     app, _ = _app(tmp_path, monkeypatch)
     import publish_jobs
     captured = {}
@@ -150,6 +150,7 @@ def test_open_job_api_defaults_to_review(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_jobs, "enqueue_job", fake_enqueue)
     response = app.test_client().post("/open/v1/jobs", json={
         "type": 3, "title": "开放任务", "files": ["a.mp4"], "accounts": ["a.json"],
+        "reviewRequired": True,
     })
     assert response.status_code == 200
-    assert captured["review_required"] is True
+    assert captured["review_required"] is False

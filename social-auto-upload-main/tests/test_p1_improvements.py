@@ -251,8 +251,10 @@ def test_scoped_user_token_authenticates(tmp_path, monkeypatch):
     assert identity["user"] == "运营A"
     assert identity["role"] == "operator"
     assert identity["scope"] == ["3"]
-    assert runtime_config.has_permission(identity, "publish") is True
-    assert runtime_config.has_permission(identity, "team") is False
+    assert runtime_config.has_permission(identity, "publish.execute") is True
+    assert runtime_config.has_permission(identity, "message.operate") is True
+    assert runtime_config.has_permission(identity, "content.edit") is False
+    assert runtime_config.has_permission(identity, "team.manage") is False
     assert runtime_config.in_scope(identity, account_id="3") is True
     assert runtime_config.in_scope(identity, account_id="9") is False
     assert runtime_config.authenticate("wrong-token") is None
@@ -264,23 +266,25 @@ def test_global_token_maps_to_admin(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_config, "TOKENS_FILE", "", raising=False)
     identity = runtime_config.authenticate("global")
     assert identity["role"] == "admin"
-    assert runtime_config.has_permission(identity, "team") is True
+    assert runtime_config.has_permission(identity, "team.manage") is True
+    assert runtime_config.has_permission(identity, "audit.read") is True
     # 管理员不受账号范围限制。
     assert runtime_config.in_scope(identity, account_id="42") is True
 
 
-def test_viewer_role_is_read_only(tmp_path, monkeypatch):
+def test_viewer_role_has_no_business_permissions(tmp_path, monkeypatch):
     runtime_config = pytest.importorskip("runtime_config")
     tokens = tmp_path / "tokens.json"
     tokens.write_text(json.dumps([
-        {"user": "只读", "role": "viewer", "token": "v-token"},
+        {"user": "只读", "role": "viewer", "scope": ["3"], "token": "v-token"},
     ]), encoding="utf-8")
     monkeypatch.setattr(runtime_config, "ACCESS_TOKEN", "", raising=False)
     monkeypatch.setattr(runtime_config, "TOKENS_FILE", str(tokens), raising=False)
     identity = runtime_config.authenticate("v-token")
-    assert runtime_config.has_permission(identity, "read") is True
-    assert runtime_config.has_permission(identity, "publish") is False
-    assert runtime_config.has_permission(identity, "message") is False
+    assert identity["permissions"] == []
+    assert runtime_config.has_permission(identity, "content.edit") is False
+    assert runtime_config.has_permission(identity, "publish.execute") is False
+    assert runtime_config.has_permission(identity, "message.operate") is False
 
 
 # ---------------------------------------------------------------- 辅助

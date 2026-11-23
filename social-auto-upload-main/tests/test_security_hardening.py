@@ -21,16 +21,12 @@ from utils.request_limiter import reset_for_tests  # noqa: E402
 
 
 def _identity(role: str = "operator", scope=None) -> dict:
-    permissions = {
-        "admin": ("read", "publish", "message", "account", "team"),
-        "operator": ("read", "publish", "message"),
-        "viewer": ("read",),
-    }[role]
     return {
         "user": role,
         "role": role,
         "scope": list(scope or []),
-        "permissions": list(permissions),
+        "scope_mode": "all" if role == "admin" else "list",
+        "permissions": list(runtime_config.ROLE_PERMISSIONS[role]),
         "source": "user-token",
     }
 
@@ -87,10 +83,28 @@ def test_ready_probe_is_public_but_returns_summary_only(backend_client, monkeypa
 
 
 def test_write_permission_is_centralized(monkeypatch):
-    assert access_scope.permission_for_request("POST", "/dm/conversations/1/reply") == "message"
-    assert access_scope.permission_for_request("POST", "/materials/cleanup") == "publish"
-    assert access_scope.permission_for_request("GET", "/publish-records") is None
-    assert access_scope.permission_for_request("GET", "/deleteFile?id=1") == "publish"
+    assert access_scope.permissions_for_request(
+        "POST", "/dm/conversations/1/reply"
+    ) == (runtime_config.PERM_MESSAGE_OPERATE,)
+    assert access_scope.permissions_for_request(
+        "POST", "/materials/cleanup"
+    ) == (runtime_config.PERM_MATERIAL_WRITE,)
+    assert access_scope.permissions_for_request(
+        "GET", "/publish-records"
+    ) == (runtime_config.PERM_PUBLISH_EXECUTE,)
+    assert access_scope.permissions_for_request(
+        "POST", "/deleteFile?id=1"
+    ) == (runtime_config.PERM_MATERIAL_WRITE,)
+    assert access_scope.permissions_for_request(
+        "GET", "/douyin/topic-suggest"
+    ) == (runtime_config.PERM_CONTENT_EDIT, runtime_config.PERM_PUBLISH_EXECUTE)
+    api = access_scope.permissions_for_request(
+        "POST", "/api/v2/accounts/1/check"
+    )
+    alias = access_scope.permissions_for_request(
+        "POST", "/v2/accounts/1/check"
+    )
+    assert api == alias == (runtime_config.PERM_ACCOUNT_MANAGE,)
 
 
 def test_viewer_is_blocked_before_destructive_route(backend_client, monkeypatch):

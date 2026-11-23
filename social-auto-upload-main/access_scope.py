@@ -23,9 +23,10 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from flask import g, has_app_context, jsonify
 
@@ -55,7 +56,7 @@ def current_identity() -> dict | None:
 
 
 def scope_entries() -> list[str]:
-    """当前身份的账号范围；空列表表示不限制（管理员或未启用鉴权）。"""
+    """当前身份的账号范围；是否不受限必须结合角色显式判断。"""
     identity = current_identity()
     if not identity:
         return []
@@ -68,7 +69,10 @@ def scope_entries() -> list[str]:
 
 def unrestricted() -> bool:
     """True 表示可以访问全部账号。"""
-    return not scope_entries()
+    identity = current_identity()
+    if identity is None:
+        return True
+    return runtime_config.scope_is_unrestricted(identity)
 
 
 def has_permission(permission: str) -> bool:
@@ -77,6 +81,22 @@ def has_permission(permission: str) -> bool:
     if identity is None:
         return True
     return runtime_config.has_permission(identity, permission)
+
+
+def has_any_permission(*permissions: str) -> bool:
+    """当前身份是否拥有任一权限；未启用鉴权时保持本机模式兼容。"""
+    identity = current_identity()
+    if identity is None:
+        return True
+    return any(runtime_config.has_permission(identity, item) for item in permissions)
+
+
+def current_actor(default: str = "system") -> str:
+    """返回审计使用的稳定操作人字符串。"""
+    identity = current_identity()
+    if not identity:
+        return default
+    return str(identity.get("user") or default)
 
 
 def forbidden(message: str = "无权访问该资源"):
@@ -91,44 +111,196 @@ def require_permission(permission: str, message: str = "") -> Any:
     return forbidden(message or f"当前身份没有「{permission}」权限")
 
 
-# 写接口按领域集中授权。顺序是从具体到宽泛，避免先命中通用前缀。
-_PERMISSION_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("/api/v2/executors", "/api/v2/migrations", "/api/v2/selectors",
-      "/api/v2/proxy-pool", "/api/v2/proxy-risks", "/api/v2/webhooks",
-      "/api/v2/maintenance", "/notify/"), runtime_config.PERM_TEAM),
-    (("/api/v2/accounts", "/accounts/slots", "/interactiveLogin/",
-      "/login", "/loginPrepare", "/loginVerify", "/uploadCookie",
-      "/deleteAccount", "/getValidAccounts", "/patrol/run",
-      "/api/v2/credentials"), runtime_config.PERM_ACCOUNT),
-    (("/api/v2/tasks/accounts",), runtime_config.PERM_ACCOUNT),
-    (("/dm/", "/messages", "/message-templates", "/comments"), runtime_config.PERM_MESSAGE),
-    (("/api/v2/tasks/dm", "/api/v2/tasks/comments"), runtime_config.PERM_MESSAGE),
-    (("/api/v2/contents", "/publish", "/postVideo", "/review/",
-      "/verify/", "/stats/", "/schedule/", "/materials/", "/media/",
-      "/compliance/", "/ai/", "/upload", "/uploadSave", "/deleteFile",
-      "/open/", "/api/v2/schedule/"), runtime_config.PERM_PUBLISH),
+def require_any_permission(*permissions: str, message: str = "") -> Any:
+    """缺少一组备选权限时返回 403。"""
+    if has_any_permission(*permissions):
+        return None
+    return forbidden(message or "当前身份没有该接口所需权限")
+
+
+UNMAPPED_PERMISSION = "__unmapped__"
+
+
+def canonical_api_path(path: str) -> str:
+    """把 /v2 兼容别名归一化到 /api/v2，授权只看这一份路径。"""
+    parsed = urlsplit(str(path or ""))
+    normalized = unquote(parsed.path or "")
+    if normalized == "/v2" or normalized.startswith("/v2/"):
+        normalized = "/api" + normalized
+    if len(normalized) > 1:
+        normalized = normalized.rstrip("/")
+    return normalized or "/"
+
+
+def _matches(path: str, prefix: str) -> bool:
+    if prefix.endswith("/"):
+        return path.startswith(prefix)
+    return path == prefix or path.startswith(prefix + "/")
+
+
+# 路由授权以“方法 + 规范路径 + 任一允许权限”表达。所有受保护路由都必须命中；
+# 未命中时启用 Token 的环境直接失败关闭。空元组表示只要求有效身份。
+_ALL_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_CONTENT_READERS = (
+    runtime_config.PERM_CONTENT_EDIT,
+    runtime_config.PERM_REVIEW_DECIDE,
+    runtime_config.PERM_PUBLISH_EXECUTE,
+)
+_CONTENT_OPERATORS = (
+    runtime_config.PERM_CONTENT_EDIT,
+    runtime_config.PERM_PUBLISH_EXECUTE,
+)
+_MATERIAL_READERS = (
+    runtime_config.PERM_CONTENT_EDIT,
+    runtime_config.PERM_MATERIAL_WRITE,
+    runtime_config.PERM_REVIEW_DECIDE,
+    runtime_config.PERM_PUBLISH_EXECUTE,
+)
+_TASK_OPERATORS = (
+    runtime_config.PERM_CONTENT_EDIT,
+    runtime_config.PERM_MATERIAL_WRITE,
+    runtime_config.PERM_REVIEW_DECIDE,
+    runtime_config.PERM_PUBLISH_EXECUTE,
+    runtime_config.PERM_MESSAGE_OPERATE,
+    runtime_config.PERM_ACCOUNT_MANAGE,
+    runtime_config.PERM_TEAM_MANAGE,
 )
 
-def permission_for_request(method: str, path: str) -> str | None:
-    """返回接口所需权限点；只读接口返回 ``None``。
+_ROUTE_POLICIES: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
+    # 身份发现与不含业务数据的运行时摘要。
+    (frozenset({"GET"}), (
+        "/api/v2/session", "/auth/check", "/client-id",
+        "/openapi.json", "/api/v2/runtime/status",
+    ), ()),
 
-    当未启用 Token 时，``require_permission`` 仍会放行，因此本机单用户模式
-    不需要任何额外配置。
-    """
+    # 账号管理面仅管理员；发布/私信所需的脱敏账号目录另行放行。
+    (frozenset({"GET"}), ("/api/v2/audit/logs",), (runtime_config.PERM_AUDIT_READ,)),
+    (frozenset({"GET"}), ("/api/v2/auth-sessions",), (runtime_config.PERM_ACCOUNT_MANAGE,)),
+    (_ALL_METHODS, (
+        "/api/v2/accounts", "/api/v2/credentials", "/api/v2/tencent",
+        "/accounts/slots", "/interactiveLogin", "/login", "/loginPrepare",
+        "/loginVerify", "/uploadCookie", "/downloadCookie", "/deleteAccount",
+        "/getValidAccounts", "/patrol", "/verify", "/updateUserinfo",
+        "/api/v2/tasks/accounts",
+    ), (runtime_config.PERM_ACCOUNT_MANAGE,)),
+    (frozenset({"GET"}), ("/getAccounts", "/account-status"), (
+        runtime_config.PERM_CONTENT_EDIT,
+        runtime_config.PERM_PUBLISH_EXECUTE,
+        runtime_config.PERM_MESSAGE_OPERATE,
+        runtime_config.PERM_ACCOUNT_MANAGE,
+    )),
+
+    # 团队运维与审计。
+    (frozenset({"GET"}), ("/api/v2/rbac/status",), (runtime_config.PERM_TEAM_MANAGE,)),
+    (_ALL_METHODS, (
+        "/api/v2/executors", "/api/v2/migrations", "/api/v2/selectors",
+        "/api/v2/proxy-pool", "/api/v2/proxy-risks", "/api/v2/webhooks",
+        "/api/v2/maintenance", "/api/v2/storage", "/api/v2/system/health",
+        "/api/v2/serial/status", "/api/v2/fingerprint/probe", "/notify",
+    ), (runtime_config.PERM_TEAM_MANAGE,)),
+
+    # 私信/评论。DM 媒体也归这里，不能借用素材读取权限。
+    (_ALL_METHODS, (
+        "/dm", "/messages", "/message-templates", "/comments",
+        "/api/v2/tasks/dm", "/api/v2/tasks/comments",
+    ), (runtime_config.PERM_MESSAGE_OPERATE,)),
+
+    # 审核决定与专用审核 DTO。
+    (_ALL_METHODS, ("/review",), (runtime_config.PERM_REVIEW_DECIDE,)),
+
+    # 内容读取。reviewer 只能看到被审核任务引用的内容，由业务函数再过滤。
+    (frozenset({"GET"}), (
+        "/api/v2/contents", "/api/v2/posts", "/ai/status",
+    ), _CONTENT_READERS),
+    # 平台话题联想和 AI 内容包状态属于内容生产/发布工具，审核角色只读审核。
+    (frozenset({"GET"}), (
+        "/douyin/topic-suggest", "/ai/pack/status", "/api/v2/ai/usage",
+    ), _CONTENT_OPERATORS),
+    (frozenset({"GET"}), (
+        "/getFiles", "/getFile", "/download", "/materials",
+        "/material-status",
+    ), _MATERIAL_READERS),
+
+    # 内容编辑、AI 写作和平台文案辅助。
+    (frozenset({"POST", "PUT", "PATCH", "DELETE"}), (
+        "/api/v2/contents", "/api/v2/posts", "/api/v2/ai", "/ai/",
+    ), (runtime_config.PERM_CONTENT_EDIT,)),
+    (frozenset({"POST", "PUT", "PATCH", "DELETE"}), (
+        "/compliance", "/douyin/topic-suggest",
+    ), _CONTENT_OPERATORS),
+
+    # 素材写操作只由 material.write 控制；发布者只能读取和使用素材。
+    (frozenset({"POST", "PUT", "PATCH", "DELETE"}), (
+        "/materials", "/media", "/upload", "/uploadSave", "/deleteFile",
+    ), (runtime_config.PERM_MATERIAL_WRITE,)),
+
+    # 发布、排期、统计和开放 API。
+    (_ALL_METHODS, (
+        "/publish", "/postVideo", "/postVideoBatch", "/open",
+        "/schedule", "/api/v2/schedule", "/local/publish", "/stats",
+        "/api/v2/stats", "/api/v2/jobs", "/jobs", "/publish-records",
+        "/api/v2/dashboard", "/api/v2/roi", "/api/v2/publish",
+        "/report/weekly",
+    ), (runtime_config.PERM_PUBLISH_EXECUTE,)),
+
+    # 异步任务本身由所属人隔离；路由层只要求拥有一个生产业务权限。
+    (_ALL_METHODS, ("/api/v2/tasks",), _TASK_OPERATORS),
+    (frozenset({"GET"}), ("/todo/summary",), _TASK_OPERATORS),
+)
+
+def permissions_for_request(method: str, path: str) -> tuple[str, ...]:
+    """返回接口允许的任一权限；空元组表示有效身份即可，哨兵表示未登记。"""
     method = str(method or "").upper()
-    path = urlsplit(str(path or "")).path
+    path = canonical_api_path(path)
     if path == "/dm/inbound":
-        return None  # 该接口使用独立 Webhook 密钥/HMAC。
-    # 兼容历史上用 GET + query 调删除素材的客户端。该路径无论如何都会
-    # 删除文件和数据库记录，不能因为动词是 GET 被当成只读接口。
-    mutating = method in {"POST", "PUT", "PATCH", "DELETE"} or path == "/deleteFile"
-    if not mutating:
+        return ()
+    if method == "HEAD":
+        method = "GET"
+    if method == "POST" and path == "/open/v1/contents":
+        return (runtime_config.PERM_CONTENT_EDIT,)
+    if method == "GET" and re.fullmatch(r"/api/v2/accounts/(?:\d+)", path):
+        return (
+            runtime_config.PERM_CONTENT_EDIT,
+            runtime_config.PERM_PUBLISH_EXECUTE,
+            runtime_config.PERM_MESSAGE_OPERATE,
+            runtime_config.PERM_ACCOUNT_MANAGE,
+        )
+    if method == "GET" and path == "/api/v2/accounts":
+        return (
+            runtime_config.PERM_CONTENT_EDIT,
+            runtime_config.PERM_PUBLISH_EXECUTE,
+            runtime_config.PERM_MESSAGE_OPERATE,
+            runtime_config.PERM_ACCOUNT_MANAGE,
+        )
+    for methods, prefixes, permissions in _ROUTE_POLICIES:
+        if method not in methods:
+            continue
+        if any(_matches(path, prefix) for prefix in prefixes):
+            return permissions
+    return (UNMAPPED_PERMISSION,)
+
+
+def permission_for_request(method: str, path: str) -> str | None:
+    """兼容旧调用：返回首个权限；无额外权限返回 None。"""
+    permissions = permissions_for_request(method, path)
+    return permissions[0] if permissions else None
+
+
+def authorize_request(method: str, path: str) -> Any:
+    """集中执行路由授权；本机无 Token 模式保持旧行为。"""
+    permissions = permissions_for_request(method, path)
+    if permissions == (UNMAPPED_PERMISSION,):
+        identity = current_identity()
+        auth_required = bool(runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE)
+        if auth_required and identity is not None:
+            return forbidden("该接口尚未登记权限策略，已按失败关闭拒绝")
         return None
-    for prefixes, permission in _PERMISSION_RULES:
-        if path.startswith(prefixes):
-            return permission
-    # 未登记的写接口默认要求发布权限，避免 viewer 因遗漏映射获得写能力。
-    return runtime_config.PERM_PUBLISH
+    if not permissions:
+        return None
+    return require_any_permission(
+        *permissions,
+        message="当前身份没有该接口所需权限：" + ", ".join(permissions),
+    )
 
 
 # ---------------------------------------------------------------- 账号范围
@@ -182,9 +354,11 @@ def _allowed() -> tuple[set[str], set[str], set[str]] | None:
     identity = current_identity()
     if identity is None:
         return None
+    if runtime_config.scope_is_unrestricted(identity):
+        return None
     scope = scope_entries()
     if not scope:
-        return None
+        return set(), set(), set()
     ids = set(scope)
     names = set(scope)
     files = set(scope)
@@ -227,9 +401,11 @@ def account_in_scope(
     identity = current_identity()
     if identity is None:
         return True
+    if runtime_config.scope_is_unrestricted(identity):
+        return True
     scope = scope_entries()
     if not scope:
-        return True
+        return False
     if runtime_config.in_scope(
         identity,
         account_id="" if account_id is None else account_id,
@@ -401,9 +577,11 @@ def dm_account_in_scope(platform: str, account: str) -> bool:
     identity = current_identity()
     if identity is None:
         return True
+    if runtime_config.scope_is_unrestricted(identity):
+        return True
     scope = scope_entries()
     if not scope:
-        return True
+        return False
     name = str(account or "").strip()
     if not name:
         return False

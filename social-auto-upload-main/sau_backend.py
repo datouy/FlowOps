@@ -209,13 +209,9 @@ def _guard_access_token():
             response.status_code = 429
             response.headers["Retry-After"] = str(retry_after)
             return response
-        permission = access_scope.permission_for_request(request.method, request.path)
-        if permission:
-            denied = access_scope.require_permission(
-                permission, f"当前身份没有「{permission}」权限"
-            )
-            if denied is not None:
-                return denied
+        denied = access_scope.authorize_request(request.method, request.path)
+        if denied is not None:
+            return denied
         return None
     return jsonify({"code": 401, "msg": "未授权：缺少或错误的访问令牌", "data": None}), 401
 
@@ -254,16 +250,24 @@ def _security_headers(response):
 def session_identity():
     """当前访问身份：用户名、角色、权限点和账号范围。"""
     identity = getattr(g, 'identity', None)
+    auth_required = bool(
+        runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE
+    )
     if identity is None:
         return jsonify({
             'code': 200,
             'data': {
-                'user': '',
-                'role': 'anonymous',
-                'permissions': [],
+                'user': 'local-admin',
+                'role': runtime_config.ROLE_ADMIN,
+                'permissions': list(runtime_config.ALL_PERMISSIONS),
                 'scope': [],
-                'authRequired': bool(
-                    runtime_config.ACCESS_TOKEN or runtime_config.TOKENS_FILE
+                'scopeMode': 'all',
+                'authRequired': auth_required,
+                'localMode': not auth_required,
+                'reviewMode': runtime_config.REVIEW_MODE,
+                'roleRevocationPolicy': (
+                    'new requests denied immediately; queued tasks continue '
+                    'unless an administrator cancels them'
                 ),
             },
             'msg': None,
@@ -272,10 +276,19 @@ def session_identity():
         'code': 200,
         'data': {
             'user': identity.get('user') or '',
-            'role': identity.get('role') or 'viewer',
+            'role': identity.get('role') or '',
             'permissions': identity.get('permissions') or [],
             'scope': identity.get('scope') or [],
+            'scopeMode': identity.get('scope_mode') or (
+                'all' if runtime_config.scope_is_unrestricted(identity) else 'list'
+            ),
             'authRequired': True,
+            'localMode': False,
+            'reviewMode': runtime_config.REVIEW_MODE,
+            'roleRevocationPolicy': (
+                'new requests denied immediately; queued tasks continue '
+                'unless an administrator cancels them'
+            ),
         },
         'msg': None,
     }), 200
@@ -744,6 +757,42 @@ def _apply_account_capabilities(accounts: list[dict]) -> list[dict]:
     return accounts
 
 
+def _public_account_view(item: dict) -> dict:
+    """非管理员只能拿到发布/私信选择所需的脱敏账号视图。"""
+    if access_scope.has_permission(runtime_config.PERM_ACCOUNT_MANAGE):
+        return item
+    identity = item.get("identity") or {}
+    cookie = item.get("cookie") or {}
+    automation = item.get("automation") or {}
+    return {
+        "id": item.get("id"),
+        "platform": item.get("platform"),
+        "name": item.get("name"),
+        "nickname": item.get("nickname"),
+        "avatar": item.get("avatar"),
+        "status": item.get("status"),
+        "statusText": item.get("statusText"),
+        "failReason": item.get("failReason"),
+        "lastCheckAt": item.get("lastCheckAt"),
+        "failStreak": item.get("failStreak"),
+        "errorKind": item.get("errorKind"),
+        "identity": {
+            "masked": identity.get("masked"),
+            "bound": bool(identity.get("bound")),
+        },
+        "cookie": {
+            "name": cookie.get("name"),
+            "exists": bool(cookie.get("exists")),
+            "sessionGroup": cookie.get("sessionGroup"),
+        },
+        "capabilities": item.get("capabilities"),
+        "automation": {
+            "paused": bool(automation.get("paused")),
+            "pauseUntil": automation.get("pauseUntil"),
+        },
+    }
+
+
 @app.route('/api/v2/accounts', methods=['GET'])
 def api_v2_accounts():
     """结构化账号列表：平台元数据 + 身份 + 健康度 + 凭据状态 + 汇总。"""
@@ -756,6 +805,7 @@ def api_v2_accounts():
     for item in accounts:
         item["errorKind"] = _account_error_kind(item)
     _apply_account_capabilities(accounts)
+    accounts = [_public_account_view(item) for item in accounts]
     return jsonify({
         "code": 200,
         "msg": None,
@@ -802,7 +852,7 @@ def api_v2_account(account_id: int):
     ):
         return access_scope.forbidden("无权访问该账号")
     _apply_account_capabilities([item])
-    return jsonify({"code": 200, "msg": None, "data": item}), 200
+    return jsonify({"code": 200, "msg": None, "data": _public_account_view(item)}), 200
 
 
 def _audit_automation_change(action: str, account_id: int, detail: str = "") -> None:
@@ -1668,14 +1718,14 @@ def upload_save():
         file_md5 = material_ops.file_md5(filepath)
         duplicate = material_ops.duplicate_count(file_md5) > 0
 
-        with db_connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                                INSERT INTO file_records (filename, filesize, file_path, md5, tags)
-            VALUES (?, ?, ?, ?, ?)
-                                ''', (filename, round(float(os.path.getsize(filepath)) / (1024 * 1024),2), final_filename, file_md5, ''))
-            conn.commit()
-            logger.info("上传文件已记录")
+        material_ops.record_upload(
+            filename,
+            round(float(os.path.getsize(filepath)) / (1024 * 1024), 2),
+            final_filename,
+            file_md5,
+            uploaded_by=access_scope.current_actor("local-admin"),
+        )
+        logger.info("上传文件已记录")
 
         return jsonify({
             "code": 200,
@@ -1953,6 +2003,16 @@ def delete_file():
             cursor.execute("DELETE FROM file_records WHERE id = ?", (file_id,))
             conn.commit()
 
+        try:
+            import rbac_audit
+            rbac_audit.record_audit(
+                "material.delete", str(file_id),
+                f"filename={record['filename']};path={record.get('file_path') or ''}",
+                actor=access_scope.current_actor("local-admin"),
+            )
+        except Exception:
+            pass
+
         return jsonify({
             "code": 200,
             "msg": "File deleted successfully",
@@ -2178,31 +2238,110 @@ def verify_resend_code():
 
 @app.route('/review/pending', methods=['GET'])
 def review_pending():
-    status = request.args.get('status', 'pending_review')
+    status = str(request.args.get('status', 'pending_review') or 'pending_review')
+    allowed_statuses = {'pending_review', 'pending', 'scheduled', 'rejected'}
+    if status not in allowed_statuses:
+        return jsonify({
+            'code': 400,
+            'msg': '审核列表不接受该状态',
+            'data': None,
+        }), 400
     with publish_jobs.get_conn() as c:
+        publish_jobs._ensure_columns(c, 'jobs', (
+            ('content_id', 'INTEGER'),
+            ('review_required', 'INTEGER DEFAULT 0'),
+            ('review_note', "TEXT DEFAULT ''"),
+            ('reviewed_at', 'DATETIME'),
+            ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
+            ('review_decision', "TEXT DEFAULT ''"),
+        ))
         rows = [dict(r) for r in c.execute(
-            'SELECT * FROM jobs WHERE status=? ORDER BY id DESC', (status,)).fetchall()]
+            'SELECT id,type,title,tags,file_list,account_list,extra,status,'
+            'created_at,finished_at,content_id,review_required,'
+            'review_note,reviewed_at,reviewed_by,review_decision '
+            'FROM jobs WHERE status=? ORDER BY id DESC',
+            (status,),
+        ).fetchall()]
+    if status != 'pending_review':
+        rows = [
+            row for row in rows
+            if bool(row.get('review_required'))
+            or bool(row.get('reviewed_at'))
+            or str(row.get('review_decision') or '')
+        ]
     rows = access_scope.filter_jobs(rows)
     return jsonify({'code': 200, 'data': rows, 'msg': None}), 200
 
 
+def _guard_review_job(job_id: int) -> Any:
+    denied = access_scope.require_permission(
+        runtime_config.PERM_REVIEW_DECIDE,
+        "当前身份没有审核决定权限",
+    )
+    if denied is not None:
+        return denied
+    with publish_jobs.get_conn() as c:
+        row = c.execute('SELECT * FROM jobs WHERE id=?', (int(job_id),)).fetchone()
+    if row is None:
+        return jsonify({'code': 404, 'data': None, 'msg': '任务不存在'}), 404
+    if not access_scope.job_in_scope(dict(row)):
+        return access_scope.forbidden("无权审核该任务")
+    if str(row['status'] or '') != 'pending_review':
+        return jsonify({
+            'code': 409,
+            'data': None,
+            'msg': '只有 pending_review 任务可以作出审核决定',
+        }), 409
+    return None
+
+
 @app.route('/review/<int:job_id>/approve', methods=['POST'])
 def review_approve(job_id):
-    denied = _guard_publish_job(job_id, "approve")
+    denied = _guard_review_job(job_id)
     if denied is not None:
         return denied
     payload = request.get_json(silent=True) or {}
-    publish_jobs.approve_job(job_id, note=payload.get('note') or '')
+    ok = publish_jobs.approve_job(
+        job_id,
+        note=payload.get('note') or '',
+        reviewed_by=access_scope.current_actor('local-admin'),
+    )
+    if not ok:
+        return jsonify({'code': 409, 'msg': '任务状态已变化', 'data': None}), 409
+    try:
+        import rbac_audit
+        rbac_audit.record_audit(
+            "review.approve", str(job_id),
+            "decision=approved",
+            actor=access_scope.current_actor("local-admin"),
+        )
+    except Exception:
+        pass
     return jsonify({'code': 200, 'msg': 'approved'}), 200
 
 
 @app.route('/review/<int:job_id>/reject', methods=['POST'])
 def review_reject(job_id):
-    denied = _guard_publish_job(job_id, "reject")
+    denied = _guard_review_job(job_id)
     if denied is not None:
         return denied
     payload = request.get_json(silent=True) or {}
-    publish_jobs.reject_job(job_id, note=payload.get('note') or '')
+    ok = publish_jobs.reject_job(
+        job_id,
+        note=payload.get('note') or '',
+        reviewed_by=access_scope.current_actor('local-admin'),
+    )
+    if not ok:
+        return jsonify({'code': 409, 'msg': '任务状态已变化', 'data': None}), 409
+    try:
+        import rbac_audit
+        rbac_audit.record_audit(
+            "review.reject", str(job_id),
+            "decision=rejected",
+            actor=access_scope.current_actor("local-admin"),
+        )
+    except Exception:
+        pass
     return jsonify({'code': 200, 'msg': 'rejected'}), 200
 
 @app.route('/publish-records', methods=['GET'])
@@ -3277,12 +3416,15 @@ def postVideo():
         'shopProductId': data.get('shopProductId') or '',
         'contentLabel': data.get('contentLabel') or data.get('declaration') or '',
     }
-    job_id = enqueue_job(platform_type, title, tags, file_list, account_list, extra,
-                         review_required=bool(data.get('reviewRequired')))
+    review_required = p0p1_ops.effective_review_required(direct_publish=True)
+    job_id = enqueue_job(
+        platform_type, title, tags, file_list, account_list, extra,
+        review_required=review_required,
+    )
     return jsonify({
         "code": 200,
-        "msg": "发布任务已加入队列",
-        "data": {"job_id": job_id}
+        "msg": "发布任务已提交审核" if review_required else "发布任务已加入队列",
+        "data": {"job_id": job_id, "reviewRequired": review_required}
     }), 200
 
 @app.route('/updateUserinfo', methods=['POST'])
@@ -3423,22 +3565,26 @@ def postVideoBatch():
         prepared.append({
             'type': batch_platform, 'title': title, 'tags': tags,
             'files': file_list, 'accounts': account_list, 'extra': extra,
-            'review_required': bool(data.get('reviewRequired')),
+            'review_required': p0p1_ops.effective_review_required(
+                direct_publish=True
+            ),
         })
 
     job_ids = []
+    review_flags = []
     for item in prepared:
         job_ids.append(enqueue_job(
             item['type'], item['title'], item['tags'], item['files'],
             item['accounts'], item['extra'],
             review_required=item['review_required'],
         ))
+        review_flags.append(bool(item['review_required']))
     # 返回响应给客户端
     return jsonify(
         {
             "code": 200,
             "msg": "批量发布任务已加入队列",
-            "data": {"job_ids": job_ids}
+            "data": {"job_ids": job_ids, "reviewRequired": review_flags}
         }), 200
 
 # Cookie文件上传API
@@ -3953,6 +4099,11 @@ def start_runtime() -> None:
         raise RuntimeError("账号暂停安全表初始化失败，已拒绝启动自动动作")
     _start_dm_storage_runtime()
     _start_background_tasks()
+
+# Some v2 endpoints are registered after the early alias pass. Run the
+# idempotent alias synchronizer again once the complete route table exists so
+# the Vite rewrite cannot turn a valid development request into a 404.
+_alias_v2_routes()
 
 if __name__ == '__main__':
     start_runtime()

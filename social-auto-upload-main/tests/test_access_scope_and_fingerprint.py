@@ -66,16 +66,12 @@ def client(tmp_path, monkeypatch):
 
 
 def _identity(role: str = "operator", scope=None) -> dict:
-    permissions = {
-        "admin": ("read", "publish", "message", "account", "team"),
-        "operator": ("read", "publish", "message"),
-        "viewer": ("read",),
-    }[role]
     return {
         "user": "u",
         "role": role,
         "scope": list(scope or []),
-        "permissions": list(permissions),
+        "scope_mode": "all" if role == "admin" else "list",
+        "permissions": list(runtime_config.ROLE_PERMISSIONS[role]),
         "source": "user-token",
     }
 

@@ -40,10 +40,49 @@ def init_rbac() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, user TEXT DEFAULT '',
             action TEXT NOT NULL, target TEXT DEFAULT '', detail TEXT DEFAULT '',
             ok INTEGER DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-        for name, perms in (("admin", "read,publish,message,account,team"),
-                            ("operator", "read,publish,message"),
-                            ("viewer", "read",)):
+        for name, perms in (
+            ("admin", "content.edit,material.write,review.decide,publish.execute,"
+                      "message.operate,account.manage,team.manage,audit.read"),
+            ("operator", "publish.execute,message.operate"),
+            ("cutter", "content.edit,material.write"),
+            ("reviewer", "review.decide"),
+            ("viewer", ""),
+        ):
             c.execute("INSERT OR IGNORE INTO roles (name, permissions) VALUES (?,?)", (name, perms))
+
+
+def current_actor(default: str = "system") -> str:
+    """从当前请求身份取操作人，避免把环境变量当成真实用户。"""
+    try:
+        import access_scope
+
+        return access_scope.current_actor(default)
+    except Exception:
+        return str(os.environ.get("YUNCE_USER") or default)
+
+
+def record_audit(
+    action: str,
+    target: str = "",
+    detail: str = "",
+    *,
+    ok: bool = True,
+    actor: str = "",
+) -> None:
+    """写一条结构化审计；失败只影响审计，不回滚已经完成的业务事务。"""
+    user = str(actor or current_actor())[:200]
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO audit_logs (user, action, target, detail, ok) "
+            "VALUES (?,?,?,?,?)",
+            (
+                user,
+                str(action or "unknown")[:120],
+                str(target or "")[:200],
+                str(detail or "")[:1000],
+                1 if ok else 0,
+            ),
+        )
 
 
 def audit(action: str, target: str = ""):
@@ -59,10 +98,7 @@ def audit(action: str, target: str = ""):
                 raise
             finally:
                 try:
-                    user = str(os.environ.get("YUNCE_USER") or "system")
-                    with get_conn() as c:
-                        c.execute("INSERT INTO audit_logs (user, action, target, detail, ok) VALUES (?,?,?,?,?)",
-                                  (user, action, str(target or "")[:200], detail[:1000], ok))
+                    record_audit(action, target, detail, ok=bool(ok))
                 except Exception:
                     pass
         return wrap

@@ -8,6 +8,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 import access_scope
+import runtime_config
 
 
 def _ensure_post_schema(conn) -> None:
@@ -31,6 +32,7 @@ def _ensure_post_schema(conn) -> None:
         str(row[1]) for row in conn.execute("PRAGMA table_info(contents)").fetchall()
     }
     for name, ddl in (
+        ("created_by", "TEXT DEFAULT ''"),
         ("review_required", "INTEGER DEFAULT 1"),
         ("updated_at", "DATETIME"),
     ):
@@ -110,10 +112,104 @@ def _ensure_jobs_content_link(conn) -> None:
         ("review_note", "TEXT DEFAULT ''"),
         ("reviewed_at", "DATETIME"),
         ("review_decision", "TEXT DEFAULT ''"),
+        ("reviewed_by", "TEXT NOT NULL DEFAULT ''"),
+        ("review_required", "INTEGER DEFAULT 0"),
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_content ON jobs(content_id)")
+
+
+def _effective_review_required(
+    current: bool | int | None = None,
+    *,
+    direct_publish: bool = False,
+) -> bool:
+    """由服务端角色和团队策略决定是否强制审核。
+
+    请求体中的 ``reviewRequired`` 不参与判断。``direct_publish`` 只保留给
+    旧调用方保持签名兼容，也必须由同一服务端策略决定结果。一旦内容已经
+    标记为需要审核，后续不能由低权限请求把它降回直发。
+    """
+    del direct_publish
+    identity = access_scope.current_identity()
+    if current is not None and bool(current):
+        return True
+    # 未启用 Token 的本机模式等价于受信任的管理员工作台。
+    role = str((identity or {}).get("role") or "")
+    if runtime_config.REVIEW_MODE == runtime_config.REVIEW_MODE_ALL_REQUIRED:
+        return True
+    if role == runtime_config.ROLE_CUTTER:
+        return True
+    if role in {"", runtime_config.ROLE_ADMIN, runtime_config.ROLE_OPERATOR}:
+        return False
+    # 审核、只读或未来新增但尚未登记的角色都失败关闭。
+    return True
+
+
+effective_review_required = _effective_review_required
+
+
+def _audit(action: str, target: str, detail: str = "") -> None:
+    try:
+        import rbac_audit
+
+        rbac_audit.record_audit(
+            action,
+            target,
+            detail,
+            actor=access_scope.current_actor("local-admin"),
+        )
+    except Exception:
+        pass
+
+
+def _content_has_active_jobs(cid: int) -> bool:
+    import publish_jobs
+
+    with publish_jobs.get_conn() as c:
+        _ensure_jobs_content_link(c)
+        row = c.execute(
+            "SELECT 1 FROM jobs WHERE content_id=? AND status IN "
+            "('pending_review','scheduled','pending','running','submitted',"
+            "'processing','queued') LIMIT 1",
+            (int(cid),),
+        ).fetchone()
+    return row is not None
+
+
+def _review_content_visible(cid: int) -> bool:
+    """reviewer 只能读取被审核任务引用的内容。"""
+    if access_scope.has_permission(runtime_config.PERM_CONTENT_EDIT):
+        return True
+    if not access_scope.has_permission(runtime_config.PERM_REVIEW_DECIDE):
+        return False
+    import publish_jobs
+
+    with publish_jobs.get_conn() as c:
+        _ensure_jobs_content_link(c)
+        rows = [dict(r) for r in c.execute(
+            "SELECT id,account_list,status,review_required,reviewed_at "
+            "FROM jobs WHERE content_id=? AND status IN "
+            "('pending_review','pending','scheduled','rejected') ORDER BY id DESC",
+            (int(cid),),
+        ).fetchall()]
+    rows = access_scope.filter_jobs(rows)
+    return any(
+        bool(row.get("review_required"))
+        or str(row.get("status") or "") == "pending_review"
+        or bool(row.get("reviewed_at"))
+        for row in rows
+    )
+
+
+def _content_visible(cid: int) -> bool:
+    if access_scope.has_any_permission(
+        runtime_config.PERM_CONTENT_EDIT,
+        runtime_config.PERM_PUBLISH_EXECUTE,
+    ):
+        return True
+    return _review_content_visible(cid)
 
 
 def _derive_post_status(jobs: list[dict]) -> str:
@@ -275,11 +371,11 @@ def register(app):
     # ---------- P0-5 RBAC/审计/迁移 ----------
     @app.route('/api/v2/rbac/status', methods=['GET'])
     def rbac_status():
-        import rbac_audit
-        rbac_audit.init_rbac()
-        return jsonify({"code": 200, "msg": None, "data": {
-            "ready": True, "healthReady": "/health/ready 已接 Docker/Nginx（见 deploy/ 注释）",
-        }}), 200
+        return jsonify({
+            "code": 200,
+            "msg": None,
+            "data": runtime_config.authorization_status(),
+        }), 200
 
     @app.route('/api/v2/audit/logs', methods=['GET'])
     def audit_logs():
@@ -310,18 +406,32 @@ def register(app):
         db = Path(BASE_DIR / "db" / "database.db")
         if request.method == "GET":
             with connect(db, timeout=15) as c:
+                _ensure_post_schema(c)
                 rows = [dict(r) for r in c.execute(
                     "SELECT * FROM contents ORDER BY id DESC LIMIT 100").fetchall()]
+            rows = [row for row in rows if _content_visible(int(row["id"]))]
             return jsonify({"code": 200, "msg": None, "data": rows}), 200
         payload = request.get_json(silent=True) or {}
         title = str(payload.get("title") or "").strip()
         if not title:
             return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
+        actor = access_scope.current_actor("local-admin")
+        review_required = 1 if _effective_review_required() else 0
         with connect(db, timeout=15) as c:
-            cur = c.execute("INSERT INTO contents (title, body, files) VALUES (?,?,?)",
-                            (title, str(payload.get("body") or ""),
-                             json.dumps(payload.get("files") or [], ensure_ascii=False)))
+            _ensure_post_schema(c)
+            cur = c.execute(
+                "INSERT INTO contents "
+                "(title, body, files, created_by, review_required) VALUES (?,?,?,?,?)",
+                (
+                    title,
+                    str(payload.get("body") or ""),
+                    json.dumps(payload.get("files") or [], ensure_ascii=False),
+                    actor,
+                    review_required,
+                ),
+            )
             cid = int(cur.lastrowid)
+        _audit("content.create", str(cid), f"title={title}")
         return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
 
     def _post_payload(cid: int) -> dict | None:
@@ -345,7 +455,7 @@ def register(app):
             _ensure_jobs_content_link(c)
             jobs = [dict(item) for item in c.execute(
                 "SELECT id,type,title,status,extra,created_at,finished_at,"
-                "review_note,reviewed_at,review_decision FROM jobs "
+                "review_note,reviewed_at,reviewed_by,review_decision FROM jobs "
                 "WHERE content_id=? ORDER BY id", (cid,)
             ).fetchall()]
         for job in jobs:
@@ -401,6 +511,7 @@ def register(app):
                     (limit,),
                 ).fetchall()]
             items = [item for item in (_post_payload(cid) for cid in ids) if item]
+            items = [item for item in items if _content_visible(int(item["id"]))]
             return jsonify({"code": 200, "msg": None, "data": {"items": items, "total": len(items)}}), 200
 
         payload = request.get_json(silent=True) or {}
@@ -408,22 +519,27 @@ def register(app):
         if not title:
             return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
         files = payload.get("files") if isinstance(payload.get("files"), list) else []
-        review_required = 1 if payload.get("reviewRequired", True) else 0
+        review_required = 1 if _effective_review_required() else 0
+        actor = access_scope.current_actor("local-admin")
         with connect(db, timeout=15) as c:
             _ensure_post_schema(c)
             cur = c.execute(
-                "INSERT INTO contents (title, body, files, review_required, updated_at) "
-                "VALUES (?,?,?,?,CURRENT_TIMESTAMP)",
+                "INSERT INTO contents "
+                "(title, body, files, review_required, created_by, updated_at) "
+                "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
                 (title, str(payload.get("body") or ""),
-                 json.dumps(files, ensure_ascii=False), review_required),
+                 json.dumps(files, ensure_ascii=False), review_required, actor),
             )
             cid = int(cur.lastrowid)
             _upsert_variants(c, cid, payload.get("variants") or {})
+        _audit("content.create", str(cid), f"title={title}")
         return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
 
     @app.route('/api/v2/posts/<int:cid>', methods=['GET', 'PATCH'])
     def post_detail(cid: int):
         if request.method == "GET":
+            if not _content_visible(cid):
+                return access_scope.forbidden("无权访问该内容")
             item = _post_payload(cid)
             if item is None:
                 return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
@@ -433,20 +549,26 @@ def register(app):
         from conf import BASE_DIR
         payload = request.get_json(silent=True) or {}
         db = Path(BASE_DIR / "db" / "database.db")
+        if _content_has_active_jobs(cid):
+            return jsonify({
+                "code": 409,
+                "msg": "内容已进入审核或发布流程，已冻结；请新建版本后再修改",
+                "data": None,
+            }), 409
         with connect(db, timeout=15) as c:
             _ensure_post_schema(c)
             row = c.execute("SELECT id FROM contents WHERE id=?", (cid,)).fetchone()
             if row is None:
                 return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
-            if any(key in payload for key in ("title", "body", "files", "reviewRequired")):
+            if any(key in payload for key in ("title", "body", "files")):
                 current = dict(c.execute("SELECT * FROM contents WHERE id=?", (cid,)).fetchone())
                 title = str(payload.get("title", current.get("title")) or "").strip()
                 if not title:
                     return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
                 body = str(payload.get("body", current.get("body")) or "")
                 files = payload.get("files", _json_value(current.get("files"), []))
-                review_required = 1 if payload.get(
-                    "reviewRequired", bool(current.get("review_required", 1))
+                review_required = 1 if _effective_review_required(
+                    current.get("review_required", 1)
                 ) else 0
                 c.execute(
                     "UPDATE contents SET title=?, body=?, files=?, review_required=?, "
@@ -455,6 +577,7 @@ def register(app):
                      review_required, cid),
                 )
             _upsert_variants(c, cid, payload.get("variants") or {})
+        _audit("content.update", str(cid), "content updated")
         return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
 
     @app.route('/api/v2/posts/<int:cid>/submit', methods=['POST'])
@@ -469,6 +592,8 @@ def register(app):
         from conf import BASE_DIR
         db = Path(BASE_DIR / "db" / "database.db")
         if request.method == "GET":
+            if not _content_visible(cid):
+                return access_scope.forbidden("无权访问该内容")
             with connect(db, timeout=15) as c:
                 rows = [dict(r) for r in c.execute(
                     "SELECT * FROM content_variants WHERE content_id=? ORDER BY platform",
@@ -481,6 +606,12 @@ def register(app):
         tags = payload.get("tags") or []
         if isinstance(tags, str):
             tags = [item.strip() for item in tags.split(",") if item.strip()]
+        if _content_has_active_jobs(cid):
+            return jsonify({
+                "code": 409,
+                "msg": "内容已进入审核或发布流程，已冻结；请新建版本后再修改",
+                "data": None,
+            }), 409
         with connect(db, timeout=15) as c:
             _ensure_variant_tags(c)
             c.execute("""INSERT INTO content_variants
@@ -491,6 +622,7 @@ def register(app):
                       (cid, platform, str(payload.get("title") or ""),
                        str(payload.get("body") or ""),
                        json.dumps(tags, ensure_ascii=False), "draft"))
+        _audit("content.update", str(cid), f"variant={platform}")
         return jsonify({"code": 200, "msg": None, "data": {"ok": True}}), 200
 
     @app.route('/api/v2/contents/<int:cid>/submit', methods=['POST'])
@@ -507,7 +639,6 @@ def register(app):
         if not isinstance(account_map, dict):
             account_map = {}
         override_map = payload.get("variants") or payload.get("overrides") or {}
-        review_required = bool(payload.get("reviewRequired", True))
         global_scheduled_at = str(payload.get("scheduledAt") or "").strip()
         with connect(db, timeout=15) as c:
             _ensure_post_schema(c)
@@ -516,6 +647,17 @@ def register(app):
                 "SELECT * FROM content_variants WHERE content_id=?", (cid,)).fetchall()]
         if not content:
             return jsonify({"code": 404, "msg": "内容不存在", "data": None}), 404
+        if not _content_visible(cid):
+            return access_scope.forbidden("无权提交该内容")
+        if _content_has_active_jobs(cid):
+            return jsonify({
+                "code": 409,
+                "msg": "该内容已有审核中或待发布任务，不能重复提交",
+                "data": None,
+            }), 409
+        review_required = _effective_review_required(
+            content["review_required"] if "review_required" in content.keys() else 1
+        )
         # Validate every target before creating any job. A later scope failure
         # must not leave half of a multi-platform submission queued.
         for variant in variants:
@@ -583,6 +725,11 @@ def register(app):
                 "UPDATE contents SET review_required=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (1 if review_required else 0, cid),
             )
+        _audit(
+            "content.submit",
+            str(cid),
+            f"jobs={','.join(str(item['jobId']) for item in job_ids)};review={review_required}",
+        )
         return jsonify({"code": 200, "msg": None, "data": {"jobs": job_ids, "reviewRequired": review_required}}), 200
 
     # ---------- P1-2 驾驶舱 ----------
@@ -858,15 +1005,7 @@ def register(app):
         payload = request.get_json(silent=True) or {}
         # 复用内容中台：直接建 content + variants
         resp = contents_create_open(payload)
-        try:
-            import rbac_audit as _ra
-            _ra.init_rbac()
-            with _ra.get_conn() as c:
-                c.execute("INSERT INTO audit_logs (user, action, target, detail, ok) VALUES (?,?,?,?,?)",
-                          ("openapi", "open.contents.create", "",
-                           str((payload or {}).get("title") or "")[:200], 1))
-        except Exception:
-            pass
+        _audit("open.contents.create", "", str((payload or {}).get("title") or "")[:200])
         return resp
 
     def contents_create_open(payload: dict):
@@ -876,11 +1015,23 @@ def register(app):
         from conf import BASE_DIR
         db = Path(BASE_DIR / "db" / "database.db")
         title = str((payload or {}).get("title") or "").strip() or "开放API内容"
+        actor = access_scope.current_actor("local-admin")
+        review_required = 1 if _effective_review_required() else 0
         with connect(db, timeout=15) as c:
-            cur = c.execute("INSERT INTO contents (title, body, files) VALUES (?,?,?)",
-                            (title, str((payload or {}).get("body") or ""),
-                             json.dumps((payload or {}).get("files") or [], ensure_ascii=False)))
+            _ensure_post_schema(c)
+            cur = c.execute(
+                "INSERT INTO contents "
+                "(title, body, files, created_by, review_required) VALUES (?,?,?,?,?)",
+                (
+                    title,
+                    str((payload or {}).get("body") or ""),
+                    json.dumps((payload or {}).get("files") or [], ensure_ascii=False),
+                    actor,
+                    review_required,
+                ),
+            )
             cid = int(cur.lastrowid)
+        _audit("content.create", str(cid), f"source=openapi;title={title}")
         return jsonify({"code": 200, "msg": None, "data": {"id": cid}}), 200
 
     @app.route('/open/v1/jobs', methods=['POST'])
@@ -900,7 +1051,7 @@ def register(app):
                 int(payload.get("type") or 3), str(payload.get("title") or "开放API任务"),
                 payload.get("tags") or [], payload.get("files") or [],
                 accounts, payload.get("extra") or {},
-                review_required=bool(payload.get("reviewRequired", True)))
+                review_required=_effective_review_required(direct_publish=True))
         except Exception as exc:
             return jsonify({"code": 400, "msg": str(exc)[:300], "data": None}), 400
         try:
@@ -919,8 +1070,11 @@ def register(app):
             return jsonify({"code": 404, "msg": "job not found", "data": None}), 404
         if not access_scope.job_in_scope(dict(row)):
             return access_scope.forbidden("无权读取该发布任务")
+        job = dict(row)
+        for key in ("lease_token", "claim_token", "heartbeat_token"):
+            job.pop(key, None)
         return jsonify({"code": 200, "msg": None,
-                        "data": {"job": dict(row),
+                        "data": {"job": job,
                                  "progress": publish_jobs.job_progress(job_id)}}), 200
 
     @app.route('/api/v2/webhooks/subscribe', methods=['POST'])

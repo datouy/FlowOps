@@ -25,8 +25,10 @@ def init_db():
             c.execute("ALTER TABLE file_records ADD COLUMN tags TEXT DEFAULT ''")
         if "md5" not in cols:
             c.execute("ALTER TABLE file_records ADD COLUMN md5 TEXT DEFAULT ''")
+        if "uploaded_by" not in cols:
+            c.execute("ALTER TABLE file_records ADD COLUMN uploaded_by TEXT NOT NULL DEFAULT ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_file_md5 ON file_records(md5)")
-        record_schema_version(c, "material_ops", 1)
+        record_schema_version(c, "material_ops", 2)
 
 
 init_db()
@@ -43,6 +45,54 @@ def file_md5(path) -> str:
 def duplicate_count(md5: str) -> int:
     with get_conn() as c:
         return c.execute("SELECT COUNT(*) FROM file_records WHERE md5=? AND md5!=''", (md5,)).fetchone()[0]
+
+
+def _audit(action: str, target: str, detail: str = "") -> None:
+    try:
+        import access_scope
+        import rbac_audit
+
+        rbac_audit.record_audit(
+            action,
+            target,
+            detail,
+            actor=access_scope.current_actor("local-admin"),
+        )
+    except Exception:
+        pass
+
+
+def record_upload(
+    filename: str,
+    filesize: float,
+    file_path: str,
+    md5: str,
+    tags: str = "",
+    *,
+    uploaded_by: str = "",
+) -> int:
+    """统一写入素材记录，保证新上传都有操作人。"""
+    with get_conn() as c:
+        cur = c.execute(
+            "INSERT INTO file_records "
+            "(filename, filesize, file_path, md5, tags, uploaded_by) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                str(filename),
+                round(float(filesize), 2),
+                str(file_path),
+                str(md5),
+                str(tags or ""),
+                str(uploaded_by or ""),
+            ),
+        )
+        record_id = int(cur.lastrowid)
+    _audit(
+        "material.upload",
+        str(record_id),
+        f"filename={filename};path={file_path};md5={md5}",
+    )
+    return record_id
 
 def _used_names() -> set:
     used = set()
@@ -99,6 +149,7 @@ def register(app):
             return jsonify({"code": 400, "msg": "id required"}), 400
         with get_conn() as c:
             c.execute("UPDATE file_records SET tags=? WHERE id=?", (tags, mid))
+        _audit("material.tags", str(mid), f"tags={tags}")
         return jsonify({"code": 200, "msg": "ok"})
 
     @app.route("/materials/duplicates", methods=["GET"])
@@ -137,5 +188,10 @@ def register(app):
                     removed.append({"id": item["id"], "filename": item["filename"], "size": item["size"]})
                 except Exception as exc:
                     errors.append({"id": item["id"], "error": str(exc)[:120]})
+        _audit(
+            "material.cleanup",
+            ",".join(str(item["id"]) for item in removed),
+            f"days={days};removed={len(removed)};errors={len(errors)}",
+        )
         return jsonify({"code": 200, "data": {"removed": removed, "errors": errors}, "msg": "ok"})
 
