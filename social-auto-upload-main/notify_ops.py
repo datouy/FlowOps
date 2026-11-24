@@ -2,7 +2,6 @@
 """异常通知：支持企业微信机器人、飞书机器人和通用 webhook。"""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from flask import jsonify
