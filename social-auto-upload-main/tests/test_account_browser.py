@@ -13,9 +13,11 @@ from utils.account_browser import (
     account_fingerprint,
     open_persistent_account_context,
     persistent_account_context,
+    save_account_storage_state,
 )
 from utils.account_environment import update_proxy
 from utils.account_fingerprint import load_fingerprint
+from utils import credential_crypto
 
 
 class FakeContext:
@@ -33,6 +35,14 @@ class FakeContext:
 
     async def close(self):
         self.closed = True
+
+
+class FakeStorageContext:
+    def __init__(self, state):
+        self._state = state
+
+    async def storage_state(self, **_kwargs):
+        return self._state
 
 
 class FakeChromium:
@@ -57,6 +67,28 @@ def _cookie(tmp_path, name="account.json", state=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state or {"cookies": [], "origins": []}), encoding="utf-8")
     return path
+
+
+def test_save_account_storage_state_writes_encrypted_and_drops_plaintext(tmp_path, monkeypatch):
+    monkeypatch.setenv(credential_crypto.MASTER_KEY_ENV, "unit-test-master-key")
+    credential_crypto.reset_master_key_cache()
+    cookie = tmp_path / "cookiesFile" / "account.json"
+    cookie.parent.mkdir(parents=True, exist_ok=True)
+    cookie.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
+    state = {
+        "cookies": [{
+            "name": "sessionid", "value": "super-secret",
+            "domain": ".douyin.com", "path": "/",
+        }],
+        "origins": [],
+    }
+
+    ok = asyncio.run(save_account_storage_state(FakeStorageContext(state), cookie))
+
+    assert ok is True
+    assert not cookie.exists()
+    assert credential_crypto.secret_path(cookie).is_file()
+    assert credential_crypto.read_storage_state(cookie) == state
 
 
 def test_persistent_profile_is_stable_and_account_scoped(tmp_path):

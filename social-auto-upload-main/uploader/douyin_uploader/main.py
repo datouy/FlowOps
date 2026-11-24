@@ -1105,9 +1105,13 @@ async def douyin_cookie_gen(
                 # 不再用 flaky 的浏览器重检（那正是导致成功被误判为失败的老 bug）。
                 # 只轻量确认文件里有 sessionid。
                 try:
-                    import json as _json
-                    _d = _json.load(open(account_file))
-                    _has_sess = any(c.get("name") in DOUYIN_AUTH_COOKIE_NAMES and c.get("value") for c in _d.get("cookies", []))
+                    from utils import credential_crypto
+
+                    _d = credential_crypto.read_storage_state(account_file)
+                    _has_sess = any(
+                        c.get("name") in DOUYIN_AUTH_COOKIE_NAMES and c.get("value")
+                        for c in (_d or {}).get("cookies", [])
+                    )
                     if not _has_sess:
                         result = _build_login_result(
                             False,

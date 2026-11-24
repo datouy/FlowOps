@@ -192,8 +192,12 @@ async def alipay_cookie_gen(account_file, qrcode_callback=None, poll_interval: i
                 await save_account_storage_state(context, account_file)
                 # 登录结束，轻量确认 cookie 文件里有点东西
                 try:
-                    _d = _json.load(open(account_file))
-                    _has_cookie = any(c.get("value") for c in _d.get("cookies", []))
+                    from utils.credential_crypto import read_storage_state
+
+                    _d = read_storage_state(account_file)
+                    _has_cookie = any(
+                        c.get("value") for c in (_d or {}).get("cookies", [])
+                    )
                     if not _has_cookie:
                         result = _build_login_result(False, "cookie_invalid", "支付宝扫码流程结束，但 cookie 为空", account_file, qrcode_info, page.url)
                 except Exception as _e:
