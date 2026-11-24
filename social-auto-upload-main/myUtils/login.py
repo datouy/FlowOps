@@ -64,6 +64,7 @@ def get_browser_options():
 async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None,
                             auth_method='qr', phone='', password=''):
     from uploader.douyin_uploader.main import (
+        cookie_auth as douyin_cookie_auth,
         douyin_cookie_gen as wait_for_douyin_login,
         douyin_form_cookie_gen,
     )
@@ -137,6 +138,27 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         if not result.get("success"):
             raise RuntimeError(result.get("message") or "抖音登录失败")
 
+        # 保存后独立复验：抖音登录成功过去只做"文件里有 sessionid"的轻量确认，
+        # 没有像视频号/快手那样再开一个独立浏览器确认这份凭据真的能进创作者后台。
+        # 这里复用发布侧稳健的 cookie_auth（3 次重试 + 稳定等待），而不是
+        # myUtils.auth 里那个 flaky 的 cookie_auth_douyin——后者正是历史上把
+        # "其实登录成功"误判成"失效"的老 bug 来源。
+        # 独立复验失败时走 fail-closed：抛错进入 except，删除凭据并返回 500，
+        # 不让一份没验证过的坏凭据进入账号表。
+        valid = False
+        for attempt in range(2):
+            try:
+                valid = await douyin_cookie_auth(str(cookie_path))
+            except Exception as exc:
+                logger.warning("抖音保存后独立复验异常（第 {} 次）: {}", attempt + 1, exc)
+                valid = False
+            if valid:
+                break
+            if attempt == 0:
+                await asyncio.sleep(2)
+        if not valid:
+            raise RuntimeError("抖音登录校验未通过，请重新扫码登录")
+
         saved = save_login_account(3, cookie_name, id, account_id)
         logger.info("抖音账号状态已记录：{} #{}", saved.get("action"), saved.get("id"))
         status_queue.put("200")
@@ -146,8 +168,12 @@ async def douyin_cookie_gen(id, status_queue, account_id=None, verify_queue=None
         error_message = re.sub(r"\s+", " ", error_message)[:240] or "抖音登录失败"
         logger.warning("抖音登录失败({}): {}", auth_method, error_message)
         status_queue.put(f"LOGIN_ERROR:{error_message}")
+        # 登录失败/复验失败都要把凭据删干净：密文 .enc 和可能残留的老明文 .json。
         try:
+            from utils import credential_crypto
+
             cookie_path.unlink(missing_ok=True)
+            credential_crypto.secret_path(cookie_path).unlink(missing_ok=True)
         except Exception:
             pass
         status_queue.put("500")
