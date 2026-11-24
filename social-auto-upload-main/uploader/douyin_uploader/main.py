@@ -17,7 +17,7 @@ from patchright.async_api import async_playwright
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
-from utils import browser_timeout
+from utils import browser_timeout, credential_crypto
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -480,7 +480,7 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
 
 
 async def cookie_auth(account_file):
-    if not os.path.exists(account_file):
+    if not credential_crypto.credential_exists(account_file):
         return False
 
     use_headless = os.environ.get("DOUYIN_COOKIE_AUTH_HEADLESS", "true").lower() in ("1", "true", "yes")
@@ -511,7 +511,7 @@ async def cookie_auth(account_file):
 
 
 async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
-    if not os.path.exists(account_file) or not await cookie_auth(account_file):
+    if not credential_crypto.credential_exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
@@ -1159,7 +1159,7 @@ class DouYinBaseUploader(BaseVideoUploader):
         self.headless = headless
 
     async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
+        if not credential_crypto.credential_exists(self.account_file):
             raise ResourceMissingError(f"cookie文件不存在，请先完成抖音登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
             raise AuthExpiredError(f"cookie文件已失效，请先完成抖音登录: {self.account_file}")
