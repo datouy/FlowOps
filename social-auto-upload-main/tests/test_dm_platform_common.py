@@ -118,3 +118,38 @@ def test_account_rows_marks_encrypted_cookie_as_present(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["has_cookie"] is True
     assert rows[0]["cookie_path"].endswith("abc123.enc")
+
+
+# ---- 主站私信会话与创作平台会话的边界 --------------------------------
+# 小红书主站私信（web_session）与创作平台发布是两套独立会话。创作平台的
+# status 由 cookie_auth_xhs 按 creator 口径判定，失效不代表主站私信失效。
+# 私信同步对这类平台不能因为 creator status == 0 就把账号一起停掉。
+
+
+def _dm_manager(dm_session_independent_of_creator: bool):
+    manager = object.__new__(dm_platform_common.BaseDmSync)
+    manager.prefer_active_accounts = False
+    manager.dm_session_independent_of_creator = dm_session_independent_of_creator
+    return manager
+
+
+def test_dm_sync_drops_creator_expired_by_default():
+    """默认（私信与创作平台同会话）时，creator status==0 不再同步私信。"""
+    manager = _dm_manager(False)
+    accounts = [
+        {"id": 1, "status": 0, "cookie_path": "/tmp/a.enc"},
+        {"id": 2, "status": 1, "cookie_path": "/tmp/b.enc"},
+    ]
+    selected = manager.resolve_accounts(accounts, {})
+    assert [item["id"] for item in selected] == [2]
+
+
+def test_dm_sync_keeps_creator_expired_when_session_independent():
+    """主站私信独立时，creator status==0 只要凭据还在就继续同步私信。"""
+    manager = _dm_manager(True)
+    accounts = [
+        {"id": 1, "status": 0, "cookie_path": "/tmp/a.enc"},
+        {"id": 2, "status": 1, "cookie_path": "/tmp/b.enc"},
+    ]
+    selected = manager.resolve_accounts(accounts, {})
+    assert [item["id"] for item in selected] == [1, 2]

@@ -382,6 +382,7 @@ class BaseDmSync:
         auto_trigger: str = "timer",
         initial_delay: float = 5,
         prefer_active_accounts: bool = False,
+        dm_session_independent_of_creator: bool = False,
         error_types: tuple[type[BaseException], ...] = (),
         max_workers: int = 8,
         failure_backoff: float = 30.0,
@@ -410,6 +411,7 @@ class BaseDmSync:
         self.auto_trigger = auto_trigger
         self.initial_delay = max(0.0, float(initial_delay))
         self.prefer_active_accounts = prefer_active_accounts
+        self.dm_session_independent_of_creator = dm_session_independent_of_creator
         self.error_types = (SyncError, *error_types)
         self.max_workers = max(1, int(max_workers))
         self.failure_backoff = max(1.0, float(failure_backoff))
@@ -726,7 +728,16 @@ class BaseDmSync:
             if not selected:
                 selected = list(accounts)
         # 失效账号全局隐藏：即使被显式选中也不再同步。
-        selected = [item for item in selected if _dm_account_alive(item)]
+        #
+        # 例外：小红书这类"主站私信"与"创作平台发布"是两套独立会话。创作
+        # 平台的 status（由 cookie_auth_xhs 按 creator 口径判定）失效，不代表
+        # 主站 web_session 失效；用创作平台状态把私信同步一起停掉，会在发布
+        # 会话过期、主站私信仍可用时漏掉客户消息。这类平台只要求凭据文件
+        # 存在，主站私信是否有效交给同步时的 XhsAuthError 判定。
+        if self.dm_session_independent_of_creator:
+            selected = [item for item in selected if item.get("cookie_path")]
+        else:
+            selected = [item for item in selected if _dm_account_alive(item)]
         result = []
         for item in selected:
             prepared = dict(item)

@@ -373,6 +373,9 @@ sync_manager = XiaohongshuDmSync(
     default_interval=120,
     default_max_conversations=50,
     default_history_days=DEFAULT_HISTORY_DAYS,
+    # 小红书主站私信（web_session）与创作平台发布（access-token-creator 等）
+    # 是两套独立会话，私信同步不能因为创作平台 status 失效就被一起停掉。
+    dm_session_independent_of_creator=True,
     error_types=(XhsError, XhsAuthError),
     max_workers=8,
     failure_backoff=30,
