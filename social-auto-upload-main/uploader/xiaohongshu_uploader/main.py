@@ -16,7 +16,7 @@ from patchright.async_api import async_playwright
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
-from utils import browser_timeout
+from utils import browser_timeout, credential_crypto
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -471,7 +471,7 @@ async def _is_xhs_login_completed(page: Page) -> bool:
 
 
 async def cookie_auth(account_file):
-    if not os.path.exists(account_file):
+    if not credential_crypto.credential_exists(account_file):
         return False
 
     async with async_playwright() as playwright:
@@ -523,7 +523,7 @@ async def xiaohongshu_setup(
     qrcode_callback=None,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
-    if not os.path.exists(account_file) or not await cookie_auth(account_file):
+    if not credential_crypto.credential_exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
@@ -625,7 +625,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         self.headless = headless
 
     async def validate_base_args(self):
-        if not os.path.exists(self.account_file):
+        if not credential_crypto.credential_exists(self.account_file):
             raise ResourceMissingError(f"cookie文件不存在，请先完成小红书登录: {self.account_file}")
         if not await cookie_auth(self.account_file):
             raise AuthExpiredError(f"cookie文件已失效，请先完成小红书登录: {self.account_file}")
