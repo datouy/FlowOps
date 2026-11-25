@@ -3,7 +3,7 @@
     <header class="section-heading">
       <div>
         <h2>团队与权限</h2>
-        <p>每个成员使用独立账号；禁用账号、修改角色或密码会立即撤销现有会话。</p>
+        <p>每个成员使用独立账号；禁用或修改角色会撤销现有会话。禁用、修改角色或变更账号范围会取消其未开始的任务和子任务，已开始访问平台的当前子任务保留人工核对。</p>
       </div>
       <div class="heading-actions">
         <el-button :loading="loading" @click="load">刷新</el-button>
@@ -69,13 +69,14 @@
         </template>
       </el-table-column>
       <el-table-column prop="lastLoginAt" label="最近登录" width="170" />
-      <el-table-column label="操作" width="390" fixed="right">
+      <el-table-column label="操作" width="470" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
           <el-button link @click="resetPassword(row)">重置密码</el-button>
           <el-button link @click="resetMfa(row)">重置双因素</el-button>
           <el-button link @click="unlockLogin(row)">解除锁定</el-button>
           <el-button link @click="revokeSessions(row)">踢下线</el-button>
+          <el-button link type="warning" @click="stopQueuedJobs(row)">停待发</el-button>
           <el-button link :type="row.disabled ? 'success' : 'danger'" @click="toggleDisabled(row)">
             {{ row.disabled ? '启用' : '禁用' }}
           </el-button>
@@ -200,6 +201,7 @@ function normalizedScope() {
 
 async function save() {
   saving.value = true
+  let response = null
   try {
     const scope = form.value.role === 'admin' ? [] : normalizedScope()
     if (form.value.role !== 'admin' && !scope.length) {
@@ -216,13 +218,20 @@ async function save() {
         mustChangePassword: form.value.mustChangePassword
       })
     } else {
-      await userApi.updateUser(editingId.value, {
+      response = await userApi.updateUser(editingId.value, {
         displayName: form.value.displayName.trim(),
         role: form.value.role,
         scope
       })
     }
-    ElMessage.success('成员信息已保存')
+    const revocation = response?.data?.jobRevocation
+    if (revocation) {
+      ElMessage.warning(
+        `成员信息已保存；取消 ${revocation.cancelled || 0} 个任务和 ${revocation.cancelledItems || 0} 个未开始子任务，${revocation.deferred || 0} 个任务保留核对`
+      )
+    } else {
+      ElMessage.success('成员信息已保存')
+    }
     dialogVisible.value = false
     await load()
   } finally {
@@ -233,12 +242,50 @@ async function save() {
 async function toggleDisabled(row) {
   try {
     await ElMessageBox.confirm(
-      row.disabled ? `确定启用 ${row.username}？` : `禁用后 ${row.username} 的现有会话会立即失效。`,
+      row.disabled
+        ? `确定启用 ${row.username}？`
+        : `禁用后 ${row.username} 的现有会话会立即失效，由该成员创建但尚未开始的任务和子任务会被取消；已开始访问平台的当前子任务保留供人工核对。`,
       row.disabled ? '启用成员' : '禁用成员',
       { type: row.disabled ? 'info' : 'warning' }
     )
-    await userApi.updateUser(row.id, { disabled: !row.disabled })
-    ElMessage.success(row.disabled ? '成员已启用' : '成员已禁用')
+    const response = await userApi.updateUser(row.id, { disabled: !row.disabled })
+    const cancelled = response.data?.jobRevocation?.cancelled || 0
+    const cancelledItems = response.data?.jobRevocation?.cancelledItems || 0
+    const deferred = response.data?.jobRevocation?.deferred || 0
+    ElMessage.success(
+      row.disabled
+        ? '成员已启用'
+        : `成员已禁用，取消 ${cancelled} 个任务和 ${cancelledItems} 个未开始子任务，${deferred} 个含执行中子任务的任务保留核对`
+    )
+    await load()
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') throw error
+  }
+}
+
+async function stopQueuedJobs(row) {
+  try {
+    const listed = await userApi.listQueuedJobs(row.id)
+    const counts = listed.data?.counts || {}
+    if (!counts.matched) {
+      ElMessage.info('该成员当前没有待执行中或执行中的发布任务')
+      return
+    }
+    const pendingItems = counts.pendingItems || 0
+    const { value } = await ElMessageBox.prompt(
+      `匹配 ${counts.matched} 个任务和 ${pendingItems} 个未开始子任务：${counts.cancellable} 个任务可整体取消，${counts.deferred} 个含已开始子任务的任务保留核对。`,
+      '停止成员任务',
+      {
+        type: 'warning',
+        inputPlaceholder: '填写审计原因',
+        inputValidator: value => String(value || '').trim().length >= 2 || '请填写至少 2 个字符'
+      }
+    )
+    const outcome = await userApi.cancelQueuedJobs(row.id, { reason: value })
+    const result = outcome.data || {}
+    ElMessage.success(
+      `已取消 ${result.cancelled || 0} 个任务和 ${result.cancelledItems || 0} 个未开始子任务，${result.deferred || 0} 个任务保留核对`
+    )
     await load()
   } catch (error) {
     if (error !== 'cancel' && error !== 'close') throw error

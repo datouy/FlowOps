@@ -316,6 +316,7 @@ def _identity_for_user(row: Any) -> dict:
     if permissions is None:
         return {}
     return {
+        "user_id": int(item.get("id") or 0),
         "user": str(item.get("username") or ""),
         "display_name": str(item.get("display_name") or ""),
         "role": role,
@@ -1334,6 +1335,7 @@ def users_create():
 @bp.patch("/api/v2/users/<int:user_id>")
 def users_update(user_id: int):
     payload = request.get_json(silent=True) or {}
+    before = get_user(user_id)
     try:
         result = update_user(
             user_id,
@@ -1345,7 +1347,103 @@ def users_update(user_id: int):
         )
     except AuthError as exc:
         return _json_error(str(exc), 400)
+    access_changed = bool(before) and (
+        (not before["disabled"] and result["disabled"])
+        or result["role"] != before["role"]
+        or list(result["scope"]) != list(before["scope"])
+    )
+    if access_changed:
+        if not before["disabled"] and result["disabled"]:
+            reason = f"成员 {result['username']} 已禁用，未开始任务停止执行"
+        elif result["role"] != before["role"]:
+            reason = (
+                f"成员 {result['username']} 角色由 {before['role']} 变更为 "
+                f"{result['role']}，未开始任务停止执行"
+            )
+        else:
+            reason = f"成员 {result['username']} 账号范围已变更，未开始任务停止执行"
+        try:
+            import publish_jobs
+
+            outcome = publish_jobs.cancel_actor_queued_jobs(
+                actor_user_id=int(user_id),
+                actor_name=str(result["username"]),
+                reason=reason,
+            )
+            result["jobRevocation"] = outcome
+            actor = (getattr(g, "identity", None) or {}).get("user") or "system"
+            _audit(
+                "user.jobs.revoke_account_access",
+                str(user_id),
+                f"cancelled={outcome.get('cancelled', 0)};"
+                f"cancelledItems={outcome.get('cancelledItems', 0)};"
+                f"deferred={outcome.get('deferred', 0)}",
+                actor=actor,
+            )
+        except Exception as exc:
+            logger.exception("成员 {} 更新后停止待执行任务失败", user_id)
+            result["jobRevocationError"] = str(exc)[:300]
+            return jsonify({
+                "code": 500,
+                "msg": "成员权限已更新，但待执行任务停止失败，请立即人工核对任务队列",
+                "data": result,
+            }), 500
     return jsonify({"code": 200, "msg": None, "data": result}), 200
+
+
+@bp.get("/api/v2/users/<int:user_id>/queued-jobs")
+def users_queued_jobs(user_id: int):
+    user = get_user(user_id)
+    if user is None:
+        return _json_error("用户不存在", 404)
+    import publish_jobs
+
+    preview = publish_jobs.cancel_actor_queued_jobs(
+        actor_user_id=int(user_id), actor_name=str(user["username"]),
+        dry_run=True,
+    )
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {
+            "user": user["username"],
+            "policy": "cancel-unstarted",
+            "jobs": preview["jobs"],
+            "counts": {
+                "matched": preview["matched"],
+                "cancellable": preview["cancellable"],
+                "deferred": preview["deferred"],
+                "pendingItems": preview["pendingItems"],
+            },
+        },
+    }), 200
+
+
+@bp.post("/api/v2/users/<int:user_id>/cancel-queued-jobs")
+def users_cancel_queued_jobs(user_id: int):
+    user = get_user(user_id)
+    if user is None:
+        return _json_error("用户不存在", 404)
+    payload = request.get_json(silent=True) or {}
+    import publish_jobs
+
+    outcome = publish_jobs.cancel_actor_queued_jobs(
+        actor_user_id=int(user_id),
+        actor_name=str(user["username"]),
+        reason=str(payload.get("reason") or f"管理员停止成员 {user['username']} 的待执行任务"),
+        dry_run=bool(payload.get("dryRun", False)),
+    )
+    if not outcome.get("dryRun"):
+        actor = (getattr(g, "identity", None) or {}).get("user") or "system"
+        _audit(
+            "user.jobs.cancel",
+            str(user_id),
+            f"cancelled={outcome.get('cancelled', 0)};"
+            f"cancelledItems={outcome.get('cancelledItems', 0)};"
+            f"deferred={outcome.get('deferred', 0)}",
+            actor=actor,
+        )
+    return jsonify({"code": 200, "msg": None, "data": outcome}), 200
 
 
 @bp.post("/api/v2/users/<int:user_id>/password")

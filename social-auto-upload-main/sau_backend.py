@@ -301,8 +301,9 @@ def session_identity():
                 'mfaEnabled': False,
                 'reviewMode': runtime_config.REVIEW_MODE,
                 'roleRevocationPolicy': (
-                    'new requests denied immediately; queued tasks continue '
-                    'unless an administrator cancels them'
+                    'new requests denied immediately; unstarted jobs and items are '
+                    'cancelled, while the current item and remote result remain '
+                    'visible for reconciliation'
                 ),
             },
             'msg': None,
@@ -325,8 +326,9 @@ def session_identity():
             'mfaEnabled': bool(identity.get('mfa_enabled')),
             'reviewMode': runtime_config.REVIEW_MODE,
             'roleRevocationPolicy': (
-                'new requests denied immediately; queued tasks continue '
-                'unless an administrator cancels them'
+                'new requests denied immediately; unstarted jobs and items are '
+                'cancelled, while the current item and remote result remain '
+                'visible for reconciliation'
             ),
         },
         'msg': None,

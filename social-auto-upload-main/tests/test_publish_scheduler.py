@@ -82,6 +82,60 @@ def test_claim_job_token_is_atomic(env):
     assert pj.heartbeat_token(job_id, "wrong-token") is False
 
 
+def test_revoked_job_is_not_claimable_or_requeued(env, monkeypatch):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    pj._expand_publish_items(job)
+    with pj.get_conn() as c:
+        c.execute(
+            "UPDATE jobs SET authorization_state='revoked',authorization_note=? "
+            "WHERE id=?",
+            ("离岗撤权", job_id),
+        )
+    queued = []
+    monkeypatch.setattr(pj, "_queue_job", lambda value: queued.append(value))
+
+    assert pj.claim_job_token(job_id) is None
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    pj._finalize_job(job_id, job=job)
+
+    with pj.get_conn() as c:
+        status = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+    assert status == "paused"
+    assert queued == []
+    assert pj.job_items(job_id)[0]["status"] == "pending"
+
+
+def test_revocation_stops_after_current_item_and_pauses_remainder(env, monkeypatch):
+    pj, _base = env
+    job_id = _create_job(pj, ["v1.mp4", "v2.mp4"], [COOKIE_A])
+    calls = []
+
+    def execute_item(item, _job, _extra):
+        calls.append(int(item["id"]))
+        with pj.get_conn() as c:
+            c.execute(
+                "UPDATE jobs SET authorization_state='revoked',"
+                "authorization_note='执行中撤权' WHERE id=?",
+                (job_id,),
+            )
+        return {"verified": True, "state": "published", "post_id": "p-1"}
+
+    monkeypatch.setattr(pj, "_execute_item", execute_item)
+    pj._run_job(job_id)
+
+    items = pj.job_items(job_id)
+    with pj.get_conn() as c:
+        status = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+    assert calls == [items[0]["id"]]
+    assert items[0]["status"] == "success"
+    assert items[1]["status"] == "pending"
+    assert status == "paused"
+
+
 def test_stale_lease_recovers_items_in_same_state_machine(env):
     pj, _base = env
     job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
@@ -116,6 +170,28 @@ def test_stale_lease_marks_submitted_item_uncertain(env):
 
     pj.release_stale_leases()
     assert pj.job_items(job_id)[0]["status"] == "uncertain"
+
+
+def test_revoked_stale_lease_is_paused_instead_of_recovered(env):
+    pj, _base = env
+    job_id = _create_job(pj, ["v.mp4"], [COOKIE_A])
+    with pj.get_conn() as c:
+        job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    pj._expand_publish_items(job)
+    with pj.get_conn() as c:
+        c.execute("UPDATE publish_items SET status='running' WHERE job_id=?", (job_id,))
+        c.execute(
+            "UPDATE jobs SET status='running',authorization_state='revoked',"
+            "authorization_note='离岗撤权',retry_count=0,"
+            "lease_until=datetime('now','-2 minutes') WHERE id=?",
+            (job_id,),
+        )
+
+    assert pj.release_stale_leases() == 0
+    with pj.get_conn() as c:
+        status = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+    assert status == "paused"
+    assert pj.job_items(job_id)[0]["status"] == "pending"
 
 
 def test_recover_pending_jobs_picks_up_stuck_schedule(env):

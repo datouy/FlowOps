@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from flask import g
 
 import access_scope
 import runtime_config
@@ -33,6 +35,8 @@ def _make_main_db(base: Path) -> Path:
 def auth_env(tmp_path, monkeypatch):
     be = pytest.importorskip("sau_backend")
     import conf
+    import job_events
+    import publish_jobs
     import rbac_audit
 
     main_db = _make_main_db(tmp_path)
@@ -40,6 +44,12 @@ def auth_env(tmp_path, monkeypatch):
     monkeypatch.setattr(conf, "BASE_DIR", tmp_path, raising=True)
     monkeypatch.setattr(user_auth, "DB", main_db, raising=True)
     monkeypatch.setattr(rbac_audit, "DB", main_db, raising=True)
+    jobs_db = tmp_path / "db" / "publish_jobs.db"
+    monkeypatch.setattr(publish_jobs, "DB", jobs_db, raising=True)
+    monkeypatch.setattr(publish_jobs, "BASE_DIR", tmp_path, raising=True)
+    monkeypatch.setattr(job_events, "DB", jobs_db, raising=True)
+    publish_jobs.init_db()
+    monkeypatch.setattr(publish_jobs, "_queue_job", lambda *_a, **_kw: False)
     access_scope.bind_base_dir(lambda: be.BASE_DIR)
     rbac_audit.init_rbac()
     user_auth.init_auth_schema(force=True)
@@ -56,10 +66,13 @@ def auth_env(tmp_path, monkeypatch):
         display_name="管理员甲", must_change_password=False,
     )
     return SimpleNamespace(
+        app=be.app,
         client=be.app.test_client(),
         db=main_db,
+        jobs_db=jobs_db,
         admin=admin,
         user_auth=user_auth,
+        publish_jobs=publish_jobs,
     )
 
 
@@ -229,6 +242,172 @@ def test_last_active_admin_cannot_be_disabled(auth_env):
     assert auth_env.client.get(
         "/api/v2/session", headers=_headers(login["token"])
     ).status_code == 200
+
+
+def test_job_provenance_and_access_revocation_are_fail_safe(auth_env):
+    operator = auth_env.user_auth.create_user(
+        "operator01", "OperatorPass-2026!", "operator", ["dy-main.json"],
+        display_name="运营甲", must_change_password=False,
+    )
+    with auth_env.app.test_request_context():
+        g.identity = {
+            "user_id": int(operator["id"]),
+            "user": "operator01",
+            "role": "operator",
+            "scope": ["dy-main.json"],
+            "source": "session",
+            "session_id": "session-hash",
+        }
+        pending_id = auth_env.publish_jobs.enqueue_job(
+            3, "待执行任务", [], ["v.mp4"], ["dy-main.json"], {},
+        )
+        running_id = auth_env.publish_jobs.enqueue_job(
+            3, "执行中任务", [], ["v.mp4"], ["dy-main.json"], {},
+        )
+        success_id = auth_env.publish_jobs.enqueue_job(
+            3, "历史成功任务", [], ["v.mp4"], ["dy-main.json"], {},
+        )
+    with auth_env.publish_jobs.get_conn() as conn:
+        pending_job = dict(conn.execute(
+            "SELECT * FROM jobs WHERE id=?", (pending_id,)
+        ).fetchone())
+        running_job = dict(conn.execute(
+            "SELECT * FROM jobs WHERE id=?", (running_id,)
+        ).fetchone())
+    auth_env.publish_jobs._expand_publish_items(pending_job)
+    auth_env.publish_jobs._expand_publish_items(running_job)
+    with sqlite3.connect(auth_env.jobs_db) as conn:
+        conn.execute(
+            "UPDATE publish_items SET status='running' WHERE job_id=?",
+            (running_id,),
+        )
+    with sqlite3.connect(auth_env.jobs_db) as conn:
+        row = conn.execute(
+            "SELECT created_by,created_by_user_id,created_by_role,"
+            "created_by_source,created_by_session_id,created_scope "
+            "FROM jobs WHERE id=?",
+            (pending_id,),
+        ).fetchone()
+        assert row[:5] == (
+            "operator01", operator["id"], "operator", "session", "session-hash",
+        )
+        assert json.loads(row[5]) == ["dy-main.json"]
+        conn.execute("UPDATE jobs SET status='running' WHERE id=?", (running_id,))
+        conn.execute("UPDATE jobs SET status='success' WHERE id=?", (success_id,))
+
+    admin_login = _login(auth_env.client, "admin01", "AdminPass-2026!")
+    listed = auth_env.client.get(
+        f"/api/v2/users/{operator['id']}/queued-jobs",
+        headers=_headers(admin_login["token"]),
+    )
+    assert listed.status_code == 200, listed.get_json()
+    listed_data = listed.get_json()["data"]
+    assert listed_data["counts"] == {
+        "matched": 2, "cancellable": 1, "deferred": 1, "pendingItems": 1,
+    }
+    dry_run = auth_env.client.post(
+        f"/api/v2/users/{operator['id']}/cancel-queued-jobs",
+        headers=_headers(admin_login["token"]),
+        json={"dryRun": True, "reason": "离岗预演"},
+    )
+    assert dry_run.status_code == 200, dry_run.get_json()
+    preview = dry_run.get_json()["data"]
+    assert preview["dryRun"] is True
+    assert preview["matched"] == 2
+    assert preview["cancellable"] == 1
+    assert preview["deferred"] == 1
+    assert preview["cancellableJobIds"] == [pending_id]
+    assert preview["deferredJobIds"] == [running_id]
+    with sqlite3.connect(auth_env.jobs_db) as conn:
+        assert conn.execute("SELECT status FROM jobs WHERE id=?", (pending_id,)).fetchone()[0] == "pending"
+        assert conn.execute("SELECT status FROM jobs WHERE id=?", (running_id,)).fetchone()[0] == "running"
+
+    disabled = auth_env.client.patch(
+        f"/api/v2/users/{operator['id']}",
+        headers=_headers(admin_login["token"]),
+        json={"disabled": True},
+    )
+    assert disabled.status_code == 200, disabled.get_json()
+    revocation = disabled.get_json()["data"]["jobRevocation"]
+    assert revocation["cancelled"] == 1
+    assert revocation["deferred"] == 1
+    assert revocation["cancelledItems"] == 1
+    assert revocation["jobIds"] == [pending_id]
+    assert revocation["deferredJobIds"] == [running_id]
+
+    with sqlite3.connect(auth_env.jobs_db) as conn:
+        pending = conn.execute(
+            "SELECT status,authorization_state,result FROM jobs WHERE id=?", (pending_id,)
+        ).fetchone()
+        running = conn.execute(
+            "SELECT status,authorization_state FROM jobs WHERE id=?", (running_id,)
+        ).fetchone()
+        success = conn.execute(
+            "SELECT status,authorization_state FROM jobs WHERE id=?", (success_id,)
+        ).fetchone()
+        events = conn.execute(
+            "SELECT job_id,code FROM job_events WHERE code='authorization_revoked' "
+            "ORDER BY id"
+        ).fetchall()
+        pending_item = conn.execute(
+            "SELECT status,error_kind FROM publish_items WHERE job_id=?",
+            (pending_id,),
+        ).fetchone()
+    assert pending[0] == "cancelled" and pending[1] == "revoked"
+    assert "已禁用" in pending[2]
+    assert running == ("running", "revoked")
+    assert success == ("success", "active")
+    assert pending_item == ("cancelled", "authorization_revoked")
+    assert events == [
+        (pending_id, "authorization_revoked"),
+        (running_id, "authorization_revoked"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_fragment"),
+    [
+        ({"role": "reviewer", "cancelQueuedJobs": False}, "角色由"),
+        ({"scope": ["xhs-main.json"]}, "账号范围已变更"),
+    ],
+)
+def test_access_change_always_stops_unstarted_jobs(
+    auth_env, payload, reason_fragment,
+):
+    operator = auth_env.user_auth.create_user(
+        "operator02", "OperatorPass-2026!", "operator", ["dy-main.json"],
+        display_name="运营乙", must_change_password=False,
+    )
+    with auth_env.app.test_request_context():
+        g.identity = {
+            "user_id": int(operator["id"]),
+            "user": "operator02",
+            "role": "operator",
+            "scope": ["dy-main.json"],
+            "source": "session",
+            "session_id": "session-before-change",
+        }
+        job_id = auth_env.publish_jobs.enqueue_job(
+            3, "权限变更前任务", [], ["v.mp4"], ["dy-main.json"], {},
+        )
+    admin_login = _login(auth_env.client, "admin01", "AdminPass-2026!")
+    changed = auth_env.client.patch(
+        f"/api/v2/users/{operator['id']}",
+        headers=_headers(admin_login["token"]),
+        json=payload,
+    )
+    assert changed.status_code == 200, changed.get_json()
+    revocation = changed.get_json()["data"]["jobRevocation"]
+    assert revocation["jobIds"] == [job_id]
+    assert revocation["cancelled"] == 1
+    with sqlite3.connect(auth_env.jobs_db) as conn:
+        row = conn.execute(
+            "SELECT status,authorization_state,authorization_note "
+            "FROM jobs WHERE id=?", (job_id,),
+        ).fetchone()
+    assert row[0] == "cancelled"
+    assert row[1] == "revoked"
+    assert reason_fragment in row[2]
 
 
 def test_auth_config_is_public_and_reports_limits(auth_env):

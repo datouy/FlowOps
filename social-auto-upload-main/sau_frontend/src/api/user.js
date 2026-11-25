@@ -60,6 +60,14 @@ export const userApi = {
     return http.post(`/api/v2/users/${id}/revoke-sessions`)
   },
 
+  listQueuedJobs(id) {
+    return http.get(`/api/v2/users/${id}/queued-jobs`)
+  },
+
+  cancelQueuedJobs(id, payload = {}) {
+    return http.post(`/api/v2/users/${id}/cancel-queued-jobs`, payload)
+  },
+
   resetMfa(id) {
     return http.post(`/api/v2/users/${id}/mfa-reset`)
   },

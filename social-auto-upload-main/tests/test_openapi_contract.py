@@ -25,6 +25,8 @@ def test_openapi_document_exposes_unified_post_contract():
         "/api/v2/auth/login", "/api/v2/auth/logout", "/api/v2/users",
         "/api/v2/auth/mfa/verify", "/api/v2/auth/mfa/setup",
         "/api/v2/users/{id}", "/api/v2/users/{id}/mfa-reset",
+        "/api/v2/users/{id}/queued-jobs",
+        "/api/v2/users/{id}/cancel-queued-jobs",
         "/api/v2/users/{id}/unlock-login", "/api/metrics",
     } <= set(spec["paths"])
     operation_ids = [

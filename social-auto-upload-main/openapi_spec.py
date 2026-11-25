@@ -395,6 +395,22 @@ def build_spec(server_url: str) -> dict:
                 "responses": {"200": _json_response("JobEnvelope"), **common_errors},
             },
         },
+        "/api/v2/users/{id}/queued-jobs": {
+            "parameters": [_path_id()],
+            "get": {
+                "operationId": "listNamedUserQueuedJobs",
+                "summary": "List jobs attributable to a named user that are not terminal",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
+        "/api/v2/users/{id}/cancel-queued-jobs": {
+            "parameters": [_path_id()],
+            "post": {
+                "operationId": "cancelNamedUserQueuedJobs",
+                "summary": "Cancel unstarted jobs created by a named user",
+                "responses": {"200": _json_response("JobEnvelope"), **common_errors},
+            },
+        },
         "/api/v2/users/{id}/mfa-reset": {
             "parameters": [_path_id()],
             "post": {

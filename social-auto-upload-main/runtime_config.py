@@ -462,7 +462,10 @@ def authorization_status() -> dict:
             role: list(ROLE_PERMISSIONS[role]) for role in PRODUCTION_ROLES
         },
         "reviewMode": REVIEW_MODE,
-        "roleRevocationPolicy": "new requests denied immediately; queued tasks continue unless an administrator cancels them",
+        "roleRevocationPolicy": (
+            "new requests denied immediately; unstarted jobs and items are cancelled, "
+            "while in-flight remote actions finish and remain visible for reconciliation"
+        ),
     }
 
 

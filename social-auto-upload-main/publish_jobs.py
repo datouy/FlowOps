@@ -136,12 +136,13 @@ def claim_job_token(job_id: int, executor_id=None) -> str | None:
             ('lease_until', "DATETIME"),
             ('heartbeat_at', "DATETIME"),
             ('lease_token', "TEXT DEFAULT ''"),
+            ('authorization_state', "TEXT NOT NULL DEFAULT 'active'"),
         ))
         cur = c.execute(
             "UPDATE jobs SET status='running', executor_id=?, lease_token=?, "
             "lease_until=datetime(CURRENT_TIMESTAMP, ?), "
             "heartbeat_at=CURRENT_TIMESTAMP "
-            "WHERE id=? AND (status='pending' OR "
+            "WHERE id=? AND authorization_state='active' AND (status='pending' OR "
             "(status='running' AND lease_until IS NOT NULL "
             " AND lease_until<=CURRENT_TIMESTAMP))",
             (executor_identity, token, f"+{EXECUTOR_LEASE_SECONDS} seconds", int(job_id)),
@@ -172,8 +173,9 @@ def release_stale_leases() -> int:
             ('executor_id', "TEXT DEFAULT ''"),
             ('lease_until', "DATETIME"),
             ('heartbeat_at', "DATETIME"),
+            ('authorization_state', "TEXT NOT NULL DEFAULT 'active'"),
         ))
-        rows = c.execute("""SELECT id,retry_count FROM jobs
+        rows = c.execute("""SELECT id,retry_count,authorization_state FROM jobs
             WHERE status='running' AND lease_until IS NOT NULL
               AND lease_until < CURRENT_TIMESTAMP""").fetchall()
         recoverable = []
@@ -207,6 +209,21 @@ def release_stale_leases() -> int:
         )
         for row in rows:
             job_id = int(row['id'])
+            if str(row['authorization_state'] or 'active') != 'active':
+                c.execute(
+                    """UPDATE jobs SET status='paused',
+                        result='操作者授权已撤销，租约回收后等待人工核对',
+                        executor_id='',lease_until=NULL,lease_token='',
+                        heartbeat_at=NULL,finished_at=NULL WHERE id=?""",
+                    (job_id,),
+                )
+                c.execute(
+                    """UPDATE publish_records SET status='paused',
+                        error='操作者授权已撤销，等待人工核对',finished_at=NULL
+                        WHERE job_id=? AND status IN ('running','failed')""",
+                    (job_id,),
+                )
+                continue
             if int(row['retry_count'] or 0) >= 1:
                 c.execute("""UPDATE publish_items SET status='failed',
                     error=COALESCE(NULLIF(error,''),'执行器连续失去租约'),
@@ -349,6 +366,15 @@ def init_db():
             reviewed_at DATETIME,
             reviewed_by TEXT NOT NULL DEFAULT '',
             review_decision TEXT DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_by_user_id INTEGER NOT NULL DEFAULT 0,
+            created_by_role TEXT NOT NULL DEFAULT '',
+            created_by_source TEXT NOT NULL DEFAULT '',
+            created_by_session_id TEXT NOT NULL DEFAULT '',
+            created_scope TEXT NOT NULL DEFAULT '[]',
+            authorization_state TEXT NOT NULL DEFAULT 'active',
+            authorization_changed_at DATETIME,
+            authorization_note TEXT NOT NULL DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME
         )''')
@@ -458,6 +484,15 @@ def init_db():
             ('reviewed_at', "DATETIME"),
             ('reviewed_by', "TEXT NOT NULL DEFAULT ''"),
             ('review_decision', "TEXT DEFAULT ''"),
+            ('created_by', "TEXT NOT NULL DEFAULT ''"),
+            ('created_by_user_id', "INTEGER NOT NULL DEFAULT 0"),
+            ('created_by_role', "TEXT NOT NULL DEFAULT ''"),
+            ('created_by_source', "TEXT NOT NULL DEFAULT ''"),
+            ('created_by_session_id', "TEXT NOT NULL DEFAULT ''"),
+            ('created_scope', "TEXT NOT NULL DEFAULT '[]'"),
+            ('authorization_state', "TEXT NOT NULL DEFAULT 'active'"),
+            ('authorization_changed_at', 'DATETIME'),
+            ('authorization_note', "TEXT NOT NULL DEFAULT ''"),
         ))
         _ensure_columns(c, 'publish_items', (
             ('remote_id', "TEXT DEFAULT ''"), ('remote_status', "TEXT DEFAULT ''"),
@@ -486,7 +521,15 @@ def init_db():
             ON publish_items(status, next_check_at)''')
         _reconcile_historical_item_stages(c)
         c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_review ON jobs(review_required,status)")
-        record_schema_version(c, "publish_jobs", 6)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_creator_state "
+            "ON jobs(created_by_user_id,authorization_state,status)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_creator_name_state "
+            "ON jobs(created_by,authorization_state,status)"
+        )
+        record_schema_version(c, "publish_jobs", 7)
 
 init_db()
 
@@ -1490,7 +1533,7 @@ def cancel_job(job_id: int) -> dict:
         c.execute(
             "UPDATE jobs SET status='cancelled', finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP),"
             " executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL"
-            " WHERE id=? AND status IN ('pending','running','pending_review','scheduled')",
+            " WHERE id=? AND status IN ('pending','running','pending_review','scheduled','paused')",
             (int(job_id),),
         )
         c.execute(
@@ -1499,6 +1542,185 @@ def cancel_job(job_id: int) -> dict:
             (int(job_id),),
         )
     return {"jobId": int(job_id), "cancelled": cancelled, **job_progress(job_id)}
+
+
+_ACTOR_OPEN_JOB_STATUSES = (
+    'pending', 'pending_review', 'scheduled', 'running', 'processing', 'paused',
+)
+_ACTOR_DEFERRED_ITEM_STATUSES = (ITEM_RUNNING, ITEM_PROCESSING, ITEM_UNCERTAIN)
+
+
+def actor_open_jobs(
+    *, actor_user_id: int = 0, actor_name: str = '', limit: int | None = 500,
+) -> list[dict]:
+    """Return unstarted or in-flight jobs attributable to one operator.
+
+    ``created_by`` is retained for users authenticated by a legacy token file,
+    where no database user id exists. Session-authenticated jobs additionally
+    carry ``created_by_user_id``.
+    """
+    clauses = []
+    params: list[object] = []
+    if int(actor_user_id or 0) > 0:
+        clauses.append('created_by_user_id=?')
+        params.append(int(actor_user_id))
+    if str(actor_name or '').strip():
+        clauses.append('(created_by_user_id=0 AND created_by=?)')
+        params.append(str(actor_name).strip())
+    if not clauses:
+        return []
+    marks = ','.join('?' for _ in _ACTOR_OPEN_JOB_STATUSES)
+    params.extend(_ACTOR_OPEN_JOB_STATUSES)
+    limit_sql = ''
+    if limit is not None:
+        limit_sql = 'LIMIT ?'
+        params.append(max(1, min(int(limit), 2000)))
+    with get_conn() as c:
+        rows = c.execute(
+            "SELECT id,type,title,status,account_list,created_at,created_by,"
+            "created_by_user_id,created_by_role,created_by_source,"
+            "authorization_state,authorization_changed_at,authorization_note "
+            f"FROM jobs WHERE ({' OR '.join(clauses)}) AND status IN ({marks}) "
+            f"ORDER BY id {limit_sql}",
+            tuple(params),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def cancel_actor_queued_jobs(
+    *,
+    actor_user_id: int = 0,
+    actor_name: str = '',
+    reason: str = '操作者授权已撤销',
+    dry_run: bool = False,
+) -> dict:
+    """Apply a fail-safe authorization interlock to a departing operator.
+
+    Every unstarted item is cancelled. A ``running`` or ``processing`` item is
+    not killed mid-flight because the remote platform may already have accepted
+    content; it remains visible for manual reconciliation. Historical terminal
+    rows are never rewritten by this operation.
+    """
+    reason = str(reason or '操作者授权已撤销').strip()[:500]
+    rows = actor_open_jobs(
+        actor_user_id=actor_user_id, actor_name=actor_name, limit=None,
+    )
+    if dry_run:
+        deferred_ids: list[int] = []
+        cancellable_ids: list[int] = []
+        pending_items = 0
+        summaries: dict[int, tuple[int, int]] = {}
+        if rows:
+            job_ids = [int(row['id']) for row in rows]
+            job_marks = ','.join('?' for _ in job_ids)
+            deferred_marks = ','.join('?' for _ in _ACTOR_DEFERRED_ITEM_STATUSES)
+            with get_conn() as c:
+                for item in c.execute(
+                    f"SELECT job_id,"
+                    f"SUM(CASE WHEN status IN ({deferred_marks}) THEN 1 ELSE 0 END) "
+                    f"AS in_flight,"
+                    f"SUM(CASE WHEN status IN (?,?,?) THEN 1 ELSE 0 END) "
+                    f"AS pending_items FROM publish_items "
+                    f"WHERE job_id IN ({job_marks}) GROUP BY job_id",
+                    (
+                        *_ACTOR_DEFERRED_ITEM_STATUSES,
+                        ITEM_PENDING, ITEM_FAILED, ITEM_SCHEDULED, *job_ids,
+                    ),
+                ).fetchall():
+                    summaries[int(item['job_id'])] = (
+                        int(item['in_flight'] or 0),
+                        int(item['pending_items'] or 0),
+                    )
+        for row in rows:
+            job_id = int(row['id'])
+            in_flight, pending = summaries.get(job_id, (0, 0))
+            pending_items += pending
+            if in_flight:
+                deferred_ids.append(job_id)
+            else:
+                cancellable_ids.append(job_id)
+        return {
+            'dryRun': True,
+            'policy': 'cancel-unstarted',
+            'matched': len(rows),
+            'cancellable': len(cancellable_ids),
+            'deferred': len(deferred_ids),
+            'pendingItems': pending_items,
+            'cancellableJobIds': cancellable_ids,
+            'deferredJobIds': deferred_ids,
+            'jobs': rows,
+        }
+
+    cancelled_ids: list[int] = []
+    deferred_ids: list[int] = []
+    cancelled_items = 0
+    now = time.strftime('%Y-%m-%d %H:%M:%S')
+    job_marks = ','.join('?' for _ in _ACTOR_OPEN_JOB_STATUSES)
+    deferred_marks = ','.join('?' for _ in _ACTOR_DEFERRED_ITEM_STATUSES)
+    with get_conn() as c:
+        for row in rows:
+            job_id = int(row['id'])
+            c.execute(
+                "UPDATE jobs SET authorization_state='revoked',"
+                "authorization_changed_at=?,authorization_note=? WHERE id=?",
+                (now, reason, job_id),
+            )
+            item_result = c.execute(
+                "UPDATE publish_items SET status=?,error=?,error_kind=?,"
+                "finished_at=? WHERE job_id=? AND status IN (?,?,?)",
+                (
+                    ITEM_CANCELLED, reason, 'authorization_revoked', now,
+                    job_id, ITEM_PENDING, ITEM_FAILED, ITEM_SCHEDULED,
+                ),
+            )
+            cancelled_items += int(item_result.rowcount or 0)
+            c.execute(
+                "UPDATE scheduled_items SET status='cancelled',last_error=?,"
+                "updated_at=? WHERE job_id=? AND status IN ('pending','running','processing')",
+                (reason, now, job_id),
+            )
+            in_flight = c.execute(
+                f"SELECT 1 FROM publish_items WHERE job_id=? "
+                f"AND status IN ({deferred_marks}) LIMIT 1",
+                (job_id, *_ACTOR_DEFERRED_ITEM_STATUSES),
+            ).fetchone()
+            if in_flight:
+                deferred_ids.append(job_id)
+                continue
+            changed = c.execute(
+                "UPDATE jobs SET status='cancelled',result=?,finished_at=?, "
+                "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+                f"WHERE id=? AND authorization_state='revoked' AND status IN ({job_marks})",
+                (reason, now, job_id, *_ACTOR_OPEN_JOB_STATUSES),
+            )
+            if int(changed.rowcount or 0) == 1:
+                cancelled_ids.append(job_id)
+            else:
+                deferred_ids.append(job_id)
+
+    for job_id in cancelled_ids + deferred_ids:
+        job_events.record(
+            job_id,
+            job_events.STAGE_AUTH,
+            reason,
+            level=job_events.LEVEL_WARN,
+            code='authorization_revoked',
+            payload={
+                'actorUserId': int(actor_user_id or 0),
+                'actorName': str(actor_name or ''),
+                'cancelled': job_id in cancelled_ids,
+            },
+        )
+    return {
+        'dryRun': False,
+        'policy': 'cancel-unstarted',
+        'matched': len(rows),
+        'cancelled': len(cancelled_ids),
+        'deferred': len(deferred_ids),
+        'cancelledItems': cancelled_items,
+        'jobIds': cancelled_ids,
+        'deferredJobIds': deferred_ids,
+    }
 
 
 VISIBILITY_PUBLIC = 'public'
@@ -1864,6 +2086,7 @@ def create_replacement_job(
     })
     replacement_job_id = enqueue_job(
         int(job['type']), new_title, new_tags, files, [str(item['cookie'])], extra,
+        origin=job,
     )
     with get_conn() as c:
         c.execute(
@@ -1994,7 +2217,7 @@ def _recover_interrupted_jobs() -> list[int]:
     recovered: list[int] = []
     with get_conn() as c:
         rows = c.execute(
-            """SELECT id,retry_count FROM jobs
+            """SELECT id,retry_count,authorization_state FROM jobs
                WHERE status='running'
                  AND (lease_until IS NULL OR lease_until<=CURRENT_TIMESTAMP)
                ORDER BY id"""
@@ -2031,6 +2254,21 @@ def _recover_interrupted_jobs() -> list[int]:
         for row in rows:
             job_id = int(row['id'])
             retry_count = int(row['retry_count'] or 0)
+            if str(row['authorization_state'] or 'active') != 'active':
+                c.execute(
+                    """UPDATE jobs SET status='paused',
+                         result='操作者授权已撤销，进程恢复时保持暂停等待人工核对',
+                         executor_id='',lease_until=NULL,lease_token='',
+                         heartbeat_at=NULL,finished_at=NULL WHERE id=?""",
+                    (job_id,),
+                )
+                c.execute(
+                    """UPDATE publish_records SET status='paused',
+                         error='操作者授权已撤销，等待人工核对',finished_at=NULL
+                         WHERE job_id=? AND status IN ('running','failed')""",
+                    (job_id,),
+                )
+                continue
             if retry_count >= 1:
                 # 已经自动重试过一次还被打断，说明任务本身有问题，
                 # 直接落 failed，避免重启后反复执行同一个坏任务。
@@ -2054,7 +2292,8 @@ def recover_pending_jobs():
     global _recovery_done
     with get_conn() as c:
         rows = c.execute(
-            "SELECT id FROM jobs WHERE status='pending' ORDER BY id"
+            "SELECT id FROM jobs WHERE status='pending' "
+            "AND authorization_state='active' ORDER BY id"
         ).fetchall()
         # 到点后进程在入队前崩溃的排期：job 已回 pending，但 scheduled_items
         # 还停在 running（run_schedule_once 已把行置 running 却还没来得及入队）。
@@ -2062,7 +2301,8 @@ def recover_pending_jobs():
         stuck = c.execute(
             "SELECT DISTINCT j.id FROM jobs j "
             "JOIN scheduled_items s ON s.job_id=j.id "
-            "WHERE j.status='pending' AND s.status='running' "
+            "WHERE j.status='pending' AND j.authorization_state='active' "
+            "AND s.status='running' "
             "AND datetime(s.scheduled_at)<=datetime(CURRENT_TIMESTAMP)"
         ).fetchall()
     with _lock:
@@ -2112,14 +2352,16 @@ def _worker(worker_id):
                         c.execute(
                             "UPDATE jobs SET status='failed', result=?, "
                             "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
-                            "WHERE id=? AND lease_token=?",
+                            "WHERE id=? AND lease_token=? AND authorization_state='active' "
+                            "AND status IN ('running','processing','paused')",
                             (str(e)[:500], job_id, token),
                         )
                     else:
                         c.execute(
                             "UPDATE jobs SET status='failed', result=?,"
                             "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
-                            "WHERE id=?",
+                            "WHERE id=? AND authorization_state='active' "
+                            "AND status IN ('pending','running')",
                             (str(e)[:500], job_id),
                         )
             except Exception:
@@ -2127,6 +2369,63 @@ def _worker(worker_id):
         finally:
             _heartbeat_stop.set()
             _q.task_done()
+
+
+def _job_authorization_revoked(job_id: int) -> bool:
+    """Read the authorization interlock from the task fact database."""
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT authorization_state FROM jobs WHERE id=?", (int(job_id),),
+        ).fetchone()
+    return bool(row and str(row['authorization_state'] or 'active') != 'active')
+
+
+def _pause_authorization_revoked_job(job_id: int) -> bool:
+    """Stop requeueing an in-flight batch while preserving platform results.
+
+    The currently claimed remote action is resolved by the worker. Remaining
+    items are paused for manual reconciliation; they cannot be claimed because
+    the job authorization state is no longer active.
+    """
+    job_id = int(job_id)
+    with get_conn() as c:
+        row = c.execute(
+            "SELECT status,authorization_state,authorization_note "
+            "FROM jobs WHERE id=?", (job_id,),
+        ).fetchone()
+    if not row or str(row['authorization_state'] or 'active') == 'active':
+        return False
+    note = str(row['authorization_note'] or '操作者授权已撤销')
+    progress = json_dumps(job_progress(job_id))
+    now = time.strftime('%Y-%m-%d %H:%M:%S')
+    with get_conn() as c:
+        changed = c.execute(
+            "UPDATE jobs SET status='paused',result=?,progress=?,finished_at=NULL,"
+            "executor_id='',lease_until=NULL,lease_token='',heartbeat_at=NULL "
+            "WHERE id=? AND authorization_state!='active' "
+            "AND status IN ('pending','running','pending_review','scheduled','paused')",
+            (f'{note}；当前任务已停止继续启动新子任务，等待管理员核对', progress, job_id),
+        ).rowcount
+        if not changed:
+            return False
+        c.execute(
+            "UPDATE publish_records SET status='paused',error=?,finished_at=NULL "
+            "WHERE job_id=? AND status='running'",
+            (note, job_id),
+        )
+    job_events.record(
+        job_id,
+        job_events.STAGE_AUTH,
+        note,
+        level=job_events.LEVEL_WARN,
+        code='authorization_paused',
+        payload={
+            'authorizationState': 'revoked',
+            'pausedAt': now,
+        },
+    )
+    return True
+
 
 def _run_job(job_id, token=None):
     """执行一个发布任务：展开成 account 级子任务后逐条执行。
@@ -2148,6 +2447,10 @@ def _run_job(job_id, token=None):
     if job['status'] in ('cancelled', 'rejected'):
         logger.info("任务 {} 状态为 {}，跳过执行", job_id, job['status'])
         return
+    if _job_authorization_revoked(job_id):
+        _pause_authorization_revoked_job(job_id)
+        logger.info("任务 {} 授权已撤销，停止执行", job_id)
+        return
 
     # P0-1 租约归属校验：只有持有者才能执行，防止重复队列项二次执行。
     try:
@@ -2166,7 +2469,8 @@ def _run_job(job_id, token=None):
         except Exception:
             with get_conn() as c:
                 claimed = c.execute(
-                    "UPDATE jobs SET status='running' WHERE id=? AND status='pending'",
+                    "UPDATE jobs SET status='running' WHERE id=? AND status='pending' "
+                    "AND authorization_state='active'",
                     (int(job_id),),
                 ).rowcount
             if not claimed:
@@ -2201,6 +2505,8 @@ def _run_job(job_id, token=None):
     )
     try:
         for item in _pending_items(job_id):
+            if _job_authorization_revoked(job_id):
+                break
             if token and not heartbeat_token(int(job_id), token):
                 raise RuntimeError("发布任务租约已失效，停止执行以避免重复发布")
             item_id = int(item['id'])
@@ -2314,14 +2620,24 @@ def _run_job(job_id, token=None):
                 with get_conn() as c:
                     claimed_item = c.execute(
                         "UPDATE publish_items SET status=?, attempts=?, started_at=? "
-                        "WHERE id=? AND status IN (?,?)",
+                        "WHERE id=? AND status IN (?,?) AND EXISTS ("
+                        "SELECT 1 FROM jobs WHERE id=? AND authorization_state='active')",
                         (
                             ITEM_RUNNING, attempts, now, item_id,
-                            ITEM_PENDING, ITEM_FAILED,
+                            ITEM_PENDING, ITEM_FAILED, int(job_id),
                         ),
                     ).rowcount
                 if not claimed_item:
+                    if _job_authorization_revoked(job_id):
+                        break
                     continue
+                if _job_authorization_revoked(job_id):
+                    _update_item(
+                        item_id, status=ITEM_CANCELLED, error='操作者授权已撤销',
+                        error_kind='authorization_revoked',
+                        finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                    )
+                    break
                 job_events.record(
                     job_id, job_events.STAGE_UPLOAD,
                     f"开始发布《{title}》到账号 {item['account_name']}",
@@ -2427,6 +2743,16 @@ def _run_job(job_id, token=None):
         verify_codes.cancel_job_requests(job_id, first_error)
 
     with get_conn() as c:
+        retryable_open = c.execute(
+            "SELECT 1 FROM publish_items WHERE job_id=? AND status IN (?,?) LIMIT 1",
+            (job_id, ITEM_PENDING, ITEM_FAILED),
+        ).fetchone()
+    if retryable_open and _job_authorization_revoked(job_id):
+        _pause_authorization_revoked_job(job_id)
+        job_events.clear_job_start(job_id)
+        return
+
+    with get_conn() as c:
         paused_open = c.execute(
             "SELECT 1 FROM publish_items WHERE job_id=? AND status=? "
             "AND error_kind='automation_paused' LIMIT 1",
@@ -2486,6 +2812,10 @@ def _finalize_job(
     counts = _summarize_items(job_id)
     pending = counts.get(ITEM_PENDING, 0)
     retry_round = int(job.get('retry_count') or 0)
+
+    if pending and _job_authorization_revoked(job_id):
+        _pause_authorization_revoked_job(job_id)
+        return
 
     if pending and retry_round < 1 and first_error:
         progress = job_progress(job_id)
@@ -2724,7 +3054,8 @@ def backfill_scheduled_items():
     """Expand schedules for existing timer-enabled jobs that have no rows yet."""
     with get_conn() as c:
         rows = c.execute(
-            "SELECT * FROM jobs WHERE status IN ('pending','scheduled')"
+            "SELECT * FROM jobs WHERE status IN ('pending','scheduled') "
+            "AND authorization_state='active'"
         ).fetchall()
     for row in rows:
         try:
@@ -2845,7 +3176,11 @@ def resume_paused_jobs_for_account(account_id: int | None = None) -> list[int]:
         target_cookie = str(row['filePath'] or '')
     with get_conn() as c:
         rows = [dict(row) for row in c.execute(
-            "SELECT id,account_list FROM jobs WHERE status='paused' ORDER BY id"
+            "SELECT id,account_list FROM jobs WHERE status='paused' "
+            "AND authorization_state='active' "
+            "AND EXISTS (SELECT 1 FROM publish_items i WHERE i.job_id=jobs.id "
+            "AND i.status=? AND i.error_kind='automation_paused') ORDER BY id",
+            (ITEM_PENDING,),
         ).fetchall()]
     candidates = []
     cookies = set()
@@ -2901,6 +3236,7 @@ def run_schedule_once(now: datetime | None = None) -> list[int]:
                FROM scheduled_items s JOIN jobs j ON j.id=s.job_id
                WHERE s.status='pending' AND s.scheduled_at IS NOT NULL
                  AND datetime(s.scheduled_at)<=datetime(?)
+                 AND j.authorization_state='active'
                  AND j.status IN ('pending','scheduled','processing')
                ORDER BY datetime(s.scheduled_at), s.id""",
             (cutoff,),
@@ -2921,7 +3257,8 @@ def run_schedule_once(now: datetime | None = None) -> list[int]:
             job_id = int(row['job_id'])
             job_available = c.execute(
                 "UPDATE jobs SET status='pending', finished_at=NULL "
-                "WHERE id=? AND status IN ('pending','scheduled','processing')",
+                "WHERE id=? AND authorization_state='active' "
+                "AND status IN ('pending','scheduled','processing')",
                 (job_id,),
             ).rowcount
             if not job_available:
@@ -2949,13 +3286,87 @@ def run_schedule_once(now: datetime | None = None) -> list[int]:
         logger.info("本地排期到点，已入队任务: {}", ", ".join(map(str, sorted(claimed_jobs))))
     return sorted(claimed_jobs)
 
-def enqueue_job(type, title, tags, file_list, account_list, extra, review_required=False):
+def _local_job_origin() -> dict:
+    """Provenance used outside a request and in zero-config local mode."""
+    return {
+        'created_by': 'local-admin',
+        'created_by_user_id': 0,
+        'created_by_role': 'admin',
+        'created_by_source': 'local',
+        'created_by_session_id': '',
+        'created_scope': [],
+    }
+
+
+def _current_job_origin() -> dict:
+    """Capture who created a job and the authorization context at that time.
+
+    Server-side authorization changes must not mutate the historical fact. The
+    later revocation flow reads this provenance and records a separate state
+    transition instead of rewriting the original actor or scope.
+    """
+    try:
+        import access_scope
+
+        identity = access_scope.current_identity()
+    except Exception:
+        identity = None
+    if not identity:
+        return _local_job_origin()
+    scope = identity.get('scope') or []
+    if not isinstance(scope, (list, tuple, set)):
+        scope = []
+    return {
+        'created_by': str(identity.get('user') or ''),
+        'created_by_user_id': int(identity.get('user_id') or 0),
+        'created_by_role': str(identity.get('role') or ''),
+        'created_by_source': str(identity.get('source') or ''),
+        'created_by_session_id': str(identity.get('session_id') or ''),
+        'created_scope': [str(item) for item in scope if str(item).strip()],
+    }
+
+
+def _normalized_job_origin(origin: dict | None = None) -> dict:
+    source = origin if isinstance(origin, dict) else _current_job_origin()
+    scope = source.get('created_scope', source.get('scope', []))
+    if isinstance(scope, str):
+        scope = json_loads(scope)
+    if not isinstance(scope, (list, tuple, set)):
+        scope = []
+    return {
+        'created_by': str(source.get('created_by') or source.get('user') or ''),
+        'created_by_user_id': int(
+            source.get('created_by_user_id') or source.get('user_id') or 0
+        ),
+        'created_by_role': str(source.get('created_by_role') or source.get('role') or ''),
+        'created_by_source': str(
+            source.get('created_by_source') or source.get('source') or ''
+        ),
+        'created_by_session_id': str(
+            source.get('created_by_session_id') or source.get('session_id') or ''
+        ),
+        'created_scope': [str(item) for item in scope if str(item).strip()],
+    }
+
+
+def enqueue_job(
+    type,
+    title,
+    tags,
+    file_list,
+    account_list,
+    extra,
+    review_required=False,
+    *,
+    origin=None,
+):
     import json
     if isinstance(tags, str):
         tags = [item.strip() for item in tags.split(',') if item.strip()]
     elif not isinstance(tags, list):
         tags = []
     timer_enabled = bool((extra or {}).get('enableTimer'))
+    provenance = _normalized_job_origin(origin)
     with get_conn() as c:
         status = (
             'pending_review' if review_required
@@ -2963,12 +3374,19 @@ def enqueue_job(type, title, tags, file_list, account_list, extra, review_requir
         )
         cur = c.execute(
             'INSERT INTO jobs '
-            '(type,title,tags,file_list,account_list,extra,status,review_required) '
-            'VALUES (?,?,?,?,?,?,?,?)',
+            '(type,title,tags,file_list,account_list,extra,status,review_required,'
+            'created_by,created_by_user_id,created_by_role,created_by_source,'
+            'created_by_session_id,created_scope,authorization_state) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (
                 type, title, json.dumps(tags, ensure_ascii=False),
                 json.dumps(file_list), json.dumps(account_list),
                 json.dumps(extra or {}), status, 1 if review_required else 0,
+                provenance['created_by'], provenance['created_by_user_id'],
+                provenance['created_by_role'], provenance['created_by_source'],
+                provenance['created_by_session_id'],
+                json.dumps(provenance['created_scope'], ensure_ascii=False),
+                'active',
             ),
         )
         job_id = cur.lastrowid
@@ -3090,7 +3508,8 @@ def poll_pending_jobs(limit: int = 100) -> list[int]:
         return []
     with get_conn() as c:
         rows = c.execute(
-            "SELECT id FROM jobs WHERE status='pending' ORDER BY id LIMIT ?",
+            "SELECT id FROM jobs WHERE status='pending' "
+            "AND authorization_state='active' ORDER BY id LIMIT ?",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
     queued = []
@@ -3124,7 +3543,9 @@ def _start_lease_reclaimer(interval_seconds: int = 30) -> None:
                     try:
                         with get_conn() as c:
                             rows = c.execute(
-                                "SELECT id FROM jobs WHERE status='pending' ORDER BY id DESC LIMIT 50"
+                                "SELECT id FROM jobs WHERE status='pending' "
+                                "AND authorization_state='active' "
+                                "ORDER BY id DESC LIMIT 50"
                             ).fetchall()
                         for r in rows:
                             try:
