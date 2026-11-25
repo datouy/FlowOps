@@ -156,6 +156,11 @@ XHS markers——captured 永远为空，`read_json`（真正测响应体超时�
 
 ## 6. 下一轮建议
 
+> 状态更新（2026-11-25）：以下建议在后续迭代中大部分已落地，此处保留历史口径并标注现状，避免与当前代码脱节。
+
 1. **批量铺开发布侧选择器**：快手/微博/抖音/小红书的内置候选表已就位，接入是纯机械替换。
+   - ✅ 已完成：`weibo`、`kuaishou`（快手）、`douyin`、`xiaohongshu`、`tencent`、`baijiahao` 的 uploader 均已接入 `wait_publish_step_async` / `publish_step_any_visible`，`PUBLISH_BUILTIN` 内置候选表覆盖六平台。
 2. **远端适配包打通**：`refresh_from_remote` 目前只拉私信侧的 yaml，扩展拉发布步骤的 yaml。
-3. **共享实例的浏览器级崩溃自愈**：单实例崩溃影响所有 context，`is_connected` 探活后重建已做，但可以加"重建后重试当前任务"。
+   - ✅ 已完成：`refresh_from_remote()` 已遍历 `PUBLISH_BUILTIN`，按 `adapters/publish/<platform>.<step>.yaml` 拉取发布步骤适配包。
+3. **共享实例的浏览器级崩溃自愈**：单实例崩溃影响所有 context，`is_connected` 探活后重建已做，但可以加“重建后重试当前任务”。
+   - ⚠️ 部分完成：`get_browser` / `get_browser_sync` 已通过 `is_connected()` 探活并在崩溃后自动重建；“重建后自动重试当前任务”仍未实现（涉及发布任务重试语义，需与 `uncertain` / 失败重试机制统一设计，避免重复发布风险）。
