@@ -58,10 +58,14 @@ scrape_configs:
 
 ### B. 人员离岗或凭据泄露
 
-1. 立即在团队页禁用该成员或重置密码；现有会话会在下一次请求失败关闭。
-2. 检查审计日志中的登录、发布、账号、素材和导出事件。
-3. 如 Cookie 或 AI Key 可能泄露，停止 executor，轮换对应平台登录态或密钥。
-4. 检查已入队任务，由管理员显式取消或保留；当前版本不会因撤权自动取消已批准任务。
+1. 立即在团队页禁用该成员或重置密码；现有会话会在下一次请求失败关闭。禁用、角色变更和账号范围变更会自动执行发布任务联锁。
+2. 核对接口返回的 `jobRevocation.cancelled`、`cancelledItems` 和 `deferred`。`deferred` 表示仍有已进入平台调用或结果未知的子任务，必须人工核对。
+3. 在团队页使用「停待发」可先查询并取消该成员仍归属的未开始任务；例行停止前可调用 `POST /api/v2/users/{id}/cancel-queued-jobs` 并传 `dryRun=true` 预览。
+4. 检查审计日志中的登录、发布、账号、素材和导出事件，并确认 `authorization_revoked` 或 `authorization_paused` 任务事件。
+5. 对 `running`、`processing`、`uncertain` 子任务回查远端平台；已发布则保留远端 ID 和证据，未发布才允许重新创建任务。禁止把暂停任务直接手工改回 pending。
+6. 如 Cookie 或 AI Key 可能泄露，停止 executor，轮换对应平台登录态或密钥。
+
+升级到 `publish_jobs` schema v7 时，历史任务无法可靠补出创建人。升级前排空或导出开放队列，升级后人工处理 `created_by` 为空且仍处于 pending/running/processing/paused 的旧任务。
 
 ### 执行器离线
 

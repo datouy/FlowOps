@@ -17,6 +17,9 @@ Multi-account management · AI content generation · Unified DM inbox · Lead ex
 [![Playwright](https://img.shields.io/badge/Playwright-Automation-2EAD33?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev/)
 [![Windows](https://img.shields.io/badge/OS-Windows%2010%2F11-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 
+[![GitHub](https://img.shields.io/badge/GitHub-datouy%2FFlowOps-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/datouy/FlowOps)
+[![Gitee](https://img.shields.io/badge/Gitee-tokyi%2Fflowops-C71D23?style=flat-square)](https://gitee.com/tokyi/flowops)
+
 [![Douyin](https://img.shields.io/badge/Douyin-FE2C55?style=flat-square&logo=tiktok&logoColor=white)](#-supported-platforms)
 [![Kuaishou](https://img.shields.io/badge/Kuaishou-FF4906?style=flat-square&logo=kuaishou&logoColor=white)](#-supported-platforms)
 [![WeChat Channels](https://img.shields.io/badge/Channels-07C160?style=flat-square&logo=wechat&logoColor=white)](#-supported-platforms)
@@ -68,6 +71,8 @@ This project is not affiliated with the upstream author. Please submit issues an
 ### 📊 Accounts & Data
 
 - **Multi-account management**: QR-code login, session persistence, and validity checks.
+- **Personal accounts and MFA**: Team members sign in with individual credentials and can be limited by role and account scope. TOTP two-factor authentication is supported, and disabling a member or changing their access revokes existing sessions.
+- **Departure publishing interlock**: New jobs snapshot the creator, role, session, and account scope. Disabling a member or changing their role or scope cancels unstarted jobs and publish items. The current item already sent to a platform is retained for reconciliation; subsequent items do not start.
 - **Expired-session alerts**: Expired logins are surfaced on the publish records page and in today's to-do list.
 - **Data reflow**: Scrape platform dashboard metrics such as views, likes, and comments.
 - **Manual linking**: When auto-matching fails, platform posts can be manually linked to publish records.
@@ -176,7 +181,36 @@ Reply rules support two generation modes: **fixed templates** (with variables li
 
 Local DM sync and workbench direct reply currently cover Douyin, Xiaohongshu, and WeChat Channels. Platform pages and risk-control policies change over time; actual availability depends on runtime results.
 
+## 🛡️ Stability & Reliability
+
+- **Shared Chromium shards**: Accounts are assigned by a stable hash to one of `FLOWOPS_SHARED_BROWSER_SHARDS` browser shards. Each account still has an isolated context, storage state, proxy, and fingerprint, so one shard failure does not take down every account.
+- **Bounded browser concurrency**: Account contexts use a global slot pool controlled by `FLOWOPS_MAX_BROWSERS` for their full lifetime.
+- **Bounded shutdown and restart**: Browser shutdown has a hard timeout, and failed connections can restart the shared browser generation without leaving an account profile permanently locked.
+- **Web and executor separation**: `FLOWOPS_PROCESS_ROLE=web|executor|all` selects process responsibilities. `publish_executor.py` owns publishing workers, schedule scanning, tracking, lease recovery, and account patrol. The default `all` mode remains available for single-process deployments.
+- **Atomic publish leases**: Workers claim a job with one atomic update and receive a unique lease token. Heartbeats renew the lease, and stale tokens are rejected.
+- **Authorization gate**: Claim, scheduling, recovery, stale-lease handling, and finalization all check the task's authorization snapshot. Revoked work cannot return to the queue after a restart or automatic retry.
+- **Cross-process account serialization**: Publishing, DMs, comments, and account health checks share SQLite `account_leases`, preventing the same platform account from entering incompatible browser operations concurrently.
+- **Production audit tooling**: `production_audit.py` reads the database without mutation and reports backlog, throughput, P50/P95 latency, success rate, executor heartbeat, and account leases. See [`docs/production-acceptance-2026-11.md`](docs/production-acceptance-2026-11.md).
+
 ## ⚡ Quick Start (Windows)
+
+### ⬇️ Get the code
+
+GitHub primary repository:
+
+```powershell
+git clone https://github.com/datouy/FlowOps.git
+cd FlowOps
+```
+
+Gitee mirror:
+
+```powershell
+git clone https://gitee.com/tokyi/flowops.git FlowOps
+cd FlowOps
+```
+
+Both repositories use the same code and README. Use Gitee when GitHub is unavailable from your network.
 
 ### 📋 Prerequisites
 
@@ -189,7 +223,8 @@ Local DM sync and workbench direct reply currently cover Douyin, Xiaohongshu, an
 
 ```powershell
 python -m venv venv
-venv\Scripts\pip install -r social-auto-upload-main\requirements.txt
+venv\Scripts\pip install --require-hashes -r social-auto-upload-main\requirements.lock
+venv\Scripts\pip install -r social-auto-upload-main\requirements-dev.txt
 venv\Scripts\python -m playwright install chromium
 venv\Scripts\patchright install chromium
 
@@ -198,7 +233,7 @@ npm install
 cd ..\..
 ```
 
-`requirements.txt` only declares direct dependencies. To reproduce the full verified environment, use `social-auto-upload-main\requirements.lock` instead. Development and test dependencies are in `social-auto-upload-main\requirements-dev.txt`.
+`requirements.txt` only declares direct dependencies. Installation and deployment use the hash-locked `social-auto-upload-main\requirements.lock`; development and test dependencies are in `social-auto-upload-main\requirements-dev.txt`.
 
 ### 🔑 Configure AI
 
@@ -209,7 +244,13 @@ Copy-Item social-auto-upload-main\.env.example social-auto-upload-main\.env
 notepad social-auto-upload-main\.env
 ```
 
-`.env` is excluded by `.gitignore` and will not be committed. Alert notifications can be configured in the same file:
+`.env` is excluded by `.gitignore` and will not be committed. Set a stable encryption key before saving account credentials. Without it, the application falls back to the operating system credential store, and saved credentials may become unreadable after moving to another machine:
+
+```text
+FLOWOPS_SECRET_KEY=a-long-random-secret
+```
+
+Alert notifications use the same file:
 
 ```text
 OPS_WEBHOOK_URL=your-wecom/feishu-bot-url
@@ -227,6 +268,8 @@ Double-click `start.bat` in the project root. The script will automatically:
 
 You can also run `run_backend.bat` and `run_frontend.bat` separately.
 
+For a split Web and executor deployment, set `FLOWOPS_PROCESS_ROLE=web` in the Web terminal, start `run_backend.bat`, then start `run_executor.bat` in the executor terminal. The default unset value remains the backward-compatible `all` mode. See [`docs/executor-separation-2026-11.md`](docs/executor-separation-2026-11.md).
+
 ## 📁 Project Structure
 
 ```text
@@ -238,6 +281,7 @@ FlowOps/
 ├─ social-auto-upload-main/      # Main app (forked from upstream)
 │  ├─ sau_backend.py             # Flask API (served by waitress in production)
 │  ├─ publish_jobs.py            # Publish queue, retry, health checks
+│  ├─ publish_executor.py        # Standalone executor entrypoint for split deployments
 │  ├─ stats_reflow.py            # Platform data reflow
 │  ├─ ops_center.py              # Message center, to-do, weekly report
 │  ├─ dm_ops.py                  # DM conversations, auto-reply, leads, webhook
@@ -271,14 +315,15 @@ Beyond running locally on Windows, the repo ships a set of server deployment scr
 - `deploy/backup.sh`: daily database backup script;
 - `deploy/smoke.sh`: post-deployment smoke-test script.
 
-See [deploy/README.md](./deploy/README.md) for full steps and parameters. Production serves backend traffic through waitress (still a single-process model) instead of the Flask development server.
+See [deploy/README.md](./deploy/README.md) for full steps and parameters. Production serves backend traffic through waitress instead of the Flask development server. The default compose stack uses the single-container `all` mode. Overlay `docker-compose.split.yml` to run Web and `yunce-executor` as separate containers sharing SQLite and runtime data. This supports a split process topology on one host; it is not a horizontally scalable multi-host design.
 
 ## 🔒 Security Notes
 
-- Backend and frontend listen on `127.0.0.1` by default; devices on the same LAN cannot directly access the workbench. For remote access, you must set `YUNCE_HOST`, `YUNCE_ALLOW_REMOTE=1`, and `YUNCE_ACCESS_TOKEN` in `.env` simultaneously; the backend refuses to start without a token. Frontend requests automatically carry `X-YunCe-Token`.
-- After setting an access token, run `localStorage.setItem('yunce_access_token', 'your-token')` in the browser console so the frontend carries it; do not put the token in `VITE_*` variables or it will be bundled into frontend code.
+- Backend and frontend listen on `127.0.0.1` by default; devices on the same LAN cannot directly access the workbench. For remote access, set `YUNCE_HOST` and `YUNCE_ALLOW_REMOTE=1`, then configure personal authentication or an emergency access token. The backend refuses unsafe remote startup without authentication. Do not put access tokens in `VITE_*` variables because those values are bundled into frontend code.
+- For team use, enable personal authentication with `YUNCE_PERSONAL_AUTH=1`. Manage members, roles, account scopes, MFA resets, and queued jobs under Settings → Team. Disabling a member or changing role or scope revokes sessions and stops that member's unstarted publishing jobs.
+- Administrators and members can bind standard TOTP MFA under Settings → Security. TOTP secrets are encrypted with AES-256-GCM in the database, and verification codes cannot be replayed. Persistent login failures are tracked by both username and IP.
 - `.env`, databases, cookies, logs, uploaded assets, virtual environments, and frontend build artifacts are all excluded from the repository.
-- Login credentials in `cookiesFile/` remain plaintext JSON — do not copy, commit, or share them via cloud drives. The workbench's local-only default access exists precisely to prevent these credentials from being abused by other devices on the same network.
+- **Encrypted login state**: Playwright storage state under `cookiesFile/` is encrypted with AES-256-GCM and stored as `.enc` files. Encryption is bound to the account identifier, so copying a file to another account, tampering with it, or using the wrong master key is rejected. Set `FLOWOPS_SECRET_KEY` in production. Never copy, commit, or share encrypted cookie files through cloud drives.
 - The database auto-creates tables on first launch; account login states must be generated by re-scanning QR codes on your machine.
 - Only operate accounts you own or are authorized to use.
 - This project automates browser actions to simulate human operations. Platforms do not offer unified publishing or DM APIs for individuals. Please follow each platform's terms of service and control posting and reply frequency.
@@ -295,11 +340,16 @@ See [deploy/README.md](./deploy/README.md) for full steps and parameters. Produc
 - Workbench direct reply currently supports text only — no images, files, voice, or stickers; send failures are written back into the conversation.
 - Auto-replies from scheduled sync only produce "pending manual send" drafts and are never auto-sent; webhook-sent replies are still governed by rules and account login state.
 - Real publishing, QR login, and DM sending must be verified in your own local account environment; platform risk controls or page redesigns may cause temporary unavailability.
+- Open jobs created before `publish_jobs` schema v7 do not contain reliable creator provenance. The upgrade does not infer historical ownership. Reconcile the existing pending, running, processing, and paused queue before deployment as described in the operations runbook.
 
-## 🔗 Repositories
+## 🔗 GitHub and Gitee repositories
 
-- Gitee: https://gitee.com/tokyi/flowops
-- GitHub: https://github.com/datouy/FlowOps
+| Platform | URL | Purpose |
+| --- | --- | --- |
+| GitHub | https://github.com/datouy/FlowOps | Primary repository |
+| Gitee | https://gitee.com/tokyi/flowops | Mirror for networks where GitHub is unavailable; `main` is kept in sync |
+
+Use [`docs/operations-runbook.md`](docs/operations-runbook.md) for departure handling, queue revocation, and schema upgrades. Enterprise acceptance evidence and remaining external checks are recorded in [`docs/flowops-issues-2026-11-23.md`](docs/flowops-issues-2026-11-23.md).
 
 ## 📄 License
 

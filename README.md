@@ -17,6 +17,9 @@
 [![Playwright](https://img.shields.io/badge/Playwright-Automation-2EAD33?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev/)
 [![Windows](https://img.shields.io/badge/OS-Windows%2010%2F11-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 
+[![GitHub](https://img.shields.io/badge/GitHub-datouy%2FFlowOps-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/datouy/FlowOps)
+[![Gitee](https://img.shields.io/badge/Gitee-tokyi%2Fflowops-C71D23?style=flat-square)](https://gitee.com/tokyi/flowops)
+
 [![抖音](https://img.shields.io/badge/抖音-FE2C55?style=flat-square&logo=tiktok&logoColor=white)](#-支持平台)
 [![快手](https://img.shields.io/badge/快手-FF4906?style=flat-square&logo=kuaishou&logoColor=white)](#-支持平台)
 [![视频号](https://img.shields.io/badge/视频号-07C160?style=flat-square&logo=wechat&logoColor=white)](#-支持平台)
@@ -69,6 +72,8 @@
 ### 📊 账号与数据
 
 - **多账号管理**：支持扫码登录、登录态保存和有效性巡检。
+- **个人账号与双因素认证**：团队成员使用独立账号登录，支持角色、账号范围和 TOTP 双因素认证；禁用成员或修改权限会立即撤销已有会话。
+- **人员离岗发布联锁**：新任务保存创建人、角色、会话和账号范围快照。禁用成员、变更角色或账号范围时，未开始的 job 和 publish item 自动取消；已进入平台调用的当前子任务保留结果供人工核对，后续子任务不再启动。
 - **账号过期提醒**：登录失效后在发布记录页和今日待办中提示。
 - **数据回流**：抓取平台后台作品播放、点赞、评论等数据。
 - **手工关联**：自动匹配失败时，可把平台作品手动关联到发布记录。
@@ -173,6 +178,7 @@ http://127.0.0.1:5409/dm/inbound
 - **有界关闭与超时重启**：共享浏览器关闭动作有硬超时，超时兜底可重启整代共享实例，卡死的连接会立刻失败，不再永久占用账号 Profile 锁。
 - **控制面与执行面分离**：`FLOWOPS_PROCESS_ROLE=web|executor|all` 控制进程职责；独立 `publish_executor.py` 独占发布 worker、排期扫描、追踪、租约回收和账号巡检。`all` 保留旧单进程部署兼容。
 - **发布租约 token**：任务抢占是单条原子 UPDATE，每次领取返回唯一 `leaseToken`；后台心跳持续续期，执行器协议只接受当前 token，失效租约返回 409。
+- **授权状态门禁**：executor claim、后台调度、定时扫描、回退扫描、过期租约恢复和任务收尾都会校验操作者授权快照；已撤权任务不会因重启、轮询或自动重试重新入队。
 - **跨进程账号串行**：发布、私信、评论和账号健康检查共用 SQLite `account_leases`；进程内锁负责减少数据库竞争，跨进程租约负责同账号互斥，持有进程崩溃后按租约过期恢复。
 - **split 日志隔离**：Web 与 executor 通过 `FLOWOPS_LOG_DIR` 写入不同日志目录，避免两个进程对同一个 loguru 文件并发轮转。
 - **生产只读审计**：`production_audit.py` 用只读 SQLite 连接输出 backlog、完成吞吐、P50/P95、成功率、executor 心跳和账号租约状态，支持阈值 gate 与 before/after JSON 对比；完整验收步骤见 [`docs/production-acceptance-2026-11.md`](docs/production-acceptance-2026-11.md)。
@@ -196,6 +202,24 @@ http://127.0.0.1:5409/dm/inbound
 本地私信同步和工作台直发目前覆盖抖音、小红书、视频号。平台页面和风控策略会变化，具体可用性以实际运行结果为准。
 
 ## ⚡ 快速开始（Windows）
+
+### ⬇️ 获取代码
+
+GitHub 主仓库：
+
+```powershell
+git clone https://github.com/datouy/FlowOps.git
+cd FlowOps
+```
+
+Gitee 镜像：
+
+```powershell
+git clone https://gitee.com/tokyi/flowops.git FlowOps
+cd FlowOps
+```
+
+两个远程仓库使用同一套代码和 README；无法访问 GitHub 时可从 Gitee 克隆。
 
 ### 📋 环境要求
 
@@ -315,7 +339,7 @@ FlowOps/
 ## 🔒 安全说明
 
 - 后端和前端默认只监听 `127.0.0.1`，同局域网设备无法直接打开工作台。确需远程访问时，必须在 `.env` 中设置 `YUNCE_HOST`、`YUNCE_ALLOW_REMOTE=1` 以及令牌或实名登录开关；缺少鉴权配置时后端会拒绝启动。
-- 企业协作建议设置 `YUNCE_PERSONAL_AUTH=1`，通过登录页使用个人账号；成员、角色和账号 scope 在「设置 → 团队」管理。禁用成员、重置密码或修改角色会撤销相关会话。全局 `YUNCE_ACCESS_TOKEN` 仅用于首次引导和应急，不应作为团队日常共享密码。
+- 企业协作建议设置 `YUNCE_PERSONAL_AUTH=1`，通过登录页使用个人账号；成员、角色和账号 scope 在「设置 → 团队」管理。禁用成员、重置密码、修改角色或账号范围会撤销相关会话；禁用或权限变更还会停止该成员未开始的发布任务。全局 `YUNCE_ACCESS_TOKEN` 仅用于首次引导和应急，不应作为团队日常共享密码。
 - 个人会话默认 12 小时过期，数据库只保存会话令牌哈希；登录接口默认限制为每 5 分钟 10 次。不要把令牌写进 `VITE_*` 变量，否则会被打包进前端代码。
 - 管理员和成员可在「设置 → 安全」绑定标准 TOTP 双因素认证；密钥用 AES-256-GCM 加密落库，验证码不可重放。登录失败同时按用户名和 IP 持久锁定，管理员可在团队页重置 MFA 或解除封锁。
 - `.env`、数据库、Cookie、日志、上传素材、虚拟环境和前端构建产物均不进入仓库。
@@ -341,11 +365,16 @@ FlowOps/
 - 工作台直发目前只支持文本回复，不支持图片、文件、语音和表情包；发送失败会在会话中回写原因。
 - 定时同步产生的自动回复只有「待人工发送」草稿，不会自动真实发送；Webhook 的发送行为仍受规则和账号登录态限制。
 - 真实发布、扫码登录和私信发送需要在你的本机账号环境中验证，平台风控或页面改版可能导致临时不可用。
+- `publish_jobs` schema v7 之前创建的开放任务没有可靠的创建人信息，升级不会猜测历史归属。部署前应按运维手册清点旧队列，避免把无法归属的任务误算到当前成员。
 
-## 🔗 仓库
+## 🔗 GitHub 与 Gitee 仓库
 
-- Gitee：https://gitee.com/tokyi/flowops
-- GitHub：https://github.com/datouy/FlowOps
+| 平台 | 地址 | 说明 |
+| --- | --- | --- |
+| GitHub | https://github.com/datouy/FlowOps | 主仓库 |
+| Gitee | https://gitee.com/tokyi/flowops | 国内访问镜像，代码同步至 `main` |
+
+成员离岗、任务撤销与 schema 升级操作见 [`docs/operations-runbook.md`](docs/operations-runbook.md)；企业验收证据与仍待完成的外部验收项见 [`docs/flowops-issues-2026-11-23.md`](docs/flowops-issues-2026-11-23.md)。
 
 ## 📄 许可证
 
