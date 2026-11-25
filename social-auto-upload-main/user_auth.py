@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import quote
 
 from flask import Blueprint, g, jsonify, request
+from loguru import logger
 
 from conf import BASE_DIR
 from db_utils import connect, record_schema_version
@@ -526,9 +527,9 @@ def _otpauth_uri(username: str, secret: str) -> str:
 
 
 def _mfa_qr_data_url(uri: str) -> str:
-    try:
-        import io
+    import io
 
+    try:
         import qrcode
 
         image = qrcode.make(uri)
@@ -536,7 +537,17 @@ def _mfa_qr_data_url(uri: str) -> str:
         image.save(output, format="PNG")
         return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
     except Exception:
-        return ""
+        try:
+            import segno
+
+            output = io.BytesIO()
+            segno.make(uri, error="m").save(output, kind="png", scale=6, border=2)
+            return "data:image/png;base64," + base64.b64encode(
+                output.getvalue()
+            ).decode("ascii")
+        except Exception:
+            logger.exception("生成双因素认证二维码失败")
+            return ""
 
 
 def _verify_active_totp(conn, row: Any, code: str) -> int:
