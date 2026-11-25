@@ -10,6 +10,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from loguru import logger
 
 _STARTED = time.monotonic()
 _LOCK = threading.Lock()
@@ -148,7 +149,7 @@ def _auth_counts(path: Path) -> dict:
             "mfa_admins": int(row["mfa_admins"] or 0),
         })
     except Exception:
-        pass
+        logger.warning("指标采集失败：认证用户统计", exc_info=True)
     return result
 
 
@@ -173,7 +174,7 @@ def _ai_today(path: Path) -> dict:
             "failures": int(row["failures"] or 0),
         })
     except Exception:
-        pass
+        logger.warning("指标采集失败：AI 用量统计", exc_info=True)
     return result
 
 
@@ -304,5 +305,5 @@ def render() -> str:
             f"yunce_disk_used_ratio {used_ratio:.6f}",
         ])
     except Exception:
-        pass
+        logger.warning("指标采集失败：磁盘容量统计", exc_info=True)
     return "\n".join(lines) + "\n"
