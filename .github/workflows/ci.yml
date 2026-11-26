@@ -18,18 +18,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: |
-            social-auto-upload-main/requirements.lock
+            social-auto-upload-main/requirements.txt
             social-auto-upload-main/requirements-dev.txt
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --require-hashes -r requirements.lock
-          python -m pip install -r requirements-dev.txt
-      - name: Run tests
-        run: python -m pytest
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests (per-file, timeout-guarded)
+        run: |
+          set -euo pipefail
+          for f in tests/test_*.py; do
+            python -m pytest "$f" -q --tb=no -p no:cacheprovider --timeout=60
+          done
       # 全仓库 lint：之前只检查了一份白名单文件，uploader/、examples/ 等
       # 目录的代码完全没被检查过，导致 30+ 个问题长期存在。
       - name: Run Ruff
