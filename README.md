@@ -379,3 +379,14 @@ FlowOps/
 ## 📄 许可证
 
 本项目遵循 MIT License，详见 [LICENSE](./LICENSE)。原项目版权归 dreammis 所有。
+
+## 📚 项目文档（2026-11-26 收敛后）
+
+项目现状、能力边界、可复现性基线与下一阶段路线图，只看这一份：[项目背景卡.md](./项目背景卡.md)。
+
+其余保留文档：
+
+- [docs/operations-runbook.md](./docs/operations-runbook.md) — 运维手册
+- [docs/competitor-benchmark-2026-11.md](./docs/competitor-benchmark-2026-11.md) — 竞品调研
+- [docs/production-canary-checklist.md](./docs/production-canary-checklist.md) — 真实平台 canary 验收清单
+- [docs/yunce-master-prompt.md](./docs/yunce-master-prompt.md) — AI 协作主提示词（定向·深挖·借力）
