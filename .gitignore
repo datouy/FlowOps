@@ -89,8 +89,6 @@ deploy/out/
 /preview/
 /checks.json
 /gen_promo_doc.py
-/README.md
-/README.en.md
 /*.docx
 /项目背景卡.md
 /deploy/README.md
