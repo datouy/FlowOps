@@ -122,15 +122,17 @@ def test_token_bucket_never_overdraws():
     assert bucket.available() < 1.0
 
 
-def test_night_window_detection():
-    """夜间时段识别。"""
+def test_night_window_detection(monkeypatch):
+    """夜间时段识别。显式开启夜间降速，避免受外部环境变量影响。"""
+    monkeypatch.setenv("FLOWOPS_PUBLISH_NIGHT_THROTTLE", "1")
     assert RL.is_night(datetime(2026, 1, 1, 23, 0)) is True
     assert RL.is_night(datetime(2026, 1, 1, 3, 0)) is True
     assert RL.is_night(datetime(2026, 1, 1, 12, 0)) is False
 
 
-def test_night_factor_reduces_rate():
-    """夜间速率要降下来。"""
+def test_night_factor_reduces_rate(monkeypatch):
+    """夜间速率要降下来。显式开启夜间降速，避免受外部环境变量影响。"""
+    monkeypatch.setenv("FLOWOPS_PUBLISH_NIGHT_THROTTLE", "1")
     assert RL.night_factor(datetime(2026, 1, 1, 23, 0)) < RL.night_factor(
         datetime(2026, 1, 1, 12, 0),
     )
