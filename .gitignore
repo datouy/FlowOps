@@ -83,3 +83,22 @@ deploy/out/
 !social-auto-upload-main/videoFile/.gitkeep
 !social-auto-upload-main/logs/.gitkeep
 
+
+# ---- 2026-11-26 仓库瘦身：文档与宣传产物只留本地，不进仓库 ----
+/docs/
+/preview/
+/checks.json
+/gen_promo_doc.py
+/README.md
+/README.en.md
+/*.docx
+/项目背景卡.md
+/deploy/README.md
+social-auto-upload-main/README.md
+social-auto-upload-main/sau_backend/README.md
+social-auto-upload-main/sau_frontend/README.md
+social-auto-upload-main/docs/
+social-auto-upload-main/media/
+social-auto-upload-main/static/
+social-auto-upload-main/skills/
+social-auto-upload-main/.github/
