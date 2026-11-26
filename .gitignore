@@ -102,3 +102,15 @@ social-auto-upload-main/media/
 social-auto-upload-main/static/
 social-auto-upload-main/skills/
 social-auto-upload-main/.github/
+
+# ---- 2026-11-26 仓库瘦身：测试与 CI 不进仓库（本地保留以便验证）----
+.github/
+social-auto-upload-main/tests/
+social-auto-upload-main/sau_frontend/e2e/
+social-auto-upload-main/sau_frontend/playwright.config.js
+social-auto-upload-main/sau_frontend/vitest.config.js
+social-auto-upload-main/sau_frontend/src/api/task.test.js
+social-auto-upload-main/sau_frontend/src/utils/dm-format.test.js
+scripts/smoke_*.py
+social-auto-upload-main/requirements-dev.txt
+social-auto-upload-main/requirements-py312.lock
