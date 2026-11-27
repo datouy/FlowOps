@@ -101,3 +101,31 @@ groups:
         annotations:
           summary: AI calls are repeatedly failing today
           runbook: docs/operations-runbook.md#ai-与第三方依赖异常
+      - alert: YunCeAccountSessionExpiring
+        expr: yunce_account_session_expiring > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Platform login window is inside the warning window (needs re-scan)
+          runbook: docs/账号会话保活方案.md#6-度量与验收不写感觉更稳了
+
+      - alert: YunCeAccountSessionExpiringSoon
+        expr: min(yunce_account_session_days_left) < 7
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: A platform login window expires in less than seven days
+          runbook: docs/账号会话保活方案.md#6-度量与验收不写感觉更稳了
+
+      - alert: YunCeAccountSessionTouchFailing
+        expr: |
+          sum(yunce_account_session_touch_total{outcome=~"network|probe_failed"})
+          / clamp_min(sum(yunce_account_session_touch_total), 1) > 0.5
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: More than half of session touches are failing in the last day
+          runbook: docs/账号会话保活方案.md#6-度量与验收不写感觉更稳了

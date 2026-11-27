@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
 
@@ -189,6 +189,72 @@ def _heartbeat_age(value) -> float:
         return -1.0
 
 
+def _session_keeper_metrics(account_db: Path) -> list[str]:
+    """会话保活指标：窗口剩余天数 + 近 24 小时的触达结论分布。
+
+    ``days_left`` 用 ``sid_guard`` 换算出的到期时间算——它是"还有多久必须重扫"
+    的唯一客观依据（访问网页不会延长它）。告警看的就是这个值逼近 0。
+    """
+    lines: list[str] = []
+    cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _readonly(account_db) as conn:
+            rows = conn.execute(
+                "SELECT u.id AS account_id,u.userName AS name,u.type AS platform,"
+                "       l.session_expires_at AS expires_at"
+                "  FROM user_info u"
+                "  LEFT JOIN account_session_ledger l ON l.id = ("
+                "      SELECT id FROM account_session_ledger"
+                "       WHERE account_id=u.id AND session_expires_at<>''"
+                "       ORDER BY id DESC LIMIT 1)"
+                " ORDER BY u.id"
+            ).fetchall()
+            outcomes = conn.execute(
+                "SELECT outcome,COUNT(*) AS n FROM account_session_ledger "
+                "WHERE touched_at>=? GROUP BY outcome",
+                (cutoff,),
+            ).fetchall()
+    except Exception:
+        # 表还没建（首次启动/尚未触达）时不要打断整个 /api/metrics
+        return lines
+
+    lines.extend([
+        "# HELP yunce_account_session_days_left Days until the platform session expires.",
+        "# TYPE yunce_account_session_days_left gauge",
+    ])
+    now = datetime.now()
+    warn_days = float(os.environ.get("FLOWOPS_KEEPER_WARN_DAYS", "30") or 30)
+    expiring = 0
+    for row in rows:
+        text = str(row["expires_at"] or "").strip()
+        if not text:
+            continue
+        try:
+            expires = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        days = round((expires - now).total_seconds() / 86400, 2)
+        if days <= warn_days:
+            expiring += 1
+        lines.append(
+            f'yunce_account_session_days_left{{account="{_escape(row["name"])}",'
+            f'account_id="{int(row["account_id"])}",platform="{int(row["platform"])}"}} {days}'
+        )
+    lines.extend([
+        "# HELP yunce_account_session_expiring Accounts inside the warning window.",
+        "# TYPE yunce_account_session_expiring gauge",
+        f"yunce_account_session_expiring {expiring}",
+        "# HELP yunce_account_session_touch_total Session touches in the last 24h by outcome.",
+        "# TYPE yunce_account_session_touch_total gauge",
+    ])
+    for row in outcomes:
+        lines.append(
+            f'yunce_account_session_touch_total{{outcome="{_escape(row["outcome"])}"}} '
+            f"{int(row['n'] or 0)}"
+        )
+    return lines
+
+
 def render() -> str:
     base = _base()
     db_dir = base / "db"
@@ -268,6 +334,9 @@ def render() -> str:
     ])
     for status, count in _group_counts(account_db, "user_info", "status"):
         lines.append(f'yunce_accounts_total{{status="{_escape(status)}"}} {count}')
+
+    # 会话保活：窗口剩余天数与触达结论分布（表不存在时返回空，不打断采集）
+    lines.extend(_session_keeper_metrics(account_db))
 
     auth = _auth_counts(account_db)
     for metric, help_text, value in (

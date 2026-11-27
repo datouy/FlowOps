@@ -100,36 +100,74 @@ async def browser_session(
                 )
 
 
-async def cookie_auth_douyin(account_file):
+DOUYIN_UPLOAD_URL = "https://creator.douyin.com/creator-micro/content/upload"
+
+#: 明确的登录失效文案
+DOUYIN_LOGIN_TEXT = ("扫码登录", "验证码登录", "手机号登录")
+#: 风控/验证文案：**不是**登录失效，不能因此把账号判死
+DOUYIN_RISK_TEXT = ("安全验证", "请完成验证", "身份验证", "环境异常", "操作过于频繁")
+
+
+async def probe_douyin(account_file) -> dict:
+    """抖音登录态三段式判定：``expired`` / ``risk`` / ``network`` / ``alive``。
+
+    旧实现（"等 5 秒看有没有『扫码登录』，超时即失效"）会把慢网络和风控页
+    一起算成"登录失效"。账号一旦被标失效，``account_safety`` 会暂停它的
+    自动化，保活不再触达 → 假死就变成真死。所以这里把三种情况拆开：
+
+    * ``network``  页面根本没加载出来 —— 保持原状态，只记原因
+    * ``risk``     出现安全验证/验证码 —— 降速，不判死
+    * ``expired``  明确出现登录入口 —— 才可以判失效
+    """
+    result = {"alive": True, "outcome": "unchanged", "detail": ""}
     async with browser_session(account_file) as (_browser, _context, page):
-        # 访问指定的 URL
-        await page.goto("https://creator.douyin.com/creator-micro/content/upload")
         try:
-            await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=5000)
-            # 三平台收拢：先走适配包判登录态，文本兜底。改版只改 yaml。
-            try:
-                import selector_adapters as _ad
-                if await _ad.publish_step_any_visible(page, "douyin", "qrcode_marker"):
-                    douyin_logger.error("[+] cookie 失效，需要扫码登录")
-                    return False
-                if await _ad.publish_step_any_visible(page, "douyin", "login_marker"):
-                    douyin_logger.success("[+]  cookie 有效")
-                    return True
-            except Exception:
-                pass
-            # 2024.06.17 抖音创作者中心改版
-            # 判断
-            # 等待“扫码登录”元素出现，超时 5 秒（如果 5 秒没出现，说明 cookie 有效）
-            try:
-                await page.get_by_text("扫码登录").wait_for(timeout=5000)
-                douyin_logger.error("[+] cookie 失效，需要扫码登录")
-                return False
-            except Exception:
-                douyin_logger.success("[+]  cookie 有效")
-                return True
+            await page.goto(DOUYIN_UPLOAD_URL, wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            douyin_logger.warning("[+] 抖音判活：页面加载失败，按环境问题处理: {}", exc)
+            return {**result, "outcome": "network", "detail": f"页面加载失败: {exc}"[:200]}
+
+        body = ""
+        try:
+            body = await page.locator("body").inner_text(timeout=4000)
         except Exception:
-            douyin_logger.error("[+] 等待5秒 cookie 失效")
-            return False
+            body = ""
+
+        if any(marker in body for marker in DOUYIN_RISK_TEXT):
+            douyin_logger.warning("[+] 抖音判活：命中安全验证，按风控处理")
+            return {**result, "outcome": "risk", "detail": "命中安全验证/风控文案"}
+
+        # 三平台收拢：先走适配包判登录态，文本兜底。改版只改 yaml。
+        try:
+            import selector_adapters as _ad
+
+            if await _ad.publish_step_any_visible(page, "douyin", "qrcode_marker"):
+                douyin_logger.error("[+] cookie 失效，需要扫码登录")
+                return {**result, "alive": False, "outcome": "expired", "detail": "出现扫码登录"}
+            if await _ad.publish_step_any_visible(page, "douyin", "login_marker"):
+                douyin_logger.success("[+] cookie 有效")
+                return {**result, "outcome": "unchanged"}
+        except Exception:
+            pass
+
+        # 文本兜底：仍然只看明确文案，超时**不再**等于失效。
+        try:
+            await page.get_by_text("扫码登录").wait_for(timeout=5000)
+            douyin_logger.error("[+] cookie 失效，需要扫码登录")
+            return {**result, "alive": False, "outcome": "expired", "detail": "出现扫码登录文案"}
+        except Exception:
+            pass
+
+        if any(marker in body for marker in DOUYIN_LOGIN_TEXT):
+            return {**result, "alive": False, "outcome": "expired", "detail": "页面出现登录文案"}
+        douyin_logger.success("[+] cookie 有效")
+        return result
+
+
+async def cookie_auth_douyin(account_file):
+    """兼容老接口：只返回存活与否。``network``/``risk`` 都算存活。"""
+    result = await probe_douyin(account_file)
+    return bool(result.get("alive"))
 
 
 async def cookie_auth_tencent(account_file):

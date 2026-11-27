@@ -3708,6 +3708,49 @@ def restart_patrol(interval_hours: int = 12) -> None:
     logger.warning("重新拉起账号巡检线程")
     start_patrol(interval_hours)
 
+
+# ---------- 会话保活（与巡检分工：巡检判生死，保活管"别掉线"）----------
+
+_KEEPER_STARTED = False
+
+
+def start_keeper() -> bool:
+    """启动账号会话保活触达循环（幂等）。"""
+    global _KEEPER_STARTED
+    try:
+        import session_keeper
+
+        started = bool(session_keeper.start_keeper())
+        _KEEPER_STARTED = started
+        return started
+    except Exception:
+        logger.exception("启动会话保活失败")
+        return False
+
+
+def restart_keeper() -> None:
+    """看门狗用：保活循环意外退出后重新拉起。"""
+    global _KEEPER_STARTED
+    _KEEPER_STARTED = False
+    logger.warning("重新拉起会话保活循环")
+    start_keeper()
+
+
+def run_keeper_once(*, force: bool = False, account_ids=None, dry_run: bool = False):
+    """手动触发一轮保活（接口/运维脚本共用）。"""
+    import session_keeper
+
+    return session_keeper.run_keeper_once(
+        account_ids=account_ids, force=force, dry_run=dry_run,
+    )
+
+
+def keeper_status() -> dict:
+    import session_keeper
+
+    return session_keeper.keeper_status()
+
+
 def run_patrol_once():
     import asyncio
     from myUtils.auth import check_cookies_concurrently

@@ -764,6 +764,38 @@ class AccountStore:
             logger.warning("回写账号 {} 健康度失败: {}", account_id, exc)
             return False
 
+    def mark_probe(
+        self,
+        account_id: int,
+        outcome: str,
+        reason: str = "",
+        threshold: int = DEFAULT_FAIL_THRESHOLD,
+    ) -> bool:
+        """用"保活触达"的结论回写健康度。
+
+        与 ``mark_checked`` 的区别只有一条，但很关键：**不是所有失败都叫失效**。
+        抖音/小红书这类页面在慢网络下会超时，风控期会弹验证码，页面改版会让
+        选择器失配——这些都不该把账号判死，否则 ``account_safety`` 会暂停它的
+        自动化，保活随之停摆，假死就变成真死（历史上账号 #1、#43 都有过
+        1→0 又 0→1 的自愈记录）。
+
+        只有 ``expired`` 走失败累计；``network``/``risk``/``page_changed`` 只
+        记录原因，不动 ``status``。
+        """
+        value = str(outcome or "").strip().lower()
+        if value == "deferred":
+            # 本轮没有真的访问平台（已有常驻通道在跑），不写任何状态。
+            return True
+        if value == "expired":
+            return self.mark_checked(
+                int(account_id), False, reason or "登录态失效，请重新登录", threshold,
+            )
+        if value in ("renewed", "device_refreshed", "unchanged", "checked_only"):
+            return self.mark_checked(int(account_id), True, "")
+        if value == "risk":
+            return self.mark_throttled(int(account_id), reason or "触达遇到安全验证")
+        return self.mark_throttled(int(account_id), reason or f"触达未得出结论：{value or 'unknown'}")
+
     def update_cookie_name(self, account_id: int, cookie_name: str) -> bool:
         self.ensure_schema()
         try:
@@ -1007,3 +1039,18 @@ def get_store(base_dir: str | Path | None = None) -> AccountStore:
         _STORE = AccountStore(base)
         _STORE_BASE = base
     return _STORE
+
+
+def mark_probe(
+    account_id: int,
+    outcome: str,
+    reason: str = "",
+    *,
+    base_dir: str | Path | None = None,
+) -> bool:
+    """模块级快捷方式：把保活触达结论回写账号健康度（见 ``mark_probe`` 方法）。"""
+    try:
+        return get_store(base_dir).mark_probe(int(account_id), outcome, reason)
+    except Exception as exc:
+        logger.warning("回写账号 {} 触达结论失败: {}", account_id, exc)
+        return False

@@ -51,11 +51,16 @@ def main() -> int:
         "account-patrol", description="账号登录态巡检",
         interval=12 * 3600, launcher=publish_jobs.restart_patrol,
     )
+    runtime_guard.register(
+        "account-keeper", description="账号会话保活触达",
+        interval=1800, launcher=publish_jobs.restart_keeper,
+    )
 
     publish_jobs.backfill_scheduled_items()
     publish_jobs.recover_pending_jobs()
     publish_jobs.start_publish_runtime()
     publish_jobs.start_patrol()
+    publish_jobs.start_keeper()
     runtime_guard.start_watchdog()
 
     logger.info(
