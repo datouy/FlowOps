@@ -151,6 +151,15 @@ TOKENS_FILE = _env_text("YUNCE_TOKENS_FILE")
 # 用于迁移期和应急引导管理员。
 PERSONAL_AUTH = _as_bool(_env_text("YUNCE_PERSONAL_AUTH"))
 
+# 单密码门禁：只需要一个密码就能进工作台（不需要用户名、不需要令牌）。
+# 密码由使用者在 .env 里自己定义；留空表示不启用。
+ACCESS_PASSWORD = _env_text("YUNCE_ACCESS_PASSWORD")
+
+
+def password_gate_enabled() -> bool:
+    """是否启用了"单密码"登录。"""
+    return bool(str(ACCESS_PASSWORD or "").strip())
+
 REVIEW_MODE = _env_text("FLOWOPS_REVIEW_MODE", REVIEW_MODE_CUTTER_REQUIRED).lower()
 
 # 非回环地址必须显式打开远程访问，并且必须设置访问令牌。
@@ -169,6 +178,12 @@ PUBLIC_PATHS = frozenset({
     "/v2/auth/config",
     "/api/v2/auth/login",
     "/v2/auth/login",
+    # 单密码门禁：只需要一个密码就能换会话，不需要用户名
+    "/api/v2/auth/unlock",
+    "/v2/auth/unlock",
+    # 静默续期：调用时 access 已过期，必须允许未鉴权访问（凭据是刷新令牌本身）
+    "/api/v2/auth/refresh",
+    "/v2/auth/refresh",
     "/api/v2/auth/mfa/verify",
     "/v2/auth/mfa/verify",
     # Webhook 使用独立密钥/HMAC，不能要求外部系统持有后台管理 Token。
@@ -329,7 +344,7 @@ def authenticate(candidate: str) -> dict | None:
     candidate = str(candidate or "").strip()
     if not candidate:
         return None
-    if PERSONAL_AUTH:
+    if PERSONAL_AUTH or password_gate_enabled():
         try:
             import user_auth
 
@@ -415,14 +430,16 @@ def scope_filter(identity: dict | None) -> list[str]:
 
 def token_ok(candidate: str) -> bool:
     """令牌是否有效（全局令牌或用户令牌都行）。"""
-    if not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH:
+    if (not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH
+            and not password_gate_enabled()):
         return True
     return authenticate(candidate) is not None
 
 
 def access_allowed(method: str, path: str, headers, args) -> bool:
     """判断一次请求是否可以通过访问令牌校验。"""
-    if not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH:
+    if (not ACCESS_TOKEN and not TOKENS_FILE and not PERSONAL_AUTH
+            and not password_gate_enabled()):
         return True
     if str(method or "").upper() == "OPTIONS" or is_public_path(path):
         return True
@@ -435,7 +452,9 @@ def is_loopback_host(host: str) -> bool:
 
 def authorization_status() -> dict:
     """返回真实生效的令牌角色/权限状态，不把数据库占位表当成鉴权事实。"""
-    auth_configured = bool(ACCESS_TOKEN or TOKENS_FILE or PERSONAL_AUTH)
+    auth_configured = bool(
+        ACCESS_TOKEN or TOKENS_FILE or PERSONAL_AUTH or password_gate_enabled()
+    )
     token_error = ""
     try:
         validate_user_tokens()
@@ -488,12 +507,15 @@ def validate_server_config() -> None:
             "如确需局域网访问，请显式开启远程访问并设置 YUNCE_ACCESS_TOKEN。"
         )
     if not ACCESS_TOKEN and not TOKENS_FILE:
-        if not PERSONAL_AUTH:
+        if not PERSONAL_AUTH and not password_gate_enabled():
             raise RuntimeError(
-                "远程访问已开启，但未设置 YUNCE_ACCESS_TOKEN、YUNCE_TOKENS_FILE "
-                "或 YUNCE_PERSONAL_AUTH。"
+                "远程访问已开启，但未设置 YUNCE_ACCESS_TOKEN、YUNCE_TOKENS_FILE、"
+                "YUNCE_PERSONAL_AUTH 或 YUNCE_ACCESS_PASSWORD。"
                 "零鉴权的局域网工作台会暴露账号 Cookie 和私信，已拒绝启动。"
             )
+        if password_gate_enabled() and not PERSONAL_AUTH:
+            # 单密码门禁自带管理员身份，无需再要求数据库里存在实名管理员
+            return
         import user_auth
 
         if user_auth.auth_status().get("activeAdmins", 0) < 1:

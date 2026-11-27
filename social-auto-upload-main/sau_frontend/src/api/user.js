@@ -13,6 +13,11 @@ export const userApi = {
     return http.post('/api/v2/auth/login', credentials)
   },
 
+  // 单密码门禁：只需要一个密码（不需要用户名/令牌）
+  unlock(password) {
+    return http.post('/api/v2/auth/unlock', { password })
+  },
+
   verifyMfa(payload) {
     return http.post('/api/v2/auth/mfa/verify', payload)
   },

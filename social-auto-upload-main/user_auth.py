@@ -38,9 +38,25 @@ PASSWORD_SCHEME = "pbkdf2_sha256"
 PASSWORD_MIN_LENGTH = 12
 PASSWORD_MAX_LENGTH = 256
 PASSWORD_ITERATIONS = 600_000
-SESSION_TTL_HOURS = 12
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(1, value)
+
+
+SESSION_TTL_HOURS = _env_positive_int("FLOWOPS_SESSION_TTL_HOURS", 12)
 SESSION_TOUCH_SECONDS = 300
 MAX_SESSIONS_PER_USER = 10
+#: 会话滑动：剩余不足一半时自动续到完整窗口，最多滑到绝对上限
+SESSION_SLIDING_ENABLED = True
+SESSION_SLIDE_RATIO = 0.5
+SESSION_ABSOLUTE_DAYS = _env_positive_int("FLOWOPS_SESSION_ABSOLUTE_DAYS", 90)
+#: 刷新令牌（默认 30 天，旋转 + 复用检测）
+REFRESH_TTL_DAYS = _env_positive_int("FLOWOPS_REFRESH_TTL_DAYS", 30)
+REFRESH_COOKIE_NAME = "yunce_refresh"
+REFRESH_COOKIE_PATH = "/api/v2/auth"
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{2,63}$")
 
 TOTP_INTERVAL = 30
@@ -155,6 +171,22 @@ def init_auth_schema(*, force: bool = False) -> None:
                     user_agent TEXT NOT NULL DEFAULT ''
                 )"""
             )
+            # 刷新令牌（滑动会话）：access 只活 12 小时，refresh 活 30 天。
+            # 关掉浏览器/后端重启之后，前端靠它静默换一张新的 access，
+            # 用户就不用每天重新登录（对齐"网页端官方登录能一直挂着"的体验）。
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS session_refresh_tokens (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    rotated_at DATETIME,
+                    revoked_at DATETIME,
+                    ip TEXT NOT NULL DEFAULT '',
+                    user_agent TEXT NOT NULL DEFAULT ''
+                )"""
+            )
             _ensure_column(conn, "users", "display_name", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(conn, "users", "disabled", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(
@@ -207,13 +239,27 @@ def init_auth_schema(*, force: bool = False) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_login_failures_locked "
                 "ON auth_login_failures(locked_until)"
             )
-            record_schema_version(conn, "named_auth", 2)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user "
+                "ON session_refresh_tokens(user_id, expires_at, revoked_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_session "
+                "ON session_refresh_tokens(session_id)"
+            )
+            record_schema_version(conn, "named_auth", 3)
         _INITIALIZED.add(path)
 
 
-def _hash_password(raw: str, *, iterations: int | None = None) -> str:
+def _hash_password(
+    raw: str, *, iterations: int | None = None, allow_short: bool = False,
+) -> str:
     password = str(raw or "")
-    if not (PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH):
+    if allow_short:
+        # 单密码门禁允许使用者自定义短密码（本地自用场景），但空密码仍然拒绝
+        if not password or len(password) > PASSWORD_MAX_LENGTH:
+            raise AuthError("密码不能为空")
+    elif not (PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH):
         raise AuthError(f"密码长度必须为 {PASSWORD_MIN_LENGTH}-{PASSWORD_MAX_LENGTH} 个字符")
     rounds = int(PASSWORD_ITERATIONS if iterations is None else iterations)
     salt = secrets.token_bytes(16)
@@ -599,6 +645,20 @@ def setup_mfa(username: str, current_password: str) -> dict:
     }
 
 
+def _revoke_user_refresh_tokens(conn, user_id: int, keep_session_id: str = "") -> int:
+    """同一连接内撤销刷新令牌，避免"会话撤了、刷新还能换新票"的口子。"""
+    sql = (
+        "UPDATE session_refresh_tokens SET revoked_at=? "
+        "WHERE user_id=? AND revoked_at IS NULL"
+    )
+    params: list[Any] = [_stamp(), int(user_id)]
+    if keep_session_id:
+        sql += " AND session_id<>?"
+        params.append(keep_session_id)
+    cursor = conn.execute(sql, tuple(params))
+    return int(cursor.rowcount or 0)
+
+
 def _revoke_other_sessions(conn, user_id: int, keep_session_id: str = "") -> int:
     sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
     params: list[Any] = [_stamp(), int(user_id)]
@@ -606,6 +666,7 @@ def _revoke_other_sessions(conn, user_id: int, keep_session_id: str = "") -> int
         sql += " AND id<>?"
         params.append(keep_session_id)
     cursor = conn.execute(sql, tuple(params))
+    _revoke_user_refresh_tokens(conn, int(user_id), keep_session_id)
     return int(cursor.rowcount or 0)
 
 
@@ -785,6 +846,7 @@ def update_user(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
                 (_stamp(), int(user_id)),
             )
+            _revoke_user_refresh_tokens(conn, int(user_id))
         row = conn.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
     result = _user_public(row)
     _audit("user.update", result["username"], f"role={result['role']};disabled={result['disabled']}")
@@ -799,6 +861,7 @@ def revoke_sessions(user_id: int, *, actor: str = "") -> int:
             (_stamp(), int(user_id)),
         )
         count = int(cursor.rowcount or 0)
+        _revoke_user_refresh_tokens(conn, int(user_id))
     _audit("user.sessions.revoke", str(user_id), f"count={count}", actor=actor)
     return count
 
@@ -820,6 +883,7 @@ def reset_password(user_id: int, new_password: str, *, must_change: bool = True)
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
             (now, int(user_id)),
         )
+        _revoke_user_refresh_tokens(conn, int(user_id))
         updated = conn.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
     _audit("user.password.reset", updated["username"], "sessions_revoked=1")
     return _user_public(updated)
@@ -842,11 +906,13 @@ def change_own_password(username: str, current_password: str, new_password: str)
             "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
             (now, int(row["id"])),
         )
+        _revoke_user_refresh_tokens(conn, int(row["id"]))
     _audit("user.password.change", username, "all_sessions_revoked=1", actor=username)
 
 
 def authenticate_session(raw_token: str) -> dict | None:
-    if not bool(runtime_config.PERSONAL_AUTH):
+    # 实名登录或单密码门禁都会签发会话，两种模式都要能校验
+    if not bool(runtime_config.PERSONAL_AUTH or runtime_config.password_gate_enabled()):
         return None
     token = str(raw_token or "").strip()
     if not token:
@@ -878,8 +944,155 @@ def authenticate_session(raw_token: str) -> dict | None:
                 "UPDATE sessions SET last_seen_at=? WHERE id=?",
                 (_stamp(now), token_hash),
             )
+        _slide_session(conn, row, now, token_hash, expiry)
     identity = _identity_for_user(row)
     return identity or None
+
+
+def _slide_session(conn, row: Any, now: datetime, token_hash: str, expiry: datetime) -> bool:
+    """滑动续期：剩余不足一半就把窗口推回完整 TTL，最多推到绝对上限。
+
+    历史实现只在签发时写一次 ``expires_at``，``last_seen_at`` 无论怎么更新都不会
+    延长有效期——用户连续工作到第 12 小时就会被踢回登录页，长上传任务尤其难受。
+    """
+    if not SESSION_SLIDING_ENABLED:
+        return False
+    ttl = timedelta(hours=max(1, int(SESSION_TTL_HOURS)))
+    remaining = (expiry - now).total_seconds()
+    if remaining > ttl.total_seconds() * float(SESSION_SLIDE_RATIO):
+        return False
+    created = _parse_stamp(row["session_created_at"]) or now
+    absolute = created + timedelta(days=max(1, int(SESSION_ABSOLUTE_DAYS)))
+    target = min(now + ttl, absolute)
+    if target <= expiry:
+        return False
+    conn.execute(
+        "UPDATE sessions SET expires_at=? WHERE id=?",
+        (_stamp(target), token_hash),
+    )
+    return True
+
+
+def refresh_session(raw_token: str) -> dict:
+    """用刷新令牌换一套新的 access + refresh（旋转 + 复用检测）。
+
+    复用检测：一枚**已作废**的刷新令牌再次被使用时，认为它可能已经泄漏
+    （正常客户端旋转后拿到的是新令牌），于是把该用户的全部会话一起撤销，
+    逼所有设备重新走一次登录——这是 OAuth2 里 refresh-token rotation 的标准做法。
+    """
+    if not bool(runtime_config.PERSONAL_AUTH or runtime_config.password_gate_enabled()):
+        raise AuthError("登录未启用")
+    raw = str(raw_token or "").strip()
+    if not raw:
+        raise AuthError("缺少刷新令牌，请重新登录")
+    init_auth_schema()
+    now = _now()
+    token_hash = hash_session_token(raw)
+    reused = False
+    with connect(DB, timeout=30) as conn:
+        row = conn.execute(
+            "SELECT t.id AS token_id,t.expires_at AS token_expires,"
+            "t.revoked_at AS token_revoked,t.session_id AS token_session,u.* "
+            "FROM session_refresh_tokens t JOIN users u ON u.id=t.user_id WHERE t.id=?",
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            raise AuthError("刷新令牌无效，请重新登录")
+        expires = _parse_stamp(row["token_expires"])
+        revoked = _parse_stamp(row["token_revoked"])
+        username = str(row["username"] or "")
+        if revoked is not None:
+            reused = True
+            conn.execute(
+                "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                (_stamp(now), int(row["id"])),
+            )
+            conn.execute(
+                "UPDATE session_refresh_tokens SET revoked_at=? "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (_stamp(now), int(row["id"])),
+            )
+        elif expires is None or expires <= now or bool(row["disabled"]):
+            raise AuthError("刷新令牌已过期，请重新登录")
+        else:
+            conn.execute(
+                "UPDATE session_refresh_tokens SET rotated_at=?,revoked_at=? WHERE id=?",
+                (_stamp(now), _stamp(now), token_hash),
+            )
+            old_session = str(row["token_session"] or "")
+            current = conn.execute(
+                "SELECT * FROM users WHERE id=?", (int(row["id"]),),
+            ).fetchone()
+            result = _issue_session(conn, current, now)
+            if old_session:
+                conn.execute(
+                    "UPDATE sessions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+                    (_stamp(now), old_session),
+                )
+    if reused:
+        _audit("auth.refresh.reuse", username, "all_sessions_revoked=1", actor=username)
+        raise AuthError("刷新令牌已失效，请重新登录")
+    _audit("auth.refresh", username, "result=accepted", actor=username)
+    return result
+
+
+def revoke_refresh_tokens(
+    raw_token: str = "",
+    session_id: str = "",
+    user_id: int | None = None,
+) -> int:
+    """撤销刷新令牌：登出按令牌/会话，改密、禁用、改角色按用户。"""
+    init_auth_schema()
+    now = _stamp()
+    revoked = 0
+    with connect(DB, timeout=15) as conn:
+        if raw_token:
+            cursor = conn.execute(
+                "UPDATE session_refresh_tokens SET revoked_at=? "
+                "WHERE id=? AND revoked_at IS NULL",
+                (now, hash_session_token(raw_token)),
+            )
+            revoked += int(cursor.rowcount or 0)
+        if session_id:
+            cursor = conn.execute(
+                "UPDATE session_refresh_tokens SET revoked_at=? "
+                "WHERE session_id=? AND revoked_at IS NULL",
+                (now, session_id),
+            )
+            revoked += int(cursor.rowcount or 0)
+        if user_id:
+            cursor = conn.execute(
+                "UPDATE session_refresh_tokens SET revoked_at=? "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (now, int(user_id)),
+            )
+            revoked += int(cursor.rowcount or 0)
+    return revoked
+
+
+def _attach_refresh_cookie(response, result: dict | None):
+    """把刷新令牌写进 HttpOnly Cookie；跨域开发环境由前端回落到显式字段。"""
+    token = str((result or {}).get("refreshToken") or "")
+    if not token:
+        return response
+    max_age = max(60, int(REFRESH_TTL_DAYS * 86400))
+    try:
+        response.set_cookie(
+            REFRESH_COOKIE_NAME, token,
+            max_age=max_age, httponly=True, samesite="Lax",
+            secure=bool(request.is_secure), path=REFRESH_COOKIE_PATH,
+        )
+    except Exception:
+        pass
+    return response
+
+
+def _clear_refresh_cookie(response):
+    try:
+        response.delete_cookie(REFRESH_COOKIE_NAME, path=REFRESH_COOKIE_PATH)
+    except Exception:
+        pass
+    return response
 
 
 def _issue_session(conn, row: Any, now: datetime) -> dict:
@@ -899,6 +1112,7 @@ def _issue_session(conn, row: Any, now: datetime) -> dict:
             _user_agent(),
         ),
     )
+    refresh = _issue_refresh_token(conn, int(row["id"]), token_hash, now)
     conn.execute(
         "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
         (_stamp(now), _stamp(now), int(row["id"])),
@@ -916,10 +1130,34 @@ def _issue_session(conn, row: Any, now: datetime) -> dict:
     return {
         "token": raw_token,
         "expiresAt": expires,
+        "refreshToken": refresh["token"],
+        "refreshExpiresAt": refresh["expiresAt"],
         "identity": _identity_for_user(row),
         "mustChangePassword": bool(row["must_change_password"]),
         "mfaRequired": False,
     }
+
+
+def _issue_refresh_token(conn, user_id: int, session_id: str, now: datetime) -> dict:
+    """签发一枚刷新令牌；只把哈希落库，明文仅出现在响应里。"""
+    raw = secrets.token_urlsafe(48)
+    expires = _stamp(now + timedelta(days=max(1, int(REFRESH_TTL_DAYS))))
+    conn.execute(
+        "INSERT INTO session_refresh_tokens "
+        "(id,user_id,session_id,created_at,expires_at,ip,user_agent) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            hash_session_token(raw), int(user_id), str(session_id or ""),
+            _stamp(now), expires, _request_ip(), _user_agent(),
+        ),
+    )
+    # 顺手清理该用户已经过期/作废太久的令牌，避免表无限增长。
+    conn.execute(
+        "DELETE FROM session_refresh_tokens WHERE user_id=? AND "
+        "(expires_at<=? OR (revoked_at IS NOT NULL AND revoked_at<=?))",
+        (int(user_id), _stamp(now), _stamp(now - timedelta(days=7))),
+    )
+    return {"token": raw, "expiresAt": expires}
 
 
 def _issue_mfa_challenge(conn, row: Any, now: datetime) -> dict:
@@ -948,7 +1186,8 @@ def _issue_mfa_challenge(conn, row: Any, now: datetime) -> dict:
 
 
 def login(username: str, password: str) -> dict:
-    if not bool(runtime_config.PERSONAL_AUTH):
+    gate_enabled = bool(runtime_config.password_gate_enabled())
+    if not bool(runtime_config.PERSONAL_AUTH) and not gate_enabled:
         raise AuthError("实名登录未启用")
     normalized_user = str(username or "").strip()
     if not normalized_user or not password:
@@ -988,6 +1227,73 @@ def login(username: str, password: str) -> dict:
         actor=normalized_user,
     )
     return result
+
+
+LOCAL_GATE_USERNAME = "local"
+
+
+def ensure_password_gate_user() -> bool:
+    """把 ``YUNCE_ACCESS_PASSWORD`` 同步成一个本地管理员账号。
+
+    为什么要落成一个"账号"：会话、刷新令牌、注销、改密失效这些机制都已经在
+    ``sessions`` 表里跑通了。单密码门禁只需要"密码 → 会话"，没必要另起一套
+    会话表，所以这里把配置里的密码同步到一个固定用户名 ``local`` 的管理员上，
+    改 .env 里的密码后重启就会同步过来。
+    """
+    password = str(runtime_config.ACCESS_PASSWORD or "").strip()
+    if not password:
+        return False
+    init_auth_schema()
+    now = _stamp()
+    with connect(DB, timeout=30) as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username=?", (LOCAL_GATE_USERNAME,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO users (username,display_name,password_hash,role,scope,"
+                "disabled,must_change_password,created_at,updated_at,password_changed_at,mfa_enabled) "
+                "VALUES (?,?,?,?,?,0,0,?,?,?,0)",
+                (
+                    LOCAL_GATE_USERNAME, "本机管理员",
+                    _hash_password(password, allow_short=True),
+                    runtime_config.ROLE_ADMIN, "[]", now, now, now,
+                ),
+            )
+        elif (
+            bool(row["disabled"])
+            or str(row["role"]) != runtime_config.ROLE_ADMIN
+            or not verify_password(password, row["password_hash"])
+        ):
+            conn.execute(
+                "UPDATE users SET password_hash=?,role=?,scope='[]',disabled=0,"
+                "must_change_password=0,updated_at=?,password_changed_at=? WHERE id=?",
+                (
+                    _hash_password(password, allow_short=True),
+                    runtime_config.ROLE_ADMIN, now, now, int(row["id"]),
+                ),
+            )
+    # 改密码后不应该还被上一次的失败次数锁住
+    try:
+        _clear_login_failures(LOCAL_GATE_USERNAME)
+    except Exception:
+        pass
+    return True
+
+
+def password_gate_login(password: str) -> dict:
+    """单密码登录：不需要用户名，配置里的密码对了就签发会话。"""
+    if not runtime_config.password_gate_enabled():
+        raise AuthError("密码登录未启用")
+    ensure_password_gate_user()
+    try:
+        return login(LOCAL_GATE_USERNAME, password)
+    except AuthError as exc:
+        text = str(exc)
+        # 门禁模式没有用户名，提示里不该出现"用户名"
+        if "用户名或密码不正确" in text:
+            raise AuthError("密码不正确") from exc
+        raise
 
 
 def verify_mfa_login(challenge_token: str, code: str) -> dict:
@@ -1129,6 +1435,15 @@ def auth_config():
             "passwordMinLength": status["passwordMinLength"],
             "mfaAvailable": status["personalAuthEnabled"],
             "mfaChallengeTtlSeconds": status["mfaChallengeTtlSeconds"],
+            # 会话保持能力：滑动续期 + 刷新令牌（前端据此决定是否启用静默续期）
+            "sessionSlidingEnabled": bool(SESSION_SLIDING_ENABLED),
+            "sessionAbsoluteDays": int(SESSION_ABSOLUTE_DAYS),
+            "refreshTtlDays": int(REFRESH_TTL_DAYS),
+            "refreshEnabled": bool(
+                runtime_config.PERSONAL_AUTH or runtime_config.password_gate_enabled()
+            ),
+            # 单密码门禁：前端据此只显示"密码"一个输入框
+            "passwordGateEnabled": bool(runtime_config.password_gate_enabled()),
         },
     }), 200
 
@@ -1182,7 +1497,77 @@ def auth_login():
         return response
     except AuthError as exc:
         return _json_error(str(exc), 401)
-    return jsonify({"code": 200, "msg": None, "data": result}), 200
+    response = jsonify({"code": 200, "msg": None, "data": result})
+    return _attach_refresh_cookie(response, result), 200
+
+
+@bp.post("/api/v2/auth/unlock")
+def auth_unlock():
+    """单密码门禁：只验一个密码，不需要用户名。
+
+    密码来自 ``.env`` 的 ``YUNCE_ACCESS_PASSWORD``（使用者自己定义）。校验通过后
+    走的是和实名登录完全相同的会话/刷新令牌流程，所以滑动续期、注销、改密失效
+    这些能力一个都不少。
+    """
+    if not runtime_config.password_gate_enabled():
+        return _json_error("密码登录未启用", 400)
+    payload = request.get_json(silent=True) or {}
+    password = str(payload.get("password") or "")
+    from utils.request_limiter import allow, request_key
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)) or default)
+        except (TypeError, ValueError):
+            return default
+        return max(1, value)
+
+    window = _env_int("FLOWOPS_LOGIN_ATTEMPT_WINDOW", 300)
+    ip_ok, ip_wait = allow(
+        "password-gate-ip",
+        limit=_env_int("FLOWOPS_LOGIN_IP_LIMIT", 60),
+        window_seconds=window,
+        key=request_key(),
+    )
+    if not ip_ok:
+        response = jsonify({"code": 429, "msg": "尝试过于频繁，请稍后重试", "data": None})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(max(int(ip_wait), 1))
+        return response
+    try:
+        result = password_gate_login(password)
+    except LoginLockedError as exc:
+        response = jsonify({"code": 429, "msg": str(exc), "data": None})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response
+    except AuthError as exc:
+        return _json_error(str(exc), 401)
+    response = jsonify({"code": 200, "msg": None, "data": result})
+    return _attach_refresh_cookie(response, result), 200
+
+
+@bp.post("/api/v2/auth/refresh")
+def auth_refresh():
+    """静默续期：refresh（30 天，旋转）→ 新 access（12 小时，可滑动）。
+
+    优先读 HttpOnly Cookie；同源部署时前端根本拿不到明文令牌。
+    跨域开发环境（5173 → 5409）浏览器不会带 Cookie，此时允许请求体显式传。
+    """
+    payload = request.get_json(silent=True) or {}
+    raw = str(request.cookies.get(REFRESH_COOKIE_NAME) or payload.get("refreshToken") or "").strip()
+    if not raw:
+        return _json_error("缺少刷新令牌，请重新登录", 401)
+    try:
+        result = refresh_session(raw)
+    except AuthError as exc:
+        response = _json_error(str(exc), 401)
+        target = response[0] if isinstance(response, tuple) else response
+        _clear_refresh_cookie(target)
+        return response
+    response = jsonify({"code": 200, "msg": None, "data": result})
+    _attach_refresh_cookie(response, result)
+    return response, 200
 
 
 @bp.post("/api/v2/auth/mfa/verify")
@@ -1219,7 +1604,8 @@ def auth_mfa_verify():
         return response
     except AuthError as exc:
         return _json_error(str(exc), 401)
-    return jsonify({"code": 200, "msg": None, "data": result}), 200
+    response = jsonify({"code": 200, "msg": None, "data": result})
+    return _attach_refresh_cookie(response, result), 200
 
 
 def _session_identity_or_error():
@@ -1284,9 +1670,18 @@ def auth_mfa_disable():
 def auth_logout():
     token = runtime_config.extract_token(request.headers, request.args)
     revoked = logout(token)
+    refresh = str(request.cookies.get(REFRESH_COOKIE_NAME) or "")
+    try:
+        revoke_refresh_tokens(
+            raw_token=refresh,
+            session_id=hash_session_token(token) if token else "",
+        )
+    except Exception:
+        pass
     identity = getattr(g, "identity", None) or {}
     _audit("auth.logout", "", f"revoked={revoked}", actor=identity.get("user") or "")
-    return jsonify({"code": 200, "msg": None, "data": {"revoked": revoked}}), 200
+    response = jsonify({"code": 200, "msg": None, "data": {"revoked": revoked}})
+    return _clear_refresh_cookie(response), 200
 
 
 @bp.post("/api/v2/auth/password")
