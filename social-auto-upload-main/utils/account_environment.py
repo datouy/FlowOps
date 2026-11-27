@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -533,6 +534,105 @@ async def hydrate_context_async(context, cookie_path: str | Path, account_id: in
     if script:
         await context.add_init_script(script=script)
     _mark_seeded(target)
+
+
+def _cookie_identity(cookie: dict[str, Any]) -> tuple[str, str, str] | None:
+    """cookie 的稳定标识：名称 + 去点域 + 路径。"""
+    name = str(cookie.get("name") or "").strip()
+    if not name:
+        return None
+    domain = str(cookie.get("domain") or "").strip().lstrip(".").lower()
+    path = str(cookie.get("path") or "/").strip() or "/"
+    return name, domain, path
+
+
+def missing_cookies(
+    state: dict[str, Any],
+    existing: list[dict[str, Any]],
+    *,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """算出"快照里有、浏览器里没有"的 cookie（幂等补种用）。
+
+    为什么需要它：``hydrate_context`` 只会在 profile 首次创建时播种一次
+    （``.flowops-storage-state-seeded`` 标记）。之后 profile 里的会话级
+    cookie（``expires=-1``，例如 ``csrf_session_id``）一旦在关闭浏览器时
+    被丢掉，就再也没有机会补回来，账号看起来"登录态半残"。
+    这里每次打开都做一次差量补种：只补缺的，不动平台已经轮换过的新值。
+    """
+    if not isinstance(state, dict):
+        return []
+    moment = now if now is not None else time.time()
+    have = set()
+    for cookie in existing or []:
+        key = _cookie_identity(cookie)
+        if key:
+            have.add(key)
+    result: list[dict[str, Any]] = []
+    for cookie in state.get("cookies") or []:
+        if not isinstance(cookie, dict):
+            continue
+        key = _cookie_identity(cookie)
+        if key is None or key in have:
+            continue
+        try:
+            expires = float(cookie.get("expires") or -1)
+        except (TypeError, ValueError):
+            expires = -1.0
+        # 已经过期的 cookie 补进去只会污染 profile。
+        if expires > 0 and expires <= moment:
+            continue
+        result.append(cookie)
+    return result
+
+
+def sync_missing_cookies(
+    context,
+    cookie_path: str | Path,
+    account_id: int | None = None,
+) -> int:
+    """同步版差量补种，返回补进去的条数。失败不外抛。"""
+    try:
+        profile_dir(cookie_path, account_id)
+        state = _read_storage_state(cookie_path)
+        if not state:
+            return 0
+        missing = missing_cookies(state, list(context.cookies() or []))
+        if missing:
+            context.add_cookies(missing)
+            logger.info(
+                "账号持久目录补种 {} 条缺失 cookie: {}",
+                len(missing), Path(cookie_path).name,
+            )
+        return len(missing)
+    except Exception as exc:
+        logger.debug("差量补种 cookie 失败（不影响启动）: {}", exc)
+        return 0
+
+
+async def sync_missing_cookies_async(
+    context,
+    cookie_path: str | Path,
+    account_id: int | None = None,
+) -> int:
+    """异步版差量补种。"""
+    try:
+        profile_dir(cookie_path, account_id)
+        state = _read_storage_state(cookie_path)
+        if not state:
+            return 0
+        existing = list(await context.cookies() or [])
+        missing = missing_cookies(state, existing)
+        if missing:
+            await context.add_cookies(missing)
+            logger.info(
+                "账号持久目录补种 {} 条缺失 cookie: {}",
+                len(missing), Path(cookie_path).name,
+            )
+        return len(missing)
+    except Exception as exc:
+        logger.debug("差量补种 cookie 失败（不影响启动）: {}", exc)
+        return 0
 
 
 def remove_environment(cookie_path: str | Path, account_id: int | None = None) -> None:

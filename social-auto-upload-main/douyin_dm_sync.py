@@ -25,6 +25,7 @@ from flask import Blueprint
 import dm_cursor
 import dm_ops
 import douyin_im_api
+from loguru import logger
 from dm_media_cache import attach_message_media
 from utils.credential_crypto import credential_exists
 from dm_platform_common import (
@@ -243,7 +244,7 @@ SCAN_SCRIPT = r"""
   };
   // 选中会话后 React 会保留一组尺寸为零的隐藏旧行。这些行属于虚拟列表
   // 的回收节点，文本可能已经错位，不能参与会话身份计算。
-  const elements = Array.from(document.querySelectorAll('.semi-list-item'))
+  const elements = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
     .map((el, index) => {
       const rect = el.getBoundingClientRect();
       return {el, index, visible: rect.width > 1 && rect.height > 1};
@@ -255,19 +256,30 @@ SCAN_SCRIPT = r"""
     // “全部”里会混入一个名为“陌生人消息”的聚合入口。它不是具体会话，
     // 点击后会改变列表位置；真正的陌生人会话由“陌生人私信”页签采集。
     if (el.querySelector('[class*="stranger-item-left-"]')) continue;
-    const header = el.querySelector('.semi-list-item-body-header');
-    if (!header) continue;
-    const nameNode = el.querySelector('[class*="item-header-name"]');
-    const timeNode = el.querySelector('[class*="item-header-time"]');
-    const contentNode = el.querySelector('[class*="item-content"]');
-    const avatar = header.querySelector('img')?.currentSrc || header.querySelector('img')?.src || '';
+    // 2026-11 改版：header 变成 ConversationItemrowArea2，头像挪到兄弟节点
+    // rowArea1，所以头像必须从整行找，不能只在 header 里找。
+    const header = el.querySelector('[class*="ConversationItemrowArea2"]')
+      || el.querySelector('.semi-list-item-body-header')
+      || el;
+    const nameNode = el.querySelector(
+      '[class*="ConversationItemtitle"]:not([class*="Wrapper"]), [class*="item-header-name"]'
+    );
+    const timeNode = el.querySelector('[class*="timeStr"], [class*="item-header-time"]');
+    const contentNode = el.querySelector(
+      '[class*="ConversationItemDesc"], [class*="HinttextBox"], [class*="item-content"]'
+    );
+    const avatarImg = el.querySelector('img');
+    const avatar = avatarImg?.currentSrc || avatarImg?.src || '';
     const rawName = String(nameNode?.innerText || '').trim();
     if (!rawName) continue;
     const cid = hashCid(`${rawName}|${canonicalAvatar(avatar)}`);
     el.setAttribute('data-flowops-dm-cid', cid);
-    const badgeText = String(el.querySelector('.semi-badge-count')?.innerText || '').trim();
+    const badgeNode = el.querySelector(
+      '.semi-badge-count, [class*="ConversationItemUnread"], [class*="unreadCount"]'
+    );
+    const badgeText = String(badgeNode?.innerText || '').trim();
     const unread = Number.parseInt(badgeText, 10) ||
-      (el.querySelector('.semi-badge-danger') ? 1 : 0);
+      (el.querySelector('.semi-badge-danger, [class*="unreadDot"]') ? 1 : 0);
     const rect = el.getBoundingClientRect();
     const visible = rect.width > 1 && rect.height > 1;
     const displayTime = String(timeNode?.innerText || '').trim();
@@ -306,14 +318,87 @@ HISTORY_SCRIPT = r"""
   };
   // 连续切换会话时页面会保留已卸载聊天的零尺寸副本。只解析当前可见的
   // 聊天内容容器，否则会读到上一会话或 DOM 回收后的错位节点。
-  const currentBox = Array.from(document.querySelectorAll('[class*="box-content-"]'))
+  // ---- 2026-11 改版：messageMessageBox + data-e2e="msg-item-content" ----
+  // 新版把"方向"放在消息行容器的 isFromMe 上、把正文放在 data-e2e 钩子里，
+  // 旧版的 box-item-/text-*/is-me- 全部消失。这里先跑新版解析，拿到结果就
+  // 直接返回；拿不到再走旧版，改版来回切换时两边都能用。
+  const newHttpUrl = value => {
+    let text = String(value || '').trim();
+    if (text.startsWith('//')) text = `https:${text}`;
+    if (!/^https?:\/\//i.test(text)) return '';
+    if (/\/(?:undefined|null)(?:[?#]|$)/i.test(text)) return '';
+    if (/\/aweme-avatar\//i.test(text)) return '';
+    return text;
+  };
+  const newLayoutRows = (() => {
+    const list = Array.from(document.querySelectorAll(
+      '[class*="messageMessageListlist"], [class*="messageMessageListwrapper"]'
+    )).filter(visible).find(el => el.querySelector('[class*="messageMessageBox"]'));
+    if (!list) return [];
+    const out = [];
+    let currentTime = '';
+    const nodes = Array.from(list.querySelectorAll(
+      '[class*="MessageBoxTimetimeLayout"], [class*="messageMessageBoxmessageBox"]'
+    ));
+    for (const node of nodes) {
+      const cls = String(node.className || '');
+      if (/timeLayout/.test(cls)) {
+        currentTime = String(node.innerText || '').trim();
+        continue;
+      }
+      if (!visible(node)) continue;
+      const isTip = /isFullRowCenterMessage/.test(cls) ||
+        Boolean(node.querySelector('[class*="SystemNormalSystem"]'));
+      const outbound = Boolean(node.querySelector('[class*="isFromMe"]'));
+      const direction = outbound ? 'outbound' : 'inbound';
+      const contentNode = node.querySelector('[data-e2e="msg-item-content"]') || node;
+      const rawText = String(contentNode.innerText || '').trim();
+      const hasVideo = Boolean(node.querySelector('video'));
+      if (hasVideo) {
+        const video = node.querySelector('video');
+        out.push({
+          text: '', media: true, media_type: 'video',
+          media_url: newHttpUrl(video?.currentSrc || video?.src),
+          media_thumb_url: '', direction, display_time: currentTime, is_tip: isTip,
+        });
+        continue;
+      }
+      if (!rawText) {
+        const image = Array.from(node.querySelectorAll('img'))
+          .filter(img => !img.closest('[class*="avatar"]'))
+          .map(img => ({
+            url: newHttpUrl(img.currentSrc || img.src),
+            width: img.naturalWidth || img.width || 0,
+            height: img.naturalHeight || img.height || 0,
+          }))
+          .filter(item => item.url && (item.width >= 80 || item.height >= 80))
+          .sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+        if (!image) continue;
+        out.push({
+          text: '', media: true, media_type: 'image',
+          media_url: image.url, direction, display_time: currentTime, is_tip: isTip,
+        });
+        continue;
+      }
+      // 占位文案（"暂不支持该消息类型"等）交给 Python 的 _is_placeholder 统一过滤，
+      // 这里不做二次判断，避免两处规则不一致。
+      out.push({
+        text: rawText.slice(0, 4000),
+        direction, display_time: currentTime, is_tip: isTip,
+      });
+    }
+    return out;
+  })();
+  if (newLayoutRows.length) return newLayoutRows;
+
+  const currentBox = Array.from(document.querySelectorAll('[class*="messageMessageListlist"], [class*="box-content-"]'))
     .filter(visible)
-    .find(el => el.querySelector('[class*="box-item-"]'));
+    .find(el => el.querySelector('[data-e2e="msg-item-content"], [class*="box-item-"]'));
   // 虚拟列表滚动后会把已卸载/回收的消息行保留成零尺寸副本，文本可能已经
   // 错位，甚至丢失 is-me- 方向标记。只解析有实际尺寸的可见行，否则会把上
   // 一会话或回收节点错当成客户消息、方向也判反。
   const nodes = Array.from(
-    (currentBox || document).querySelectorAll('[class*="box-item-"]')
+    (currentBox || document).querySelectorAll('[data-e2e="msg-item-content"], [class*="box-item-"]')
   ).filter(visible);
   const rows = [];
   let currentTime = '';
@@ -428,9 +513,9 @@ SCROLL_HISTORY_SCRIPT = r"""
       style.display !== 'none' && style.visibility !== 'hidden' &&
       Number(style.opacity || 1) > 0;
   };
-  const currentBox = Array.from(document.querySelectorAll('[class*="box-content-"]'))
+  const currentBox = Array.from(document.querySelectorAll('[class*="messageMessageListlist"], [class*="box-content-"]'))
     .filter(visible)
-    .find(el => el.querySelector('[class*="box-item-"]'));
+    .find(el => el.querySelector('[data-e2e="msg-item-content"], [class*="box-item-"]'));
   if (!currentBox) return false;
   const style = window.getComputedStyle(currentBox);
   if (!/(auto|scroll)/.test(style.overflowY) ||
@@ -878,33 +963,33 @@ async def _click_conversation(
         # 必须从可见列表项反查它所属的 Grid，不能盲点页面里的第一个 Grid。
         if reset:
             await page.evaluate("""() => {
-                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                const item = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                     .find(el => {
                         const rect = el.getBoundingClientRect();
                         return rect.width > 1 && rect.height > 1;
                     });
-                const grid = item?.closest('.ReactVirtualized__Grid');
+                const grid = (() => { let node = item; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return item?.closest('.ReactVirtualized__Grid'); })();
                 if (grid) grid.scrollTop = 0;
             }""")
             await page.wait_for_timeout(300)
         original_scroll_top = await page.evaluate("""() => {
-            const item = Array.from(document.querySelectorAll('.semi-list-item'))
+            const item = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                 .find(el => {
                     const rect = el.getBoundingClientRect();
                     return rect.width > 1 && rect.height > 1;
                 });
-            const grid = item?.closest('.ReactVirtualized__Grid');
+            const grid = (() => { let node = item; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return item?.closest('.ReactVirtualized__Grid'); })();
             return grid ? Number(grid.scrollTop || 0) : 0;
         }""")
 
         async def _restore_scroll_and_fail() -> bool:
             await page.evaluate("""(scrollTop) => {
-                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                const item = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                     .find(el => {
                         const rect = el.getBoundingClientRect();
                         return rect.width > 1 && rect.height > 1;
                     });
-                const grid = item?.closest('.ReactVirtualized__Grid');
+                const grid = (() => { let node = item; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return item?.closest('.ReactVirtualized__Grid'); })();
                 if (grid) grid.scrollTop = Number(scrollTop || 0);
             }""", original_scroll_top)
             await page.wait_for_timeout(120)
@@ -937,7 +1022,7 @@ async def _click_conversation(
                     const hit = document.elementFromPoint(x, y);
                     return Boolean(hit && (el === hit || el.contains(hit)));
                 };
-                const items = Array.from(document.querySelectorAll('.semi-list-item'))
+                const items = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                     .filter(clickable);
                 const target = items.find(
                     el => el.getAttribute('data-flowops-dm-cid') === cid
@@ -962,14 +1047,17 @@ async def _click_conversation(
                                 style.visibility !== 'hidden';
                         };
                         const box = Array.from(
-                            document.querySelectorAll('[class*="box-content-"]')
+                            document.querySelectorAll('[class*="messageMessageListlist"], [class*="box-content-"]')
                         ).filter(visible).find(
-                            el => el.querySelector('[class*="box-item-"]')
+                            el => el.querySelector('[data-e2e="msg-item-content"], [class*="box-item-"]')
                         );
                         if (!box) return '';
                         return String(box.innerText || '').slice(0, 2000);
                     }""")
-                    await page.locator('.semi-list-item[data-flowops-dm-target="1"]').click(
+                    await page.locator(
+                        '[data-e2e="conversation-item"][data-flowops-dm-target="1"], '
+                        '.semi-list-item[data-flowops-dm-target="1"]'
+                    ).click(
                         timeout=max(500, click_timeout_ms)
                     )
                 except Exception:
@@ -982,8 +1070,10 @@ async def _click_conversation(
                 for _ in range(24):
                     detail_ready = await page.evaluate("""(args) => {
                         const [name, prevSignature] = args;
+                        // 2026-11 改版后详情标题在 RightPanelHeader/summatyBox 里，
+                        // 旧版的 box-container- 已经不存在；三个都试。
                         const titled = Array.from(document.querySelectorAll(
-                            '[class*="box-container-"]'
+                            '[class*="RightPanelHeader"], [class*="summatyBox"], [class*="box-container-"]'
                         )).some(el => {
                             const rect = el.getBoundingClientRect();
                             const style = window.getComputedStyle(el);
@@ -992,7 +1082,7 @@ async def _click_conversation(
                                 String(el.innerText || '').includes(name);
                         });
                         const hasMessage = Array.from(document.querySelectorAll(
-                            '[class*="box-item-"]'
+                            '[data-e2e="msg-item-content"], [class*="box-item-"]'
                         )).some(el => {
                             const rect = el.getBoundingClientRect();
                             return rect.width > 1 && rect.height > 1;
@@ -1005,9 +1095,9 @@ async def _click_conversation(
                                 style.visibility !== 'hidden';
                         };
                         const box = Array.from(
-                            document.querySelectorAll('[class*="box-content-"]')
+                            document.querySelectorAll('[class*="messageMessageListlist"], [class*="box-content-"]')
                         ).filter(visible).find(
-                            el => el.querySelector('[class*="box-item-"]')
+                            el => el.querySelector('[data-e2e="msg-item-content"], [class*="box-item-"]')
                         );
                         const signature = box ?
                             String(box.innerText || '').slice(0, 2000) : '';
@@ -1017,14 +1107,22 @@ async def _click_conversation(
                             signature: signature,
                         };
                     }""", [expected_name, panel_signature])
-                    if (detail_ready.get("titled") and detail_ready.get("hasMessage")
-                            and (not panel_signature or
-                                 detail_ready.get("signature") != panel_signature)):
+                    # 详情标题已经是目标昵称，就说明面板切换过去了；内容签名只作
+                    # 辅助信号。很多会话的内容完全一样（都是"对方回复或关注你之前…"
+                    # ＋"暂不支持该消息类型展示"），拿签名判断有没有切换会永远判失败，
+                    # 那也是改版后"尾部会话无法打开详情"的直接原因。
+                    signature_changed = (
+                        not panel_signature
+                        or detail_ready.get("signature") != panel_signature
+                    )
+                    if detail_ready.get("titled") and (
+                        detail_ready.get("hasMessage") or signature_changed
+                    ):
                         return True
                     await page.wait_for_timeout(250)
                 return await _restore_scroll_and_fail()
             moved = await page.evaluate("""() => {
-                const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                const item = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                     .find(el => {
                         const rect = el.getBoundingClientRect();
                         return rect.width > 1 && rect.height > 1 &&
@@ -1032,7 +1130,7 @@ async def _click_conversation(
                             rect.top < window.innerHeight &&
                             rect.left < window.innerWidth;
                     });
-                const grid = item?.closest('.ReactVirtualized__Grid');
+                const grid = (() => { let node = item; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return item?.closest('.ReactVirtualized__Grid'); })();
                 if (!grid) return false;
                 const before = grid.scrollTop;
                 grid.scrollTop = Math.min(
@@ -1419,6 +1517,165 @@ def _run_douyin_browser_coroutine(coro):
     return future.result()
 
 
+def probe_dm_readable_sync(account: dict, wait_seconds: int = 75) -> dict:
+    """账号"私信能力"体检：只回答能不能读到会话列表。
+
+    "待检"只代表**没测过**，用户看到会以为系统含糊。这个探针打开一次真实页面，
+    按新版选择器数会话行，给出三种明确结论：
+
+    * ``ready``   能读出 N 个会话 —— 私信能力可用
+    * ``blocked`` 出现登录墙 —— 需要重新扫码
+    * ``unknown`` 等满 ``wait_seconds`` 仍没读出来（网络/风控/改版），附原因
+
+    它不点开会话、不发消息，只做一次"列表可见性"判断，所以很轻。
+    """
+    from pathlib import Path as _Path
+
+    from patchright.sync_api import sync_playwright
+
+    from conf import BASE_DIR as _BASE_DIR
+    from utils.account_browser import open_persistent_account_context_sync
+    from utils.account_serial import account_lease, lease_key
+    from utils.credential_crypto import resolve_credential_path
+
+    cookie_path = resolve_credential_path(
+        _Path(_BASE_DIR) / "cookiesFile" / str(account.get("filePath") or "")
+    )
+    if cookie_path is None:
+        return {"state": "blocked", "reason": "凭据文件不存在，请重新登录", "rows": 0}
+
+    row_selector = '[data-e2e="conversation-item"], .semi-list-item'
+    try:
+        with account_lease(lease_key(account), timeout=180):
+            with sync_playwright() as playwright:
+                handle = open_persistent_account_context_sync(
+                    playwright, cookie_path,
+                    account_id=account.get("id"), headless=True, channel="chromium",
+                )
+                try:
+                    page = handle.pages[0] if handle.pages else handle.new_page()
+                    page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
+                    deadline = time.monotonic() + max(10, int(wait_seconds))
+                    while time.monotonic() < deadline:
+                        rows = page.locator(row_selector).count()
+                        if rows > 0:
+                            return {
+                                "state": "ready",
+                                "reason": f"可读取 {rows} 个会话",
+                                "rows": rows,
+                            }
+                        try:
+                            body = page.locator("body").inner_text(timeout=3000)
+                        except Exception:
+                            body = ""
+                        if any(marker in body for marker in ("扫码登录", "手机号登录", "验证码登录")):
+                            return {
+                                "state": "blocked",
+                                "reason": "出现登录入口，请重新扫码",
+                                "rows": 0,
+                            }
+                        page.wait_for_timeout(1500)
+                    return {
+                        "state": "unknown",
+                        "reason": (
+                            f"等待 {wait_seconds} 秒仍未读出会话列表"
+                            "（网络或风控较慢，可稍后重试）"
+                        ),
+                        "rows": 0,
+                    }
+                finally:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+    except Exception as exc:
+        return {"state": "unknown", "reason": f"检测失败：{str(exc)[:120]}", "rows": 0}
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量；非法值回落到默认值。"""
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+async def _evict_warm_sessions(keep: str = "") -> int:
+    """常驻浏览器页面数量上限（LRU）。
+
+    一个常驻的抖音私信页面实测要 1.2~1.5 GB（browser + gpu + renderer + utility
+    一串子进程），账号多了必须设上限，否则 16G 机器跑 6 个号就爆内存。
+    超限时淘汰"最久没被用过"的那个账号；它下一轮会走冷启动（约 30~50 秒），
+    但至少不会把整台机器拖死。
+    """
+    limit = _env_int("FLOWOPS_DM_MAX_WARM_SESSIONS", 2)
+    if limit <= 0:
+        return 0
+    sessions = _douyin_browser_runtime["sessions"]
+    if len(sessions) <= limit:
+        return 0
+    ordered = sorted(
+        sessions.items(),
+        key=lambda item: float((item[1] or {}).get("last_used_at") or 0),
+    )
+    dropped = 0
+    for key, session in ordered:
+        if len(sessions) <= limit:
+            break
+        if key == keep:
+            continue
+        logger.info("常驻私信页面超过上限（{}），淘汰 {} 的会话", limit, key[:24])
+        await _drop_douyin_session(key)
+        dropped += 1
+    return dropped
+
+
+def drop_sessions_for(account_id: int) -> int:
+    """丢掉某个账号的常驻会话（快轮询失败/页面僵死时用）。
+
+    会话 key 形如 ``"<account_id>|<name>|<cookie path>"``，按前缀匹配即可。
+    真正的关闭动作交给协程在浏览器循环里执行，这里只排一个任务。
+    """
+    prefix = f"{int(account_id)}|"
+    keys = [key for key in list(_douyin_browser_runtime["sessions"]) if key.startswith(prefix)]
+    if not keys:
+        return 0
+
+    async def _drop_all() -> None:
+        for key in keys:
+            await _drop_douyin_session(key)
+
+    try:
+        _run_douyin_browser_coroutine(_drop_all())
+    except Exception as exc:
+        logger.debug("丢弃账号 {} 的常驻会话失败: {}", account_id, exc)
+        for key in keys:
+            _douyin_browser_runtime["sessions"].pop(key, None)
+    return len(keys)
+
+
+def live_session_ids() -> set[int]:
+    """当前有常驻标签页的抖音账号 id（同步函数，供保活引擎直接调用）。
+
+    私信同步会把"一个账号一个 context"的浏览器留到 cookie 文件变化为止，
+    每轮还会 ``page.reload()`` ——这本身就是一个真实的网页端活跃信号。
+    保活引擎据此跳过这些账号，避免同时开第二个浏览器把会话挤掉。
+    """
+    ids: set[int] = set()
+    for key, session in list(_douyin_browser_runtime["sessions"].items()):
+        page = (session or {}).get("page")
+        try:
+            if page is None or page.is_closed():
+                continue
+        except Exception:
+            continue
+        try:
+            ids.add(int(str(key).split("|", 1)[0]))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
 async def _drop_douyin_session(key: str):
     session = _douyin_browser_runtime["sessions"].pop(key, None)
     if not session:
@@ -1457,6 +1714,7 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
     if session and session.get("cookie_mtime") == cookie_mtime:
         page = session.get("page")
         if page is not None and not page.is_closed():
+            session["last_used_at"] = time.monotonic()
             return key, session
     if session:
         await _drop_douyin_session(key)
@@ -1465,6 +1723,17 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
     headless = str(os.environ.get("FLOWOPS_DOUYIN_HEADLESS", "1")).lower() not in (
         "0", "false", "no", "off",
     )
+    # 常驻私信页面的内存开销：实测一个账号 ~1.2-1.5 GB（browser + gpu + renderer
+    # + utility 一堆子进程）。这里做两件事把占用压下来：
+    #   1) 关 GPU 合成、限制渲染进程数和 V8 堆大小；
+    #   2) 常驻会话数量设上限，超了按"最久没被用过"淘汰。
+    lean_args = [
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--renderer-process-limit=1",
+        "--js-flags=--max-old-space-size=384",
+        "--disable-features=Translate,BackForwardCache,CalculateNativeWinOcclusion",
+    ]
     try:
         context = await open_persistent_account_context(
             playwright,
@@ -1472,6 +1741,7 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
             account_id=account.get("id"),
             headless=headless,
             channel="chromium",
+            args=lean_args,
         )
     except Exception as exc:
         raise SyncError(
@@ -1516,7 +1786,7 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
             # 再给当前页面一个本地等待机会；只有列表仍不可用才向上报错。
             try:
                 await page.wait_for_selector(
-                    ".semi-list-item", state="visible", timeout=25000,
+                    "[data-e2e=\"conversation-item\"], .semi-list-item", state="visible", timeout=25000,
                 )
             except PlaywrightTimeoutError:
                 if await _page_is_login(page):
@@ -1540,14 +1810,17 @@ async def _get_douyin_session(account: dict, quick: bool) -> tuple[str, dict]:
 
     session = {
         "context": context, "page": page, "cookie_mtime": cookie_mtime,
-        "created_at": time.monotonic(), "user_details": user_details,
+        "created_at": time.monotonic(), "last_used_at": time.monotonic(),
+        "user_details": user_details,
     }
     _douyin_browser_runtime["sessions"][key] = session
+    await _evict_warm_sessions(keep=key)
     return key, session
 
 
 async def _scan_douyin_in_browser(
     settings: dict, account: dict, quick: bool = False,
+    api_only: bool = False, keep_session: bool = False,
 ) -> dict:
     started_mono = time.monotonic()
     key, session = await _get_douyin_session(account, quick)
@@ -1565,10 +1838,10 @@ async def _scan_douyin_in_browser(
 
         await page.evaluate("""() => {
             const list = document.querySelector('.semi-list-items');
-            const grid = list?.closest('.ReactVirtualized__Grid');
+            const grid = (() => { let node = list; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return list?.closest('.ReactVirtualized__Grid'); })();
             if (grid) grid.scrollTop = 0;
         }""")
-        if not await page.locator(".semi-list-item").count():
+        if not await page.locator('[data-e2e="conversation-item"], .semi-list-item').count():
             body = ""
             try:
                 body = await page.locator("body").inner_text(timeout=3000)
@@ -1578,7 +1851,7 @@ async def _scan_douyin_in_browser(
                 return {"rows": [], "scanned": 0, "timings": timings}
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_selector(".semi-list-item", timeout=6000)
+                await page.wait_for_selector('[data-e2e="conversation-item"], .semi-list-item', timeout=6000)
             except PlaywrightTimeoutError as exc:
                 raise SyncError("抖音私信页面刷新超时") from exc
         if await _page_is_login(page):
@@ -1633,12 +1906,12 @@ async def _scan_douyin_in_browser(
                 if len(collected) >= limit:
                     break
                 moved = await page.evaluate("""() => {
-                    const item = Array.from(document.querySelectorAll('.semi-list-item'))
+                    const item = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item'))
                         .find(el => {
                             const rect = el.getBoundingClientRect();
                             return rect.width > 1 && rect.height > 1;
                         });
-                    const grid = item?.closest('.ReactVirtualized__Grid');
+                    const grid = (() => { let node = item; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return item?.closest('.ReactVirtualized__Grid'); })();
                     if (!grid) return false;
                     const before = grid.scrollTop;
                     grid.scrollTop = Math.min(grid.scrollHeight, grid.scrollTop + grid.clientHeight * 0.85);
@@ -1650,20 +1923,24 @@ async def _scan_douyin_in_browser(
 
         # 先采集当前页签，再遍历其余子页签；未关注/陌生人会话在
         # "陌生人私信"页签下，不切换就永远扫不到。
-        all_status, _all_active = await _select_dm_tab(page, "全部")
-        if all_status != "missing":
-            await _collect_current_tab("全部")
-        else:
-            # 旧版/精简页面没有分类页签时，当前唯一列表就是全部会话。
-            await _collect_current_tab("")
-        for tab_label in ("陌生人私信", "朋友私信", "群消息"):
-            status, _already_active = await _select_dm_tab(page, tab_label)
-            if status == "missing":
-                continue
-            await _collect_current_tab(tab_label)
+        #
+        # api_only（快轮询）：完全跳过 DOM 列表扫描。快轮询只关心"有没有新消息"，
+        # 会话列表直接从 IM 接口拿，省掉切换页签 + 解析几十个 DOM 行的开销。
+        if not api_only:
+            all_status, _all_active = await _select_dm_tab(page, "全部")
+            if all_status != "missing":
+                await _collect_current_tab("全部")
+            else:
+                # 旧版/精简页面没有分类页签时，当前唯一列表就是全部会话。
+                await _collect_current_tab("")
+            for tab_label in ("陌生人私信", "朋友私信", "群消息"):
+                status, _already_active = await _select_dm_tab(page, tab_label)
+                if status == "missing":
+                    continue
+                await _collect_current_tab(tab_label)
         timings["list_ms"] = int((time.monotonic() - started_mono) * 1000)
 
-        data = list(collected.values())
+        data = [] if api_only else list(collected.values())
         legacy_ids = _legacy_external_ids_by_name(account_name)
         for row in data:
             row["dom_cid"] = str(row.get("cid") or "")
@@ -1921,14 +2198,22 @@ async def _scan_douyin_in_browser(
             await _drop_douyin_session(key)
         raise
     finally:
-        # The durable identity lives on disk. Keeping a browser open here would
-        # hold the account lock forever and starve account checks and publishes.
-        await _drop_douyin_session(key)
+        # 常驻会话（keep_session）：快轮询需要一个"热页面"，每次重开都要付
+        # 50 秒冷启动，30 秒级轮询根本追不上；这种情况下会话由快轮询拥有，
+        # 全量同步也会复用同一个页面。
+        if not keep_session:
+            await _drop_douyin_session(key)
 
 
-def _scan_douyin(settings: dict, account: dict, quick: bool = False) -> dict:
+def _scan_douyin(
+    settings: dict, account: dict, quick: bool = False,
+    api_only: bool = False, keep_session: bool = False,
+) -> dict:
     return _run_douyin_browser_coroutine(
-        _scan_douyin_in_browser(settings, account, quick=quick)
+        _scan_douyin_in_browser(
+            settings, account, quick=quick,
+            api_only=api_only, keep_session=keep_session,
+        )
     )
 
 
@@ -2136,12 +2421,20 @@ def _reconcile_media_placeholders(items: list[dict], account: dict) -> int:
     return repaired
 
 
-def _sync_account(settings: dict, account: dict, quick: bool = False) -> dict:
+def _sync_account(
+    settings: dict, account: dict, quick: bool = False,
+    api_only: bool = False, keep_session: bool | None = None,
+) -> dict:
     name = _account_name(account)
     if not account.get("cookie_path"):
         raise SyncError(f"账号 {name} 的 Cookie 文件不存在，请重新登录")
+    if keep_session is None:
+        keep_session = bool(int(os.environ.get("FLOWOPS_DM_WARM_SESSION", "1") or 1))
     merged_contacts = dm_ops.merge_dom_contact_duplicates()
-    scan = _scan_douyin(settings, account, quick=quick)
+    scan = _scan_douyin(
+        settings, account, quick=quick,
+        api_only=api_only, keep_session=keep_session,
+    )
     # 日常窗口由 history_days 决定；长时间未成功同步时自动扩展下界，避免
     # 恰好落在固定窗口之外的中间消息被跳过。0 表示不限。
     history_hours, _catchup, _gap_hours = _history_fetch_plan(settings, account)

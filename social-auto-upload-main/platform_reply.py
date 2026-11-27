@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from loguru import logger
 from conf import BASE_DIR
 from db_utils import connect
 import account_safety
+from utils.account_serial import account_key, account_lease
 from utils.credential_crypto import resolve_credential_path
 from utils.account_browser import open_persistent_account_context_sync
 
@@ -21,8 +24,59 @@ MAIN_DB = Path(BASE_DIR / "db" / "database.db")
 COOKIE_DIR = Path(BASE_DIR / "cookiesFile")
 DOUYIN_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 
+#: 会话行选择器（2026-11 改版后用 data-e2e 钩子，旧版保留）
+DOUYIN_ROW_SELECTORS = (
+    '[data-e2e="conversation-item"]',
+    '.semi-list-item',
+)
+DOUYIN_ROW_SELECTOR = ", ".join(DOUYIN_ROW_SELECTORS)
+#: 会话标题：新版 ConversationItemtitle（要排除 titleWrapper），旧版 item-header-name
+DOUYIN_NAME_SELECTOR = (
+    '[class*="ConversationItemtitle"]:not([class*="Wrapper"])', '[class*="item-header-name"]'
+)
+#: 发送按钮：新版 publishBtn/e2e-send-msg-btn，旧版 button.chat-btn
+DOUYIN_SEND_BUTTON_SELECTORS = (
+    '.messageMsgInputpublishBtn',
+    '[class*="MsgInputpublishBtn"]',
+    '.e2e-send-msg-btn',
+    'button.chat-btn',
+)
+#: 发送接口 URL 特征（不同版本路径不同，命中任一即记录响应）
+DOUYIN_SEND_URL_MARKERS = (
+    "message/send", "send/message", "im/send", "message/send_msg", "im/message/send",
+)
+
 _send_locks: dict[str, threading.Lock] = {}
 _send_locks_guard = threading.Lock()
+
+
+def _lease_timeout() -> float:
+    try:
+        return max(10.0, float(os.environ.get("FLOWOPS_REPLY_LEASE_TIMEOUT", "180") or 180))
+    except ValueError:
+        return 180.0
+
+
+@contextmanager
+def _serial_lease(account):
+    """跨进程、跨线程的账号租约：同一账号同一时刻只允许一个浏览器动作。
+
+    ``_send_lock_for`` 只在**本进程内**串行。可账号还会被发布、巡检、保活、
+    评论同步用到，而那些可能跑在别的进程（发布执行器）里——两个进程同时开
+    同一份 profile，平台侧看到的是"两台设备抢同一个账号"，轻则判环境异常，
+    重则把网页会话挤下线。这里统一挂到 ``utils.account_serial`` 的租约上，
+    与发布/巡检/保活共用同一把键。
+
+    拿不到锁就抛 ``RuntimeError``（调用方会把它转成"稍后重试"），
+    绝不无限等待——把私信回复卡死比失败更糟。
+    """
+    payload = account or {}
+    key = account_key(
+        payload.get("type"), payload.get("userName"),
+        payload.get("id"), payload.get("filePath"),
+    )
+    with account_lease(key, timeout=_lease_timeout()):
+        yield
 
 
 def _send_lock_for(account) -> threading.Lock:
@@ -129,20 +183,21 @@ def _select_douyin_tab(page, label: str) -> None:
 
 def _find_douyin_conversation(page, author: str):
     """Find an exact conversation row in the current virtualized DM list."""
-    page.locator(".semi-list-item").first.wait_for(
+    page.locator(DOUYIN_ROW_SELECTOR).first.wait_for(
         state="visible", timeout=45000,
     )
     page.evaluate("""() => {
-        const grid = document.querySelector('.ReactVirtualized__Grid');
+        const grid = (() => { const rows = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item')); const row = rows.find(el => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; }) || rows[0]; let node = row; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return document.querySelector('.ReactVirtualized__Grid'); })();
         if (grid) grid.scrollTop = 0;
     }""")
     page.wait_for_timeout(500)
     for _ in range(30):
-        found = page.evaluate("""(target) => {
+        found = page.evaluate("""(args) => {
+            const [target, rowSelector, nameSelector] = args;
             document.querySelectorAll('[data-flowops-send-target]').forEach(
                 el => el.removeAttribute('data-flowops-send-target')
             );
-            const items = Array.from(document.querySelectorAll('.semi-list-item'))
+            const items = Array.from(document.querySelectorAll(rowSelector))
                 .filter(el => {
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -151,17 +206,19 @@ def _find_douyin_conversation(page, author: str):
                         Number(style.opacity || 1) > 0;
                 });
             const match = items.find(el => {
-                const node = el.querySelector('[class*="item-header-name"]');
+                const node = el.querySelector(nameSelector);
                 return String(node?.innerText || '').trim() === target;
             });
             if (!match) return false;
             match.setAttribute('data-flowops-send-target', '1');
             return true;
-        }""", author)
+        }""", [author, DOUYIN_ROW_SELECTOR, DOUYIN_NAME_SELECTOR])
         if found:
-            return page.locator('.semi-list-item[data-flowops-send-target="1"]').first
+            return page.locator(
+                f'{DOUYIN_ROW_SELECTOR}[data-flowops-send-target="1"]'
+            ).first
         moved = page.evaluate("""() => {
-            const grid = document.querySelector('.ReactVirtualized__Grid');
+            const grid = (() => { const rows = Array.from(document.querySelectorAll('[data-e2e="conversation-item"], .semi-list-item')); const row = rows.find(el => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; }) || rows[0]; let node = row; while (node && node !== document.body) { const s = getComputedStyle(node); if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight + 20) return node; node = node.parentElement; } return document.querySelector('.ReactVirtualized__Grid'); })();
             if (!grid) return false;
             const before = grid.scrollTop;
             grid.scrollTop = Math.min(
@@ -222,12 +279,56 @@ def _douyin_send_acknowledged(responses: list[dict]) -> bool:
     return False
 
 
+def _douyin_send_button(page):
+    """返回抖音私信发送按钮 locator；新版是纯图标按钮，旧版是 button.chat-btn。"""
+    for selector in DOUYIN_SEND_BUTTON_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 4)):
+            candidate = locator.nth(index)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def _douyin_sent_in_dom(page, text: str, timeout_ms: int = 6000) -> bool:
+    """界面上是否出现了刚发送的这条文本。
+
+    新版气泡正文在 ``data-e2e="msg-item-content"`` 里，旧版在 ``[class*="text-"]``。
+    发送接口路径会随改版变化，所以"界面出现这条消息"是一个独立于接口的确认信号。
+    """
+    needle = " ".join(str(text or "").split())[:40]
+    if not needle:
+        return False
+    deadline = time.time() + max(1.0, timeout_ms / 1000)
+    while time.time() < deadline:
+        try:
+            seen = page.evaluate(
+                """() => Array.from(document.querySelectorAll(
+                        '[data-e2e="msg-item-content"], [class*="box-item-"], [class*="text-"]'
+                    )).map(el => (el.innerText || '').trim()).join('\\n')"""
+            )
+        except Exception:
+            seen = ""
+        if needle in " ".join(str(seen or "").split()):
+            return True
+        page.wait_for_timeout(400)
+    return False
+
+
 def _watch_douyin_send_responses(page) -> list[dict]:
     """Capture message-send status codes and business result bodies."""
     responses: list[dict] = []
 
     def on_response(response):
-        if "message/send" not in response.url.lower():
+        url = str(response.url or "").lower()
+        if not any(marker in url for marker in DOUYIN_SEND_URL_MARKERS):
             return
         status = int(response.status)
         payload = None
@@ -250,10 +351,9 @@ def _open_douyin_conversation(page, cdp, author: str):
     必须先 scrollIntoViewIfNeeded，再重新取坐标点击。
     """
     page.goto(DOUYIN_CHAT_URL, wait_until="domcontentloaded", timeout=90000)
-    # 当前创作者中心使用 semi-list-item；首屏接口与虚拟列表均可能
-    # 在 20 秒后才完成，不能沿用旧 gridcell 的短超时。
+    # 首屏接口与虚拟列表都可能在 20 秒后才完成，不能沿用旧 gridcell 的短超时。
     try:
-        page.locator(".semi-list-item").first.wait_for(
+        page.locator(DOUYIN_ROW_SELECTOR).first.wait_for(
             state="visible", timeout=45000,
         )
     except Exception as exc:
@@ -262,8 +362,11 @@ def _open_douyin_conversation(page, cdp, author: str):
         ) from exc
     if any(marker in page.url.lower() for marker in ("/login", "/passport/", "website-login")):
         raise RuntimeError("抖音登录已失效，请重新扫码登录")
+    # 2026-11 改版后页面标题里不再有"私信管理"字样，改成看输入框占位文案 / 分组栏，
+    # 两者都没有才认为真的进不去（避免把改版误判成"账号无权访问私信"）。
     body_text = page.locator("body").inner_text()
-    if "私信管理" not in body_text:
+    if not any(marker in body_text for marker in ("发送消息", "分组", "消息")) \
+            and "私信管理" not in body_text:
         raise RuntimeError("当前抖音账号无法访问私信管理页面")
 
     _select_douyin_tab(page, "全部")
@@ -362,7 +465,7 @@ def send_douyin_media(account_name: str, author: str,
     if not account:
         raise RuntimeError("未找到可用的抖音登录账号，请先在账号管理中登录")
 
-    with _send_lock_for(account):
+    with _send_lock_for(account), _serial_lease(account):
         with sync_playwright() as playwright:
             context = open_persistent_account_context_sync(
                 playwright,
@@ -487,7 +590,7 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
     if not account:
         raise RuntimeError("未找到可用的抖音登录账号，请先在账号管理中登录")
 
-    with _send_lock_for(account):
+    with _send_lock_for(account), _serial_lease(account):
         with sync_playwright() as playwright:
             context = open_persistent_account_context_sync(
                 playwright,
@@ -508,27 +611,39 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
                 page.keyboard.press("Backspace")
                 page.keyboard.insert_text(text)
                 page.wait_for_timeout(500)
-                send_button = page.locator("button.chat-btn").first
-                send_button.wait_for(state="visible", timeout=6000)
-                if send_button.is_disabled():
-                    raise RuntimeError("抖音发送按钮不可用，账号可能被限制私信")
+                send_button = _douyin_send_button(page)
+                if send_button is not None:
+                    if send_button.is_disabled():
+                        raise RuntimeError("抖音发送按钮不可用，账号可能被限制私信")
                 if dry_run:
                     # 链路验证：输入框可用、按钮可点，但不清空也不发送
                     return {
                         "dry_run": True,
                         "editor_found": True,
                         "button_enabled": True,
+                        "send_button": bool(send_button is not None),
                         "transport": "douyin-web",
                     }
-                send_button.click()
+                if send_button is not None:
+                    send_button.click()
+                else:
+                    # 新版把发送按钮做成纯图标（.messageMsgInputpublishBtn）甚至
+                    # 只在有输入时才渲染；拿不到按钮就按 Enter，抖音网页端同样发送。
+                    logger.info("抖音发送按钮未定位到，改用 Enter 发送: {}", author)
+                    page.keyboard.press("Enter")
                 page.wait_for_timeout(2500)
 
                 delivered = _douyin_send_acknowledged(send_responses)
+                confirmed_by_dom = False
                 if not delivered:
+                    # 接口路径会随改版变化（message/send → im/... 都可能），
+                    # 所以再用"气泡里出现这条文本"作为独立确认。
+                    confirmed_by_dom = _douyin_sent_in_dom(page, text)
+                if not delivered and not confirmed_by_dom:
                     statuses = [item.get("status") for item in send_responses]
                     raise RuntimeError(
                         "抖音消息发送未获平台确认"
-                        + (f"（响应码 {statuses}）" if statuses else "（未捕获发送接口）")
+                        + (f"（响应码 {statuses}）" if statuses else "（未捕获发送接口，界面也未出现该消息）")
                     )
                 return {
                     "client_message_id": hashlib.sha1(
@@ -537,6 +652,8 @@ def send_douyin(account_name: str, author: str, text: str, dry_run: bool = False
                     "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "transport": "douyin-web",
                     "ack_statuses": [item.get("status") for item in send_responses],
+                    "ack_source": "api" if delivered else "dom",
+                    "send_button": bool(send_button is not None),
                 }
             finally:
                 context.close()
@@ -562,7 +679,8 @@ def send_xiaohongshu(account_name: str, external_user_id: str, text: str) -> dic
         finally:
             client.close()
 
-    return run_sync_playwright_isolated(deliver)
+    with _serial_lease(account):
+        return run_sync_playwright_isolated(deliver)
 
 
 def send_xiaohongshu_media(account_name: str, external_user_id: str,
@@ -586,7 +704,8 @@ def send_xiaohongshu_media(account_name: str, external_user_id: str,
         finally:
             client.close()
 
-    return run_sync_playwright_isolated(deliver)
+    with _serial_lease(account):
+        return run_sync_playwright_isolated(deliver)
 
 
 def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
@@ -604,7 +723,8 @@ def send_channels(account_name: str, external_user_id: str, text: str) -> dict:
 
     client = ChannelsClient(account)
     try:
-        return client.send_text(external_user_id, text)
+        with _serial_lease(account):
+            return client.send_text(external_user_id, text)
     finally:
         client.close()
 
@@ -625,6 +745,7 @@ def send_channels_media(account_name: str, external_user_id: str,
 
     client = ChannelsClient(account)
     try:
-        return client.send_media(external_user_id, path)
+        with _serial_lease(account):
+            return client.send_media(external_user_id, path)
     finally:
         client.close()

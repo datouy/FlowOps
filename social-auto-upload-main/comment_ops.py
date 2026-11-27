@@ -44,6 +44,7 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 from datetime import datetime
 from typing import Any
@@ -52,6 +53,14 @@ from typing import Any
 import account_safety
 from utils.credential_crypto import credential_exists
 from utils import browser_timeout
+
+
+def _lease_timeout() -> float:
+    """评论动作等账号租约的上限（秒）；拿不到就明确失败，不无限等待。"""
+    try:
+        return max(10.0, float(os.environ.get("FLOWOPS_COMMENT_LEASE_TIMEOUT", "180") or 180))
+    except ValueError:
+        return 180.0
 
 # ---------------------------------------------------------------- 动作定义
 
@@ -350,6 +359,22 @@ class DomCommentAdapter:
         self.platform_type = int(platform_type)
 
     async def _run(self, action: str, comment: dict, text: str = "", capture=None) -> dict:
+        """对外入口：先拿账号租约，再做页面动作（详见 ``_run_locked``）。
+
+        评论/点赞/删除走的是"打开账号持久 profile → 找评论 → 点击"。发布和保活
+        也可能同时操作同一账号；不拿租约就等于允许平台看到同一账号两个浏览器
+        同时在线。这里用 ``account_lease_async``（只走数据库租约，跨线程安全），
+        和发布/巡检/保活共用同一把键。
+        """
+        from utils.account_serial import account_lease_async, lease_key
+
+        if not str((self.account or {}).get("cookie_path") or ""):
+            # 交给 _run_locked 报出更准确的错误
+            return await self._run_locked(action, comment, text=text, capture=capture)
+        async with account_lease_async(lease_key(self.account), timeout=_lease_timeout()):
+            return await self._run_locked(action, comment, text=text, capture=capture)
+
+    async def _run_locked(self, action: str, comment: dict, text: str = "", capture=None) -> dict:
         from patchright.async_api import async_playwright
 
         from utils.account_browser import open_persistent_account_context

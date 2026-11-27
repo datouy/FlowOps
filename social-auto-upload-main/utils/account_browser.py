@@ -26,6 +26,8 @@ from utils.account_environment import (
     hydrate_context_async,
     profile_dir,
     proxy_settings,
+    sync_missing_cookies,
+    sync_missing_cookies_async,
 )
 from utils.account_fingerprint import (
     context_options as fingerprint_context_options,
@@ -371,6 +373,9 @@ async def persistent_account_context(
                 )
                 register_context_profile(context, profile)
                 await hydrate_context_async(context, resolved, account_id)
+                # 每次打开都补一次缺失 cookie：会话级 cookie（expires=-1）在
+                # 浏览器关闭后可能丢，种子标记只播种一次，补种必须是幂等的。
+                await sync_missing_cookies_async(context, resolved, account_id)
                 await context.add_init_script(script=fingerprint_init_script(fingerprint))
                 from runtime_config import FINGERPRINT_FAIL_CLOSED
                 if FINGERPRINT_FAIL_CLOSED:
@@ -485,6 +490,7 @@ def persistent_account_context_sync(
                 )
                 register_context_profile(context, profile)
                 hydrate_context(context, resolved, account_id)
+                sync_missing_cookies(context, resolved, account_id)
                 context.add_init_script(script=fingerprint_init_script(fingerprint))
                 from runtime_config import FINGERPRINT_FAIL_CLOSED
                 if FINGERPRINT_FAIL_CLOSED:

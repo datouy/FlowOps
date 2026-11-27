@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -26,6 +27,14 @@ from utils.credential_crypto import resolve_credential_path
 
 ACCOUNT_DB = Path(BASE_DIR) / "db" / "database.db"
 COOKIE_DIR = Path(BASE_DIR) / "cookiesFile"
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量；非法值回落到默认值。"""
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return int(default)
 
 # 历史回补窗口：默认 7 天，前端可调；0 表示不按时间过滤（尽量把平台给的全收进来）。
 DEFAULT_HISTORY_DAYS = 7
@@ -61,6 +70,7 @@ DM_ERROR_ACCOUNT_EXPIRED = "account_expired"
 DM_ERROR_NO_ACCOUNTS = "no_accounts"
 DM_ERROR_COOKIE_MISSING = "cookie_missing"
 DM_ERROR_NETWORK = "network"
+DM_ERROR_PARTIAL = "partial"
 DM_ERROR_UNKNOWN = "error"
 
 _DM_ERROR_RULES = (
@@ -68,6 +78,13 @@ _DM_ERROR_RULES = (
     (
         DM_ERROR_COOKIE_MISSING,
         ("Cookie 文件不存在", "Cookie 文件无法读取", "Cookie 文件为空"),
+    ),
+    # "历史补采未完成"是数据完整度问题：登录是好的，消息也在同步，只是有些
+    # 老会话的详情页没读全。把它当成"账号失效"会让能力矩阵显示"私信 阻断"，
+    # 用户以为号掉了，实际只是历史没补完。
+    (
+        DM_ERROR_PARTIAL,
+        ("历史补采未完成", "仅完成页面回退同步", "部分会话未能读取", "未能读取详情"),
     ),
     (
         DM_ERROR_ACCOUNT_EXPIRED,
@@ -945,6 +962,10 @@ class BaseDmSync:
 
         冷账号按分级调度跳过：本轮还没到它的执行时间就不扫描，
         避免每个账号都用同样的高频轮询。
+
+        ``FLOWOPS_DM_ACCOUNTS_PER_TICK``（默认 0=不限）把一个 tick 限制成只扫
+        N 个账号，并按 round-robin 轮转。多账号时这是"每 30 秒只看一个号"的
+        实现方式：3 个号 → 每个号 90 秒被看一次，既准实时又不把所有号同时拉满。
         """
         due_accounts = []
         skipped_cold = 0
@@ -961,6 +982,16 @@ class BaseDmSync:
         self._skipped_cold = skipped_cold
         if not due_accounts:
             return []
+        per_tick = _env_int("FLOWOPS_DM_ACCOUNTS_PER_TICK", 0)
+        if per_tick > 0 and len(due_accounts) > per_tick:
+            index = getattr(self, "_rr_index", 0) % len(due_accounts)
+            self._rr_index = index + 1
+            rotated = due_accounts[index:] + due_accounts[:index]
+            self.log.info(
+                "本轮只扫 {} 个账号（共 {} 个到期，round-robin）",
+                per_tick, len(due_accounts),
+            )
+            due_accounts = rotated[:per_tick]
         if len(due_accounts) <= 1 or self.max_workers <= 1:
             results = [self._scan_one(settings, account, quick) for account in due_accounts]
         else:
@@ -1017,6 +1048,10 @@ class BaseDmSync:
         now = now_text()
         ok = bool(result.get("ok"))
         complete = bool(result.get("complete", True))
+        # 本轮"跟平台通信成功"与"历史数据补全"是两件事：
+        # 通信成功就要刷新 last_success_at（否则能力矩阵会说"还没有成功同步记录"），
+        # 完整度单独用 error/kind 表达。
+        synced = ok
         state_success = ok and complete
         if state_success:
             error = ""
@@ -1043,7 +1078,7 @@ class BaseDmSync:
                          last_imported=excluded.last_imported""",
                     (
                         self.platform, key, self.account_name(account),
-                        now if state_success else "", error, kind, now,
+                        now if synced else "", error, kind, now,
                         int(result.get("imported") or 0),
                     ),
                 )
@@ -1191,9 +1226,8 @@ class BaseDmSync:
             )[:1000]
             finished_at = now_text()
             duration_ms = int((time.monotonic() - started_mono) * 1000)
-            self.save_settings(
+            settings_update = dict(
                 last_finished_at=finished_at,
-                last_success_at=finished_at if succeeded else "",
                 last_scanned=scanned,
                 last_imported=imported,
                 last_duplicates=duplicates,
@@ -1203,6 +1237,12 @@ class BaseDmSync:
                 last_error=error_summary,
                 last_skip_reasons=json.dumps(skip_reasons, ensure_ascii=False),
             )
+            # 分级调度会频繁出现"本轮没轮到任何账号"（skipped_all）的情况。
+            # 那种轮次不能把"上次成功时间"清空——否则设置页会一直显示"从未成功"，
+            # 而账号其实几分钟前刚同步过。
+            if succeeded:
+                settings_update["last_success_at"] = finished_at
+            self.save_settings(**settings_update)
             # 所有账号都被分级调度跳过（还没轮到执行）时，
             # account_results 是空的——这不是失败，只是本轮没轮上。
             # 之前 ok = bool(succeeded) 会把它判成失败，

@@ -21,8 +21,12 @@ ADAPTER_DIR = BASE / "adapters"
 
 BUILTIN = {
     "douyin": [
-        {"selector": ".semi-list-item", "assert": "visible", "timeout": 12000},
+        # 2026-11 改版：会话行换成 data-e2e 钩子，旧版的 semi-list-item 已不存在。
+        # 两个都放进来，改版回滚或灰度时都能命中。
+        {"selector": "[data-e2e='conversation-item']", "assert": "visible", "timeout": 12000},
+        {"selector": ".semi-list-item", "assert": "visible", "timeout": 8000},
         {"selector": "[class*='list-item']", "assert": "attached", "timeout": 8000},
+        {"selector": "[class*='ConversationItem']", "assert": "attached", "timeout": 6000},
     ],
     "xiaohongshu": [
         {"selector": ".conversation-item", "assert": "visible", "timeout": 12000},

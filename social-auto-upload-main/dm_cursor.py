@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,10 +24,19 @@ from loguru import logger
 
 import dm_ops
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 # 活跃账号：最近一次同步有新消息 → 用活跃间隔。
-ACTIVE_ACCOUNT_INTERVAL = 120
+ACTIVE_ACCOUNT_INTERVAL = _env_int("FLOWOPS_DM_ACTIVE_INTERVAL", 120)
 # 冷账号：最近没有新消息 → 用冷账号间隔。
-COLD_ACCOUNT_INTERVAL = 1800
+# 想要"准实时收消息"就把它调小（例如 90~120 秒）；调大则更省资源。
+COLD_ACCOUNT_INTERVAL = _env_int("FLOWOPS_DM_COLD_INTERVAL", 1800)
 # 夜间降频窗口（本地时间 0 点到 7 点）。
 NIGHT_START_HOUR = 0
 NIGHT_END_HOUR = 7

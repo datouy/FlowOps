@@ -14,7 +14,15 @@ from urllib.parse import parse_qs, urlparse
 
 from utils.credential_crypto import credential_exists, read_storage_state
 from dm_platform_common import account_name, clean_text, normalize_timestamp
+from utils.account_serial import account_lease, lease_key
 from utils.account_browser import open_persistent_account_context_sync
+
+
+def _lease_timeout() -> float:
+    try:
+        return max(10.0, float(os.environ.get("FLOWOPS_DM_LEASE_TIMEOUT", "180") or 180))
+    except ValueError:
+        return 180.0
 
 XHS_CHAT_URL = "https://www.xiaohongshu.com/chat"
 XHS_CHAT_LIST_PATH = "/api/im/web/v3/chats"
@@ -266,6 +274,7 @@ class XhsClient:
         self._browser = None
         self._context = None
         self._page = None
+        self._lease = None
         self._me_payload: dict | None = None
         self._chats_payload: dict | None = None
         self._history_payloads: dict[str, dict] = {}
@@ -280,6 +289,11 @@ class XhsClient:
             raise XhsAuthError(
                 f"账号 {account_name(self.account)} 的 Cookie 文件不存在，请重新登录"
             )
+        # 一账号一写者：和发布、巡检、保活共用同一把账号租约。
+        # 不拿租约就开客户端 = 允许"评论/私信"和"发布"同时操作同一份 profile，
+        # 平台看到的是两台设备抢同一个账号，最容易把网页会话挤掉。
+        self._lease = account_lease(lease_key(self.account), timeout=_lease_timeout())
+        self._lease.__enter__()
         _load_storage_state(cookie_file)
         try:
             from patchright.sync_api import sync_playwright
@@ -849,3 +863,9 @@ class XhsClient:
             except Exception:
                 pass
             self._playwright = None
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            try:
+                lease.__exit__(None, None, None)
+            except Exception:
+                pass

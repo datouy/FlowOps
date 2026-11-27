@@ -410,6 +410,13 @@ def close_async_resource(
 
     同时兼容异步 ``close()``（异步 Playwright 上下文）和同步 ``close()``
     （同步 Playwright 上下文）。
+
+    **同步 ``close()`` 必须在当前线程直接调用。**
+    同步版 Playwright 的每个对象都绑定在创建它的 greenlet 上；换到
+    ``asyncio.to_thread`` 里调用会抛 ``Cannot switch to a different thread``，
+    结果是"关浏览器"静默失败、返回 False，浏览器进程和 profile 单实例锁
+    都留着——下一轮同账号的发布/私信/巡检就会因为"目录被占用"失败。
+    （2026-11-27 实测：``platform_reply`` / ``xiaohongshu_dm`` 走的正是这条路径。）
     """
     if resource is None:
         return True
@@ -423,12 +430,8 @@ def close_async_resource(
                 close, timeout=limit, label=label,
             )
         else:
-            # 同步 close()：放到线程里执行并限时。
-            run_async_with_timeout(
-                lambda: asyncio.to_thread(close),
-                timeout=limit,
-                label=label,
-            )
+            # 同步 close()：留在当前线程执行，见上面的 greenlet 说明。
+            close()
         return True
     except PlatformReadTimeout:
         logger.warning("{}超时（{:.0f} 秒），已放弃等待", label, limit)

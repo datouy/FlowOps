@@ -97,6 +97,22 @@ def build_account_capabilities(
             capabilities["dm"] = _item(
                 False, "blocked", error or "主站私信登录已失效，请重新登录"
             )
+        elif error_kind == "partial":
+            # 登录正常、消息也在同步，只是部分历史会话的详情没读全。
+            # 这不该把"私信"判成阻断，否则用户会以为账号掉了。
+            capabilities["dm"] = _item(
+                True, "ready",
+                (
+                    f"已同步（最近成功：{last_success}），{error}" if last_success
+                    else error or "已同步，部分历史会话未读全"
+                ),
+            )
+        elif error_kind == "probe_unknown":
+            # 刚做过检测但暂时读不出列表（网络/风控慢）：保持"未检测"，
+            # 但把原因带出来，避免页面只剩一句"尚未取得状态"。
+            capabilities["dm"] = _item(
+                False, "unknown", error or "暂时没读出会话列表，可稍后重试"
+            )
         elif error_kind:
             capabilities["dm"] = _item(
                 False, "blocked", error or "私信同步异常"
@@ -107,7 +123,7 @@ def build_account_capabilities(
             )
         else:
             capabilities["dm"] = _item(
-                False, "unknown", "主站会话存在，但还没有成功同步记录"
+                False, "unknown", "尚未检测：点「检测私信」给出明确结论"
             )
 
     identity = account.get("identity") or {}

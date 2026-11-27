@@ -20,14 +20,15 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 
 _LOCKS: dict[str, threading.Lock] = {}
 _GUARD = threading.Lock()
 _LAST_ACTION: dict[str, float] = {}
+_HOLDING = threading.local()
 _SCHEMA_READY: set[str] = set()
 
 
@@ -248,6 +249,119 @@ def account_serial(account_key: str, timeout: float = 600.0) -> Iterator[dict]:
             lock.release()
         except RuntimeError:
             pass
+
+
+def lease_key(account: Any) -> str:
+    """从账号字典（``user_info`` 行）生成与发布/保活一致的账号键。"""
+    payload = account if isinstance(account, dict) else {}
+    return account_key(
+        payload.get("type"), payload.get("userName"),
+        payload.get("id"), payload.get("filePath") or payload.get("cookie_path"),
+    )
+
+
+def _holding_keys() -> set[str]:
+    keys = getattr(_HOLDING, "keys", None)
+    if keys is None:
+        keys = set()
+        _HOLDING.keys = keys
+    return keys
+
+
+@contextmanager
+def account_lease(target: Any, timeout: float = 600.0) -> Iterator[dict]:
+    """``account_serial`` 的**可重入**包装（按线程）。``target`` 可以是账号字典或键。
+
+    为什么需要可重入：私信/评论这类调用链会"外层函数先拿租约，内层客户端
+    再拿一次"。``account_serial`` 用的是不可重入的 ``threading.Lock``，同一线程
+    第二次获取会直接自锁。这里记住"本线程已持有的键"，重复获取时直接放行。
+    """
+    key = str(target or "").strip() or "default"
+    holding = _holding_keys()
+    if key in holding:
+        yield {"account": key, "reentrant": True}
+        return
+    with account_serial(key, timeout=timeout) as info:
+        holding.add(key)
+        try:
+            yield {**info, "reentrant": False}
+        finally:
+            holding.discard(key)
+
+
+class DatabaseLease:
+    """只走数据库租约的句柄：可在任意线程 acquire/release（asyncio 用）。
+
+    ``account_serial`` 依赖线程内 ``threading.Lock``，而 asyncio 把一个协程的
+    前后半段调度到不同线程时无法安全释放。这里只用 ``_try_acquire/_release``，
+    它们本来就是跨线程/跨进程安全的。
+    """
+
+    def __init__(self, target: Any, timeout: float = 600.0) -> None:
+        self.key = str(target or "").strip() or "default"
+        self.timeout = max(1.0, float(timeout or 600.0))
+        self._token = ""
+        self._stop: threading.Event | None = None
+        self._heartbeat: threading.Thread | None = None
+
+    def acquire(self) -> None:
+        try:
+            lease_seconds = max(
+                10.0, float(os.environ.get("FLOWOPS_ACCOUNT_LEASE_SECONDS", "180") or 180),
+            )
+        except ValueError:
+            lease_seconds = 180.0
+        token = uuid.uuid4().hex
+        owner = f"{os.getpid()}:{threading.get_ident()}:{token[:8]}"
+        deadline = time.monotonic() + self.timeout
+        while True:
+            if _try_acquire(self.key, token, owner, lease_seconds):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"账号 {self.key} 正被其他进程占用，等待超时")
+            time.sleep(min(0.25 + random.random() * 0.25, remaining))
+        self._token = token
+        stop = threading.Event()
+        self._stop = stop
+        heartbeat = threading.Thread(
+            target=_heartbeat, args=(self.key, token, lease_seconds, stop),
+            name=f"account-db-lease-{token[:8]}", daemon=True,
+        )
+        heartbeat.start()
+        self._heartbeat = heartbeat
+
+    def release(self) -> None:
+        stop, self._stop = self._stop, None
+        token, self._token = self._token, ""
+        if stop is not None:
+            stop.set()
+        if not token:
+            return
+        try:
+            _release(self.key, token)
+        except Exception:
+            pass
+
+    def __enter__(self) -> "DatabaseLease":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
+
+
+@asynccontextmanager
+async def account_lease_async(target: Any, timeout: float = 600.0):
+    """异步版租约：获取/释放在线程池里做，协程本身不被阻塞。"""
+    import asyncio
+
+    lease = DatabaseLease(target, timeout=timeout)
+    await asyncio.to_thread(lease.acquire)
+    try:
+        yield {"account": lease.key}
+    finally:
+        await asyncio.to_thread(lease.release)
 
 
 def serial_status() -> dict:
