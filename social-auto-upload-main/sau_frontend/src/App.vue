@@ -47,7 +47,7 @@
         </button>
 
         <el-menu
-          :default-active="route.path"
+          :default-active="activeMenuIndex"
           class="sidebar-menu"
           :router="true"
           :collapse="isCollapse && !isMobile"
@@ -64,11 +64,19 @@
         </el-menu>
 
         <el-menu
-          :default-active="route.path"
+          :default-active="activeMenuIndex"
           class="sidebar-menu sidebar-menu--secondary"
           :router="true"
           :collapse="isCollapse && !isMobile"
         >
+          <el-menu-item
+            v-if="userStore.can('account.manage')"
+            index="/settings?view=accounts"
+            @click="mobileNavOpen = false"
+          >
+            <el-icon><User /></el-icon>
+            <template #title>账号登录</template>
+          </el-menu-item>
           <el-menu-item index="/settings" @click="mobileNavOpen = false">
             <el-icon><Setting /></el-icon>
             <template #title>设置</template>
@@ -125,6 +133,7 @@
       <div>
         <strong>云策内容运营台</strong>
         <p v-if="mfaRequired">请输入认证器中的 6 位动态验证码。</p>
+        <p v-else-if="passwordGateMode">输入访问密码后进入工作台。</p>
         <p v-else-if="loginMode === 'password'">使用管理员分配的个人账号登录。</p>
         <p v-else>输入管理员提供的访问令牌，或直接打开邀请链接。</p>
       </div>
@@ -140,6 +149,18 @@
         autocomplete="one-time-code"
         placeholder="6 位数字"
         @keyup.enter="submitMfaLogin"
+      />
+    </template>
+    <template v-else-if="passwordGateMode">
+      <label class="access-label" for="gate-password">访问密码</label>
+      <el-input
+        id="gate-password"
+        v-model="passwordInput"
+        type="password"
+        show-password
+        autocomplete="current-password"
+        placeholder="请输入访问密码"
+        @keyup.enter="submitPasswordGate"
       />
     </template>
     <template v-else-if="loginMode === 'password'">
@@ -184,7 +205,7 @@
           返回账号登录
         </el-button>
         <el-button
-          v-else-if="authConfig.personalAuthEnabled && authConfig.tokenFallbackEnabled"
+          v-else-if="!passwordGateMode && authConfig.personalAuthEnabled && authConfig.tokenFallbackEnabled"
           text
           @click="toggleLoginMode"
         >
@@ -193,7 +214,7 @@
         <el-button
           type="primary"
           :loading="checking"
-          @click="mfaRequired ? submitMfaLogin() : loginMode === 'password' ? submitPasswordLogin() : submitToken()"
+          @click="mfaRequired ? submitMfaLogin() : passwordGateMode ? submitPasswordGate() : loginMode === 'password' ? submitPasswordLogin() : submitToken()"
         >
           {{ mfaRequired ? '验证并进入' : '进入工作台' }}
         </el-button>
@@ -246,7 +267,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAccessToken, setAccessToken } from '@/config'
-import { http } from '@/utils/request'
+import { http, rememberRefreshToken, setRefreshToken } from '@/utils/request'
 import { userApi } from '@/api/user'
 import { useUserStore } from '@/stores/user'
 import {
@@ -257,10 +278,12 @@ import {
   Fold,
   HomeFilled,
   Menu as MenuIcon,
+  Monitor,
   Plus,
   Search,
   Setting,
   SwitchButton,
+  User,
 } from '@element-plus/icons-vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 
@@ -287,8 +310,11 @@ const loginMode = ref('password')
 const authConfig = ref({
   personalAuthEnabled: false,
   tokenFallbackEnabled: true,
+  passwordGateEnabled: false,
   passwordMinLength: 12
 })
+// 单密码门禁：只显示一个密码框（密码在 .env 的 YUNCE_ACCESS_PASSWORD 里自定义）
+const passwordGateMode = computed(() => Boolean(authConfig.value.passwordGateEnabled))
 const checking = ref(false)
 let mediaQuery = null
 let syncViewport = null
@@ -301,6 +327,7 @@ const navigationItems = computed(() => [
   { path: '/today', label: '今天', icon: HomeFilled, visible: userStore.canAny(...allBusinessPermissions) },
   { path: '/content', label: '内容', icon: Files, visible: userStore.canAny('content.edit', 'review.decide', 'publish.execute') },
   { path: '/inbox', label: '收件箱', icon: ChatDotRound, visible: userStore.can('message.operate') },
+  { path: '/console', label: '官方私信', icon: Monitor, visible: userStore.can('message.operate') },
   { path: '/insights', label: '洞察', icon: DataLine, visible: userStore.can('publish.execute') },
 ].filter(item => item.visible))
 
@@ -308,11 +335,17 @@ const pageTitles = {
   '/today': '今天',
   '/content': '内容',
   '/inbox': '收件箱',
+  '/console': '官方私信',
   '/insights': '洞察',
   '/settings': '设置',
 }
 
 const pageTitle = computed(() => pageTitles[route.path] || '云策工作台')
+const activeMenuIndex = computed(() => (
+  route.path === '/settings' && route.query.view === 'accounts'
+    ? '/settings?view=accounts'
+    : route.path
+))
 const roleNames = {
   admin: '管理员', operator: '运营', cutter: '剪辑', reviewer: '审核', viewer: '只读'
 }
@@ -361,13 +394,40 @@ async function loadAuthConfig() {
     const response = await userApi.getAuthConfig()
     authConfig.value = { ...authConfig.value, ...(response.data || {}) }
   } catch {
-    authConfig.value = { ...authConfig.value, personalAuthEnabled: false, tokenFallbackEnabled: true }
+    authConfig.value = {
+      ...authConfig.value,
+      personalAuthEnabled: false,
+      tokenFallbackEnabled: true,
+      passwordGateEnabled: false
+    }
   }
   loginMode.value = authConfig.value.personalAuthEnabled ? 'password' : 'token'
 }
 
 function toggleLoginMode() {
   loginMode.value = loginMode.value === 'password' ? 'token' : 'password'
+}
+
+async function submitPasswordGate() {
+  const password = String(passwordInput.value || '')
+  if (!password || checking.value) return
+  checking.value = true
+  try {
+    const response = await userApi.unlock(password)
+    setAccessToken(response.data?.token || '')
+    rememberRefreshToken(response.data)
+    passwordInput.value = ''
+    const ok = await verifyAccess()
+    if (!ok) {
+      ElMessage.error('密码不正确或登录状态校验失败')
+    }
+  } catch (error) {
+    passwordInput.value = ''
+    // 后端已返回具体原因（密码错误 / 尝试过于频繁），这里不重复弹第二遍
+    if (!error?.response) ElMessage.error('登录失败，请稍后重试')
+  } finally {
+    checking.value = false
+  }
 }
 
 async function submitPasswordLogin() {
@@ -386,6 +446,7 @@ async function submitPasswordLogin() {
       return
     }
     setAccessToken(response.data?.token || '')
+    rememberRefreshToken(response.data)
     tokenInput.value = response.data?.token || ''
     const ok = await verifyAccess()
     if (!ok) ElMessage.error('登录状态校验失败')
@@ -409,6 +470,7 @@ async function submitMfaLogin() {
       code
     })
     setAccessToken(response.data?.token || '')
+    rememberRefreshToken(response.data)
     mfaRequired.value = false
     mfaChallengeToken.value = ''
     mfaCode.value = ''
@@ -480,6 +542,7 @@ async function logout() {
     // Local/expired sessions can already be invalid; clear the client either way.
   }
   setAccessToken('')
+  setRefreshToken('')
   tokenInput.value = ''
   passwordInput.value = ''
   userStore.reset()
@@ -493,6 +556,7 @@ async function logout() {
 
 function handleAuthExpired() {
   setAccessToken('')
+  setRefreshToken('')
   userStore.reset()
   accessReady.value = false
   accessDialog.value = true
