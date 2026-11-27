@@ -53,6 +53,31 @@ export const accountApi = {
     return http.post(`/api/v2/accounts/${id}/check`)
   },
 
+  // 私信能力检测：打开一次真实页面数会话行，给出明确结论
+  // （可读 N 个会话 / 需要重新扫码 / 暂时读不出来+原因）
+  checkDmCapability(id) {
+    return http.post(`/api/v2/accounts/${id}/dm-check`)
+  },
+
+  // ---- 会话保活（登录窗口剩余天数 / 触达证据 / 立即续期）----
+  // 抖音的窗口来自 sid_guard 里的 60 天固定区间：普通网页访问不会延长它，
+  // 所以这里展示的是"还剩多久到期、上次触达有没有刷新设备票"。
+
+  // 单个账号的会话摘要 + 近 10 次触达证据
+  getAccountSession(id) {
+    return http.get(`/api/v2/accounts/${id}/session`)
+  },
+
+  // 立即做一次保活触达（后端后台线程执行，几秒到几十秒）
+  touchAccountSession(id) {
+    return http.post(`/api/v2/accounts/${id}/session/touch`)
+  },
+
+  // 保活循环状态 + 全部账号的会话摘要（一次拿全，避免逐账号 N+1）
+  getKeeperStatus() {
+    return http.get('/api/v2/keeper/status')
+  },
+
   // 批量健康检查（逐个校验并回写状态，返回汇总）
   checkAllAccounts() {
     return http.post('/api/v2/accounts/check-all')

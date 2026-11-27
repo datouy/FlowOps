@@ -6,6 +6,25 @@ export const useAccountStore = defineStore('account', () => {
   // 存储所有账号信息
   const accounts = ref([])
   const accountsLoaded = ref(false)
+  const keeper = ref({
+    enabled: false,
+    running: false,
+    activeWindow: [8, 23],
+    warnDays: 30,
+    lastRound: { at: '', results: [] }
+  })
+  // 会话保活摘要的默认值（未触达过的账号就是这套空值）
+  const emptySession = () => ({
+    daysLeft: null,
+    lastOutcome: '',
+    lastTouchedAt: '',
+    nextDueAt: '',
+    warningAt: '',
+    sessionExpiresAt: '',
+    sessionIssuedAt: '',
+    renewed30d: 0,
+    deviceRefreshed30d: 0
+  })
   let accountsLoadedAt = 0
   let accountsPromise = null
   const ACCOUNT_CACHE_TTL_MS = 5000
@@ -37,6 +56,7 @@ export const useAccountStore = defineStore('account', () => {
         identity: '',
         identityBound: false,
         sessionGroup: '',
+        session: emptySession(),
         automation: { configured: false, paused: false, pauseUntil: '', reason: '', updatedAt: '' }
       }
     })
@@ -45,26 +65,48 @@ export const useAccountStore = defineStore('account', () => {
   }
 
   // 把 v2 结构化账号直接转为页面使用的统一结构。
+  //
+  // 关键点：**内容没变的行要复用原对象**。以前每次轮询都整表重建，Vue 看到的
+  // 是一批全新对象，账号卡片、表格、以及依赖 accounts 的 computed 全部重算，
+  // 页面挂久了叠加轮询就会出现明显的掉帧甚至"页面无响应"。
+  const rowSignature = (row) => JSON.stringify([
+    row.id, row.name, row.status, row.platform, row.lastCheckAt, row.failReason,
+    row.errorKind, row.failStreak, row.identity, row.identityBound, row.sessionGroup,
+    row.capabilities, row.automation, row.cookie?.size, row.cookie?.updatedAt,
+    row.session?.daysLeft, row.session?.lastOutcome, row.session?.lastTouchedAt
+  ])
+
   const setDetailedAccounts = (detailed) => {
-    accounts.value = (detailed || []).map(item => ({
-      id: item.id,
-      type: item.platform?.type,
-      filePath: item.cookie?.name || '',
-      name: item.name || '',
-      status: item.status === -1 ? '验证中' : (item.status === 1 ? '正常' : '异常'),
-      platform: item.platform?.label || '未知',
-      lastCheckAt: item.lastCheckAt || '',
-      failReason: item.failReason || '',
-      errorKind: item.errorKind || '',
-      failStreak: Number(item.failStreak || 0),
-      identity: item.identity?.masked || '',
-      identityBound: Boolean(item.identity?.bound),
-      sessionGroup: item.cookie?.sessionGroup || '',
-      cookie: item.cookie || {},
-      environment: item.environment || {},
-      capabilities: item.capabilities || null,
-      automation: item.automation || { configured: false, paused: false, pauseUntil: '', reason: '', updatedAt: '' }
-    }))
+    const previous = new Map(accounts.value.map(item => [item.id, item]))
+    const next = (detailed || []).map(item => {
+      const row = {
+        id: item.id,
+        type: item.platform?.type,
+        filePath: item.cookie?.name || '',
+        name: item.name || '',
+        status: item.status === -1 ? '验证中' : (item.status === 1 ? '正常' : '异常'),
+        platform: item.platform?.label || '未知',
+        lastCheckAt: item.lastCheckAt || '',
+        failReason: item.failReason || '',
+        errorKind: item.errorKind || '',
+        failStreak: Number(item.failStreak || 0),
+        identity: item.identity?.masked || '',
+        identityBound: Boolean(item.identity?.bound),
+        sessionGroup: item.cookie?.sessionGroup || '',
+        session: item.session ? { ...emptySession(), ...item.session } : emptySession(),
+        cookie: item.cookie || {},
+        environment: item.environment || {},
+        capabilities: item.capabilities || null,
+        automation: item.automation || { configured: false, paused: false, pauseUntil: '', reason: '', updatedAt: '' }
+      }
+      const old = previous.get(row.id)
+      // 内容一致就复用以外的字段，保持引用稳定，避免整块重渲染
+      if (old && rowSignature(old) === rowSignature(row)) return old
+      return row
+    })
+    const unchanged = next.length === accounts.value.length
+      && next.every((row, index) => row === accounts.value[index])
+    if (!unchanged) accounts.value = next
     accountsLoaded.value = true
     accountsLoadedAt = Date.now()
     return accounts.value
@@ -87,6 +129,62 @@ export const useAccountStore = defineStore('account', () => {
       return applyHealth(detailed)
     } catch (error) {
       console.warn('加载账号健康度失败（已降级为旧接口数据）:', error)
+      return accounts.value
+    }
+  }
+
+  // 把保活后台返回的会话摘要按 accountId 合并进账号行。
+  //
+  // 一次请求拿全量（/api/v2/keeper/status），不给每个账号单独打接口：
+  // 账号多的时候 N+1 会让"打开账号管理页"变慢，也会把后端线程占满。
+  const applySessions = (payload) => {
+    const data = payload || {}
+    keeper.value = {
+      enabled: Boolean(data.enabled),
+      running: Boolean(data.running),
+      activeWindow: Array.isArray(data.activeWindow) ? data.activeWindow : [8, 23],
+      warnDays: Number(data.warnDays || 30),
+      lastRound: data.lastRound || { at: '', results: [] }
+    }
+    const byId = new Map(
+      (data.accounts || []).map(item => [Number(item.accountId), item])
+    )
+    if (!byId.size) return accounts.value
+    let changed = false
+    const merged = accounts.value.map(row => {
+      const item = byId.get(Number(row.id))
+      if (!item) return row
+      const session = {
+        ...emptySession(),
+        daysLeft: item.daysLeft ?? null,
+        lastOutcome: item.lastOutcome || '',
+        lastTouchedAt: item.lastTouchedAt || '',
+        nextDueAt: item.nextDueAt || '',
+        warningAt: item.warningAt || '',
+        sessionExpiresAt: item.sessionExpiresAt || '',
+        renewed30d: Number(item.renewed30d || 0),
+        deviceRefreshed30d: Number(item.deviceRefreshed30d || 0)
+      }
+      const current = row.session || {}
+      const same = ['daysLeft', 'lastOutcome', 'lastTouchedAt', 'nextDueAt', 'warningAt',
+        'sessionExpiresAt', 'renewed30d', 'deviceRefreshed30d']
+        .every(key => current[key] === session[key])
+      // 内容一致就保持同一引用，避免整个账号行重新渲染
+      if (same) return row
+      changed = true
+      return { ...row, session }
+    })
+    if (changed) accounts.value = merged
+    return accounts.value
+  }
+
+  // 拉取会话保活摘要；后端不可用时保持原样，不阻塞页面
+  const loadSessions = async () => {
+    try {
+      const response = await accountApi.getKeeperStatus()
+      return applySessions(response?.data || {})
+    } catch (error) {
+      console.warn('加载会话保活状态失败（账号列表继续可用）:', error)
       return accounts.value
     }
   }
@@ -140,10 +238,13 @@ export const useAccountStore = defineStore('account', () => {
   return {
     accounts,
     accountsLoaded,
+    keeper,
     setAccounts,
     setDetailedAccounts,
     applyHealth,
     loadHealth,
+    applySessions,
+    loadSessions,
     loadAccounts,
     addAccount,
     updateAccount,

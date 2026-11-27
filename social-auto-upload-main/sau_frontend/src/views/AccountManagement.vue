@@ -5,6 +5,12 @@
         <h1>账号</h1>
       </div>
     </header>
+    <header v-else class="account-intro">
+      <div>
+        <h2>媒体账号登录</h2>
+        <p>在这里添加抖音、小红书、视频号等平台账号。点击“添加账号”完成扫码或验证后，账号会用于内容发布、私信同步和数据统计。</p>
+      </div>
+    </header>
     
     <section class="account-tabs panel">
       <el-tabs v-model="activeTab" class="account-tabs-nav">
@@ -42,6 +48,14 @@
                 </el-button>
                 <el-button :loading="checkingAll" @click="checkAllAccounts">批量检查</el-button>
               </div>
+            </div>
+
+            <div v-if="filterActive" class="account-filter-hint">
+              <span>
+                当前筛选：{{ String(searchKeyword || '').trim() ? `“${String(searchKeyword).trim()}”` : '只看异常' }}
+                · 共 {{ totalAccountCount }} 个账号，显示 {{ activeAccounts.length }} 个
+              </span>
+              <el-button link size="small" @click="clearAccountFilters">清除筛选</el-button>
             </div>
 
             <div v-if="activeAccounts.length > 0" class="account-list">
@@ -95,6 +109,38 @@
                         :loading="checkingAccountId === scope.row.id"
                         @click="handleCheckAccount(scope.row)"
                       >复检</el-button>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="会话保活" width="215">
+                  <template #default="scope">
+                    <div class="session-cell">
+                      <div class="session-head">
+                        <span
+                          class="session-days mono"
+                          :class="sessionDaysClass(scope.row)"
+                        >{{ sessionDaysText(scope.row) }}</span>
+                        <el-tooltip
+                          :content="sessionTooltip(scope.row)"
+                          placement="top"
+                        >
+                          <span class="health-note">触达</span>
+                        </el-tooltip>
+                        <el-button
+                          link
+                          size="small"
+                          class="session-touch"
+                          :loading="touchingAccountId === scope.row.id"
+                          :disabled="!accountStore.keeper.enabled || scope.row.automation?.paused"
+                          @click="handleTouchSession(scope.row)"
+                        >立即续期</el-button>
+                      </div>
+                      <span class="session-meta">
+                        {{ sessionOutcomeText(scope.row) }}
+                        <template v-if="scope.row.session?.lastTouchedAt">
+                          · {{ scope.row.session.lastTouchedAt.slice(5, 16) }}
+                        </template>
+                      </span>
                     </div>
                   </template>
                 </el-table-column>
@@ -156,6 +202,14 @@
                       </el-tooltip>
                     </div>
                     <span v-else class="capability-summary">{{ accountCapabilities(scope.row).length }} 项正常</span>
+                    <el-button
+                      v-if="needsDmProbe(scope.row)"
+                      link
+                      size="small"
+                      class="dm-probe-button"
+                      :loading="dmProbingId === scope.row.id"
+                      @click="handleProbeDm(scope.row)"
+                    >检测私信</el-button>
                   </template>
                 </el-table-column>
                 <el-table-column label="操作" width="190" align="right">
@@ -589,6 +643,7 @@ import {
   Refresh,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute, useRouter } from 'vue-router'
 import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { waitForTask } from '@/api/task'
@@ -600,6 +655,9 @@ const props = defineProps({
   embedded: Boolean,
   initialFilter: { type: String, default: '' }
 })
+
+const route = useRoute()
+const router = useRouter()
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -696,6 +754,8 @@ onMounted(() => {
   // 网页会话判失效（表现为列表里一片红、重扫后又好了）。校验改成显式动作：
   // 点右上角刷新、或点某一行的"复检"。
   fetchAccountsQuick()
+  // 会话摘要单独拉一次（一次请求拿全量），失败不影响账号列表
+  accountStore.loadSessions()
 })
 
 // 单账号复检：走 /api/v2/accounts/<id>/check，回写状态/最后校验时间/失效原因
@@ -728,8 +788,38 @@ const CAPABILITY_LABELS = {
 const CAPABILITY_STATE_LABELS = {
   ready: '正常',
   blocked: '阻断',
-  unknown: '待检',
+  unknown: '未检测',
   unsupported: '未接入',
+}
+
+// 私信能力"未检测"时给一个明确的检测入口：点一下就有结论，不留"待检"这种含糊状态
+const dmProbingId = ref(null)
+
+const needsDmProbe = (row) => {
+  const dm = row?.capabilities?.dm
+  return Boolean(dm) && dm.state === 'unknown'
+}
+
+const handleProbeDm = async (row) => {
+  if (dmProbingId.value) return
+  dmProbingId.value = row.id
+  try {
+    const res = await accountApi.checkDmCapability(row.id)
+    const data = res?.data || {}
+    if (data.state === 'ready') {
+      ElMessage.success(`私信可用：${data.reason || '可读取会话列表'}`)
+    } else if (data.state === 'blocked') {
+      ElMessage.error(`私信不可用：${data.reason || '需要重新扫码'}`)
+    } else {
+      ElMessage.warning(data.reason || '暂时没读出会话列表，可稍后重试')
+    }
+    await accountStore.loadHealth()
+    accountStore.loadSessions()
+  } catch (error) {
+    console.error('私信能力检测失败:', error)
+  } finally {
+    dmProbingId.value = null
+  }
 }
 
 // 后端逐项判断；这里仅做展示映射，不再从“账号状态正常”推导其它能力。
@@ -771,6 +861,7 @@ const handleCheckAccount = async (row) => {
       ElMessage.warning(data.reason || '账号已失效，请重新登录')
     }
     await accountStore.loadHealth()
+    accountStore.loadSessions()
   } catch (error) {
     console.error('账号复检失败:', error)
   } finally {
@@ -778,9 +869,93 @@ const handleCheckAccount = async (row) => {
   }
 }
 
+// ---------------- 会话保活（登录窗口剩余天数 / 立即续期）----------------
+//
+// 语义提醒：抖音的 60 天窗口由 sid_guard 决定，普通网页访问**不会**延长它。
+// 所以这里显示"还剩几天 + 上次触达刷到了什么"，而不是"%已自动续期"。
+// 「立即续期」= 让后端立刻像官方网页一样访问一次（刷新设备票、更新证据）。
+
+const SESSION_OUTCOME_LABELS = {
+  renewed: '会话已重签',
+  device_refreshed: '设备票已刷新',
+  unchanged: '页面正常但无变化',
+  checked_only: '仅做了存活校验',
+  expired: '登录已失效',
+  risk: '遇到安全验证',
+  network: '网络失败',
+  page_changed: '页面可能改版',
+  probe_failed: '探针异常',
+  window_warning: '窗口预警'
+}
+
+const touchingAccountId = ref(null)
+
+const sessionDaysText = (row) => {
+  const days = row?.session?.daysLeft
+  if (days === null || days === undefined || Number.isNaN(Number(days))) return '窗口未知'
+  const value = Number(days)
+  if (value <= 0) return '窗口已到期'
+  return `剩余 ${value >= 10 ? Math.round(value) : value.toFixed(1)} 天`
+}
+
+const sessionDaysClass = (row) => {
+  const days = row?.session?.daysLeft
+  if (days === null || days === undefined) return 'is-muted'
+  const value = Number(days)
+  const warnDays = Number(accountStore.keeper?.warnDays || 30)
+  if (value <= 7) return 'is-danger'
+  if (value <= warnDays) return 'is-warning'
+  return 'is-ok'
+}
+
+const sessionOutcomeText = (row) => {
+  const outcome = row?.session?.lastOutcome
+  if (!outcome) return '尚未触达'
+  return SESSION_OUTCOME_LABELS[outcome] || outcome
+}
+
+const sessionTooltip = (row) => {
+  const session = row?.session || {}
+  const parts = []
+  if (session.sessionIssuedAt) parts.push(`签发 ${session.sessionIssuedAt}`)
+  if (session.sessionExpiresAt) parts.push(`到期 ${session.sessionExpiresAt}`)
+  if (session.nextDueAt) parts.push(`下次触达 ${session.nextDueAt}`)
+  if (session.warningAt) parts.push(`已预警 ${session.warningAt}`)
+  parts.push(`30 天内设备票刷新 ${session.deviceRefreshed30d || 0} 次`)
+  parts.push('窗口到期只能重新扫码，任何访问都无法延长它')
+  return parts.join('；')
+}
+
+const handleTouchSession = async (row) => {
+  if (touchingAccountId.value) return
+  touchingAccountId.value = row.id
+  try {
+    const res = await accountApi.touchAccountSession(row.id)
+    const data = res?.data || {}
+    const outcome = data.outcome || ''
+    if (data.skipped) {
+      ElMessage.warning(data.reason || '该账号自动动作已暂停，未触达平台')
+    } else if (outcome === 'expired') {
+      ElMessage.error('保活触达返回登录失效，请重新扫码登录')
+    } else if (outcome === 'risk') {
+      ElMessage.warning('触达遇到安全验证，已自动降速，稍后再试')
+    } else if (outcome === 'network' || outcome === 'probe_failed') {
+      ElMessage.warning(data.error || '触达没成功，账号状态未改变')
+    } else if (data.licenseLeft !== undefined && data.licenseLeft !== null) {
+      ElMessage.success(`触达完成：${SESSION_OUTCOME_LABELS[outcome] || outcome}，窗口剩余 ${Number(data.licenseLeft).toFixed(1)} 天`)
+    } else {
+      ElMessage.success(`触达完成：${SESSION_OUTCOME_LABELS[outcome] || outcome || '已刷新'}`)
+    }
+    await Promise.all([accountStore.loadSessions(), accountStore.loadHealth()])
+  } catch (error) {
+    console.error('保活触达失败:', error)
+  } finally {
+    touchingAccountId.value = null
+  }
+}
+
 // 判断状态是否可点击（异常状态可点击）
-const isStatusClickable = (status) => {
-  return status === '异常'; // 只有异常状态可点击，验证中不可点击
+const isStatusClickable = (status) => {  return status === '异常'; // 只有异常状态可点击，验证中不可点击
 }
 
 const statusClass = (status) => {
@@ -812,6 +987,25 @@ const activeAccounts = computed(() => {
   if (!tab || tab.name === 'all') return filteredAccounts.value
   return filteredAccounts.value.filter(account => account.platform === tab.label)
 })
+
+// 是否正在筛选（搜索词或"只看异常"）。
+// 从「今天」页点某个账号卡片跳过来时会带 ``?filter=账号名``，搜索框会被预填，
+// 列表只剩一条——用户很容易误以为"账号丢了"。这里显式提示并给一键清除。
+const filterActive = computed(
+  () => Boolean(String(searchKeyword.value || '').trim()) || attentionOnly.value
+)
+
+const totalAccountCount = computed(() => accountStore.accounts.length)
+
+function clearAccountFilters() {
+  searchKeyword.value = ''
+  attentionOnly.value = false
+  if (String(route.query.filter || '').trim()) {
+    const query = { ...route.query }
+    delete query.filter
+    router.replace({ path: route.path, query })
+  }
+}
 
 const tabEmptyText = (tab) => {
   if (attentionOnly.value && !searchKeyword.value) return '账号状态正常'
@@ -2066,6 +2260,33 @@ onBeforeUnmount(() => {
 .account-management {
   padding-bottom: 32px;
 
+  .account-intro {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 18px;
+    padding: 18px 20px;
+    border: 1px solid $border-lighter;
+    border-radius: 12px;
+    background: $bg-color-raised;
+
+    h2 {
+      margin: 0;
+      color: $text-primary;
+      font-size: 17px;
+      font-weight: 600;
+    }
+
+    p {
+      max-width: 760px;
+      margin: 7px 0 0;
+      color: $text-secondary;
+      font-size: 12px;
+      line-height: 1.7;
+    }
+  }
+
   .transport-list {
     display: flex;
     flex-direction: column;
@@ -2168,6 +2389,63 @@ onBeforeUnmount(() => {
     margin-left: auto;
   }
 
+  // 会话保活列：剩余天数 + 上次触达结论 + 立即续期
+  .session-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .session-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+
+  .session-days {
+    font-size: 12px;
+    font-weight: 600;
+
+    &.is-ok {
+      color: #2f9e44;
+    }
+
+    &.is-warning {
+      color: #d98324;
+    }
+
+    &.is-danger {
+      color: $danger-color;
+    }
+
+    &.is-muted {
+      color: $text-secondary;
+      font-weight: 400;
+    }
+  }
+
+  .session-touch {
+    margin-left: auto;
+    font-size: 12px;
+  }
+
+  .session-meta {
+    color: var(--el-text-color-secondary);
+    font-size: 11px;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  // "未检测"时的检测入口
+  .dm-probe-button {
+    margin-top: 4px;
+    font-size: 12px;
+  }
+
   .account-list-container {
     .account-toolbar {
       display: flex;
@@ -2179,6 +2457,20 @@ onBeforeUnmount(() => {
 
     .account-search {
       width: min(340px, 100%);
+    }
+
+    // 筛选提示：避免"从今天页点账号跳过来 → 列表只剩一条"被误认为账号丢失
+    .account-filter-hint {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: -6px 0 10px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: #f2f6ff;
+      border: 1px solid #dbe6ff;
+      color: #38518f;
+      font-size: 12px;
     }
 
     .action-buttons {
