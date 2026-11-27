@@ -1306,8 +1306,8 @@ async function refreshLive() {
   liveTick.value += 1
   try {
     await Promise.all([loadSyncStatus(), loadConversations(true)])
-    if (liveTick.value % 10 === 1) loadAnalytics()
-    if (liveTick.value % 30 === 1) loadStorageHealth()
+    if (liveTick.value % 2 === 1) loadAnalytics()
+    if (liveTick.value % 6 === 1) loadStorageHealth()
     if (contactId) {
       const latest = conversations.value.find(item => item.id === contactId)
       const latestId = Number(latest?.last_message_id || 0)
@@ -1800,7 +1800,7 @@ function exportLeads() {
   window.open(withToken(`${apiBase}/dm/export${query}`), '_blank')
 }
 
-useLivePolling(refreshLive, { interval: 1000, isActive: () => activeTab.value === 'inbox' })
+useLivePolling(refreshLive, { interval: 5000, isActive: () => activeTab.value === 'inbox' })
 
 let messagesReady = false
 
