@@ -209,13 +209,15 @@ _ROUTE_POLICIES: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], 
         "/api/v2/proxy-pool", "/api/v2/proxy-risks", "/api/v2/webhooks",
         "/api/v2/maintenance", "/api/v2/storage", "/api/v2/system/health",
         "/api/v2/serial/status", "/api/v2/fingerprint/probe", "/notify",
-        "/api/metrics",
+        "/api/metrics", "/api/v2/keeper",
     ), (runtime_config.PERM_TEAM_MANAGE,)),
 
     # 私信/评论。DM 媒体也归这里，不能借用素材读取权限。
     (_ALL_METHODS, (
         "/dm", "/messages", "/message-templates", "/comments",
         "/api/v2/tasks/dm", "/api/v2/tasks/comments",
+        # 内嵌浏览器窗口（在页面里看/操作平台官方私信页）
+        "/api/v2/console",
     ), (runtime_config.PERM_MESSAGE_OPERATE,)),
 
     # 审核决定与专用审核 DTO。

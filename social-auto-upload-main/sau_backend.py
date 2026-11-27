@@ -179,11 +179,10 @@ def _guard_access_token():
         return None
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         fetch_site = str(request.headers.get("Sec-Fetch-Site") or "").strip().lower()
-        if fetch_site == "cross-site":
-            return jsonify({"code": 403, "msg": "拒绝跨站写请求", "data": None}), 403
         claimed_origin = str(request.headers.get("Origin") or "").strip()
         if not claimed_origin:
             claimed_origin = str(request.headers.get("Referer") or "").strip()
+        trusted_origin = True
         if claimed_origin:
             origin_parts = urlsplit(claimed_origin)
             claimed = (
@@ -197,8 +196,26 @@ def _guard_access_token():
                 for item in runtime_config.CORS_ORIGINS
                 if str(item or "").strip()
             }
-            if not claimed or (claimed != own and claimed not in allowed_origins):
-                return jsonify({"code": 403, "msg": "写请求来源不受信任", "data": None}), 403
+            # 本机开发时前端跑在 5173、后端在 5409，浏览器按"站点"判定会把
+            # localhost:5173 → 127.0.0.1:5409 算成 cross-site（两个主机名不是
+            # 同一个 site），于是所有写请求都被拦。localhost / 127.0.0.1 / ::1
+            # 是同一台机器，按可信来源处理。
+            local_hosts = {"localhost", "127.0.0.1", "::1"}
+            same_local_host = (
+                (origin_parts.hostname or "").lower() in local_hosts
+                and (own_parts.hostname or "").lower() in local_hosts
+            )
+            trusted_origin = bool(claimed) and (
+                claimed == own
+                or claimed in allowed_origins
+                or same_local_host
+            )
+        # 跨站请求不再"见 cross-site 就拦"：真正决定信任的是 Origin 是否可信。
+        # 恶意站点的 Origin 不在允许列表里，照样会被下面的判断挡掉。
+        if fetch_site == "cross-site" and not trusted_origin:
+            return jsonify({"code": 403, "msg": "拒绝跨站写请求", "data": None}), 403
+        if claimed_origin and not trusted_origin:
+            return jsonify({"code": 403, "msg": "写请求来源不受信任", "data": None}), 403
     if runtime_config.access_allowed(
         request.method, request.path, request.headers, request.args
     ):
@@ -675,6 +692,199 @@ def interactive_login_start():
             **session.snapshot(),
         },
     }), 200
+
+
+@app.route('/dm/fast-poll/status', methods=['GET'])
+def dm_fast_poll_status():
+    """私信快轮询状态：每 N 秒轮一个账号，只收新消息。"""
+    try:
+        import douyin_fast_poll
+
+        data = douyin_fast_poll.fast_poll_status()
+    except Exception as exc:
+        return jsonify({"code": 500, "msg": str(exc), "data": None}), 500
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/dm-check', methods=['POST'])
+async def api_v2_account_dm_check(account_id: int):
+    """给「私信能力」一个明确结论：能读 / 不能读 / 暂时读不出来（附原因）。
+
+    能力矩阵里的"未检测"只代表没有证据，不是系统含糊。这里打开一次真实页面数
+    会话行：读到就是 ready，出现登录墙就是 blocked，超时就是 unknown + 原因。
+    结论写回 ``dm_account_sync_state``，页面刷新后能力列直接生效。
+    """
+    store = get_store(BASE_DIR)
+    item = store.get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    if int(item["platform"]["type"]) != 3:
+        return jsonify({
+            "code": 400, "msg": "目前只支持抖音账号的私信检测", "data": None,
+        }), 400
+    if account_safety.is_paused(item):
+        return jsonify({
+            "code": 200, "msg": "该账号自动动作已暂停，未访问平台",
+            "data": {"state": "unknown", "reason": item["automation"]["reason"]},
+        }), 200
+
+    row = {
+        "id": account_id,
+        "type": 3,
+        "userName": item.get("name") or "",
+        "filePath": str((item.get("cookie") or {}).get("name") or ""),
+    }
+    import douyin_dm_sync
+
+    try:
+        result = await asyncio.to_thread(douyin_dm_sync.probe_dm_readable_sync, row)
+    except Exception as exc:
+        logger.exception("私信能力检测失败: {}", account_id)
+        result = {"state": "unknown", "reason": f"检测异常：{exc}", "rows": 0}
+
+    state = str(result.get("state") or "unknown")
+    kind = {"ready": "", "blocked": "account_expired"}.get(state, "probe_unknown")
+    checked_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        import dm_ops
+
+        with dm_ops.get_conn() as conn:
+            conn.execute(
+                """INSERT INTO dm_account_sync_state
+                   (platform, account_key, account_name, last_success_at,
+                    last_error, last_error_kind, last_checked_at, last_imported)
+                   VALUES (?,?,?,?,?,?,?,0)
+                   ON CONFLICT(platform, account_key) DO UPDATE SET
+                     account_name=excluded.account_name,
+                     last_success_at=CASE WHEN excluded.last_success_at != ''
+                                          THEN excluded.last_success_at
+                                          ELSE dm_account_sync_state.last_success_at END,
+                     last_error=excluded.last_error,
+                     last_error_kind=excluded.last_error_kind,
+                     last_checked_at=excluded.last_checked_at""",
+                (
+                    "抖音", str(account_id), row["userName"],
+                    checked_at if state == "ready" else "",
+                    str(result.get("reason") or "")[:500],
+                    kind, checked_at,
+                ),
+            )
+    except Exception as exc:
+        logger.warning("写入私信检测结果失败: {}", exc)
+
+    return jsonify({
+        "code": 200,
+        "msg": None,
+        "data": {
+            "accountId": account_id,
+            "state": state,
+            "reason": result.get("reason") or "",
+            "rows": int(result.get("rows") or 0),
+            "checkedAt": checked_at,
+        },
+    }), 200
+
+
+@app.route('/api/v2/console/open', methods=['POST'])
+def api_console_open():
+    """在项目页面里打开一个真实浏览器的"内嵌窗口"（当前用于抖音私信页）。
+
+    返回会话 id 后，前端用 ``/api/v2/console/frame`` 拿画面、``/api/v2/console/input``
+    回放点击与输入。同一账号同时只保留一个内嵌会话。
+    """
+    import embedded_console as console_module
+
+    data = request.get_json(silent=True) or {}
+    try:
+        account_id = int(data.get('accountId') or 0)
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "账号 ID 格式错误", "data": None}), 400
+    if account_id <= 0:
+        return jsonify({"code": 400, "msg": "缺少账号 ID", "data": None}), 400
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    url = str(data.get('url') or '').strip()
+    try:
+        session_id, session = console_module.embedded_console.open(account_id, url)
+    except RuntimeError as exc:
+        return jsonify({"code": 409, "msg": str(exc), "data": None}), 409
+    return jsonify({"code": 200, "msg": None, "data": session.snapshot()}), 200
+
+
+@app.route('/api/v2/console/frame', methods=['GET'])
+def api_console_frame():
+    import embedded_console as console_module
+
+    session_id = str(request.args.get('id') or '').strip()[:64]
+    session = console_module.embedded_console.get(session_id)
+    if session is None:
+        return jsonify({"code": 404, "msg": "内嵌窗口不存在或已关闭", "data": None}), 404
+    frame = b''
+    for _ in range(20):
+        frame, _version = session.current_frame()
+        if frame:
+            break
+        time.sleep(0.1)
+    if not frame:
+        return Response(status=204)
+    response = Response(frame, mimetype='image/jpeg')
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
+@app.route('/api/v2/console/input', methods=['POST'])
+def api_console_input():
+    import embedded_console as console_module
+
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('id') or '').strip()[:64]
+    session = console_module.embedded_console.get(session_id)
+    if session is None:
+        return jsonify({"code": 404, "msg": "内嵌窗口不存在或已关闭", "data": None}), 404
+    kind = str(data.get('kind') or '').strip().lower()
+    payload = data.get('payload') if isinstance(data.get('payload'), dict) else {}
+    try:
+        session.submit(kind, payload)
+    except RuntimeError as exc:
+        return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
+    return jsonify({"code": 200, "msg": None, "data": session.snapshot()}), 200
+
+
+@app.route('/api/v2/console/close', methods=['POST'])
+def api_console_close():
+    import embedded_console as console_module
+
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get('id') or '').strip()[:64]
+    closed = console_module.embedded_console.close(session_id)
+    return jsonify({"code": 200, "msg": None, "data": {"closed": closed}}), 200
+
+
+@app.route('/api/v2/console/status', methods=['GET'])
+def api_console_status():
+    import embedded_console as console_module
+
+    session_id = str(request.args.get('id') or '').strip()[:64]
+    if session_id:
+        session = console_module.embedded_console.get(session_id)
+        if session is None:
+            return jsonify({"code": 404, "msg": "内嵌窗口不存在或已关闭", "data": None}), 404
+        return jsonify({"code": 200, "msg": None, "data": session.snapshot()}), 200
+    return jsonify({"code": 200, "msg": None, "data": console_module.embedded_console.status()}), 200
 
 
 @app.route('/interactiveLogin/status', methods=['GET'])
@@ -1207,6 +1417,75 @@ async def api_v2_account_check(account_id: int):
             "errorKind": _account_error_kind(fresh),
         },
     }), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/session', methods=['GET'])
+def api_v2_account_session(account_id: int):
+    """账号登录窗口与保活证据：剩余天数、上次触达结论、近 10 次记录。
+
+    抖音的窗口来自 ``sid_guard``（登录时签发的 60 天固定区间），普通网页访问
+    不会延长它——所以这里展示的是"还剩多久到期"，而不是"已自动续期"。
+    """
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    import session_ledger
+
+    data = session_ledger.state_for(account_id)
+    data.update({
+        "accountId": account_id,
+        "accountName": item.get("name") or "",
+        "platform": item["platform"]["type"],
+        "platformLabel": item["platform"]["label"],
+        "status": item.get("status"),
+        "statusText": item.get("statusText"),
+        "history": session_ledger.rows(account_id, 10),
+    })
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
+@app.route('/api/v2/accounts/<int:account_id>/session/touch', methods=['POST'])
+async def api_v2_account_session_touch(account_id: int):
+    """立即做一次保活触达（后台线程执行，不阻塞 Web 请求）。"""
+    item = get_store(BASE_DIR).get(account_id)
+    if item is None:
+        return jsonify({"code": 404, "msg": "账号不存在", "data": None}), 404
+    if not access_scope.account_in_scope(
+        account_id=account_id,
+        account_name=str(item.get("name") or ""),
+        cookie_file=str((item.get("cookie") or {}).get("name") or ""),
+    ):
+        return access_scope.forbidden("无权访问该账号")
+    if account_safety.is_paused(item):
+        return jsonify({
+            "code": 200, "msg": "该账号自动动作已暂停，未触达平台",
+            "data": {"skipped": True, "reason": item["automation"]["reason"]},
+        }), 200
+    from publish_jobs import run_keeper_once
+
+    try:
+        results = await asyncio.to_thread(
+            run_keeper_once, force=True, account_ids=[account_id],
+        )
+    except Exception as exc:
+        logger.exception("手动保活触达失败: {}", account_id)
+        return jsonify({"code": 500, "msg": f"触达失败：{exc}", "data": None}), 500
+    data = results[0] if results else {"outcome": "not_due", "accountId": account_id}
+    return jsonify({"code": 200, "msg": None, "data": data}), 200
+
+
+@app.route('/api/v2/keeper/status', methods=['GET'])
+def api_v2_keeper_status():
+    """保活循环运行状态 + 每个账号的剩余天数与下次触达时间。"""
+    from publish_jobs import keeper_status
+
+    return jsonify({"code": 200, "msg": None, "data": keeper_status()}), 200
 
 
 @app.route('/api/v2/accounts/<int:account_id>/environment', methods=['GET', 'PUT'])
@@ -4017,6 +4296,10 @@ def _start_background_tasks() -> None:
             "account-patrol", description="账号登录态巡检",
             interval=12 * 3600, launcher=publish_jobs.restart_patrol,
         )
+        runtime_guard.register(
+            "account-keeper", description="账号会话保活触达",
+            interval=1800, launcher=publish_jobs.restart_keeper,
+        )
     else:
         logger.info(
             "FLOWOPS_PROCESS_ROLE=web：发布 worker/调度/追踪由独立 executor 提供"
@@ -4045,6 +4328,16 @@ def _start_background_tasks() -> None:
 
     if owns_publish_runtime:
         publish_jobs.start_publish_runtime()
+    try:
+        publish_jobs.start_keeper()
+    except Exception:
+        logger.exception("会话保活启动失败")
+    try:
+        import douyin_fast_poll
+
+        douyin_fast_poll.start_fast_poll()
+    except Exception:
+        logger.exception("私信快轮询启动失败")
     try:
         task_jobs.start_runtime()
     except Exception:
