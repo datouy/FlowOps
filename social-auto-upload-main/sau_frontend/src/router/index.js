@@ -5,6 +5,7 @@ const ContentCenter = () => import('../views/ContentCenter.vue')
 const Inbox = () => import('../views/Inbox.vue')
 const Insights = () => import('../views/Insights.vue')
 const WorkspaceSettings = () => import('../views/WorkspaceSettings.vue')
+const OfficialConsole = () => import('../views/OfficialConsole.vue')
 
 const redirectWithView = (path, view) => to => ({
   path,
@@ -16,6 +17,7 @@ const routes = [
   { path: '/today', name: 'Today', component: Today },
   { path: '/content', name: 'Content', component: ContentCenter },
   { path: '/inbox', name: 'Inbox', component: Inbox },
+  { path: '/console', name: 'OfficialConsole', component: OfficialConsole },
   { path: '/insights', name: 'Insights', component: Insights },
   { path: '/settings', name: 'Settings', component: WorkspaceSettings },
 
